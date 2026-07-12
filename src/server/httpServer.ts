@@ -8,6 +8,10 @@ import { createCodexBridgeMiddleware } from './codexAppServerBridge.js'
 import { createAuthSession } from './authMiddleware.js'
 import { createDirectoryListingHtml, createTextEditorHtml, decodeBrowsePath, getLocalDirectoryListing, isTextEditableFile, normalizeLocalPath } from './localBrowseUi.js'
 import { WebSocketServer, type WebSocket } from 'ws'
+import {
+  PERMISSIVE_SECURITY_POLICY,
+  type ServerSecurityPolicy,
+} from './securityPolicy.js'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
 const distDir = join(__dirname, '..', 'dist')
@@ -15,6 +19,7 @@ const spaEntryFile = join(distDir, 'index.html')
 
 export type ServerOptions = {
   password?: string
+  securityPolicy?: ServerSecurityPolicy
 }
 
 export type ServerInstance = {
@@ -74,7 +79,8 @@ function readWildcardPathParam(value: unknown): string {
 
 export function createServer(options: ServerOptions = {}): ServerInstance {
   const app = express()
-  const bridge = createCodexBridgeMiddleware()
+  const securityPolicy = options.securityPolicy ?? PERMISSIVE_SECURITY_POLICY
+  const bridge = createCodexBridgeMiddleware({ securityPolicy })
   const authSession = options.password ? createAuthSession(options.password) : null
 
   // 1. Auth middleware (if password is set)
@@ -86,11 +92,16 @@ export function createServer(options: ServerOptions = {}): ServerInstance {
   app.use(bridge)
 
   // 3. Serve local images referenced in markdown (desktop parity for absolute image paths)
-  app.get('/codex-local-image', (req, res) => {
+  app.get('/codex-local-image', async (req, res) => {
     const rawPath = typeof req.query.path === 'string' ? req.query.path : ''
-    const localPath = normalizeLocalImagePath(rawPath)
-    if (!localPath || !isAbsolute(localPath)) {
+    const requestedPath = normalizeLocalImagePath(rawPath)
+    if (!requestedPath || !isAbsolute(requestedPath)) {
       res.status(400).json({ error: 'Expected absolute local file path.' })
+      return
+    }
+    const localPath = await securityPolicy.resolveLocalPath(requestedPath)
+    if (!localPath) {
+      res.status(403).json({ error: 'Path is outside configured roots.' })
       return
     }
 
@@ -109,11 +120,16 @@ export function createServer(options: ServerOptions = {}): ServerInstance {
   })
 
   // 4. Serve local files inline for direct file open.
-  app.get('/codex-local-file', (req, res) => {
+  app.get('/codex-local-file', async (req, res) => {
     const rawPath = typeof req.query.path === 'string' ? req.query.path : ''
-    const localPath = normalizeLocalPath(rawPath)
-    if (!localPath || !isAbsolute(localPath)) {
+    const requestedPath = normalizeLocalPath(rawPath)
+    if (!requestedPath || !isAbsolute(requestedPath)) {
       res.status(400).json({ error: 'Expected absolute local file path.' })
+      return
+    }
+    const localPath = await securityPolicy.resolveLocalPath(requestedPath)
+    if (!localPath) {
+      res.status(403).json({ error: 'Path is outside configured roots.' })
       return
     }
 
@@ -130,9 +146,14 @@ export function createServer(options: ServerOptions = {}): ServerInstance {
     const rawPath = typeof req.query.path === 'string' ? req.query.path : ''
     const showHidden = typeof req.query.showHidden === 'string'
       && ['1', 'true', 'yes', 'on'].includes(req.query.showHidden.toLowerCase())
-    const localPath = normalizeLocalPath(rawPath)
-    if (!localPath || !isAbsolute(localPath)) {
+    const requestedPath = normalizeLocalPath(rawPath)
+    if (!requestedPath || !isAbsolute(requestedPath)) {
       res.status(400).json({ error: 'Expected absolute local directory path.' })
+      return
+    }
+    const localPath = await securityPolicy.resolveLocalPath(requestedPath)
+    if (!localPath) {
+      res.status(403).json({ error: 'Path is outside configured roots.' })
       return
     }
 
@@ -152,10 +173,15 @@ export function createServer(options: ServerOptions = {}): ServerInstance {
   // 6. Serve local files by path to preserve relative asset loading for HTML.
   app.get('/codex-local-browse/*path', async (req, res) => {
     const rawPath = readWildcardPathParam(req.params.path)
-    const localPath = decodeBrowsePath(`/${rawPath}`)
-    const newProjectName = typeof req.query.newProjectName === 'string' ? req.query.newProjectName : ''
-    if (!localPath || !isAbsolute(localPath)) {
+    const requestedPath = decodeBrowsePath(`/${rawPath}`)
+    if (!requestedPath || !isAbsolute(requestedPath)) {
       res.status(400).json({ error: 'Expected absolute local file path.' })
+      return
+    }
+    const localPath = await securityPolicy.resolveLocalPath(requestedPath)
+    const newProjectName = typeof req.query.newProjectName === 'string' ? req.query.newProjectName : ''
+    if (!localPath) {
+      res.status(403).json({ error: 'Path is outside configured roots.' })
       return
     }
 
@@ -179,10 +205,19 @@ export function createServer(options: ServerOptions = {}): ServerInstance {
 
   // 7. Edit text-like local files.
   app.get('/codex-local-edit/*path', async (req, res) => {
+    if (!securityPolicy.fileEditingEnabled) {
+      res.status(403).json({ error: 'File editing is disabled by the active security policy.' })
+      return
+    }
     const rawPath = readWildcardPathParam(req.params.path)
-    const localPath = decodeBrowsePath(`/${rawPath}`)
-    if (!localPath || !isAbsolute(localPath)) {
+    const requestedPath = decodeBrowsePath(`/${rawPath}`)
+    if (!requestedPath || !isAbsolute(requestedPath)) {
       res.status(400).json({ error: 'Expected absolute local file path.' })
+      return
+    }
+    const localPath = await securityPolicy.resolveLocalPath(requestedPath)
+    if (!localPath) {
+      res.status(403).json({ error: 'Path is outside configured roots.' })
       return
     }
     try {
@@ -199,10 +234,19 @@ export function createServer(options: ServerOptions = {}): ServerInstance {
   })
 
   app.put('/codex-local-edit/*path', express.text({ type: '*/*', limit: '10mb' }), async (req, res) => {
+    if (!securityPolicy.fileEditingEnabled) {
+      res.status(403).json({ error: 'File editing is disabled by the active security policy.' })
+      return
+    }
     const rawPath = readWildcardPathParam(req.params.path)
-    const localPath = decodeBrowsePath(`/${rawPath}`)
-    if (!localPath || !isAbsolute(localPath)) {
+    const requestedPath = decodeBrowsePath(`/${rawPath}`)
+    if (!requestedPath || !isAbsolute(requestedPath)) {
       res.status(400).json({ error: 'Expected absolute local file path.' })
+      return
+    }
+    const localPath = await securityPolicy.resolveLocalPath(requestedPath)
+    if (!localPath) {
+      res.status(403).json({ error: 'Path is outside configured roots.' })
       return
     }
     if (!(await isTextEditableFile(localPath))) {

@@ -48,6 +48,10 @@ import {
 } from '../commandResolution.js'
 import type { CollaborationModeKind, ReasoningEffort } from '../types/codex.js'
 import { isAbsoluteLikePath } from '../pathUtils.js'
+import {
+  PERMISSIVE_SECURITY_POLICY,
+  type ServerSecurityPolicy,
+} from './securityPolicy.js'
 
 type JsonRpcCall = {
   jsonrpc: '2.0'
@@ -7438,7 +7442,10 @@ async function buildThreadSearchIndex(appServer: AppServerProcess): Promise<Thre
   return { docsById }
 }
 
-export function createCodexBridgeMiddleware(): CodexBridgeMiddleware {
+export function createCodexBridgeMiddleware(options: {
+  securityPolicy?: ServerSecurityPolicy
+} = {}): CodexBridgeMiddleware {
+  const securityPolicy = options.securityPolicy ?? PERMISSIVE_SECURITY_POLICY
   const { appServer, terminalManager, methodCatalog, telegramBridge, backendQueueProcessor } = getSharedBridgeState()
   let threadSearchIndex: ThreadSearchIndex | null = null
   let threadSearchIndexPromise: Promise<ThreadSearchIndex> | null = null
@@ -7457,15 +7464,17 @@ export function createCodexBridgeMiddleware(): CodexBridgeMiddleware {
     }
     return threadSearchIndexPromise
   }
-  void initializeSkillsSyncOnStartup(appServer)
-  void readTelegramBridgeConfig()
-    .then((config) => {
-      if (!config.botToken) return
-      telegramBridge.configureToken(config.botToken)
-      telegramBridge.configureAllowedUserIds(config.allowedUserIds)
-      telegramBridge.start()
-    })
-    .catch(() => {})
+  if (securityPolicy.backgroundIntegrationsEnabled) {
+    void initializeSkillsSyncOnStartup(appServer)
+    void readTelegramBridgeConfig()
+      .then((config) => {
+        if (!config.botToken) return
+        telegramBridge.configureToken(config.botToken)
+        telegramBridge.configureAllowedUserIds(config.allowedUserIds)
+        telegramBridge.start()
+      })
+      .catch(() => {})
+  }
 
   const middleware = async (req: IncomingMessage, res: ServerResponse, next: () => void) => {
     const requestStartNs = process.hrtime.bigint()
@@ -7516,6 +7525,11 @@ export function createCodexBridgeMiddleware(): CodexBridgeMiddleware {
       }
 
       const url = new URL(req.url, 'http://localhost')
+
+      if (securityPolicy.isRouteDisabled(req.method ?? 'GET', url.pathname)) {
+        setJson(res, 403, { error: 'This integration is disabled by the active security policy.' })
+        return
+      }
 
       if (url.pathname === '/codex-api/zen-proxy/v1/responses' && req.method === 'POST') {
         if (!isLoopbackRemoteAddress(req.socket.remoteAddress)) {
@@ -7853,6 +7867,10 @@ export function createCodexBridgeMiddleware(): CodexBridgeMiddleware {
       }
 
       if (req.method === 'POST' && url.pathname === '/codex-api/thread-terminal/input') {
+        if (!securityPolicy.terminalInputEnabled) {
+          setJson(res, 403, { error: 'Terminal input is disabled by the active security policy.' })
+          return
+        }
         const availability = terminalManager.getAvailability()
         if (!availability.available) {
           setJson(res, 503, { error: availability.reason || 'Integrated terminal is unavailable on this host' })
@@ -7931,6 +7949,11 @@ export function createCodexBridgeMiddleware(): CodexBridgeMiddleware {
 	          setJson(res, 400, { error: 'Invalid body: expected { method, params? }' })
 	          return
 	        }
+
+        if (!securityPolicy.isRpcMethodAllowed(body.method)) {
+          setJson(res, 403, { error: `RPC method is not allowed: ${body.method}` })
+          return
+        }
 
 	        if (body.method === 'generate-thread-title') {
 	          setJson(res, 200, { result: { title: '' } })
