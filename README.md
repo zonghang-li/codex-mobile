@@ -22,12 +22,18 @@ Start the safe command in the foreground:
 
 ```bash
 codex-mobile-safe start /path/to/project \
-  --password-file ~/.codex/codex-mobile-safe-password \
   --no-open
+```
+
+While that foreground process remains running, use a second terminal for exposure and status commands:
+
+```bash
 codex-mobile-safe expose tailscale
 codex-mobile-safe status
 codex-mobile-safe urls
 ```
+
+On the first foreground start, omit `--password-file`: the safe CLI generates a password, stores it in `~/.codex/codex-mobile-safe-password` with mode `0600`, and prints only the generated file path. Read the password locally from that file when signing in; do not pass it as `--password` or copy it into logs. Later foreground restarts can reuse the generated credential with `--password-file ~/.codex/codex-mobile-safe-password`.
 
 For a persistent Linux user service:
 
@@ -44,7 +50,7 @@ codex-mobile-safe expose tailscale
 
 If the service should survive logout, enable user lingering once with `loginctl enable-linger "$USER"`.
 
-To update a foreground/manual installation from the clone:
+To update a foreground/manual installation that has already completed its first safe start:
 
 ```bash
 cd /path/to/codex-mobile
@@ -56,6 +62,8 @@ codex-mobile-safe start /path/to/project \
   --password-file ~/.codex/codex-mobile-safe-password \
   --no-open
 ```
+
+If the generated password file does not exist, omit `--password-file` on that start so the safe CLI creates it securely; never replace this with a plaintext password in the command line.
 
 For a persistent user service, refresh the installed package, rendered unit, systemd daemon state, and running process together:
 
@@ -95,6 +103,8 @@ codex-mobile-safe start /path/to/project \
   --ntfy-url-file /path/to/private-ntfy-url-file \
   --no-open
 ```
+
+This example reuses the password file created by an earlier safe foreground start or `service:install`. If it is absent, omit `--password-file` and let the safe CLI generate it securely.
 
 Qualifying turns use these titles:
 
