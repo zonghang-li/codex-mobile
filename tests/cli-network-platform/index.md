@@ -10,6 +10,7 @@ Return to the [manual test index](../../tests.md).
 | --- |
 | [Missing Codex CLI chat error](missing-codex-cli-chat-error.md) |
 | [Startup avoids duplicate setup probes](startup-avoids-duplicate-setup-probes.md) |
+| [Feature: modular safe CLI local install and tailnet service](modular-safe-cli-local-install-and-tailnet-service.md) |
 | [CLI password output redaction](cli-password-output-redaction.md) |
 | [npx run dev compatibility shim](npx-run-dev-compatibility-shim.md) |
 | [Termux install without native PTY build](termux-install-without-native-pty-build.md) |
