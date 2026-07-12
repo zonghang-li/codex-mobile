@@ -32,6 +32,8 @@ describe('local installation packaging', () => {
   it('keeps plaintext passwords out of the restartable systemd unit', async () => {
     const unit = await readRepoFile('packaging/systemd/codex-mobile-safe.service.in')
     expect(unit).toContain('Restart=on-failure')
+    expect(unit).toContain('--sandbox-mode danger-full-access')
+    expect(unit).toContain('--approval-policy never')
     expect(unit).toContain('--password-file %h/.codex/codex-mobile-safe-password')
     expect(unit).toContain('--no-open')
     expect(unit).not.toMatch(/--password(?:=|\s)/u)
