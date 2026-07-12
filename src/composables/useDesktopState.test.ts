@@ -79,6 +79,33 @@ function installTestWindow(initialStorage: Record<string, string> = {}) {
   })
 }
 
+async function setupTurnLifecycleNotificationState(selectedThreadId: string) {
+  installTestWindow()
+  let notificationHandler: ((notification: { method: string; params?: unknown }) => void) | undefined
+  gatewayMocks.subscribeCodexNotifications.mockImplementation((handler) => {
+    notificationHandler = handler as typeof notificationHandler
+    return vi.fn()
+  })
+  gatewayMocks.getPendingServerRequests.mockResolvedValue([])
+  gatewayMocks.getThreadGroupsPage.mockResolvedValue({
+    groups: [{ projectName: 'Project', threads: [thread('thread-1', '/tmp/project')] }],
+    nextCursor: null,
+  })
+
+  const state = useDesktopState()
+  await state.refreshAll({ includeSelectedThreadMessages: false })
+  state.primeSelectedThread(selectedThreadId)
+  state.startPolling()
+  expect(notificationHandler).toBeDefined()
+
+  return {
+    state,
+    emit(notification: { method: string; params?: unknown }) {
+      notificationHandler!(notification)
+    },
+  }
+}
+
 beforeEach(() => {
   vi.clearAllMocks()
   gatewayMocks.getThreadQueueState.mockResolvedValue({})
@@ -616,6 +643,149 @@ describe('startup request deduplication', () => {
       nowSpy.mockRestore()
     }
   })
+})
+
+describe('turn completion lifecycle', () => {
+  it('keeps a thread running and unread false while fallback retry starts', async () => {
+    const { state, emit } = await setupTurnLifecycleNotificationState('thread-1')
+    gatewayMocks.resumeThread.mockResolvedValue({
+      model: 'gpt-5.5',
+      modelProvider: 'openai',
+      messages: [],
+      inProgress: true,
+      activeTurnId: 'turn-primary',
+      hasMoreOlder: false,
+      turnIndexByTurnId: {},
+    })
+    gatewayMocks.getThreadDetail.mockResolvedValue({
+      model: 'gpt-5.5',
+      modelProvider: 'openai',
+      messages: [],
+      inProgress: true,
+      activeTurnId: 'turn-primary',
+      hasMoreOlder: false,
+      turnIndexByTurnId: {},
+    })
+    gatewayMocks.rollbackThread.mockResolvedValue([])
+    let resolveFallbackStart: ((turnId: string) => void) | undefined
+    gatewayMocks.startThreadTurn
+      .mockResolvedValueOnce('turn-primary')
+      .mockImplementationOnce(() => new Promise<string>((resolve) => {
+        resolveFallbackStart = resolve
+      }))
+
+    await state.sendMessageToSelectedThread('retry this request')
+    emit({
+      method: 'turn/started',
+      params: {
+        threadId: 'thread-1',
+        turn: { id: 'turn-primary' },
+      },
+    })
+    emit({
+      method: 'turn/completed',
+      params: {
+        threadId: 'thread-1',
+        turn: {
+          id: 'turn-primary',
+          status: 'failed',
+          error: { message: 'model is not supported' },
+        },
+      },
+    })
+
+    expect(state.projectGroups.value[0]?.threads[0]).toMatchObject({
+      inProgress: true,
+      unread: false,
+    })
+    await vi.waitFor(() => {
+      expect(gatewayMocks.startThreadTurn).toHaveBeenCalledTimes(2)
+    })
+
+    gatewayMocks.getThreadDetail.mockResolvedValue({
+      model: 'gpt-5.5',
+      modelProvider: 'openai',
+      messages: [],
+      inProgress: false,
+      activeTurnId: '',
+      hasMoreOlder: false,
+      turnIndexByTurnId: {},
+    })
+    await state.loadMessages('thread-1', { silent: true })
+
+    expect(state.projectGroups.value[0]?.threads[0]).toMatchObject({
+      inProgress: true,
+      unread: false,
+    })
+    expect(gatewayMocks.startThreadTurn).toHaveBeenLastCalledWith(
+      'thread-1',
+      'retry this request',
+      [],
+      'gpt-5.4-mini',
+      'medium',
+      undefined,
+      [],
+      'default',
+    )
+    resolveFallbackStart?.('turn-fallback')
+  })
+
+  it('marks a successful background completion unread', async () => {
+    const { state, emit } = await setupTurnLifecycleNotificationState('other-thread')
+
+    emit({
+      method: 'turn/started',
+      params: { threadId: 'thread-1', turn: { id: 'turn-1' } },
+    })
+    emit({
+      method: 'turn/completed',
+      params: { threadId: 'thread-1', turn: { id: 'turn-1', status: 'completed' } },
+    })
+
+    expect(state.projectGroups.value[0]?.threads[0]).toMatchObject({
+      inProgress: false,
+      unread: true,
+    })
+  })
+
+  it('does not mark a selected successful thread unread', async () => {
+    const { state, emit } = await setupTurnLifecycleNotificationState('thread-1')
+
+    emit({
+      method: 'turn/started',
+      params: { threadId: 'thread-1', turn: { id: 'turn-1' } },
+    })
+    emit({
+      method: 'turn/completed',
+      params: { threadId: 'thread-1', turn: { id: 'turn-1', status: 'completed' } },
+    })
+
+    expect(state.projectGroups.value[0]?.threads[0]).toMatchObject({
+      inProgress: false,
+      unread: false,
+    })
+  })
+
+  it.each(['failed', 'interrupted', 'declined', 'timeout', 'future-terminal-status'])(
+    'does not mark a background %s completion unread',
+    async (status) => {
+      const { state, emit } = await setupTurnLifecycleNotificationState('other-thread')
+
+      emit({
+        method: 'turn/started',
+        params: { threadId: 'thread-1', turn: { id: 'turn-1' } },
+      })
+      emit({
+        method: 'turn/completed',
+        params: { threadId: 'thread-1', turn: { id: 'turn-1', status } },
+      })
+
+      expect(state.projectGroups.value[0]?.threads[0]).toMatchObject({
+        inProgress: false,
+        unread: false,
+      })
+    },
+  )
 })
 
 describe('live error overlay', () => {

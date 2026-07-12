@@ -60,6 +60,7 @@ import type {
   UiThread,
 } from '../types/codex'
 import { getPathParent, isProjectlessChatPath, normalizePathForUi, toProjectName } from '../pathUtils.js'
+import { resolveTurnCompletionDisposition, type TurnTerminalStatus } from './threadLifecycle'
 
 function flattenThreads(groups: UiProjectGroup[]): UiThread[] {
   return groups.flatMap((group) => group.threads)
@@ -829,6 +830,7 @@ type TurnStartedInfo = {
 type TurnCompletedInfo = {
   threadId: string
   turnId: string
+  status: TurnTerminalStatus
   completedAtMs: number
   startedAtMs?: number
 }
@@ -3335,6 +3337,7 @@ export function useDesktopState() {
     return {
       threadId,
       turnId,
+      status: readString(turnPayload?.status),
       completedAtMs,
       startedAtMs,
     }
@@ -3826,9 +3829,19 @@ export function useDesktopState() {
       if (activeTurnIdByThreadId.value[completedTurn.threadId]) {
         activeTurnIdByThreadId.value = omitKey(activeTurnIdByThreadId.value, completedTurn.threadId)
       }
-      setThreadInProgress(completedTurn.threadId, false)
-      setTurnActivityForThread(completedTurn.threadId, null)
-      markThreadUnreadByEvent(completedTurn.threadId)
+      clearDelayedTurnSync(completedTurn.threadId)
+      const disposition = resolveTurnCompletionDisposition(
+        completedTurn.status,
+        shouldRetryWithFallback,
+        completedTurn.threadId === selectedThreadId.value,
+      )
+      if (!disposition.keepRunning) {
+        setThreadInProgress(completedTurn.threadId, false)
+        setTurnActivityForThread(completedTurn.threadId, null)
+      }
+      if (disposition.markUnread) {
+        markThreadUnreadByEvent(completedTurn.threadId)
+      }
       if (!shouldRetryWithFallback) {
         clearPendingTurnRequest(completedTurn.threadId)
         scheduleQueueStateRefresh(completedTurn.threadId)
@@ -3978,17 +3991,6 @@ export function useDesktopState() {
       clearLiveReasoningForThread(notificationThreadId)
       if (liveCommandsByThreadId.value[notificationThreadId]) {
         liveCommandsByThreadId.value = omitKey(liveCommandsByThreadId.value, notificationThreadId)
-      }
-      const completedThreadId = extractThreadIdFromNotification(notification)
-      if (completedThreadId) {
-        clearDelayedTurnSync(completedThreadId)
-        setThreadInProgress(completedThreadId, false)
-        setTurnActivityForThread(completedThreadId, null)
-        markThreadUnreadByEvent(completedThreadId)
-        if (!shouldRetryWithFallback) {
-          clearPendingTurnRequest(completedThreadId)
-          scheduleQueueStateRefresh(completedThreadId)
-        }
       }
     }
 
@@ -4419,7 +4421,11 @@ export function useDesktopState() {
         }
       }
 
-      const { messages: nextMessages, inProgress, activeTurnId, turnIndexByTurnId } = detail
+      const { messages: nextMessages, inProgress: serverInProgress, activeTurnId, turnIndexByTurnId } = detail
+      const retainLocalInProgress =
+        inProgressById.value[threadId] === true &&
+        pendingTurnRequestByThreadId.value[threadId]?.fallbackRetried === true
+      const inProgress = serverInProgress || retainLocalInProgress
       hasMoreOlderMessagesByThreadId.value = {
         ...hasMoreOlderMessagesByThreadId.value,
         [threadId]: detail.hasMoreOlder === true,
