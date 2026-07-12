@@ -70,6 +70,20 @@ function readApprovalPolicy(value: string | undefined): SafeApprovalPolicy {
     : DEFAULT_SAFE_RUNTIME_CONFIG.approvalPolicy
 }
 
+export function parseSafeSandboxMode(value: string | undefined): SafeSandboxMode {
+  const normalized = value?.trim().toLowerCase()
+  if (!normalized || normalized === 'workspace-write') return 'workspace-write'
+  if (normalized === 'read-only' || normalized === 'danger-full-access') return normalized
+  throw new Error(`Invalid safe sandbox mode: ${value}`)
+}
+
+export function parseSafeApprovalPolicy(value: string | undefined): SafeApprovalPolicy {
+  const normalized = value?.trim().toLowerCase()
+  if (!normalized || normalized === 'on-request') return 'on-request'
+  if (normalized === 'untrusted' || normalized === 'on-failure' || normalized === 'never') return normalized
+  throw new Error(`Invalid safe approval policy: ${value}`)
+}
+
 export function loadSafeRuntimeConfig(env: NodeJS.ProcessEnv = process.env): SafeRuntimeConfig {
   const lanEnabled = readBoolean(env.CODEX_MOBILE_SAFE_LAN)
   return {

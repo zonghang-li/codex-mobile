@@ -17,8 +17,8 @@ import {
 import { readSecurePasswordFile } from '../safe/passwordFile.js'
 import {
   loadSafeRuntimeConfig,
-  type SafeApprovalPolicy,
-  type SafeSandboxMode,
+  parseSafeApprovalPolicy,
+  parseSafeSandboxMode,
 } from '../safe/runtimePolicy.js'
 import {
   clearManagedState,
@@ -105,20 +105,6 @@ async function resolvePassword(options: {
   }
   const password = generatePassword()
   return { password, generatedPath: await persistGeneratedPassword(password) }
-}
-
-function parseSafeSandboxMode(value: string | undefined): SafeSandboxMode {
-  const normalized = value?.trim().toLowerCase()
-  if (!normalized || normalized === 'workspace-write') return 'workspace-write'
-  if (normalized === 'read-only' || normalized === 'danger-full-access') return normalized
-  throw new Error(`Invalid safe sandbox mode: ${value}`)
-}
-
-function parseSafeApprovalPolicy(value: string | undefined): SafeApprovalPolicy {
-  const normalized = value?.trim().toLowerCase()
-  if (!normalized || normalized === 'on-request') return 'on-request'
-  if (normalized === 'untrusted' || normalized === 'on-failure' || normalized === 'never') return normalized
-  throw new Error(`Invalid safe approval policy: ${value}`)
 }
 
 program.command('start')

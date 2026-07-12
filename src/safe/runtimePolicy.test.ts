@@ -1,6 +1,11 @@
 import { delimiter, resolve } from 'node:path'
 import { describe, expect, it } from 'vitest'
-import { DEFAULT_SAFE_RUNTIME_CONFIG, loadSafeRuntimeConfig } from './runtimePolicy'
+import {
+  DEFAULT_SAFE_RUNTIME_CONFIG,
+  loadSafeRuntimeConfig,
+  parseSafeApprovalPolicy,
+  parseSafeSandboxMode,
+} from './runtimePolicy'
 
 describe('safe runtime policy', () => {
   it('uses loopback, authenticated, non-exposed defaults', () => {
@@ -44,6 +49,15 @@ describe('safe runtime policy', () => {
       sandboxMode: 'workspace-write',
       approvalPolicy: 'on-request',
     })
+  })
+
+  it('strictly parses CLI execution profiles', () => {
+    expect(parseSafeSandboxMode(undefined)).toBe('workspace-write')
+    expect(parseSafeApprovalPolicy(undefined)).toBe('on-request')
+    expect(parseSafeSandboxMode('danger-full-access')).toBe('danger-full-access')
+    expect(parseSafeApprovalPolicy('never')).toBe('never')
+    expect(() => parseSafeSandboxMode('unknown')).toThrow('Invalid safe sandbox mode')
+    expect(() => parseSafeApprovalPolicy('unknown')).toThrow('Invalid safe approval policy')
   })
 
   it('normalizes and de-duplicates allowed roots', () => {
