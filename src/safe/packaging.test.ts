@@ -49,6 +49,8 @@ describe('local installation packaging', () => {
     expect(localInstaller).toContain('npm install --global --prefix')
     expect(serviceInstaller).toContain('systemd-analyze --user verify')
     expect(serviceInstaller).toContain('loginctl show-user')
+    expect(serviceInstaller).toContain('systemctl --user enable codex-mobile-safe.service')
+    expect(serviceInstaller).toContain('systemctl --user restart codex-mobile-safe.service')
   })
 
   it('honors the conventional PREFIX override for isolated installs', async () => {

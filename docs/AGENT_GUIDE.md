@@ -22,7 +22,7 @@ This repository maintains the upstream-compatible `codex-mobile` command and a h
 
 ## Non-negotiable safe-mode invariants
 
-1. Bind to `127.0.0.1` by default. Do not add a LAN-listen shortcut to safe mode.
+1. Bind to `127.0.0.1` by default. The compatibility `--lan` override must remain explicit and must never be used by the Tailnet-only service.
 2. Require authentication. A password file must be a regular file owned by the current user, contain a non-empty password, and grant no group/other permissions (mode `0600` or stricter).
 3. Never start Cloudflare tunnels or Tailscale Funnel from safe mode. Remote access is opt-in Tailscale Serve only.
 4. Do not treat a Tailscale source address as an authentication bypass.

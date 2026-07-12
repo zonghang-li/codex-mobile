@@ -51,7 +51,8 @@ export async function exposeTailscale(port: number, run: CommandRunner = default
     `http://127.0.0.1:${String(port)}`,
   ])
   if (result.status !== 0) throw new Error(result.stderr || 'tailscale serve failed')
-  return result.stdout.trim() || `http://127.0.0.1:${String(port)}`
+  const tailnetUrl = result.stdout.match(/https:\/\/[^\s|]+/u)?.[0]
+  return tailnetUrl || `http://127.0.0.1:${String(port)}`
 }
 
 export async function unexposeTailscale(_port: number, run: CommandRunner = defaultRunner): Promise<void> {

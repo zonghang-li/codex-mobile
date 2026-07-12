@@ -2,12 +2,12 @@
 set -eu
 
 root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd -P)
-prefix=${CODEX_MOBILE_PREFIX:-"$HOME/.local"}
+prefix=${PREFIX:-${CODEX_MOBILE_PREFIX:-"$HOME/.local"}}
 unit_dir=${XDG_CONFIG_HOME:-"$HOME/.config"}/systemd/user
 unit_file=$unit_dir/codex-mobile-safe.service
 password_file=$HOME/.codex/codex-mobile-safe-password
 
-sh "$root/scripts/install-local.sh"
+PREFIX=$prefix sh "$root/scripts/install-local.sh"
 
 mkdir -p "$unit_dir" "$(dirname -- "$password_file")"
 if [ ! -f "$password_file" ]; then
@@ -30,7 +30,8 @@ chmod 600 "$unit_file"
 
 systemd-analyze --user verify "$unit_file"
 systemctl --user daemon-reload
-systemctl --user enable --now codex-mobile-safe.service
+systemctl --user enable codex-mobile-safe.service
+systemctl --user restart codex-mobile-safe.service
 
 linger=$(loginctl show-user "$USER" -p Linger --value 2>/dev/null || true)
 if [ "$linger" != yes ]; then

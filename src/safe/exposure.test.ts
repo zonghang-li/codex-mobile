@@ -26,6 +26,17 @@ describe('Tailscale exposure', () => {
     expect(calls.flatMap(([, args]) => args)).not.toContain('funnel')
   })
 
+  it('extracts the Tailnet HTTPS URL from Tailscale Serve output', async () => {
+    const runner: CommandRunner = async (_command, args) => ({
+      status: 0,
+      stdout: args[0] === 'serve'
+        ? 'Available within your tailnet:\n\nhttps://host.tailnet.ts.net/\n|-- proxy http://127.0.0.1:5900\n'
+        : '{}',
+      stderr: '',
+    })
+    await expect(exposeTailscale(5900, runner)).resolves.toBe('https://host.tailnet.ts.net/')
+  })
+
   it('refuses exposure without password protection', () => {
     expect(() => assertPasswordProtectedExposure(false)).toThrow('password-protected')
     expect(() => assertPasswordProtectedExposure(true)).not.toThrow()
