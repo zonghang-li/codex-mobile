@@ -1,4 +1,4 @@
-import { chmod, mkdtemp, readFile, readdir, stat, symlink, writeFile } from 'node:fs/promises'
+import { chmod, mkdir, mkdtemp, readFile, readdir, rename, stat, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { describe, expect, it, vi } from 'vitest'
@@ -160,6 +160,53 @@ describe('durable ntfy state', () => {
     await expect(new FileNtfyStateStore(path).save(populatedState())).rejects.toThrow('state path')
 
     expect(await readFile(target, 'utf8')).toBe(original)
+  })
+
+  it('rejects a symlink used as the final parent directory', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'codex-safe-ntfy-parent-link-'))
+    const realParent = join(root, 'real-parent')
+    const linkedParent = join(root, 'linked-parent')
+    await new FileNtfyStateStore(join(realParent, 'existing.json')).save(createEmptyNtfyState())
+    await symlink(realParent, linkedParent)
+
+    await expect(new FileNtfyStateStore(join(linkedParent, 'state.json')).save(populatedState()))
+      .rejects.toThrow('state directory')
+  })
+
+  it('rejects a symlink in an earlier ancestor directory', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'codex-safe-ntfy-ancestor-link-'))
+    const realAncestor = join(root, 'real-ancestor')
+    const linkedAncestor = join(root, 'linked-ancestor')
+    await new FileNtfyStateStore(join(realAncestor, 'private', 'existing.json')).save(createEmptyNtfyState())
+    await symlink(realAncestor, linkedAncestor)
+
+    await expect(new FileNtfyStateStore(join(linkedAncestor, 'private', 'state.json')).save(populatedState()))
+      .rejects.toThrow('state directory')
+  })
+
+  it('detects parent replacement after opening it without writing through the replacement', async () => {
+    const path = await temporaryStatePath()
+    const parent = dirname(path)
+    const root = dirname(parent)
+    const movedParent = join(root, 'moved-private')
+    const replacement = join(root, 'replacement')
+    await mkdir(replacement, { mode: 0o700 })
+    await new FileNtfyStateStore(path).save(createEmptyNtfyState())
+    const original = await readFile(path, 'utf8')
+    let replaced = false
+    const racingStore = new FileNtfyStateStore(path, () => {}, {
+      afterDirectoryOpen: async () => {
+        await rename(parent, movedParent)
+        await symlink(replacement, parent)
+        replaced = true
+      },
+    })
+
+    await expect(racingStore.save(populatedState())).rejects.toThrow('Unable to save ntfy notifier state')
+
+    expect(replaced).toBe(true)
+    expect(await readFile(join(movedParent, 'ntfy-state.json'), 'utf8')).toBe(original)
+    await expect(readFile(join(replacement, 'ntfy-state.json'), 'utf8')).rejects.toMatchObject({ code: 'ENOENT' })
   })
 
   it('preserves the previous state and removes the private temporary file when rename fails', async () => {

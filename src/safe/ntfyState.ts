@@ -1,7 +1,7 @@
 import { constants } from 'node:fs'
-import { chmod, lstat, mkdir, open, readFile, rename, rm, type FileHandle } from 'node:fs/promises'
+import { lstat, mkdir, open, readFile, rename, rm, type FileHandle } from 'node:fs/promises'
 import { randomUUID } from 'node:crypto'
-import { basename, dirname, join } from 'node:path'
+import { basename, dirname, join, parse, resolve, sep } from 'node:path'
 
 export type ActiveTurnRecord = { key: string; threadId: string; turnId: string; startedAt: number }
 export type PendingNtfyRecord = {
@@ -20,9 +20,18 @@ export type NtfyNotifierState = {
 type WarningCallback = (message: string) => void
 
 type NtfyStateStoreOperations = {
+  afterDirectoryOpen: () => Promise<void>
   rename: (source: string, destination: string) => Promise<void>
   write: (handle: FileHandle, contents: string) => Promise<void>
 }
+
+type DirectoryIdentity = {
+  path: string
+  dev: number
+  ino: number
+}
+
+class UnsafeStatePathError extends Error {}
 
 const TITLES = new Set<PendingNtfyRecord['title']>([
   'Codex 任务完成',
@@ -106,19 +115,71 @@ async function assertSafeStatePath(path: string): Promise<void> {
     throw new Error('Unable to inspect ntfy notifier state path')
   })
   if (!info) return
-  if (info.isSymbolicLink()) throw new Error('ntfy notifier state path must not be a symlink')
-  if (!info.isFile()) throw new Error('ntfy notifier state path must be a regular file')
+  if (info.isSymbolicLink()) throw new UnsafeStatePathError('ntfy notifier state path must not be a symlink')
+  if (!info.isFile()) throw new UnsafeStatePathError('ntfy notifier state path must be a regular file')
 }
 
-async function ensurePrivateDirectory(path: string): Promise<void> {
-  try {
-    await mkdir(path, { recursive: true, mode: 0o700 })
-    const info = await lstat(path)
-    if (!info.isDirectory() || info.isSymbolicLink()) {
-      throw new Error('unsafe directory')
+function directoryChain(path: string): string[] {
+  const absolute = resolve(path)
+  const root = parse(absolute).root
+  const components = absolute.slice(root.length).split(sep).filter(Boolean)
+  const paths = [root]
+  for (const component of components) paths.push(join(paths[paths.length - 1], component))
+  return paths
+}
+
+async function inspectDirectoryChain(path: string, createMissing: boolean): Promise<DirectoryIdentity[]> {
+  const identities: DirectoryIdentity[] = []
+  for (const componentPath of directoryChain(path)) {
+    let info = await lstat(componentPath).catch((error: NodeJS.ErrnoException) => {
+      if (createMissing && error.code === 'ENOENT') return null
+      throw error
+    })
+    if (!info) {
+      await mkdir(componentPath, { mode: 0o700 })
+      info = await lstat(componentPath)
     }
-    await chmod(path, 0o700)
+    if (info.isSymbolicLink() || !info.isDirectory()) throw new Error('unsafe directory chain')
+    identities.push({ path: componentPath, dev: info.dev, ino: info.ino })
+  }
+  return identities
+}
+
+function matchesDirectoryChain(expected: DirectoryIdentity[], actual: DirectoryIdentity[]): boolean {
+  return expected.length === actual.length && expected.every((identity, index) => {
+    const candidate = actual[index]
+    return candidate?.path === identity.path && candidate.dev === identity.dev && candidate.ino === identity.ino
+  })
+}
+
+async function assertDirectoryChainUnchanged(expected: DirectoryIdentity[]): Promise<void> {
+  try {
+    const actual = await inspectDirectoryChain(expected[expected.length - 1].path, false)
+    if (!matchesDirectoryChain(expected, actual)) throw new Error('directory chain changed')
   } catch {
+    throw new Error('Unable to save ntfy notifier state')
+  }
+}
+
+async function openVerifiedDirectory(path: string): Promise<{
+  handle: FileHandle
+  identities: DirectoryIdentity[]
+}> {
+  let handle: FileHandle | null = null
+  try {
+    const identities = await inspectDirectoryChain(path, true)
+    handle = await open(path, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW)
+    const opened = await handle.stat()
+    const expected = identities[identities.length - 1]
+    if (opened.dev !== expected.dev || opened.ino !== expected.ino || !opened.isDirectory()) {
+      throw new Error('directory changed while opening')
+    }
+    await assertDirectoryChainUnchanged(identities)
+    await handle.chmod(0o700)
+    if (((await handle.stat()).mode & 0o777) !== 0o700) throw new Error('directory permissions are unsafe')
+    return { handle, identities }
+  } catch {
+    await handle?.close().catch(() => undefined)
     throw new Error('Unable to prepare private ntfy notifier state directory')
   }
 }
@@ -132,6 +193,7 @@ export class FileNtfyStateStore {
     operations: Partial<NtfyStateStoreOperations> = {},
   ) {
     this.operations = {
+      afterDirectoryOpen: operations.afterDirectoryOpen ?? (async () => undefined),
       rename: operations.rename ?? rename,
       write: operations.write ?? ((handle, contents) => handle.writeFile(contents, 'utf8')),
     }
@@ -152,29 +214,41 @@ export class FileNtfyStateStore {
   async save(state: NtfyNotifierState): Promise<void> {
     const validated = parseNtfyState(state)
     if (!validated) throw new Error('Unable to save invalid ntfy notifier state')
-    await assertSafeStatePath(this.path)
-    const directory = dirname(this.path)
-    await ensurePrivateDirectory(directory)
-    const temporaryPath = join(directory, `.${basename(this.path)}.${process.pid}.${randomUUID()}.tmp`)
-    let handle: FileHandle | null = null
+    const statePath = resolve(this.path)
+    const directory = dirname(statePath)
+    const verifiedDirectory = await openVerifiedDirectory(directory)
+    const anchoredDirectory = `/proc/self/fd/${verifiedDirectory.handle.fd}`
+    const destinationPath = join(anchoredDirectory, basename(statePath))
+    const temporaryPath = join(
+      anchoredDirectory,
+      `.${basename(statePath)}.${process.pid}.${randomUUID()}.tmp`,
+    )
+    let temporaryHandle: FileHandle | null = null
     try {
-      handle = await open(
+      await this.operations.afterDirectoryOpen()
+      await assertDirectoryChainUnchanged(verifiedDirectory.identities)
+      await assertSafeStatePath(destinationPath)
+      temporaryHandle = await open(
         temporaryPath,
         constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW,
         0o600,
       )
-      await handle.chmod(0o600)
-      await this.operations.write(handle, `${JSON.stringify(boundNtfyState(validated), null, 2)}\n`)
-      await handle.sync()
-      await handle.close()
-      handle = null
-      await assertSafeStatePath(this.path)
-      await this.operations.rename(temporaryPath, this.path)
-      await chmod(this.path, 0o600)
-    } catch {
-      await handle?.close().catch(() => undefined)
+      await temporaryHandle.chmod(0o600)
+      await this.operations.write(temporaryHandle, `${JSON.stringify(boundNtfyState(validated), null, 2)}\n`)
+      await temporaryHandle.sync()
+      await temporaryHandle.close()
+      temporaryHandle = null
+      await assertDirectoryChainUnchanged(verifiedDirectory.identities)
+      await assertSafeStatePath(destinationPath)
+      await this.operations.rename(temporaryPath, destinationPath)
+      await assertDirectoryChainUnchanged(verifiedDirectory.identities)
+    } catch (error) {
+      await temporaryHandle?.close().catch(() => undefined)
       await rm(temporaryPath, { force: true }).catch(() => undefined)
+      if (error instanceof UnsafeStatePathError) throw error
       throw new Error('Unable to save ntfy notifier state')
+    } finally {
+      await verifiedDirectory.handle.close().catch(() => undefined)
     }
   }
 }
