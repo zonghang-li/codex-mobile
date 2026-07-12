@@ -41,6 +41,8 @@ const gatewayMocks = vi.hoisted(() => ({
   subscribeCodexNotifications: vi.fn(),
 }))
 
+const pollingCleanups: Array<() => void> = []
+
 vi.mock('../api/codexGateway', () => ({
   ...gatewayMocks,
   getBackgroundThreadListLimit: vi.fn(() => 100),
@@ -79,6 +81,12 @@ function installTestWindow(initialStorage: Record<string, string> = {}) {
   })
 }
 
+async function flushMicrotasks(): Promise<void> {
+  for (let index = 0; index < 6; index += 1) {
+    await Promise.resolve()
+  }
+}
+
 async function setupTurnLifecycleNotificationState(selectedThreadId: string) {
   installTestWindow()
   let notificationHandler: ((notification: { method: string; params?: unknown }) => void) | undefined
@@ -96,6 +104,7 @@ async function setupTurnLifecycleNotificationState(selectedThreadId: string) {
   await state.refreshAll({ includeSelectedThreadMessages: false })
   state.primeSelectedThread(selectedThreadId)
   state.startPolling()
+  pollingCleanups.push(() => state.stopPolling())
   expect(notificationHandler).toBeDefined()
 
   return {
@@ -109,11 +118,15 @@ async function setupTurnLifecycleNotificationState(selectedThreadId: string) {
 beforeEach(() => {
   vi.clearAllMocks()
   gatewayMocks.getThreadQueueState.mockResolvedValue({})
+  gatewayMocks.setThreadQueueState.mockResolvedValue(undefined)
   gatewayMocks.getThreadTitleCache.mockResolvedValue({ titles: {} })
   gatewayMocks.getWorkspaceRootsState.mockRejectedValue(new Error('no workspace roots state'))
 })
 
 afterEach(() => {
+  for (const cleanup of pollingCleanups.splice(0)) {
+    cleanup()
+  }
   vi.unstubAllGlobals()
 })
 
@@ -667,12 +680,21 @@ describe('turn completion lifecycle', () => {
       turnIndexByTurnId: {},
     })
     gatewayMocks.rollbackThread.mockResolvedValue([])
+    gatewayMocks.interruptThreadTurn.mockRejectedValue(new Error('stop rejected for lifecycle test'))
     let resolveFallbackStart: ((turnId: string) => void) | undefined
+    let markFallbackStartSettled: (() => void) | undefined
+    const fallbackStartSettled = new Promise<void>((resolve) => {
+      markFallbackStartSettled = resolve
+    })
     gatewayMocks.startThreadTurn
       .mockResolvedValueOnce('turn-primary')
-      .mockImplementationOnce(() => new Promise<string>((resolve) => {
-        resolveFallbackStart = resolve
-      }))
+      .mockImplementationOnce(async () => {
+        const turnId = await new Promise<string>((resolve) => {
+          resolveFallbackStart = resolve
+        })
+        markFallbackStartSettled?.()
+        return turnId
+      })
 
     await state.sendMessageToSelectedThread('retry this request')
     emit({
@@ -728,6 +750,29 @@ describe('turn completion lifecycle', () => {
       'default',
     )
     resolveFallbackStart?.('turn-fallback')
+    await fallbackStartSettled
+    await flushMicrotasks()
+
+    await state.interruptSelectedThreadTurn()
+    expect(gatewayMocks.interruptThreadTurn).toHaveBeenCalledWith('thread-1', 'turn-fallback')
+    expect(state.projectGroups.value[0]?.threads[0]).toMatchObject({
+      inProgress: true,
+      unread: false,
+    })
+
+    emit({
+      method: 'turn/completed',
+      params: { threadId: 'thread-1', turn: { id: 'turn-fallback', status: 'interrupted' } },
+    })
+    await flushMicrotasks()
+
+    expect(state.projectGroups.value[0]?.threads[0]).toMatchObject({
+      inProgress: false,
+      unread: false,
+    })
+    await state.interruptSelectedThreadTurn()
+    expect(gatewayMocks.interruptThreadTurn).toHaveBeenCalledTimes(1)
+    expect(gatewayMocks.startThreadTurn).toHaveBeenCalledTimes(2)
   })
 
   it('marks a successful background completion unread', async () => {
@@ -746,6 +791,26 @@ describe('turn completion lifecycle', () => {
       inProgress: false,
       unread: true,
     })
+
+    const refreshedThread = thread('thread-1', '/tmp/project')
+    refreshedThread.updatedAtIso = '2099-01-01T00:00:00.000Z'
+    gatewayMocks.getThreadGroupsPage.mockResolvedValue({
+      groups: [{ projectName: 'Project', threads: [refreshedThread] }],
+      nextCursor: null,
+    })
+    await state.refreshAll({ includeSelectedThreadMessages: false, forceThreadRefresh: true })
+    expect(state.projectGroups.value[0]?.threads[0]?.unread).toBe(true)
+
+    gatewayMocks.resumeThread.mockResolvedValue({
+      messages: [],
+      inProgress: false,
+      activeTurnId: '',
+      hasMoreOlder: false,
+      turnIndexByTurnId: {},
+    })
+    state.primeSelectedThread('thread-1')
+    await state.loadMessages('thread-1')
+    expect(state.projectGroups.value[0]?.threads[0]?.unread).toBe(false)
   })
 
   it('does not mark a selected successful thread unread', async () => {
@@ -779,6 +844,35 @@ describe('turn completion lifecycle', () => {
         method: 'turn/completed',
         params: { threadId: 'thread-1', turn: { id: 'turn-1', status } },
       })
+
+      expect(state.projectGroups.value[0]?.threads[0]).toMatchObject({
+        inProgress: false,
+        unread: false,
+      })
+    },
+  )
+
+  it.each(['failed', 'interrupted', 'declined', 'timeout', 'future-terminal-status'])(
+    'keeps a background %s completion read after its refreshed summary advances',
+    async (status) => {
+      const { state, emit } = await setupTurnLifecycleNotificationState('other-thread')
+
+      emit({
+        method: 'turn/started',
+        params: { threadId: 'thread-1', turn: { id: 'turn-1' } },
+      })
+      emit({
+        method: 'turn/completed',
+        params: { threadId: 'thread-1', turn: { id: 'turn-1', status } },
+      })
+
+      const refreshedThread = thread('thread-1', '/tmp/project')
+      refreshedThread.updatedAtIso = '2099-01-01T00:00:00.000Z'
+      gatewayMocks.getThreadGroupsPage.mockResolvedValue({
+        groups: [{ projectName: 'Project', threads: [refreshedThread] }],
+        nextCursor: null,
+      })
+      await state.refreshAll({ includeSelectedThreadMessages: false, forceThreadRefresh: true })
 
       expect(state.projectGroups.value[0]?.threads[0]).toMatchObject({
         inProgress: false,
