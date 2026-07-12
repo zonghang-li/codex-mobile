@@ -15,6 +15,12 @@ export const NTFY_IMMEDIATE_ATTEMPTS = 3
 type TerminalTitle = PendingNtfyRecord['title']
 type Notification = { method: string; params?: unknown }
 type StateStore = Pick<FileNtfyStateStore, 'load' | 'save'>
+type TurnEvent = {
+  method: 'turn/started' | 'turn/completed'
+  threadId: string
+  turnId: string
+  status: string
+}
 
 export type NtfySendRequest = {
   publishUrl: string
@@ -66,13 +72,14 @@ export function summarizeAssistantResponse(text: string): string {
   return truncateText(sentence.trim(), NTFY_SUMMARY_MAX_LENGTH)
 }
 
-export function readLatestAssistantText(threadReadResult: unknown): string {
+export function readLatestAssistantText(threadReadResult: unknown, turnId: string): string {
   const response = asRecord(threadReadResult)
   const nestedThread = asRecord(response?.thread)
   const thread = nestedThread ?? response
   const turns = Array.isArray(thread?.turns) ? thread.turns : []
   for (let turnIndex = turns.length - 1; turnIndex >= 0; turnIndex -= 1) {
     const turn = asRecord(turns[turnIndex])
+    if (readString(turn?.id, turn?.turnId, turn?.turn_id) !== turnId) continue
     const items = Array.isArray(turn?.items) ? turn.items : []
     for (let itemIndex = items.length - 1; itemIndex >= 0; itemIndex -= 1) {
       const item = asRecord(items[itemIndex])
@@ -84,12 +91,7 @@ export function readLatestAssistantText(threadReadResult: unknown): string {
   return ''
 }
 
-function readEvent(notification: unknown): {
-  method: string
-  threadId: string
-  turnId: string
-  status: string
-} | null {
+function readEvent(notification: unknown): TurnEvent | null {
   const root = asRecord(notification)
   const method = readString(root?.method)
   const params = asRecord(root?.params)
@@ -106,6 +108,8 @@ function readEvent(notification: unknown): {
     turn?.thread_id,
   )
   const turnId = readString(params.turnId, params.turn_id, turn?.id, turn?.turnId, turn?.turn_id)
+  if (method !== 'turn/started' && method !== 'turn/completed') return null
+  if (!threadId || !turnId) return null
   return {
     method,
     threadId,
@@ -146,6 +150,7 @@ async function sendNtfyRequest(request: NtfySendRequest): Promise<void> {
 export class NtfyCompletionNotifier {
   private state: NtfyNotifierState = createEmptyNtfyState()
   private work: Promise<void> = Promise.resolve()
+  private drainQueued = false
   private started = false
   private readonly send: (request: NtfySendRequest) => Promise<void>
   private readonly now: () => number
@@ -169,22 +174,24 @@ export class NtfyCompletionNotifier {
         this.state = createEmptyNtfyState()
         this.warn('Unable to load long-task notification state')
       }
-      await this.drainPending()
+      this.requestDrain()
     })
-    await this.work
+    await this.flushWork()
   }
 
   handle(notification: Notification): void {
     if (!this.started) return
+    const event = readEvent(notification)
+    if (!event) return
     const receivedAt = this.now()
     this.enqueue(async () => {
-      await this.processNotification(notification, receivedAt)
-      await this.drainPending()
+      await this.processNotification(event, receivedAt)
+      this.requestDrain()
     })
   }
 
   async dispose(): Promise<void> {
-    await this.work
+    await this.flushWork()
   }
 
   private enqueue(task: () => Promise<void>): void {
@@ -193,23 +200,42 @@ export class NtfyCompletionNotifier {
     })
   }
 
-  private async processNotification(notification: unknown, receivedAt: number): Promise<void> {
-    const event = readEvent(notification)
-    if (!event || !event.threadId || !event.turnId) return
+  private async flushWork(): Promise<void> {
+    let pending: Promise<void>
+    do {
+      pending = this.work
+      await pending
+    } while (pending !== this.work)
+  }
+
+  private requestDrain(): void {
+    if (this.drainQueued) return
+    this.drainQueued = true
+    this.enqueue(async () => {
+      this.drainQueued = false
+      await this.drainPending()
+    })
+  }
+
+  private async processNotification(event: TurnEvent, receivedAt: number): Promise<void> {
     const key = `${event.threadId}:${event.turnId}`
 
     if (event.method === 'turn/started') {
       const active = this.state.active.find((record) => record.key === key)
       if (active) return
       if (this.state.sent.some((record) => record.key === key)) return
-      this.state.active.push({
-        key,
-        threadId: event.threadId,
-        turnId: event.turnId,
-        startedAt: receivedAt,
-      })
-      this.state = boundNtfyState(this.state)
-      await this.options.stateStore.save(this.state)
+      await this.persistState(boundNtfyState({
+        ...this.state,
+        active: [
+          ...this.state.active,
+          {
+            key,
+            threadId: event.threadId,
+            turnId: event.turnId,
+            startedAt: receivedAt,
+          },
+        ],
+      }))
       return
     }
 
@@ -218,30 +244,43 @@ export class NtfyCompletionNotifier {
     if (this.state.pending.some((record) => record.key === key)) return
     const activeIndex = this.state.active.findIndex((record) => record.key === key)
     if (activeIndex < 0) return
-    const [active] = this.state.active.splice(activeIndex, 1)
+    const active = this.state.active[activeIndex]
     if (!active) return
+    const stateWithoutActive: NtfyNotifierState = {
+      ...this.state,
+      active: this.state.active.filter((_, index) => index !== activeIndex),
+    }
 
     if (receivedAt - active.startedAt < NTFY_MIN_DURATION_MS) {
-      await this.options.stateStore.save(this.state)
+      await this.persistState(stateWithoutActive)
       return
     }
 
     const classification = classifyStatus(event.status)
     let assistantText = ''
     try {
-      assistantText = readLatestAssistantText(await this.options.readThread(event.threadId))
+      assistantText = readLatestAssistantText(await this.options.readThread(event.threadId), event.turnId)
     } catch {
       this.warn('Unable to read final assistant response for long-task notification')
     }
     const message = summarizeAssistantResponse(assistantText) || classification.fallback
-    this.state.pending.push({
-      key,
-      title: classification.title,
-      message,
-      createdAt: receivedAt,
-    })
-    this.state = boundNtfyState(this.state)
-    await this.options.stateStore.save(this.state)
+    await this.persistState(boundNtfyState({
+      ...stateWithoutActive,
+      pending: [
+        ...stateWithoutActive.pending,
+        {
+          key,
+          title: classification.title,
+          message,
+          createdAt: receivedAt,
+        },
+      ],
+    }))
+  }
+
+  private async persistState(nextState: NtfyNotifierState): Promise<void> {
+    await this.options.stateStore.save(nextState)
+    this.state = nextState
   }
 
   private async drainPending(): Promise<void> {
@@ -265,12 +304,14 @@ export class NtfyCompletionNotifier {
         // Delivery is best effort; only a redacted summary is reported after bounded retries.
         continue
       }
-      this.state.pending = this.state.pending.filter((candidate) => candidate.key !== record.key)
-      if (!this.state.sent.some((candidate) => candidate.key === record.key)) {
-        this.state.sent.push({ key: record.key, sentAt: this.now() })
-      }
-      this.state = boundNtfyState(this.state)
-      await this.options.stateStore.save(this.state)
+      const sent = this.state.sent.some((candidate) => candidate.key === record.key)
+        ? this.state.sent
+        : [...this.state.sent, { key: record.key, sentAt: this.now() }]
+      await this.persistState(boundNtfyState({
+        ...this.state,
+        pending: this.state.pending.filter((candidate) => candidate.key !== record.key),
+        sent,
+      }))
       return
     }
     await this.options.stateStore.save(this.state)

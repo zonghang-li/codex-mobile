@@ -45,6 +45,73 @@ describe('durable ntfy state', () => {
     await expect(store.load()).resolves.toEqual(populatedState())
   })
 
+  it('refuses to load state through a symlink', async () => {
+    const path = await temporaryStatePath()
+    const target = `${path}-target-with-secret-topic`
+    const bootstrap = new FileNtfyStateStore(target)
+    await bootstrap.save(populatedState())
+    await symlink(target, path)
+    const warn = vi.fn()
+
+    await expect(new FileNtfyStateStore(path, warn).load()).resolves.toEqual(createEmptyNtfyState())
+
+    expect(warn).toHaveBeenCalledWith('Unable to load ntfy notifier state; starting with empty state')
+    expect(String(warn.mock.calls[0]?.[0])).not.toContain(path)
+    expect(String(warn.mock.calls[0]?.[0])).not.toContain('secret-topic')
+  })
+
+  it('refuses to load group-readable state', async () => {
+    const path = await temporaryStatePath()
+    const bootstrap = new FileNtfyStateStore(path)
+    await bootstrap.save(populatedState())
+    await chmod(path, 0o640)
+    const warn = vi.fn()
+
+    await expect(new FileNtfyStateStore(path, warn).load()).resolves.toEqual(createEmptyNtfyState())
+
+    expect(warn).toHaveBeenCalledWith('Unable to load ntfy notifier state; starting with empty state')
+  })
+
+  it('refuses to load world-readable state', async () => {
+    const path = await temporaryStatePath()
+    const bootstrap = new FileNtfyStateStore(path)
+    await bootstrap.save(populatedState())
+    await chmod(path, 0o644)
+    const warn = vi.fn()
+
+    await expect(new FileNtfyStateStore(path, warn).load()).resolves.toEqual(createEmptyNtfyState())
+
+    expect(warn).toHaveBeenCalledWith('Unable to load ntfy notifier state; starting with empty state')
+  })
+
+  it('refuses to load a non-regular state path', async () => {
+    const path = await temporaryStatePath()
+    await mkdir(path, { recursive: true })
+    const warn = vi.fn()
+
+    await expect(new FileNtfyStateStore(path, warn).load()).resolves.toEqual(createEmptyNtfyState())
+
+    expect(warn).toHaveBeenCalledWith('Unable to load ntfy notifier state; starting with empty state')
+  })
+
+  it('refuses to load state not owned by the current user', async () => {
+    const path = await temporaryStatePath()
+    const bootstrap = new FileNtfyStateStore(path)
+    await bootstrap.save(populatedState())
+    const currentUid = process.getuid?.()
+    if (currentUid === undefined) return
+    const getuid = vi.spyOn(process, 'getuid').mockReturnValue((currentUid + 1) % 65_536)
+    const warn = vi.fn()
+
+    try {
+      await expect(new FileNtfyStateStore(path, warn).load()).resolves.toEqual(createEmptyNtfyState())
+    } finally {
+      getuid.mockRestore()
+    }
+
+    expect(warn).toHaveBeenCalledWith('Unable to load ntfy notifier state; starting with empty state')
+  })
+
   it('recovers from malformed JSON with a redacted warning', async () => {
     const path = await temporaryStatePath()
     const storeForDirectory = new FileNtfyStateStore(path)

@@ -1,5 +1,5 @@
 import { constants } from 'node:fs'
-import { lstat, mkdir, open, readFile, rename, rm, type FileHandle } from 'node:fs/promises'
+import { lstat, mkdir, open, rename, rm, type FileHandle } from 'node:fs/promises'
 import { randomUUID } from 'node:crypto'
 import { basename, dirname, join, parse, resolve, sep } from 'node:path'
 
@@ -200,14 +200,23 @@ export class FileNtfyStateStore {
   }
 
   async load(): Promise<NtfyNotifierState> {
+    let handle: FileHandle | null = null
     try {
-      const parsed = parseNtfyState(JSON.parse(await readFile(this.path, 'utf8')))
+      handle = await open(this.path, constants.O_RDONLY | constants.O_NOFOLLOW)
+      const info = await handle.stat()
+      if (!info.isFile()) throw new Error('unsafe state file type')
+      const uid = process.getuid?.()
+      if (uid !== undefined && info.uid !== uid) throw new Error('unsafe state file owner')
+      if ((info.mode & 0o077) !== 0) throw new Error('unsafe state file permissions')
+      const parsed = parseNtfyState(JSON.parse(await handle.readFile('utf8')))
       if (!parsed) throw new Error('invalid state shape')
       return boundNtfyState(parsed)
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === 'ENOENT') return createEmptyNtfyState()
       this.warn('Unable to load ntfy notifier state; starting with empty state')
       return createEmptyNtfyState()
+    } finally {
+      await handle?.close().catch(() => undefined)
     }
   }
 

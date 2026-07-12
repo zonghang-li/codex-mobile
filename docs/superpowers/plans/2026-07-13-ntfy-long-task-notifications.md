@@ -466,7 +466,7 @@ From a clean worktree, rebase `codex/ntfy-completion-notifications` onto updated
 
 - [ ] **Step 5: Store the real ntfy URL securely and deploy**
 
-Write the user-approved URL to `~/.codex/codex-mobile-safe-ntfy-url` with mode `0600` without printing it. Run `pnpm run service:install`, verify active service and loopback listener, and confirm logs show notifications enabled without the topic.
+Write the user-approved URL to `~/.codex/codex-mobile-safe-ntfy-url` with mode `0600` without printing it. Run `pnpm run service:install`, verify the active service and loopback listener, then use the successful live receipt in Step 6 as the positive notification-enablement check. The topic must not appear in logs or process arguments.
 
 - [ ] **Step 6: Perform a real delivery test without waiting ten minutes**
 

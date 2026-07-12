@@ -53,7 +53,7 @@ function harness(options: {
 } = {}) {
   const store = options.store ?? new MemoryStateStore()
   const readThread = vi.fn(options.readThread ?? (async () => ({
-    thread: { turns: [{ items: [{ type: 'agentMessage', text: '工作完成。更多内容' }] }] },
+    thread: { turns: [{ id: 'turn-1', items: [{ type: 'agentMessage', text: '工作完成。更多内容' }] }] },
   })))
   const requests: NtfySendRequest[] = []
   const send = vi.fn(options.send ?? (async (request: NtfySendRequest) => {
@@ -96,20 +96,27 @@ describe('assistant response extraction', () => {
     expect(summarizeAssistantResponse('A'.repeat(220))).toHaveLength(180)
   })
 
-  it('reads the newest non-empty agent message', () => {
+  it('reads the newest non-empty agent message from the requested turn only', () => {
     expect(readLatestAssistantText({
       thread: {
         turns: [
-          { items: [{ type: 'agentMessage', text: '旧回复。' }] },
-          { items: [{ type: 'agentMessage', text: '较新回复。' }, { type: 'commandExecution' }] },
-          { items: [{ type: 'agentMessage', text: '最新回复。' }] },
+          { id: 'turn-before', items: [{ type: 'agentMessage', text: '历史回复。' }] },
+          {
+            id: 'turn-target',
+            items: [
+              { type: 'agentMessage', text: '目标较早回复。' },
+              { type: 'commandExecution' },
+              { type: 'agentMessage', text: '目标最终回复。' },
+            ],
+          },
+          { id: 'turn-after', items: [{ type: 'agentMessage', text: '未来回复。' }] },
         ],
       },
-    })).toBe('最新回复。')
+    }, 'turn-target')).toBe('目标最终回复。')
   })
 
   it('returns empty text for malformed thread results', () => {
-    expect(readLatestAssistantText({ thread: { turns: [{ items: null }] } })).toBe('')
+    expect(readLatestAssistantText({ thread: { turns: [{ id: 'turn-1', items: null }] } }, 'turn-1')).toBe('')
   })
 })
 
@@ -156,6 +163,22 @@ describe('long-turn notification decisions', () => {
       status,
     )
     expect(fixture.send.mock.calls[0]?.[0].record.message).toBe(message)
+  })
+
+  it('uses the fallback when only historical and future turns have assistant messages', async () => {
+    const fixture = await runTurn(NTFY_MIN_DURATION_MS, {
+      readThread: async () => ({
+        thread: {
+          turns: [
+            { id: 'turn-before', items: [{ type: 'agentMessage', text: '历史回复。' }] },
+            { id: 'turn-1', items: [{ type: 'commandExecution' }] },
+            { id: 'turn-after', items: [{ type: 'agentMessage', text: '未来回复。' }] },
+          ],
+        },
+      }),
+    })
+
+    expect(fixture.send.mock.calls[0]?.[0].record.message).toBe('任务已完成。')
   })
 
   it('ignores missing IDs and completions without a matching start', async () => {
@@ -217,6 +240,56 @@ describe('long-turn notification decisions', () => {
 })
 
 describe('durable sequential delivery', () => {
+  it('does not enqueue offline retries for a high volume of unrelated events', async () => {
+    const store = new MemoryStateStore({
+      active: [],
+      pending: [{
+        key: 'thread-pending:turn-pending',
+        title: 'Codex 任务完成',
+        message: '持久消息。',
+        createdAt: 1,
+      }],
+      sent: [],
+    })
+    const fixture = harness({
+      store,
+      send: async () => { throw new Error('offline') },
+    })
+    await fixture.notifier.start()
+
+    for (let index = 0; index < 1_000; index += 1) {
+      fixture.notifier.handle({ method: 'item/updated', params: { index } })
+    }
+    await fixture.notifier.dispose()
+
+    expect(fixture.send).toHaveBeenCalledTimes(NTFY_IMMEDIATE_ATTEMPTS)
+  })
+
+  it('coalesces a burst of relevant events into one additional pending drain', async () => {
+    const store = new MemoryStateStore({
+      active: [],
+      pending: [{
+        key: 'thread-pending:turn-pending',
+        title: 'Codex 任务完成',
+        message: '持久消息。',
+        createdAt: 1,
+      }],
+      sent: [],
+    })
+    const fixture = harness({
+      store,
+      send: async () => { throw new Error('offline') },
+    })
+    await fixture.notifier.start()
+
+    for (let index = 0; index < 100; index += 1) {
+      fixture.notifier.handle(started(`thread-${index}`, `turn-${index}`))
+    }
+    await fixture.notifier.dispose()
+
+    expect(fixture.send).toHaveBeenCalledTimes(NTFY_IMMEDIATE_ATTEMPTS * 2)
+  })
+
   it('returns from handle before an active-record save completes', async () => {
     let releaseSave: (() => void) | undefined
     const store = new MemoryStateStore()
@@ -262,6 +335,65 @@ describe('durable sequential delivery', () => {
       },
     })
     expect(fixture.store.saves.some((state) => state.pending.length === 1)).toBe(true)
+  })
+
+  it('never sends an unpersisted pending record and can retry its completion later', async () => {
+    let now = 0
+    const store = new MemoryStateStore()
+    let saveCount = 0
+    const originalSave = store.save.bind(store)
+    store.save = vi.fn(async (state: NtfyNotifierState) => {
+      saveCount += 1
+      if (saveCount === 2) throw new Error('pending save failed')
+      await originalSave(state)
+    })
+    const fixture = harness({ store, now: () => now })
+    await fixture.notifier.start()
+    fixture.notifier.handle(started())
+    await fixture.notifier.dispose()
+
+    now = NTFY_MIN_DURATION_MS
+    fixture.notifier.handle(completed())
+    await fixture.notifier.dispose()
+    expect(fixture.send).not.toHaveBeenCalled()
+    expect(store.state.active.map(({ key }) => key)).toEqual(['thread-1:turn-1'])
+    expect(store.state.pending).toHaveLength(0)
+
+    fixture.notifier.handle(started('thread-other', 'turn-other'))
+    await fixture.notifier.dispose()
+    expect(fixture.send).not.toHaveBeenCalled()
+    expect(store.state.pending).toHaveLength(0)
+
+    fixture.notifier.handle(completed())
+    await fixture.notifier.dispose()
+    expect(fixture.send).toHaveBeenCalledTimes(1)
+    expect(store.state.sent.map(({ key }) => key)).toContain('thread-1:turn-1')
+  })
+
+  it('does not classify a completion from an active record whose save failed', async () => {
+    let now = 0
+    const store = new MemoryStateStore()
+    let failNextSave = true
+    const originalSave = store.save.bind(store)
+    store.save = vi.fn(async (state: NtfyNotifierState) => {
+      if (failNextSave) {
+        failNextSave = false
+        throw new Error('active save failed')
+      }
+      await originalSave(state)
+    })
+    const fixture = harness({ store, now: () => now })
+    await fixture.notifier.start()
+    fixture.notifier.handle(started())
+    await fixture.notifier.dispose()
+
+    now = NTFY_MIN_DURATION_MS
+    fixture.notifier.handle(completed())
+    await fixture.notifier.dispose()
+
+    expect(fixture.readThread).not.toHaveBeenCalled()
+    expect(fixture.send).not.toHaveBeenCalled()
+    expect(store.state).toEqual(createEmptyNtfyState())
   })
 
   it('makes exactly three immediate attempts and keeps failed pending durable', async () => {
