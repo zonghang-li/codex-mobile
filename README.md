@@ -1,3 +1,71 @@
+# codex-mobile fork
+
+This fork packages the upstream `codexapp` UI as two commands:
+
+- `codex-mobile` keeps the upstream-compatible behavior, including LAN binding and optional Cloudflare tunneling.
+- `codex-mobile-safe` is the recommended command for daily use. It binds to loopback, requires password authentication, uses conservative Codex sandbox defaults, and exposes the service only through an explicit Tailscale Serve command.
+
+## Install from this fork
+
+Node.js 18+ and pnpm are required. Clone the repository so later updates remain an ordinary Git pull:
+
+```bash
+git clone https://github.com/zonghang-li/codex-mobile.git
+cd codex-mobile
+pnpm install
+pnpm run install:local
+```
+
+The installer builds the current checkout and installs both commands under `${HOME}/.local` by default. Ensure `${HOME}/.local/bin` is on `PATH`.
+
+Start the safe command in the foreground:
+
+```bash
+codex-mobile-safe start /path/to/project \
+  --password-file ~/.codex/codex-mobile-safe-password \
+  --no-open
+codex-mobile-safe expose tailscale
+codex-mobile-safe status
+codex-mobile-safe urls
+```
+
+For a persistent Linux user service:
+
+```bash
+pnpm run service:install
+pnpm run service:status
+```
+
+The service listens only on `127.0.0.1:5900`. `service:install` creates a mode-`0600` password file when one does not exist, installs the unit, and starts it. Tailscale exposure remains a separate, explicit action:
+
+```bash
+codex-mobile-safe expose tailscale
+```
+
+If the service should survive logout, enable user lingering once with `loginctl enable-linger "$USER"`.
+
+To update a clone and reinstall the service:
+
+```bash
+git pull --ff-only
+pnpm install
+pnpm run install:local
+pnpm run service:restart
+```
+
+| Command | Default listener | Remote exposure |
+| --- | --- | --- |
+| `codex-mobile-safe` | `127.0.0.1:5900` | None until `expose tailscale`; never Cloudflare Funnel |
+| `codex-mobile` | `0.0.0.0` | Upstream-compatible behavior; may start Cloudflare unless disabled |
+
+Use `codex-mobile-safe doctor` to inspect security invariants. A mobile `RPC thread/resume failed with HTTP 502` normally means the local backend stopped or its reverse proxy cannot reach port 5900. Check `pnpm run service:status` and `journalctl --user -u codex-mobile-safe -n 100` before changing Tailscale configuration.
+
+Agents modifying or operating this fork must read [docs/AGENT_GUIDE.md](docs/AGENT_GUIDE.md).
+
+## Upstream documentation
+
+The remaining README describes upstream `codexapp`. Its `npx codexapp` examples run the published upstream package, not this fork's safe module.
+
 # 🔥 codexapp
 
 ### 🚀 Run Codex App UI Anywhere: Linux, Windows, or Termux on Android 🚀

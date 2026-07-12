@@ -1,5 +1,13 @@
 # AGENTS.md
 
+## Codex Mobile Safe Module
+
+- Read [`docs/AGENT_GUIDE.md`](docs/AGENT_GUIDE.md) before changing CLI startup, HTTP/RPC authorization, filesystem routes, exposure, authentication, packaging, or service lifecycle code.
+- Preserve these safe-mode invariants: loopback-only default binding; password-file authentication; no Cloudflare tunnel or Tailscale Funnel; explicit Tailscale Serve exposure; `workspace-write` sandbox; `on-request` approvals; RPC and route allowlists; canonical allowed-root checks for filesystem access.
+- Keep upstream-compatible behavior behind `codex-mobile`; safe restrictions belong to injected policy modules and the `codex-mobile-safe` entry point.
+- Run focused tests for the changed module, then `pnpm run test:unit`, `pnpm run build`, `codex-mobile --help`, and `codex-mobile-safe doctor`. Packaging changes also require a temporary-prefix install and user-unit verification.
+- Never commit password files, managed runtime state, generated service units, package tarballs, or Tailscale credentials.
+
 ## Git Workflow
 
 - Before any merge, rebase, sync, or continuation after interruption, re-check live state:

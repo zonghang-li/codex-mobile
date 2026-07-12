@@ -1,20 +1,18 @@
 {
   "name": "codexapp",
-  "version": "0.1.87",
+  "version": "0.2.0-local.0",
+  "private": true,
   "description": "A lightweight web interface for Codex that runs on top of the Codex app-server, allowing remote access from any browser",
   "type": "module",
   "license": "MIT",
   "author": "Pavel Voronin, Igor Levochkin",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/friuns2/codexui.git"
+    "url": "git+https://github.com/zonghang-li/codex-mobile.git"
   },
-  "homepage": "https://github.com/friuns2/codexui#readme",
+  "homepage": "https://github.com/zonghang-li/codex-mobile#readme",
   "bugs": {
-    "url": "https://github.com/friuns2/codexui/issues"
-  },
-  "publishConfig": {
-    "access": "public"
+    "url": "https://github.com/zonghang-li/codex-mobile/issues"
   },
   "keywords": [
     "codex",
@@ -28,11 +26,15 @@
   },
   "bin": {
     "codexapp": "dist-cli/index.js",
-    "codexui": "dist-cli/index.js"
+    "codexui": "dist-cli/index.js",
+    "codex-mobile": "dist-cli/index.js",
+    "codex-mobile-safe": "dist-cli/safe.js"
   },
   "files": [
     "dist/",
     "dist-cli/",
+    "src/",
+    "packaging/",
     "scripts/dev.cjs",
     "scripts/dev-random-home.cjs",
     "scripts/fix-pty-native-build.cjs"
@@ -57,7 +59,12 @@
     "preview": "vite preview",
     "prepublishOnly": "pnpm run build",
     "profile:browser": "node scripts/profile-browser-runtime.cjs",
-    "profile:thread": "PROFILE_ROUTE='#/thread/019da7c0-4e12-7a91-837c-f7c11cc8ab6c' node scripts/profile-browser-runtime.cjs"
+    "profile:thread": "PROFILE_ROUTE='#/thread/019da7c0-4e12-7a91-837c-f7c11cc8ab6c' node scripts/profile-browser-runtime.cjs",
+    "install:local": "sh scripts/install-local.sh",
+    "service:install": "sh scripts/install-user-service.sh",
+    "service:restart": "systemctl --user restart codex-mobile-safe.service",
+    "service:status": "systemctl --user --no-pager --full status codex-mobile-safe.service",
+    "service:uninstall": "sh scripts/uninstall-user-service.sh"
   },
   "dependencies": {
     "@composio/client": "0.1.0-alpha.66",
