@@ -47,11 +47,72 @@ If the service should survive logout, enable user lingering once with `loginctl 
 To update a clone and reinstall the service:
 
 ```bash
+cd /path/to/codex-mobile
 git pull --ff-only
 pnpm install
 pnpm run install:local
 pnpm run service:restart
 ```
+
+Because both commands are installed from the current checkout, repeat this update sequence after every repository change you want to run locally. Review incoming changes before pulling if the checkout has local modifications.
+
+## Long-task phone notifications
+
+`codex-mobile-safe` can publish an ntfy alert after a Codex turn has run for at least 10 minutes (`600_000` ms). Install the ntfy app on the phone, create an unguessable topic locally, and subscribe the phone to that same topic. Then create the secret URL file without putting the topic in Git, a CLI argument, or a systemd unit:
+
+```bash
+install -d -m 700 ~/.codex
+install -m 600 /dev/null ~/.codex/codex-mobile-safe-ntfy-url
+read -r NTFY_TOPIC
+printf 'https://ntfy.sh/%s\n' "$NTFY_TOPIC" > ~/.codex/codex-mobile-safe-ntfy-url
+unset NTFY_TOPIC
+chmod 600 ~/.codex/codex-mobile-safe-ntfy-url
+pnpm run service:restart
+```
+
+Enter only the topic name at the `read` prompt; do not paste the example literally. The file must be a current-user-owned regular file with mode `0600` or stricter. Its only accepted value is `https://ntfy.sh/<single-topic>`, where the topic contains letters, numbers, `_`, or `-`; credentials, extra path segments, queries, fragments, other origins, and symlinks are rejected. The real topic file is local configuration and must never be committed.
+
+For a foreground start, the default file is detected automatically. An alternate secure file can be selected by path, without putting its URL in the process arguments:
+
+```bash
+codex-mobile-safe start /path/to/project \
+  --password-file ~/.codex/codex-mobile-safe-password \
+  --ntfy-url-file /path/to/private-ntfy-url-file \
+  --no-open
+```
+
+Qualifying turns use these titles:
+
+| Turn result | Notification title |
+| --- | --- |
+| Completed | `Codex 任务完成` |
+| Failed | `Codex 任务失败` |
+| Cancelled or another terminal status | `Codex 任务已中断` |
+
+The body is the first non-empty sentence of the latest assistant response, with whitespace collapsed and a maximum length of 180 characters. If no assistant response is available, a fixed status-specific sentence is used. This is deterministic and does not make another AI request. Tasks shorter than 10 minutes do not read the final thread for notification purposes and do not notify.
+
+Ordinary duplicate completion events are suppressed with bounded local state. Retries reuse one stable ntfy sequence ID so supported clients treat them as one logical notification. This is not transport-level exactly-once delivery: after an ambiguous network timeout, or a crash after ntfy accepts a request but before local state is committed, the phone may alert again.
+
+Check the installation and service with:
+
+```bash
+codex-mobile-safe doctor
+codex-mobile-safe status
+codex-mobile-safe urls
+pnpm run service:status
+journalctl --user -u codex-mobile-safe -n 100 --no-pager
+```
+
+`doctor` validates packaged safety wiring; `status` and `urls` report the managed runtime. Notification errors in the journal are intentionally redacted and must not contain the URL, topic, or message body. To disable notifications, remove only the URL file and restart the service:
+
+```bash
+rm ~/.codex/codex-mobile-safe-ntfy-url
+pnpm run service:restart
+```
+
+Use `codex-mobile-safe stop` for a foreground managed process, `codex-mobile-safe unexpose` to remove the Tailscale Serve mapping, and `pnpm run service:uninstall` to disable and remove the Linux user service. The service uninstaller intentionally preserves the password file and Tailscale Serve configuration, so run `unexpose` first when removing remote access.
+
+The notification feature is outbound-only. It does not expose the web UI. Keep the service on `127.0.0.1:5900`, use `codex-mobile-safe expose tailscale`, and open the HTTPS URL only from devices logged into the intended tailnet. Password authentication remains required. Do not use `--lan`, Tailscale Funnel, Cloudflare/public tunnels, or the upstream Telegram integration for the safe deployment.
 
 | Command | Default listener | Remote exposure |
 | --- | --- | --- |
@@ -64,7 +125,7 @@ Agents modifying or operating this fork must read [docs/AGENT_GUIDE.md](docs/AGE
 
 ## Upstream documentation
 
-The remaining README describes upstream `codexapp`. Its `npx codexapp` examples run the published upstream package, not this fork's safe module.
+The remaining README describes upstream `codexapp`. Its `npx codexapp`, Telegram, LAN, and Cloudflare tunnel examples run the upstream-compatible behavior, not this fork's safe module. Do not apply those exposure examples to a `codex-mobile-safe` deployment.
 
 # 🔥 codexapp
 
