@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Send one lock-screen ntfy notification with a one-sentence final-response summary for every successful, failed, or interrupted Codex turn lasting at least ten minutes.
+**Goal:** Send one logical lock-screen ntfy notification with a one-sentence final-response summary for every successful, failed, or interrupted Codex turn lasting at least ten minutes.
 
 **Architecture:** Safe-mode startup reads an optional mode-`0600` ntfy URL file and passes a validated configuration into the shared HTTP server. A focused notifier subscribes to app-server turn events, persists bounded timing/outbox/deduplication state, reads the final thread only for qualifying turns, and posts asynchronously to one strictly validated ntfy.sh topic.
 
@@ -14,7 +14,7 @@
 - Success, failure, and interruption all notify; shorter turns never notify.
 - Titles are exactly `Codex 任务完成`, `Codex 任务失败`, and `Codex 任务已中断`.
 - Body is the first non-empty final-assistant sentence with collapsed whitespace, truncated to at most 180 characters; no additional AI call.
-- Each `threadId + turnId` pair produces at most one notification.
+- Each `threadId + turnId` pair represents one logical notification: suppress ordinary duplicates with local pending/sent state and reuse one stable ntfy sequence ID for client-side replacement. This is not transport-level exactly-once delivery; an ambiguous timeout or crash before the local sent-state commit may still re-alert.
 - Accept only `https://ntfy.sh/<single-topic>` with no credentials, query, or fragment.
 - The URL/topic is read only from a current-user mode-`0600` regular file and never enters Git, process arguments, systemd units, managed notifier state, response bodies, or logs.
 - The notifier is explicit outbound-only safe functionality; do not enable Telegram, other background integrations, incoming commands, LAN access, Funnel, or authentication bypasses.
@@ -192,7 +192,7 @@ Event cases must assert:
 - `completed`, `failed`, and another terminal status produce the three exact titles;
 - missing IDs or a missing start record sends nothing;
 - duplicate starts keep the earliest timestamp;
-- duplicate completes produce one pending/sent key and one successful delivery;
+- ordinary duplicate completes produce one local pending/sent key and, on the non-ambiguous successful test path, one sender call;
 - `readThread` is never called for short turns;
 - final assistant text is read from the newest `agentMessage` item;
 - fallback text is used when no assistant message exists.
@@ -399,7 +399,7 @@ Document no secret logging, fixed ntfy origin, no incoming control, bounded stat
 
 - [ ] **Step 3: Add exact manual test**
 
-Include prerequisites, fake-clock or injectable-threshold test actions, one real locked-phone notification, success/failure/interruption cases, short-turn negative case, restart recovery, duplicate prevention, and cleanup.
+Include prerequisites, fake-clock or injectable-threshold test actions, one real locked-phone notification, success/failure/interruption cases, short-turn negative case, restart recovery, local duplicate suppression with stable sequence replacement, ambiguous-delivery caveats, and cleanup.
 
 - [ ] **Step 4: Check links/content and commit**
 
@@ -470,7 +470,7 @@ Write the user-approved URL to `~/.codex/codex-mobile-safe-ntfy-url` with mode `
 
 - [ ] **Step 6: Perform a real delivery test without waiting ten minutes**
 
-Use the notifier's injected fake clock or a test-only invocation from the focused test harness; never add a production threshold override. Confirm the phone receives one fixed test summary, then confirm a simulated `599_999` ms turn sends nothing and duplicate completion sends once.
+Use the notifier's injected fake clock or a test-only invocation from the focused test harness; never add a production threshold override. Confirm the phone receives one fixed test summary, then confirm a simulated `599_999` ms turn sends nothing and an ordinary duplicate completion creates no second local pending/sent record while retaining the same sequence ID.
 
 - [ ] **Step 7: Push notification branch and create draft PR**
 
