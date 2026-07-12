@@ -15,10 +15,12 @@ import {
   unexposeTailscale,
 } from '../safe/exposure.js'
 import { readSecurePasswordFile } from '../safe/passwordFile.js'
+import { loadNtfyPublishUrl } from '../safe/ntfyConfig.js'
 import { loadSafeRuntimeConfig } from '../safe/runtimePolicy.js'
 import {
   clearManagedState,
   getCurrentCommandMarker,
+  getSafeHome,
   readLiveManagedState,
   writeManagedState,
 } from '../safe/state.js'
@@ -122,6 +124,7 @@ program.command('start')
   .option('-p, --port <port>', 'port to listen on', '5900')
   .option('--password <pass>', 'set a specific password')
   .option('--password-file <path>', 'read the password from a mode-0600 file')
+  .option('--ntfy-url-file <path>', 'read a mode-0600 ntfy.sh publish URL file')
   .option('--no-password', 'disable password protection for local-only development')
   .option('--lan', 'bind to 0.0.0.0 for LAN access')
   .option('--open', 'open browser on startup', true)
@@ -136,6 +139,7 @@ program.command('start')
     port: string
     password: string | boolean
     passwordFile?: string
+    ntfyUrlFile?: string
     lan: boolean
     open: boolean
     login: boolean
@@ -170,9 +174,18 @@ program.command('start')
       CODEX_MOBILE_SAFE_ALLOWED_ROOTS: allowedRoots,
     })
     const passwordResolution = await resolvePassword(options)
+    const ntfyPublishUrl = await loadNtfyPublishUrl({ explicitPath: options.ntfyUrlFile })
     const { app, dispose, attachWebSocket } = createApp({
       password: passwordResolution.password,
       securityPolicy: buildSafeSecurityPolicy(runtimeConfig),
+      ...(ntfyPublishUrl
+        ? {
+            ntfyNotifications: {
+              publishUrl: ntfyPublishUrl,
+              statePath: join(getSafeHome(), 'ntfy-notifier.json'),
+            },
+          }
+        : {}),
     })
     const server = createHttpServer(app)
     attachWebSocket(server)

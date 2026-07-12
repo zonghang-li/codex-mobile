@@ -11,8 +11,13 @@ describe('safe CLI entry packaging', () => {
     const packageJson = JSON.parse(packageSource) as { bin?: Record<string, string> }
     expect(safeSource).toContain("command('start')")
     expect(safeSource).toContain(".option('--password-file <path>',")
+    expect(safeSource).toContain(".option('--ntfy-url-file <path>',")
+    expect(safeSource).toContain('loadNtfyPublishUrl({ explicitPath: options.ntfyUrlFile })')
+    expect(safeSource).toContain("join(getSafeHome(), 'ntfy-notifier.json')")
+    expect(safeSource).toContain('ntfyNotifications:')
     expect(safeSource).toContain('buildSafeSecurityPolicy')
     expect(safeSource).not.toContain('cloudflared')
+    expect(safeSource).not.toContain('private-test-topic')
     expect(tsupSource).toContain("'src/cli/safe.ts'")
     expect(packageJson.bin?.['codex-mobile']).toBe('dist-cli/index.js')
     expect(packageJson.bin?.['codex-mobile-safe']).toBe('dist-cli/safe.js')

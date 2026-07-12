@@ -6,6 +6,9 @@ export type SafeSourceSet = {
   featureGate: string
   bridge: string
   safeCli: string
+  ntfyConfig: string
+  httpServer: string
+  securityPolicy: string
 }
 
 export type DoctorResult = {
@@ -29,6 +32,18 @@ export function inspectSafeSources(sources: SafeSourceSet): DoctorResult {
   requireText(failures, sources.bridge, 'securityPolicy.terminalInputEnabled', 'Bridge must gate terminal input')
   requireText(failures, sources.safeCli, 'exposeTailscale(state.port)', 'Safe CLI must expose only through explicit Tailscale command')
   requireText(failures, sources.safeCli, "option('--password-file <path>'", 'Safe CLI must support password files')
+  requireText(failures, sources.safeCli, "option('--ntfy-url-file <path>'", 'Safe CLI must support an optional ntfy URL file')
+  requireText(failures, sources.safeCli, 'loadNtfyPublishUrl({ explicitPath: options.ntfyUrlFile })', 'Safe CLI must use the validated ntfy loader')
+  requireText(failures, sources.ntfyConfig, "url.origin !== 'https://ntfy.sh'", 'ntfy configuration must require the fixed HTTPS origin')
+  requireText(failures, sources.ntfyConfig, 'url.username', 'ntfy configuration must reject URL credentials')
+  requireText(failures, sources.ntfyConfig, 'url.search', 'ntfy configuration must reject URL query strings')
+  requireText(failures, sources.ntfyConfig, '!/^\\/[A-Za-z0-9_-]+$/u.test(url.pathname)', 'ntfy configuration must require one strict topic segment')
+  requireText(failures, sources.bridge, 'readThreadForNotifier', 'Bridge must keep notifier thread reads internal')
+  requireText(failures, sources.httpServer, 'options.ntfyNotifications', 'HTTP server must keep ntfy wiring optional')
+  requireText(failures, sources.httpServer, 'createNtfyNotifierLifecycle', 'HTTP server must own the optional ntfy lifecycle')
+  requireText(failures, sources.httpServer, 'bridge.subscribeNotifications', 'HTTP server must explicitly subscribe the enabled notifier')
+  requireText(failures, sources.httpServer, 'NtfyCompletionNotifier', 'HTTP server must use the bounded completion notifier')
+  requireText(failures, sources.securityPolicy, 'backgroundIntegrationsEnabled: false', 'Safe policy must keep background integrations disabled')
   return { ok: failures.length === 0, failures }
 }
 
@@ -46,5 +61,8 @@ export async function runDoctor(root: string): Promise<DoctorResult> {
     featureGate: await readSource(root, 'src/safe/featureGate.ts'),
     bridge: await readSource(root, 'src/server/codexAppServerBridge.ts'),
     safeCli: await readSource(root, 'src/cli/safe.ts'),
+    ntfyConfig: await readSource(root, 'src/safe/ntfyConfig.ts'),
+    httpServer: await readSource(root, 'src/server/httpServer.ts'),
+    securityPolicy: await readSource(root, 'src/server/securityPolicy.ts'),
   })
 }

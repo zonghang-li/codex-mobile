@@ -7317,6 +7317,7 @@ class MethodCatalog {
 
 type CodexBridgeMiddleware = ((req: IncomingMessage, res: ServerResponse, next: () => void) => Promise<void>) & {
   dispose: () => void
+  readThreadForNotifier: (threadId: string) => Promise<unknown>
   subscribeNotifications: (listener: (value: { method: string; params: unknown; atIso: string }) => void) => () => void
 }
 
@@ -9674,6 +9675,9 @@ export function createCodexBridgeMiddleware(options: {
       unsubscribeTerminal()
     }
   }
+  middleware.readThreadForNotifier = (threadId: string) => (
+    appServer.rpc('thread/read', { threadId, includeTurns: true })
+  )
 
   return middleware
 }

@@ -12,6 +12,8 @@ import {
   PERMISSIVE_SECURITY_POLICY,
   type ServerSecurityPolicy,
 } from './securityPolicy.js'
+import { NtfyCompletionNotifier, type NtfyCompletionNotifierOptions } from './ntfyCompletionNotifier.js'
+import { FileNtfyStateStore } from '../safe/ntfyState.js'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
 const distDir = join(__dirname, '..', 'dist')
@@ -20,12 +22,65 @@ const spaEntryFile = join(distDir, 'index.html')
 export type ServerOptions = {
   password?: string
   securityPolicy?: ServerSecurityPolicy
+  ntfyNotifications?: {
+    publishUrl: string
+    statePath: string
+  }
 }
 
 export type ServerInstance = {
   app: Express
   dispose: () => void
   attachWebSocket: (server: HttpServer) => void
+}
+
+type NtfyBridge = {
+  readThreadForNotifier: (threadId: string) => Promise<unknown>
+  subscribeNotifications: (
+    listener: (notification: { method: string; params: unknown; atIso: string }) => void,
+  ) => () => void
+}
+
+type NtfyNotifier = Pick<NtfyCompletionNotifier, 'start' | 'handle' | 'dispose'>
+
+export function createNtfyNotifierLifecycle(options: {
+  bridge: NtfyBridge
+  config?: ServerOptions['ntfyNotifications']
+  createStateStore?: (statePath: string, warn: (message: string) => void) => FileNtfyStateStore
+  createNotifier?: (options: NtfyCompletionNotifierOptions) => NtfyNotifier
+  warn?: (message: string) => void
+}): { dispose: () => void } {
+  if (!options.config) return { dispose: () => undefined }
+  const warn = options.warn ?? ((message: string) => console.warn(message))
+  const createStateStore = options.createStateStore ?? ((statePath, stateWarn) => (
+    new FileNtfyStateStore(statePath, stateWarn)
+  ))
+  const createNotifier = options.createNotifier ?? ((notifierOptions) => (
+    new NtfyCompletionNotifier(notifierOptions)
+  ))
+  const notifier = createNotifier({
+    publishUrl: options.config.publishUrl,
+    stateStore: createStateStore(options.config.statePath, warn),
+    readThread: options.bridge.readThreadForNotifier,
+    warn,
+  })
+  void notifier.start().catch(() => {
+    warn('Unable to start long-task notifications')
+  })
+  const unsubscribe = options.bridge.subscribeNotifications((notification) => {
+    notifier.handle(notification)
+  })
+  let disposed = false
+  return {
+    dispose: () => {
+      if (disposed) return
+      disposed = true
+      unsubscribe()
+      void notifier.dispose().catch(() => {
+        warn('Unable to stop long-task notifications')
+      })
+    },
+  }
 }
 
 const IMAGE_CONTENT_TYPES: Record<string, string> = {
@@ -81,6 +136,10 @@ export function createServer(options: ServerOptions = {}): ServerInstance {
   const app = express()
   const securityPolicy = options.securityPolicy ?? PERMISSIVE_SECURITY_POLICY
   const bridge = createCodexBridgeMiddleware({ securityPolicy })
+  const ntfyLifecycle = createNtfyNotifierLifecycle({
+    bridge,
+    config: options.ntfyNotifications,
+  })
   const authSession = options.password ? createAuthSession(options.password) : null
 
   // 1. Auth middleware (if password is set)
@@ -295,7 +354,10 @@ export function createServer(options: ServerOptions = {}): ServerInstance {
 
   return {
     app,
-    dispose: () => bridge.dispose(),
+    dispose: () => {
+      ntfyLifecycle.dispose()
+      bridge.dispose()
+    },
     attachWebSocket: (server: HttpServer) => {
       const wss = new WebSocketServer({ noServer: true })
 

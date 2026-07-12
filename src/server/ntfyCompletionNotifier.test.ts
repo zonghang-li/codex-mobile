@@ -33,11 +33,13 @@ class MemoryStateStore {
   }
 }
 
-function started(threadId = 'thread-1', turnId = 'turn-1'): unknown {
+type TestNotification = { method: string; params: unknown }
+
+function started(threadId = 'thread-1', turnId = 'turn-1'): TestNotification {
   return { method: 'turn/started', params: { threadId, turn: { id: turnId } } }
 }
 
-function completed(status = 'completed', threadId = 'thread-1', turnId = 'turn-1'): unknown {
+function completed(status = 'completed', threadId = 'thread-1', turnId = 'turn-1'): TestNotification {
   return { method: 'turn/completed', params: { threadId, turn: { id: turnId, status } } }
 }
 
@@ -380,7 +382,9 @@ describe('durable sequential delivery', () => {
   })
 
   it('builds the real default fetch request with RFC 2047 title and sequence ID headers', async () => {
-    const fetchMock = vi.fn(async () => ({ ok: true, status: 200 } as Response))
+    const fetchMock = vi.fn(async (..._args: Parameters<typeof fetch>): Promise<Response> => (
+      { ok: true, status: 200 } as Response
+    ))
     vi.stubGlobal('fetch', fetchMock)
     const store = new MemoryStateStore({
       active: [],
