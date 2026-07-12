@@ -374,7 +374,7 @@
                   <template v-for="(block, blockIndex) in getMessageBlocks(message)" :key="`block-${blockIndex}`">
                     <CopyableOutputBlock
                       v-if="block.kind !== 'thematicBreak' && block.kind !== 'image'"
-                      :copy-text="message.role === 'user' ? '' : serializeMessageBlockForCopy(block)"
+                      :copy-text="messageBlockCopyText(message, block)"
                       :label="messageBlockCopyLabel(message)"
                     >
                     <p v-if="block.kind === 'paragraph'" class="message-text">
@@ -962,7 +962,7 @@ import {
   latestThreadRenderWindowStart,
 } from './threadConversationWindow'
 import type { ListItem, MessageBlock, TableAlignment, TaskListItem } from './messageBlockTypes'
-import { serializeMessageBlockForCopy } from './outputBlockCopy'
+import { messageBlockCopyLabel, messageBlockCopyText } from './outputBlockCopy'
 
 import CopyableOutputBlock from './CopyableOutputBlock.vue'
 import IconTablerArrowBackUp from '../icons/IconTablerArrowBackUp.vue'
@@ -1065,12 +1065,6 @@ function isPlanMessage(message: UiMessage): boolean {
 
 function isTurnErrorMessage(message: UiMessage): boolean {
   return message.messageType === 'turnError'
-}
-
-function messageBlockCopyLabel(message: UiMessage): string {
-  if (isTurnErrorMessage(message)) return 'Copy error'
-  if ((message.messageType ?? '').toLowerCase().includes('reasoning')) return 'Copy reasoning'
-  return 'Copy output block'
 }
 
 function buildPlanMessageText(explanation: string, steps: UiPlanStep[]): string {

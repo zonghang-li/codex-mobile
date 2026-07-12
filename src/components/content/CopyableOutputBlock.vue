@@ -19,7 +19,7 @@
 
 <script setup lang="ts">
 import { onBeforeUnmount, ref } from 'vue'
-import { copyTextToClipboard } from '../../utils/clipboard'
+import { createOutputBlockCopyController } from './outputBlockCopyController'
 import IconTablerCopy from '../icons/IconTablerCopy.vue'
 
 const props = defineProps<{
@@ -29,32 +29,20 @@ const props = defineProps<{
 
 const copied = ref(false)
 const errorText = ref('')
-let resetTimer: ReturnType<typeof setTimeout> | null = null
 
-function clearResetTimer(): void {
-  if (resetTimer === null) return
-  clearTimeout(resetTimer)
-  resetTimer = null
+const controller = createOutputBlockCopyController({
+  getCopyText: () => props.copyText,
+  onStateChange: (state) => {
+    copied.value = state.copied
+    errorText.value = state.errorText
+  },
+})
+
+function copyOutput(event: MouseEvent): Promise<void> {
+  return controller.copyOutput(event)
 }
 
-async function copyOutput(): Promise<void> {
-  clearResetTimer()
-  copied.value = false
-  errorText.value = ''
-
-  try {
-    await copyTextToClipboard(props.copyText)
-    copied.value = true
-    resetTimer = setTimeout(() => {
-      copied.value = false
-      resetTimer = null
-    }, 1500)
-  } catch {
-    errorText.value = 'Copy failed'
-  }
-}
-
-onBeforeUnmount(clearResetTimer)
+onBeforeUnmount(controller.dispose)
 </script>
 
 <style scoped>

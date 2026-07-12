@@ -21,12 +21,12 @@ For fallback coverage, deny or remove `navigator.clipboard.writeText` while keep
 ## Actions and exact clipboard expectations
 
 1. Copy each paragraph, heading, and blockquote. Expect its original block text, never rendered HTML.
-2. Copy unordered and ordered lists. Expect `- ` markers and the original ordered start/incremented numbers, with item paragraphs separated by blank lines and nested block text retained.
+2. Copy unordered and ordered lists. Expect `- ` markers and the original ordered start/incremented numbers, with item paragraphs separated by blank lines and each nested list depth indented by two additional spaces; for example `- parent\n\n  3. child\n\n    - grandchild`.
 3. Copy a task list. Expect checked and unchecked lines exactly as `- [x] done` and `- [ ] next`.
 4. Copy a table. Expect header and body cells separated by tabs and rows separated by newlines, for example `Name\tValue\nalpha\t1`.
 5. Copy fenced code. Expect only the original source, with no backtick fence and no language label.
 6. Expand and copy command output. Expect `aggregatedOutput` exactly, including its whitespace and newlines. An empty output displaying `(no output)` has no per-block copy button.
-7. Copy completed and live reasoning. Expect the raw displayed reasoning text exactly.
+7. Copy persisted completed reasoning and live reasoning. Expect only the user-visible reasoning summary text exactly. Reload the completed thread and confirm the persisted summary remains visible/copyable; raw reasoning content must never appear.
 8. Copy a plan explanation, then each plan step. Expect explanation text separately and each step's text without `✓`, `•`, `○`, or other status UI.
 9. Copy turn and live errors. Expect the original error text.
 10. Confirm each successful action visibly changes to `Copied`, its accessible label also reports `Copied`, and it resets after about 1.5 seconds.

@@ -470,7 +470,16 @@ function toUiMessages(item: ThreadItem): UiMessage[] {
   }
 
   if (item.type === 'reasoning') {
-    return []
+    const text = item.summary
+      .filter((part) => part.trim().length > 0)
+      .join('\n\n')
+    if (!text) return []
+    return [{
+      id: item.id,
+      role: 'assistant',
+      text,
+      messageType: 'reasoning',
+    }]
   }
 
 

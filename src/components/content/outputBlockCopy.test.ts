@@ -1,5 +1,9 @@
 import { describe, expect, it } from 'vitest'
-import { serializeMessageBlockForCopy } from './outputBlockCopy'
+import {
+  messageBlockCopyLabel,
+  messageBlockCopyText,
+  serializeMessageBlockForCopy,
+} from './outputBlockCopy'
 
 describe('output block clipboard serialization', () => {
   it.each([
@@ -24,12 +28,18 @@ describe('output block clipboard serialization', () => {
           children: [{
             kind: 'orderedList',
             start: 3,
-            items: [{ paragraphs: ['child'] }],
+            items: [{
+              paragraphs: ['child'],
+              children: [{
+                kind: 'unorderedList',
+                items: [{ paragraphs: ['grandchild'] }],
+              }],
+            }],
           }],
         },
         { paragraphs: ['next'] },
       ],
-    })).toBe('- parent\n\nsecond paragraph\n\n3. child\n- next')
+    })).toBe('- parent\n\n  second paragraph\n\n  3. child\n\n    - grandchild\n- next')
   })
 
   it('preserves list and task markers', () => {
@@ -54,5 +64,14 @@ describe('output block clipboard serialization', () => {
   it('returns empty text for thematic breaks and images', () => {
     expect(serializeMessageBlockForCopy({ kind: 'thematicBreak' })).toBe('')
     expect(serializeMessageBlockForCopy({ kind: 'image', url: '/image.png', alt: 'image', markdown: '![]()' })).toBe('')
+  })
+
+  it('only exposes structured output payloads and labels persisted reasoning and errors', () => {
+    const paragraph = { kind: 'paragraph', value: 'visible summary' } as const
+
+    expect(messageBlockCopyText({ role: 'user' }, paragraph)).toBe('')
+    expect(messageBlockCopyText({ role: 'assistant', messageType: 'reasoning' }, paragraph)).toBe('visible summary')
+    expect(messageBlockCopyLabel({ role: 'assistant', messageType: 'reasoning' })).toBe('Copy reasoning')
+    expect(messageBlockCopyLabel({ role: 'system', messageType: 'turnError' })).toBe('Copy error')
   })
 })
