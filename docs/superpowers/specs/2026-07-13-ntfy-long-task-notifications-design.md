@@ -15,7 +15,7 @@ The notification contains one concise sentence derived from the final assistant 
 - Body: the first non-empty sentence from the final assistant response, with whitespace collapsed and a maximum of 180 characters.
 - Fallback body when no assistant response exists: a short fixed sentence matching the final status.
 - The phone decides whether the notification rings, vibrates, remains silent, or is suppressed by Focus/Do Not Disturb.
-- Each `threadId + turnId` pair produces at most one notification.
+- Each `threadId + turnId` pair is treated as one logical notification. Local pending/sent state suppresses ordinary duplicates, and every retry uses the same deterministic ntfy sequence ID so supported clients replace the prior notification instead of displaying an unrelated one.
 
 ## Architecture
 
@@ -42,7 +42,7 @@ A focused server module owns:
 - calculating elapsed time on `turn/completed`;
 - reading the latest assistant response only after the ten-minute threshold is met;
 - producing the fixed title and one-sentence body;
-- queueing and sending an ntfy POST request;
+- queueing and sending an ntfy POST request with an RFC 2047 ASCII-encoded title header and deterministic `X-Sequence-ID`;
 - deduplicating completed turns.
 
 The shared bridge accepts the notifier as an optional dependency and forwards app-server notifications to it. The original `codex-mobile` command does not enable it by default. The safe command enables it only when a valid secret URL file is present.
@@ -60,6 +60,8 @@ Notifier state is stored under the existing safe home, in a mode-`0600` JSON fil
 The state never contains the ntfy URL or topic. Active timing survives service restarts. Completed pending notifications survive restart until accepted by ntfy.
 
 Sending is asynchronous and does not block or fail the Codex turn. Each delivery uses a five-second request timeout and at most three immediate attempts. A failed record remains in the bounded durable outbox and is retried on notifier startup and the next notification event. The outbox and sent-key history are each capped at 256 records, evicting the oldest record first, so failure cannot create unbounded state or retry fanout.
+
+For each pending key, the sender derives the same bounded ASCII sequence ID from `threadId + turnId` and includes it as `X-Sequence-ID` on every attempt and post-restart retry. ntfy documents sequence IDs as a client-side notification update mechanism: the server remains append-only, while supported clients replace an earlier notification in the same sequence. This combines local sent-state deduplication with logical client replacement; it is not a transport-level exactly-once transaction. An ambiguous timeout, or a process crash after ntfy accepts the POST but before local sent state is committed, can still publish another append-only event and may re-alert on a client depending on timing and platform behavior. See the [ntfy publish documentation](https://docs.ntfy.sh/publish/#updating-notifications).
 
 ## Event and status handling
 
@@ -83,6 +85,7 @@ Automated tests cover:
 - 9 minutes 59.999 seconds does not notify;
 - exactly 10 minutes notifies;
 - successful, failed, and interrupted titles/fallback bodies;
+- RFC 2047 ASCII title headers and deterministic, distinct, bounded ASCII sequence IDs in the real default request path;
 - deterministic first-sentence extraction and 180-character truncation;
 - duplicate started/completed events;
 - missing IDs and missing start state;
@@ -98,4 +101,4 @@ The relevant manual test verifies a synthetic threshold configuration or fake cl
 
 Disabled configuration adds no notification listener or network work. Enabled configuration performs constant-time map operations for start events. Thread reading and network delivery occur only for turns that reach ten minutes. State and retry queues are strictly bounded to 256 records. No polling loop, extra browser request, frontend bundle, or render work is added.
 
-The implementation must be checked for secret redaction, SSRF prevention, duplicate sends, unbounded retries, service restart behavior, and notification work accidentally delaying app-server event handling.
+The implementation must be checked for secret redaction, SSRF prevention, local duplicate suppression, stable ntfy sequence IDs, ambiguous-delivery behavior, unbounded retries, service restart behavior, and notification work accidentally delaying app-server event handling. Verification must not describe this append-only network workflow as atomic exactly-once delivery.

@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto'
 import {
   boundNtfyState,
   createEmptyNtfyState,
@@ -18,6 +19,7 @@ type StateStore = Pick<FileNtfyStateStore, 'load' | 'save'>
 export type NtfySendRequest = {
   publishUrl: string
   record: PendingNtfyRecord
+  sequenceId: string
   signal: AbortSignal
 }
 
@@ -118,13 +120,22 @@ function classifyStatus(status: string): { title: TerminalTitle; fallback: strin
   return { title: 'Codex 任务已中断', fallback: '任务已中断。' }
 }
 
+function encodeRfc2047(value: string): string {
+  return `=?UTF-8?B?${Buffer.from(value, 'utf8').toString('base64')}?=`
+}
+
+function createNtfySequenceId(turnKey: string): string {
+  return `codex-${createHash('sha256').update(turnKey, 'utf8').digest('base64url')}`
+}
+
 async function sendNtfyRequest(request: NtfySendRequest): Promise<void> {
   const response = await fetch(request.publishUrl, {
     method: 'POST',
     headers: {
-      Title: request.record.title,
+      Title: encodeRfc2047(request.record.title),
       Priority: 'default',
       Tags: 'white_check_mark',
+      'X-Sequence-ID': request.sequenceId,
     },
     body: request.record.message,
     signal: request.signal,
@@ -247,6 +258,7 @@ export class NtfyCompletionNotifier {
         await this.send({
           publishUrl: this.options.publishUrl,
           record,
+          sequenceId: createNtfySequenceId(record.key),
           signal: this.createTimeoutSignal(NTFY_REQUEST_TIMEOUT_MS),
         })
       } catch {

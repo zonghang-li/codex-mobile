@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import { createEmptyNtfyState, type NtfyNotifierState } from '../safe/ntfyState'
 import {
   NTFY_IMMEDIATE_ATTEMPTS,
@@ -9,6 +9,10 @@ import {
   summarizeAssistantResponse,
   type NtfySendRequest,
 } from './ntfyCompletionNotifier'
+
+afterEach(() => {
+  vi.unstubAllGlobals()
+})
 
 function cloneState(state: NtfyNotifierState): NtfyNotifierState {
   return structuredClone(state)
@@ -287,15 +291,25 @@ describe('durable sequential delivery', () => {
 
   it('reconstructs and retries a pending record left by failed delivery', async () => {
     const store = new MemoryStateStore()
+    const firstSequenceIds: string[] = []
     const first = await runTurn(NTFY_MIN_DURATION_MS, {
       store,
-      send: async () => { throw new Error('offline') },
+      send: async (request) => {
+        firstSequenceIds.push(request.sequenceId)
+        throw new Error('offline')
+      },
     })
     expect(first.store.state.pending).toHaveLength(1)
 
-    const second = harness({ store, now: () => NTFY_MIN_DURATION_MS + 1 })
-    await second.notifier.start()
-    expect(second.send).toHaveBeenCalledTimes(1)
+    const secondSequenceIds: string[] = []
+    const secondWithSender = harness({
+      store,
+      now: () => NTFY_MIN_DURATION_MS + 1,
+      send: async (request) => { secondSequenceIds.push(request.sequenceId) },
+    })
+    await secondWithSender.notifier.start()
+    expect(secondWithSender.send).toHaveBeenCalledTimes(1)
+    expect(new Set(firstSequenceIds)).toEqual(new Set([secondSequenceIds[0]]))
     expect(store.state.pending).toHaveLength(0)
     expect(store.state.sent).toHaveLength(1)
   })
@@ -339,6 +353,68 @@ describe('durable sequential delivery', () => {
     await fixture.notifier.start()
     expect(fixture.send).toHaveBeenCalledTimes(2)
     expect(maximumConcurrent).toBe(1)
+  })
+
+  it('uses stable, distinct, bounded ASCII sequence IDs for turn pairs', async () => {
+    const store = new MemoryStateStore({
+      active: [],
+      pending: [
+        { key: '线程一:轮次一', title: 'Codex 任务完成', message: '一。', createdAt: 1 },
+        { key: '线程二:轮次二', title: 'Codex 任务完成', message: '二。', createdAt: 2 },
+      ],
+      sent: [],
+    })
+    const sequenceIds: string[] = []
+    const fixture = harness({
+      store,
+      send: async (request) => { sequenceIds.push(request.sequenceId) },
+    })
+    await fixture.notifier.start()
+
+    expect(sequenceIds).toHaveLength(2)
+    expect(sequenceIds[0]).not.toBe(sequenceIds[1])
+    for (const sequenceId of sequenceIds) {
+      expect(sequenceId).toMatch(/^[A-Za-z0-9_-]+$/u)
+      expect(sequenceId.length).toBeLessThanOrEqual(64)
+    }
+  })
+
+  it('builds the real default fetch request with RFC 2047 title and sequence ID headers', async () => {
+    const fetchMock = vi.fn(async () => ({ ok: true, status: 200 } as Response))
+    vi.stubGlobal('fetch', fetchMock)
+    const store = new MemoryStateStore({
+      active: [],
+      pending: [{
+        key: 'thread-real:turn-real',
+        title: 'Codex 任务完成',
+        message: '默认请求测试。',
+        createdAt: 1,
+      }],
+      sent: [],
+    })
+    const notifier = new NtfyCompletionNotifier({
+      publishUrl: 'https://ntfy.sh/private-test-topic',
+      stateStore: store,
+      readThread: async () => ({}),
+      createTimeoutSignal: () => new AbortController().signal,
+      warn: vi.fn(),
+    })
+
+    await notifier.start()
+
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+    const [url, init] = fetchMock.mock.calls[0] ?? []
+    const headers = new Headers(init?.headers)
+    const encodedTitle = headers.get('Title') ?? ''
+    expect(url).toBe('https://ntfy.sh/private-test-topic')
+    expect(init?.method).toBe('POST')
+    expect(init?.body).toBe('默认请求测试。')
+    expect(encodedTitle).toMatch(/^=\?UTF-8\?B\?[A-Za-z0-9+/]+=*\?=$/u)
+    expect(Buffer.from(encodedTitle.slice(10, -2), 'base64').toString('utf8')).toBe('Codex 任务完成')
+    expect([...encodedTitle].every((character) => character.charCodeAt(0) <= 0x7f)).toBe(true)
+    expect(headers.get('X-Sequence-ID')).toMatch(/^[A-Za-z0-9_-]{1,64}$/u)
+    expect(headers.get('Priority')).toBe('default')
+    expect(headers.get('Tags')).toBe('white_check_mark')
   })
 
   it('creates a fresh 5,000 ms timeout signal for every attempt', async () => {

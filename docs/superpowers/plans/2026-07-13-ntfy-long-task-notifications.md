@@ -228,6 +228,8 @@ Cover:
 - success moves the key from pending to sent before returning;
 - multiple pending rows drain sequentially, not with unbounded fanout;
 - injected sender receives a signal configured for a 5,000 ms timeout;
+- retries and reconstruction use one deterministic bounded ASCII sequence ID for the same turn key, while different keys produce different IDs;
+- the real default sender RFC 2047-encodes the logical Chinese title and includes `X-Sequence-ID`;
 - warning strings contain no URL/topic or message body.
 
 - [ ] **Step 5: Implement bounded durable delivery**
@@ -235,26 +237,23 @@ Cover:
 Default sending behavior:
 
 ```ts
-async function sendNtfyRequest(
-  publishUrl: string,
-  record: PendingNtfyRecord,
-  signal: AbortSignal,
-): Promise<void> {
-  const response = await fetch(publishUrl, {
+async function sendNtfyRequest(request: NtfySendRequest): Promise<void> {
+  const response = await fetch(request.publishUrl, {
     method: 'POST',
     headers: {
-      Title: record.title,
+      Title: encodeRfc2047(request.record.title),
       Priority: 'default',
       Tags: 'white_check_mark',
+      'X-Sequence-ID': request.sequenceId,
     },
-    body: record.message,
-    signal,
+    body: request.record.message,
+    signal: request.signal,
   })
   if (!response.ok) throw new Error(`ntfy request failed with HTTP ${String(response.status)}`)
 }
 ```
 
-Create a fresh timeout signal with `createTimeoutSignal(NTFY_REQUEST_TIMEOUT_MS)` for every attempt; the production default is `AbortSignal.timeout`. Persist before attempting, after success, and after bounded retry failure. Never include `publishUrl` or message text in warnings. `dispose()` awaits the private promise chain so tests and shutdown can observe completion without exposing production polling.
+RFC 2047-encode the exact logical Chinese title so Node's Fetch implementation receives an ASCII-safe header. Derive a deterministic, non-secret, bounded ASCII sequence ID from the turn key and reuse it across all attempts and restarts. This gives local deduplication plus ntfy client-side logical replacement, not atomic transport-level exactly-once delivery; an ambiguous timeout or crash before the local sent-state commit can still cause a repeated alert. Create a fresh timeout signal with `createTimeoutSignal(NTFY_REQUEST_TIMEOUT_MS)` for every attempt; the production default is `AbortSignal.timeout`. Persist before attempting, after success, and after bounded retry failure. Never include `publishUrl` or message text in warnings. `dispose()` awaits the private promise chain so tests and shutdown can observe completion without exposing production polling.
 
 - [ ] **Step 6: Run focused tests and commit**
 
