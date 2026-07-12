@@ -28,7 +28,6 @@
             :data-pinned="isPinned(thread.id)"
             :data-menu-open="isThreadMenuOpen(thread.id) ? 'true' : 'false'"
             :force-right-hover="isThreadMenuOpen(thread.id)"
-            @click="onSelect(thread.id)"
             @mouseleave="onThreadRowLeave(thread.id, $event)"
             @contextmenu="onThreadRowContextMenu($event, thread.id)"
           >
@@ -192,7 +191,6 @@
           :data-pinned="isPinned(thread.id)"
           :data-menu-open="isThreadMenuOpen(thread.id) ? 'true' : 'false'"
           :force-right-hover="isThreadMenuOpen(thread.id)"
-          @click="onSelect(thread.id)"
           @mouseleave="onThreadRowLeave(thread.id, $event)"
           @contextmenu="onThreadRowContextMenu($event, thread.id)"
         >
@@ -397,7 +395,6 @@
                 :data-pinned="isPinned(thread.id)"
                 :data-menu-open="isThreadMenuOpen(thread.id) ? 'true' : 'false'"
                 :force-right-hover="isThreadMenuOpen(thread.id)"
-                @click="onSelect(thread.id)"
                 @mouseleave="onThreadRowLeave(thread.id, $event)"
                 @contextmenu="onThreadRowContextMenu($event, thread.id)"
               >
@@ -526,7 +523,6 @@
             :data-pinned="isPinned(thread.id)"
             :data-menu-open="isThreadMenuOpen(thread.id) ? 'true' : 'false'"
             :force-right-hover="isThreadMenuOpen(thread.id)"
-            @click="onSelect(thread.id)"
             @mouseleave="onThreadRowLeave(thread.id, $event)"
             @contextmenu="onThreadRowContextMenu($event, thread.id)"
           >
@@ -3340,12 +3336,6 @@ onBeforeUnmount(() => {
   @apply bg-zinc-200;
 }
 
-.thread-row:hover .thread-delete-button,
-.thread-row:focus-within .thread-delete-button,
-.thread-delete-button[data-confirming='true'] {
-  @apply opacity-100 pointer-events-auto;
-}
-
 .thread-status-indicator[data-state='unread'] {
   width: 6.6667px;
   height: 6.6667px;
@@ -3364,15 +3354,22 @@ onBeforeUnmount(() => {
   @apply bg-sky-500;
 }
 
-.thread-row:hover .thread-status-indicator[data-state='unread'],
-.thread-row:hover .thread-status-indicator[data-state='working'],
-.thread-row:hover .thread-status-indicator[data-state='awaiting-approval'],
-.thread-row:hover .thread-status-indicator[data-state='awaiting-response'],
-.thread-row:focus-within .thread-status-indicator[data-state='unread'],
-.thread-row:focus-within .thread-status-indicator[data-state='working'],
-.thread-row:focus-within .thread-status-indicator[data-state='awaiting-approval'],
-.thread-row:focus-within .thread-status-indicator[data-state='awaiting-response'] {
-  @apply opacity-0;
+@media (hover: hover) and (pointer: fine) {
+  .thread-row:hover .thread-delete-button,
+  .thread-row:focus-within .thread-delete-button {
+    @apply opacity-100 pointer-events-auto;
+  }
+
+  .thread-row:hover .thread-status-indicator[data-state='unread'],
+  .thread-row:hover .thread-status-indicator[data-state='working'],
+  .thread-row:hover .thread-status-indicator[data-state='awaiting-approval'],
+  .thread-row:hover .thread-status-indicator[data-state='awaiting-response'],
+  .thread-row:focus-within .thread-status-indicator[data-state='unread'],
+  .thread-row:focus-within .thread-status-indicator[data-state='working'],
+  .thread-row:focus-within .thread-status-indicator[data-state='awaiting-approval'],
+  .thread-row:focus-within .thread-status-indicator[data-state='awaiting-response'] {
+    @apply opacity-0;
+  }
 }
 
 .rename-thread-overlay {
