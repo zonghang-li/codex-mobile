@@ -5,6 +5,7 @@ output/
 .playwright-cli/
 test-results/
 *.tsbuildinfo
+*.tgz
 
 package-lock.json
 pnpm-lock.yaml

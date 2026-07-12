@@ -1,0 +1,12 @@
+#!/bin/sh
+set -eu
+
+root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd -P)
+prefix=${CODEX_MOBILE_PREFIX:-"$HOME/.local"}
+
+cd "$root"
+pnpm run build
+npm install --global --prefix "$prefix" "$root"
+
+printf 'Installed codex-mobile and codex-mobile-safe under %s/bin\n' "$prefix"
+printf 'Ensure %s/bin is in PATH.\n' "$prefix"
