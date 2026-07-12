@@ -9,6 +9,7 @@ describe('turn completion disposition', () => {
     ['failed', false, false, false, false],
     ['interrupted', false, false, false, false],
     ['declined', false, false, false, false],
+    ['timeout', false, false, false, false],
   ])(
     'status=%s retry=%s selected=%s => running=%s unread=%s',
     (status, retry, selected, keepRunning, markUnread) => {
