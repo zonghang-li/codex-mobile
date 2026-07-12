@@ -22,7 +22,6 @@
       </li>
       <template v-for="message in visibleMessages" :key="message.id">
       <li
-        v-if="!hiddenGroupedCommandIds.has(message.id) && !hiddenFileChangeMessageIds.has(message.id)"
         class="conversation-item"
         :data-role="message.role"
         :data-message-type="message.messageType || ''"
@@ -926,6 +925,7 @@ import { copyTextToClipboard, copyTextWithSelectionFallback } from '../../utils/
 import {
   clampThreadRenderWindowStart,
   earlierThreadRenderWindowStart,
+  filterRenderableThreadMessages,
   latestThreadRenderWindowStart,
 } from './threadConversationWindow'
 
@@ -1435,12 +1435,6 @@ const LOAD_MORE_SCROLL_THRESHOLD_PX = 200
 
 const renderWindowStart = ref(0)
 const isLoadingMore = ref(false)
-const effectiveRenderWindowStart = computed(() => clampThreadRenderWindowStart(
-  renderWindowStart.value,
-  props.messages.length,
-))
-const visibleMessages = computed(() => props.messages.slice(effectiveRenderWindowStart.value))
-const hasMoreAbove = computed(() => effectiveRenderWindowStart.value > 0 || props.hasMorePersistedAbove === true)
 
 const showJumpToLatestButton = computed(
   () => !autoFollowOutput.value && (props.messages.length > 0 || props.pendingRequests.length > 0 || Boolean(props.liveOverlay)),
@@ -2017,6 +2011,18 @@ const hiddenFileChangeMessageIds = computed(() => {
   }
   return next
 })
+
+const renderableMessages = computed(() => filterRenderableThreadMessages(
+  props.messages,
+  hiddenGroupedCommandIds.value,
+  hiddenFileChangeMessageIds.value,
+))
+const effectiveRenderWindowStart = computed(() => clampThreadRenderWindowStart(
+  renderWindowStart.value,
+  renderableMessages.value.length,
+))
+const visibleMessages = computed(() => renderableMessages.value.slice(effectiveRenderWindowStart.value))
+const hasMoreAbove = computed(() => effectiveRenderWindowStart.value > 0 || props.hasMorePersistedAbove === true)
 
 function readAnchoredFileChangeSummary(message: UiMessage): TurnFileChangeSummary | null {
   return anchoredFileChangeSummaryByAnchorId.value[message.id] ?? null
@@ -4246,7 +4252,7 @@ function onPendingImageSettled(): void {
 
 function jumpToLatest(): void {
   autoFollowOutput.value = true
-  renderWindowStart.value = latestThreadRenderWindowStart(props.messages.length)
+  renderWindowStart.value = latestThreadRenderWindowStart(renderableMessages.value.length)
   enforceBottomState()
   scheduleBottomLock(4)
 }
@@ -4266,7 +4272,7 @@ async function loadMoreAbove(): Promise<void> {
     if (effectiveRenderWindowStart.value > 0) {
       renderWindowStart.value = earlierThreadRenderWindowStart(
         effectiveRenderWindowStart.value,
-        props.messages.length,
+        renderableMessages.value.length,
       )
     } else if (props.hasMorePersistedAbove === true) {
       await props.loadEarlierMessages?.(threadIdAtStart)
@@ -4353,9 +4359,12 @@ watch(
     )
 
     if (autoFollowOutput.value) {
-      renderWindowStart.value = latestThreadRenderWindowStart(next.length)
+      renderWindowStart.value = latestThreadRenderWindowStart(renderableMessages.value.length)
     } else {
-      renderWindowStart.value = clampThreadRenderWindowStart(renderWindowStart.value, next.length)
+      renderWindowStart.value = clampThreadRenderWindowStart(
+        renderWindowStart.value,
+        renderableMessages.value.length,
+      )
     }
 
     await scheduleConversationScroll()
@@ -4407,7 +4416,7 @@ watch(
   () => props.isLoading,
   async (loading) => {
     if (loading) return
-    renderWindowStart.value = latestThreadRenderWindowStart(props.messages.length)
+    renderWindowStart.value = latestThreadRenderWindowStart(renderableMessages.value.length)
     await scheduleConversationScroll()
   },
 )
@@ -4422,7 +4431,7 @@ watch(
     fileChangeActionError.value = {}
     fileChangeRedoPatchIds.value = {}
     // Apply immediately for cached threads where isLoading never toggles.
-    renderWindowStart.value = latestThreadRenderWindowStart(props.messages.length)
+    renderWindowStart.value = latestThreadRenderWindowStart(renderableMessages.value.length)
     await scheduleConversationScroll()
   },
   { flush: 'post' },
