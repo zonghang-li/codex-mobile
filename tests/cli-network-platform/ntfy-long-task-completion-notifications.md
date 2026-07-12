@@ -4,7 +4,7 @@
 
 - Linux with Node.js 18+, pnpm, systemd user services, and Tailscale installed and logged into the intended tailnet.
 - A clean local clone of `https://github.com/zonghang-li/codex-mobile.git` with dependencies installed.
-- `codex-mobile-safe` installed from this checkout with `pnpm run install:local` or `pnpm run service:install`.
+- The persistent `codex-mobile-safe` user service installed from this checkout with `pnpm run service:install`. This manual test uses the service lifecycle throughout; foreground-only `install:local` is not equivalent because it does not install or refresh the systemd unit.
 - The ntfy mobile app installed. The phone is subscribed to one locally generated, unguessable topic and is logged into the same tailnet for browser access.
 - No real topic, publish URL, password, or Tailnet credential is present in tracked files, shell history, process arguments, systemd units, or logs.
 

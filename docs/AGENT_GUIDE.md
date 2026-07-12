@@ -156,7 +156,7 @@ Keep remotes named `origin` for `zonghang-li/codex-mobile` and `upstream` for `f
 
 ```bash
 git fetch origin upstream
-git switch -c codex/<topic> origin/main
+git switch -c codex/ntfy-docs origin/main
 git rebase upstream/main
 ```
 

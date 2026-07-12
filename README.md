@@ -16,7 +16,7 @@ pnpm install
 pnpm run install:local
 ```
 
-The installer builds the current checkout and installs both commands under `${HOME}/.local` by default. Ensure `${HOME}/.local/bin` is on `PATH`.
+The local installer builds the current checkout and installs both commands under `${HOME}/.local` by default. Ensure `${HOME}/.local/bin` is on `PATH`. This is the foreground/manual installation path; it does not install or refresh the systemd user unit.
 
 Start the safe command in the foreground:
 
@@ -44,17 +44,32 @@ codex-mobile-safe expose tailscale
 
 If the service should survive logout, enable user lingering once with `loginctl enable-linger "$USER"`.
 
-To update a clone and reinstall the service:
+To update a foreground/manual installation from the clone:
 
 ```bash
 cd /path/to/codex-mobile
 git pull --ff-only
 pnpm install
 pnpm run install:local
-pnpm run service:restart
+codex-mobile-safe stop
+codex-mobile-safe start /path/to/project \
+  --password-file ~/.codex/codex-mobile-safe-password \
+  --no-open
 ```
 
-Because both commands are installed from the current checkout, repeat this update sequence after every repository change you want to run locally. Review incoming changes before pulling if the checkout has local modifications.
+For a persistent user service, refresh the installed package, rendered unit, systemd daemon state, and running process together:
+
+```bash
+cd /path/to/codex-mobile
+git pull --ff-only
+pnpm install
+pnpm run service:install
+codex-mobile-safe expose tailscale
+```
+
+`service:install` already rebuilds and reinstalls the current checkout before rendering and restarting the unit. Do not substitute `install:local` followed only by `service:restart`; that does not refresh the rendered unit/template or daemon state.
+
+Repeat the applicable foreground or service update sequence after every repository change you want to run locally. Review incoming changes before pulling if the checkout has local modifications.
 
 ## Long-task phone notifications
 
