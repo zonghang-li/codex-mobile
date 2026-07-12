@@ -26,10 +26,20 @@ describe('safe runtime policy', () => {
     })
   })
 
-  it('falls back from dangerous sandbox and approval values', () => {
+  it('accepts an explicit unrestricted no-approval profile', () => {
     expect(loadSafeRuntimeConfig({
       CODEX_MOBILE_SAFE_SANDBOX_MODE: 'danger-full-access',
       CODEX_MOBILE_SAFE_APPROVAL_POLICY: 'never',
+    })).toMatchObject({
+      sandboxMode: 'danger-full-access',
+      approvalPolicy: 'never',
+    })
+  })
+
+  it('falls back from unknown sandbox and approval values', () => {
+    expect(loadSafeRuntimeConfig({
+      CODEX_MOBILE_SAFE_SANDBOX_MODE: 'unknown',
+      CODEX_MOBILE_SAFE_APPROVAL_POLICY: 'unknown',
     })).toMatchObject({
       sandboxMode: 'workspace-write',
       approvalPolicy: 'on-request',

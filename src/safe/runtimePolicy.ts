@@ -1,8 +1,8 @@
 import { delimiter, resolve } from 'node:path'
 
 export type ExternalExposure = 'disabled' | 'tailscale'
-export type SafeSandboxMode = 'read-only' | 'workspace-write'
-export type SafeApprovalPolicy = 'untrusted' | 'on-failure' | 'on-request'
+export type SafeSandboxMode = 'read-only' | 'workspace-write' | 'danger-full-access'
+export type SafeApprovalPolicy = 'untrusted' | 'on-failure' | 'on-request' | 'never'
 
 export type SafeRuntimeConfig = {
   bindHost: string
@@ -57,12 +57,15 @@ function readAllowedRoots(value: string | undefined): string[] {
 }
 
 function readSandboxMode(value: string | undefined): SafeSandboxMode {
-  return value?.trim().toLowerCase() === 'read-only' ? 'read-only' : DEFAULT_SAFE_RUNTIME_CONFIG.sandboxMode
+  const normalized = value?.trim().toLowerCase()
+  return normalized === 'read-only' || normalized === 'danger-full-access'
+    ? normalized
+    : DEFAULT_SAFE_RUNTIME_CONFIG.sandboxMode
 }
 
 function readApprovalPolicy(value: string | undefined): SafeApprovalPolicy {
   const normalized = value?.trim().toLowerCase()
-  return normalized === 'untrusted' || normalized === 'on-failure' || normalized === 'on-request'
+  return normalized === 'untrusted' || normalized === 'on-failure' || normalized === 'on-request' || normalized === 'never'
     ? normalized
     : DEFAULT_SAFE_RUNTIME_CONFIG.approvalPolicy
 }

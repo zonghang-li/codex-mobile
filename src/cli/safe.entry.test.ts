@@ -11,6 +11,10 @@ describe('safe CLI entry packaging', () => {
     const packageJson = JSON.parse(packageSource) as { bin?: Record<string, string> }
     expect(safeSource).toContain("command('start')")
     expect(safeSource).toContain(".option('--password-file <path>',")
+    expect(safeSource).toContain('Codex sandbox mode: read-only, workspace-write, danger-full-access')
+    expect(safeSource).toContain('Codex approval policy: untrusted, on-failure, on-request, never')
+    expect(safeSource).toContain("normalized === 'danger-full-access'")
+    expect(safeSource).toContain("normalized === 'never'")
     expect(safeSource).toContain('buildSafeSecurityPolicy')
     expect(safeSource).not.toContain('cloudflared')
     expect(tsupSource).toContain("'src/cli/safe.ts'")
