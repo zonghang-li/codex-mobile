@@ -48,6 +48,8 @@ describe('local installation packaging', () => {
     expect(localInstaller).toContain('pnpm run build')
     expect(localInstaller).toContain('npm install --global --prefix')
     expect(localInstaller).toContain('npm uninstall --global --prefix "$prefix" codex-mobile-safe')
+    expect(localInstaller).toContain('legacy_mobile_bin="$prefix/bin/codex-mobile"')
+    expect(localInstaller).toContain('rm -f "$legacy_mobile_bin"')
     expect(serviceInstaller).toContain('systemd-analyze --user verify')
     expect(serviceInstaller).toContain('loginctl show-user')
     expect(serviceInstaller).toContain('systemctl --user enable codex-mobile-safe.service')
