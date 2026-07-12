@@ -923,6 +923,11 @@ import { updateThreadFileChanges } from '../../api/codexGateway'
 import { useFeedbackDiagnostics } from '../../composables/useFeedbackDiagnostics'
 import { useMobile } from '../../composables/useMobile'
 import { copyTextToClipboard, copyTextWithSelectionFallback } from '../../utils/clipboard'
+import {
+  clampThreadRenderWindowStart,
+  earlierThreadRenderWindowStart,
+  latestThreadRenderWindowStart,
+} from './threadConversationWindow'
 
 import IconTablerArrowBackUp from '../icons/IconTablerArrowBackUp.vue'
 import IconTablerArrowUp from '../icons/IconTablerArrowUp.vue'
@@ -1426,15 +1431,16 @@ function setBoundedCacheEntry<K, V>(cache: Map<K, V>, key: K, value: V, limit: n
   return value
 }
 
-const RENDER_WINDOW_SIZE = 50
-const LOAD_MORE_CHUNK = 30
 const LOAD_MORE_SCROLL_THRESHOLD_PX = 200
 
 const renderWindowStart = ref(0)
 const isLoadingMore = ref(false)
-
-const visibleMessages = computed(() => props.messages.slice(renderWindowStart.value))
-const hasMoreAbove = computed(() => renderWindowStart.value > 0 || props.hasMorePersistedAbove === true)
+const effectiveRenderWindowStart = computed(() => clampThreadRenderWindowStart(
+  renderWindowStart.value,
+  props.messages.length,
+))
+const visibleMessages = computed(() => props.messages.slice(effectiveRenderWindowStart.value))
+const hasMoreAbove = computed(() => effectiveRenderWindowStart.value > 0 || props.hasMorePersistedAbove === true)
 
 const showJumpToLatestButton = computed(
   () => !autoFollowOutput.value && (props.messages.length > 0 || props.pendingRequests.length > 0 || Boolean(props.liveOverlay)),
@@ -4240,6 +4246,7 @@ function onPendingImageSettled(): void {
 
 function jumpToLatest(): void {
   autoFollowOutput.value = true
+  renderWindowStart.value = latestThreadRenderWindowStart(props.messages.length)
   enforceBottomState()
   scheduleBottomLock(4)
 }
@@ -4248,6 +4255,7 @@ async function loadMoreAbove(): Promise<void> {
   const container = conversationListRef.value
   if (!container || !hasMoreAbove.value || isLoadingMore.value || props.isLoadingPersistedAbove === true) return
 
+  autoFollowOutput.value = false
   isLoadingMore.value = true
   const threadIdAtStart = props.activeThreadId
 
@@ -4255,8 +4263,11 @@ async function loadMoreAbove(): Promise<void> {
   const prevScrollTop = container.scrollTop
 
   try {
-    if (renderWindowStart.value > 0) {
-      renderWindowStart.value = Math.max(0, renderWindowStart.value - LOAD_MORE_CHUNK)
+    if (effectiveRenderWindowStart.value > 0) {
+      renderWindowStart.value = earlierThreadRenderWindowStart(
+        effectiveRenderWindowStart.value,
+        props.messages.length,
+      )
     } else if (props.hasMorePersistedAbove === true) {
       await props.loadEarlierMessages?.(threadIdAtStart)
     }
@@ -4341,15 +4352,10 @@ watch(
       ]),
     )
 
-    // Keep renderWindowStart in bounds whenever the message list changes length.
-    // Following output: always pin the window to the last RENDER_WINDOW_SIZE messages so
-    //   the rendered count stays bounded (handles both growth and shrink/rollback).
-    // Scrolled up: only clamp downward so renderWindowStart never exceeds the list length
-    //   (prevents visibleMessages from becoming empty after a rollback).
     if (autoFollowOutput.value) {
-      renderWindowStart.value = Math.max(0, next.length - RENDER_WINDOW_SIZE)
+      renderWindowStart.value = latestThreadRenderWindowStart(next.length)
     } else {
-      renderWindowStart.value = Math.min(renderWindowStart.value, Math.max(0, next.length - 1))
+      renderWindowStart.value = clampThreadRenderWindowStart(renderWindowStart.value, next.length)
     }
 
     await scheduleConversationScroll()
@@ -4401,7 +4407,7 @@ watch(
   () => props.isLoading,
   async (loading) => {
     if (loading) return
-    renderWindowStart.value = Math.max(0, props.messages.length - RENDER_WINDOW_SIZE)
+    renderWindowStart.value = latestThreadRenderWindowStart(props.messages.length)
     await scheduleConversationScroll()
   },
 )
@@ -4416,7 +4422,7 @@ watch(
     fileChangeActionError.value = {}
     fileChangeRedoPatchIds.value = {}
     // Apply immediately for cached threads where isLoading never toggles.
-    renderWindowStart.value = Math.max(0, props.messages.length - RENDER_WINDOW_SIZE)
+    renderWindowStart.value = latestThreadRenderWindowStart(props.messages.length)
     await scheduleConversationScroll()
   },
   { flush: 'post' },
