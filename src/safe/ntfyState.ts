@@ -1,5 +1,7 @@
-import { chmod, mkdir, readFile, writeFile } from 'node:fs/promises'
-import { dirname } from 'node:path'
+import { constants } from 'node:fs'
+import { chmod, lstat, mkdir, open, readFile, rename, rm, type FileHandle } from 'node:fs/promises'
+import { randomUUID } from 'node:crypto'
+import { basename, dirname, join } from 'node:path'
 
 export type ActiveTurnRecord = { key: string; threadId: string; turnId: string; startedAt: number }
 export type PendingNtfyRecord = {
@@ -16,6 +18,11 @@ export type NtfyNotifierState = {
 }
 
 type WarningCallback = (message: string) => void
+
+type NtfyStateStoreOperations = {
+  rename: (source: string, destination: string) => Promise<void>
+  write: (handle: FileHandle, contents: string) => Promise<void>
+}
 
 const TITLES = new Set<PendingNtfyRecord['title']>([
   'Codex 任务完成',
@@ -93,11 +100,42 @@ export function boundNtfyState(state: NtfyNotifierState, limit = 256): NtfyNotif
   }
 }
 
+async function assertSafeStatePath(path: string): Promise<void> {
+  const info = await lstat(path).catch((error: NodeJS.ErrnoException) => {
+    if (error.code === 'ENOENT') return null
+    throw new Error('Unable to inspect ntfy notifier state path')
+  })
+  if (!info) return
+  if (info.isSymbolicLink()) throw new Error('ntfy notifier state path must not be a symlink')
+  if (!info.isFile()) throw new Error('ntfy notifier state path must be a regular file')
+}
+
+async function ensurePrivateDirectory(path: string): Promise<void> {
+  try {
+    await mkdir(path, { recursive: true, mode: 0o700 })
+    const info = await lstat(path)
+    if (!info.isDirectory() || info.isSymbolicLink()) {
+      throw new Error('unsafe directory')
+    }
+    await chmod(path, 0o700)
+  } catch {
+    throw new Error('Unable to prepare private ntfy notifier state directory')
+  }
+}
+
 export class FileNtfyStateStore {
+  private readonly operations: NtfyStateStoreOperations
+
   constructor(
     private readonly path: string,
     private readonly warn: WarningCallback = (message) => console.warn(message),
-  ) {}
+    operations: Partial<NtfyStateStoreOperations> = {},
+  ) {
+    this.operations = {
+      rename: operations.rename ?? rename,
+      write: operations.write ?? ((handle, contents) => handle.writeFile(contents, 'utf8')),
+    }
+  }
 
   async load(): Promise<NtfyNotifierState> {
     try {
@@ -114,8 +152,29 @@ export class FileNtfyStateStore {
   async save(state: NtfyNotifierState): Promise<void> {
     const validated = parseNtfyState(state)
     if (!validated) throw new Error('Unable to save invalid ntfy notifier state')
-    await mkdir(dirname(this.path), { recursive: true, mode: 0o700 })
-    await writeFile(this.path, `${JSON.stringify(boundNtfyState(validated), null, 2)}\n`, { mode: 0o600 })
-    await chmod(this.path, 0o600)
+    await assertSafeStatePath(this.path)
+    const directory = dirname(this.path)
+    await ensurePrivateDirectory(directory)
+    const temporaryPath = join(directory, `.${basename(this.path)}.${process.pid}.${randomUUID()}.tmp`)
+    let handle: FileHandle | null = null
+    try {
+      handle = await open(
+        temporaryPath,
+        constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW,
+        0o600,
+      )
+      await handle.chmod(0o600)
+      await this.operations.write(handle, `${JSON.stringify(boundNtfyState(validated), null, 2)}\n`)
+      await handle.sync()
+      await handle.close()
+      handle = null
+      await assertSafeStatePath(this.path)
+      await this.operations.rename(temporaryPath, this.path)
+      await chmod(this.path, 0o600)
+    } catch {
+      await handle?.close().catch(() => undefined)
+      await rm(temporaryPath, { force: true }).catch(() => undefined)
+      throw new Error('Unable to save ntfy notifier state')
+    }
   }
 }

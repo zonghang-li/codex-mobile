@@ -1,4 +1,4 @@
-import { chmod, mkdtemp, mkdir, writeFile } from 'node:fs/promises'
+import { chmod, mkdtemp, mkdir, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { describe, expect, it } from 'vitest'
@@ -43,6 +43,15 @@ describe('secure ntfy configuration', () => {
     const path = await temporaryPath('url')
     await writeFile(path, 'https://ntfy.sh/topic\n', { mode: 0o600 })
     await expect(loadNtfyPublishUrl({ explicitPath: path, uid: 42 })).rejects.toThrow('current user')
+  })
+
+  it('rejects a symlink instead of following it to a valid secret file', async () => {
+    const target = await temporaryPath('target')
+    const link = `${target}-link`
+    await writeFile(target, 'https://ntfy.sh/linked-topic\n', { mode: 0o600 })
+    await symlink(target, link)
+
+    await expect(loadNtfyPublishUrl({ explicitPath: link })).rejects.toThrow('ntfy URL file')
   })
 
   it.each([

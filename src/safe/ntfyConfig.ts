@@ -1,4 +1,5 @@
-import { readFile, stat } from 'node:fs/promises'
+import { constants } from 'node:fs'
+import { open } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { join, resolve } from 'node:path'
 
@@ -32,21 +33,24 @@ export async function loadNtfyPublishUrl(options: {
 } = {}): Promise<string | null> {
   const path = resolve(options.explicitPath ?? options.defaultPath ?? DEFAULT_NTFY_URL_FILE)
   const required = Boolean(options.explicitPath)
-  const info = await stat(path).catch((error: NodeJS.ErrnoException) => {
+  const handle = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW).catch((error: NodeJS.ErrnoException) => {
     if (!required && error.code === 'ENOENT') return null
     throw new Error('Unable to read ntfy URL file')
   })
-  if (!info) return null
-  if (!info.isFile()) throw new Error('ntfy URL file must be a regular file')
-  const uid = options.uid ?? process.getuid?.()
-  if (uid !== undefined && info.uid !== uid) throw new Error('ntfy URL file must be owned by the current user')
-  if ((info.mode & 0o077) !== 0) throw new Error('ntfy URL file permissions must be 0600 or stricter')
-
-  let value: string
+  if (!handle) return null
   try {
-    value = (await readFile(path, 'utf8')).trim()
-  } catch {
-    throw new Error('Unable to read ntfy URL file')
+    const info = await handle.stat().catch(() => {
+      throw new Error('Unable to read ntfy URL file')
+    })
+    if (!info.isFile()) throw new Error('ntfy URL file must be a regular file')
+    const uid = options.uid ?? process.getuid?.()
+    if (uid !== undefined && info.uid !== uid) throw new Error('ntfy URL file must be owned by the current user')
+    if ((info.mode & 0o077) !== 0) throw new Error('ntfy URL file permissions must be 0600 or stricter')
+    const value = await handle.readFile('utf8').catch(() => {
+      throw new Error('Unable to read ntfy URL file')
+    })
+    return validateNtfyPublishUrl(value.trim())
+  } finally {
+    await handle.close().catch(() => undefined)
   }
-  return validateNtfyPublishUrl(value)
 }
