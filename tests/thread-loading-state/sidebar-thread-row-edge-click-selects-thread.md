@@ -1,7 +1,7 @@
-### Sidebar thread row edge click selects thread
+### Sidebar thread main target selects thread
 
 #### Feature/Change Name
-Thread rows now select when clicking anywhere on the highlighted row area (including left/right edge/time area), while pin/menu buttons keep their own actions.
+Thread rows expose one explicit main navigation target, while pin/menu controls remain independent actions.
 
 #### Prerequisites/Setup
 1. Dev server running (`pnpm run dev`)
@@ -10,16 +10,16 @@ Thread rows now select when clicking anywhere on the highlighted row area (inclu
 
 #### Steps
 1. Hover a thread row and confirm the row highlight appears
-2. Click near the left edge (outside the title text and not on pin icon)
-3. Click near the right edge/time area (outside the menu button)
-4. Click the thread title/body area
-5. Click the pin button and menu button to verify their behavior
+2. Click the thread title/body inside the main thread button
+3. Reopen the sidebar, then click the pin button and menu button
+4. On a coarse-pointer viewport, tap the main thread button once
+5. Reopen the sidebar and tap the already-visible overflow control once
 
 #### Expected Results
-- Steps 2, 3, and 4 all select/open the clicked thread
-- Hover highlight and click target area now match user expectations
-- Pin button toggles pin state without selecting due to event bubbling
-- Menu button opens thread menu without selecting due to event bubbling
+- The main thread button opens the clicked thread with one navigation/request path
+- Pin and menu controls do not select or resume the thread
+- The coarse-pointer overflow control is reachable without a preparatory tap or long press
+- The row has no competing outer click handler, so one tap never produces duplicate navigation
 
 #### Rollback/Cleanup
 - None
