@@ -7,7 +7,7 @@ describe('safe doctor', () => {
       runtimePolicy: "bindHost: '127.0.0.1'; approvalPolicy: 'on-request'; sandboxMode: 'workspace-write'",
       featureGate: 'isDisabledRoute isAllowedRpcMethod',
       bridge: 'securityPolicy.isRouteDisabled securityPolicy.isRpcMethodAllowed securityPolicy.terminalInputEnabled',
-      safeCli: "exposeTailscale(state.port); option('--password-file <path>')",
+      safeCli: "exposeTailscale(state.port); option('--password-file <path>', 'description')",
     })
     expect(result).toEqual({ ok: true, failures: [] })
   })

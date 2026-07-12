@@ -28,7 +28,9 @@
   },
   "bin": {
     "codexapp": "dist-cli/index.js",
-    "codexui": "dist-cli/index.js"
+    "codexui": "dist-cli/index.js",
+    "codex-mobile": "dist-cli/index.js",
+    "codex-mobile-safe": "dist-cli/safe.js"
   },
   "files": [
     "dist/",

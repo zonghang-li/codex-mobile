@@ -28,7 +28,7 @@ export function inspectSafeSources(sources: SafeSourceSet): DoctorResult {
   requireText(failures, sources.bridge, 'securityPolicy.isRpcMethodAllowed', 'Bridge must enforce RPC allowlisting')
   requireText(failures, sources.bridge, 'securityPolicy.terminalInputEnabled', 'Bridge must gate terminal input')
   requireText(failures, sources.safeCli, 'exposeTailscale(state.port)', 'Safe CLI must expose only through explicit Tailscale command')
-  requireText(failures, sources.safeCli, "option('--password-file <path>')", 'Safe CLI must support password files')
+  requireText(failures, sources.safeCli, "option('--password-file <path>'", 'Safe CLI must support password files')
   return { ok: failures.length === 0, failures }
 }
 

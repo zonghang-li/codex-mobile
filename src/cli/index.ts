@@ -25,6 +25,7 @@ import {
 import { createServer as createApp } from '../server/httpServer.js'
 import { generatePassword } from '../server/password.js'
 import { spawnSyncCommand } from '../utils/commandInvocation.js'
+import { listenWithFallback, openBrowser } from './shared/launcher.js'
 
 const program = new Command().name('codexui').description('Web interface for Codex app-server')
 const __dirname = dirname(fileURLToPath(import.meta.url))
@@ -291,18 +292,6 @@ function printTermuxKeepAlive(lines: string[]): void {
   lines.push('  3) Optional: run `termux-wake-lock` in another shell.')
 }
 
-function openBrowser(url: string): void {
-  const command = process.platform === 'darwin'
-    ? { cmd: 'open', args: [url] }
-    : process.platform === 'win32'
-      ? { cmd: 'cmd', args: ['/c', 'start', '', url] }
-      : { cmd: 'xdg-open', args: [url] }
-
-  const child = spawn(command.cmd, command.args, { detached: true, stdio: 'ignore' })
-  child.on('error', () => {})
-  child.unref()
-}
-
 function buildTunnelAutologinUrl(tunnelUrl: string, _password: string | undefined): string {
   return tunnelUrl
 }
@@ -409,31 +398,6 @@ async function startCloudflaredTunnel(command: string, localPort: number): Promi
   })
 }
 
-function listenWithFallback(server: ReturnType<typeof createServer>, startPort: number): Promise<number> {
-  return new Promise((resolve, reject) => {
-    const attempt = (port: number) => {
-      const onError = (error: NodeJS.ErrnoException) => {
-        server.off('listening', onListening)
-        if (error.code === 'EADDRINUSE' || error.code === 'EACCES') {
-          attempt(port + 1)
-          return
-        }
-        reject(error)
-      }
-      const onListening = () => {
-        server.off('error', onError)
-        resolve(port)
-      }
-
-      server.once('error', onError)
-      server.once('listening', onListening)
-      server.listen(port, '0.0.0.0')
-    }
-
-    attempt(startPort)
-  })
-}
-
 function getCodexGlobalStatePath(): string {
   const codexHome = getCodexHomePath()
   return join(codexHome, '.codex-global-state.json')
@@ -537,7 +501,8 @@ async function startServer(options: {
   const { app, dispose, attachWebSocket } = createApp({ password })
   const server = createServer(app)
   attachWebSocket(server)
-  const port = await listenWithFallback(server, requestedPort)
+  const listening = await listenWithFallback(server, requestedPort, '0.0.0.0')
+  const port = listening.port
   process.env.CODEXUI_SERVER_PORT = String(port)
   let tunnelChild: ReturnType<typeof spawn> | null = null
   let tunnelUrl: string | null = null
