@@ -2,7 +2,7 @@
 set -eu
 
 root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd -P)
-prefix=${CODEX_MOBILE_PREFIX:-"$HOME/.local"}
+prefix=${PREFIX:-${CODEX_MOBILE_PREFIX:-"$HOME/.local"}}
 
 cd "$root"
 pnpm run build

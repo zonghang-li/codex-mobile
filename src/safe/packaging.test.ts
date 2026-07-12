@@ -1,5 +1,12 @@
-import { readFile } from 'node:fs/promises'
+import { execFile } from 'node:child_process'
+import { chmod, mkdtemp, readFile, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { fileURLToPath } from 'node:url'
+import { promisify } from 'node:util'
 import { describe, expect, it } from 'vitest'
+
+const execFileAsync = promisify(execFile)
 
 async function readRepoFile(path: string): Promise<string> {
   return readFile(new URL(`../../${path}`, import.meta.url), 'utf8')
@@ -42,5 +49,39 @@ describe('local installation packaging', () => {
     expect(localInstaller).toContain('npm install --global --prefix')
     expect(serviceInstaller).toContain('systemd-analyze --user verify')
     expect(serviceInstaller).toContain('loginctl show-user')
+  })
+
+  it('honors the conventional PREFIX override for isolated installs', async () => {
+    const temporaryRoot = await mkdtemp(join(tmpdir(), 'codex-mobile-prefix-test-'))
+    const binDirectory = join(temporaryRoot, 'bin')
+    const capturePath = join(temporaryRoot, 'npm-args.txt')
+    await execFileAsync('mkdir', ['-p', binDirectory])
+    await writeFile(join(binDirectory, 'pnpm'), '#!/bin/sh\nexit 0\n')
+    await writeFile(
+      join(binDirectory, 'npm'),
+      '#!/bin/sh\nprintf "%s\\n" "$@" > "$CAPTURE"\n',
+    )
+    await Promise.all([
+      chmod(join(binDirectory, 'pnpm'), 0o755),
+      chmod(join(binDirectory, 'npm'), 0o755),
+    ])
+
+    await execFileAsync('sh', [fileURLToPath(new URL('../../scripts/install-local.sh', import.meta.url))], {
+      env: {
+        ...process.env,
+        PATH: `${binDirectory}:${process.env.PATH ?? ''}`,
+        PREFIX: join(temporaryRoot, 'prefix'),
+        CODEX_MOBILE_PREFIX: '',
+        CAPTURE: capturePath,
+      },
+    })
+
+    const npmArguments = (await readFile(capturePath, 'utf8')).trim().split('\n')
+    expect(npmArguments.slice(0, 4)).toEqual([
+      'install',
+      '--global',
+      '--prefix',
+      join(temporaryRoot, 'prefix'),
+    ])
   })
 })
