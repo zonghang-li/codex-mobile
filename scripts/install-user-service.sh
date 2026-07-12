@@ -6,8 +6,11 @@ prefix=${PREFIX:-${CODEX_MOBILE_PREFIX:-"$HOME/.local"}}
 unit_dir=${XDG_CONFIG_HOME:-"$HOME/.config"}/systemd/user
 unit_file=$unit_dir/codex-mobile-safe.service
 password_file=$HOME/.codex/codex-mobile-safe-password
+test_mode=${CODEX_MOBILE_SERVICE_INSTALL_TEST_MODE:-0}
 
-PREFIX=$prefix sh "$root/scripts/install-local.sh"
+if [ "$test_mode" != 1 ]; then
+  PREFIX=$prefix sh "$root/scripts/install-local.sh"
+fi
 
 mkdir -p "$unit_dir" "$(dirname -- "$password_file")"
 if [ ! -f "$password_file" ]; then
@@ -27,6 +30,10 @@ sed \
   -e "s|@PREFIX@|$prefix_escaped|g" \
   "$root/packaging/systemd/codex-mobile-safe.service.in" > "$unit_file"
 chmod 600 "$unit_file"
+
+if [ "$test_mode" = 1 ]; then
+  exit 0
+fi
 
 systemd-analyze --user verify "$unit_file"
 systemctl --user daemon-reload
