@@ -46,7 +46,7 @@
                 </button>
               </span>
             </template>
-            <button class="thread-main-button" type="button" @click.stop="onSelect(thread.id)">
+            <button class="thread-main-button" type="button" @click.stop="onThreadMainClick(thread.id)">
               <span class="thread-row-title-wrap">
                 <span class="thread-row-title-line">
                   <span class="thread-row-title">{{ thread.title }}</span>
@@ -80,7 +80,7 @@
                   class="thread-menu-trigger"
                   type="button"
                   title="thread_menu"
-                  @click.stop="toggleThreadMenu(thread.id)"
+                  @click.stop="onThreadOverflowClick(thread.id)"
                 >
                   <IconTablerDots class="thread-icon" />
                 </button>
@@ -213,7 +213,7 @@
               </button>
             </span>
           </template>
-          <button class="thread-main-button" type="button" @click.stop="onSelect(thread.id)">
+          <button class="thread-main-button" type="button" @click.stop="onThreadMainClick(thread.id)">
             <span class="thread-row-title-wrap">
               <span class="thread-row-title-line">
                 <span class="thread-row-title">{{ thread.title }}</span>
@@ -247,7 +247,7 @@
                 class="thread-menu-trigger"
                 type="button"
                 title="thread_menu"
-                @click.stop="toggleThreadMenu(thread.id)"
+                @click.stop="onThreadOverflowClick(thread.id)"
               >
                 <IconTablerDots class="thread-icon" />
               </button>
@@ -417,7 +417,7 @@
                     </button>
                   </span>
                 </template>
-                <button class="thread-main-button" type="button" @click.stop="onSelect(thread.id)">
+                <button class="thread-main-button" type="button" @click.stop="onThreadMainClick(thread.id)">
                   <span class="thread-row-title-wrap">
                     <span class="thread-row-title-line">
                       <span class="thread-row-title">{{ thread.title }}</span>
@@ -451,7 +451,7 @@
                       class="thread-menu-trigger"
                       type="button"
                       title="thread_menu"
-                      @click.stop="toggleThreadMenu(thread.id)"
+                      @click.stop="onThreadOverflowClick(thread.id)"
                     >
                       <IconTablerDots class="thread-icon" />
                     </button>
@@ -545,7 +545,7 @@
                 </button>
               </span>
             </template>
-            <button class="thread-main-button" type="button" @click.stop="onSelect(thread.id)">
+            <button class="thread-main-button" type="button" @click.stop="onThreadMainClick(thread.id)">
               <span class="thread-row-title-wrap">
                 <span class="thread-row-title-line">
                   <span class="thread-row-title">{{ thread.title }}</span>
@@ -579,7 +579,7 @@
                   class="thread-menu-trigger"
                   type="button"
                   title="thread_menu"
-                  @click.stop="toggleThreadMenu(thread.id)"
+                  @click.stop="onThreadOverflowClick(thread.id)"
                 >
                   <IconTablerDots class="thread-icon" />
                 </button>
@@ -900,6 +900,7 @@ import { getPathLeafName, getPathParent, isAbsoluteLikePath, isProjectlessChatPa
 import ComposerDropdown from '../content/ComposerDropdown.vue'
 import SidebarMenuRow from './SidebarMenuRow.vue'
 import { reconcilePinnedThreadIds } from './pinnedThreadUtils'
+import { dispatchThreadRowInteraction } from './threadRowInteraction'
 
 const props = defineProps<{
   groups: UiProjectGroup[]
@@ -1779,6 +1780,19 @@ function toggleThreadMenu(threadId: string): void {
   nextTick(() => {
     updateOpenThreadMenuPlacement(threadId)
   })
+}
+
+const threadRowInteractionHandlers = {
+  onOverflow: toggleThreadMenu,
+  onSelect,
+}
+
+function onThreadMainClick(threadId: string): void {
+  dispatchThreadRowInteraction('main', threadId, threadRowInteractionHandlers)
+}
+
+function onThreadOverflowClick(threadId: string): void {
+  dispatchThreadRowInteraction('overflow', threadId, threadRowInteractionHandlers)
 }
 
 function onThreadRowContextMenu(event: MouseEvent, threadId: string): void {
