@@ -9,6 +9,7 @@ test-results/
 package-lock.json
 pnpm-lock.yaml
 .codex/
+.worktrees/
 .env.local
 
 package.json
