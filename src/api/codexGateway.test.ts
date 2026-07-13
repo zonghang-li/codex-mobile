@@ -4,6 +4,7 @@ import {
   getAvailableModelIds,
   getThreadDetail,
   getThreadRuntimeState,
+  getThreadRuntimeStates,
   listDirectoryComposioConnectors,
   readThreadDetailRuntime,
   resumeThread,
@@ -466,5 +467,133 @@ describe('getThreadRuntimeState', () => {
     }))
 
     await expect(getThreadRuntimeState('thread-1')).resolves.toEqual({ state: 'unknown' })
+  })
+})
+
+describe('getThreadRuntimeStates', () => {
+  afterEach(() => {
+    vi.unstubAllGlobals()
+  })
+
+  it('posts one ordered runtime batch and parses exact states', async () => {
+    let requestUrl = ''
+    let requestInit: RequestInit | undefined
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      requestUrl = String(input)
+      requestInit = init
+      return new Response(JSON.stringify({
+        states: {
+          'thread-a': {
+            state: 'running',
+            turnId: 'turn-a',
+            interruptible: false,
+            source: 'external-session-writer',
+          },
+          'thread-b': { state: 'idle' },
+        },
+      }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      })
+    }))
+
+    await expect(getThreadRuntimeStates(['thread-a', 'thread-b'])).resolves.toEqual({
+      'thread-a': {
+        state: 'running',
+        turnId: 'turn-a',
+        interruptible: false,
+        source: 'external-session-writer',
+      },
+      'thread-b': { state: 'idle' },
+    })
+    expect(requestUrl).toBe('/codex-api/thread-runtime-states')
+    expect(requestInit).toMatchObject({
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+    })
+    expect(JSON.parse(String(requestInit?.body))).toEqual({ threadIds: ['thread-a', 'thread-b'] })
+  })
+
+  it('normalizes missing and malformed requested states to unknown', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({
+      states: {
+        'thread-b': { state: 'idle', extra: true },
+      },
+    }), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' },
+    })))
+
+    await expect(getThreadRuntimeStates(['thread-a', 'thread-b'])).resolves.toEqual({
+      'thread-a': { state: 'unknown' },
+      'thread-b': { state: 'unknown' },
+    })
+  })
+
+  it('ignores unrequested response states', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({
+      states: {
+        'thread-a': { state: 'idle' },
+        'thread-extra': {
+          state: 'running',
+          turnId: 'turn-extra',
+          interruptible: false,
+          source: 'external-session-writer',
+        },
+      },
+    }), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' },
+    })))
+
+    await expect(getThreadRuntimeStates(['thread-a'])).resolves.toEqual({
+      'thread-a': { state: 'idle' },
+    })
+  })
+
+  it('normalizes a non-OK batch response to unknown states', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response('unavailable', { status: 503 })))
+
+    await expect(getThreadRuntimeStates(['thread-a', 'thread-b'])).resolves.toEqual({
+      'thread-a': { state: 'unknown' },
+      'thread-b': { state: 'unknown' },
+    })
+  })
+
+  it('normalizes invalid batch JSON to unknown states', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response('{not-json', { status: 200 })))
+
+    await expect(getThreadRuntimeStates(['thread-a', 'thread-b'])).resolves.toEqual({
+      'thread-a': { state: 'unknown' },
+      'thread-b': { state: 'unknown' },
+    })
+  })
+
+  it('normalizes a rejected batch request to unknown states', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => {
+      throw new Error('network unavailable')
+    }))
+
+    await expect(getThreadRuntimeStates(['thread-a', 'thread-b'])).resolves.toEqual({
+      'thread-a': { state: 'unknown' },
+      'thread-b': { state: 'unknown' },
+    })
+  })
+
+  it('passes an abort signal to the batch runtime endpoint fetch', async () => {
+    const controller = new AbortController()
+    let receivedSignal: AbortSignal | null | undefined
+    vi.stubGlobal('fetch', vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+      receivedSignal = init?.signal
+      return new Response(JSON.stringify({ states: { 'thread-a': { state: 'unknown' } } }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      })
+    }))
+
+    await expect(getThreadRuntimeStates(['thread-a'], controller.signal)).resolves.toEqual({
+      'thread-a': { state: 'unknown' },
+    })
+    expect(receivedSignal).toBe(controller.signal)
   })
 })

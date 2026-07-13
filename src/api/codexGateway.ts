@@ -472,6 +472,10 @@ function parseExternalThreadRuntime(value: unknown): ExternalThreadRuntime {
   return { state: 'unknown' }
 }
 
+function unknownRuntimeMap(threadIds: readonly string[]): Record<string, ExternalThreadRuntime> {
+  return Object.fromEntries(threadIds.map((threadId) => [threadId, { state: 'unknown' }]))
+}
+
 function readExternalRuntime(payload: ThreadReadResponse): ExternalThreadRuntime {
   return parseExternalThreadRuntime(asRecord(payload.thread)?.externalRuntime)
 }
@@ -516,6 +520,31 @@ export async function getThreadRuntimeState(
     return parseExternalThreadRuntime(await response.json())
   } catch {
     return { state: 'unknown' }
+  }
+}
+
+export async function getThreadRuntimeStates(
+  threadIds: readonly string[],
+  signal?: AbortSignal,
+): Promise<Record<string, ExternalThreadRuntime>> {
+  const fallback = unknownRuntimeMap(threadIds)
+  try {
+    const response = await fetch('/codex-api/thread-runtime-states', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ threadIds }),
+      signal,
+    })
+    if (!response.ok) return fallback
+    const payload = asRecord(await response.json())
+    const states = asRecord(payload?.states)
+    if (!states) return fallback
+    return Object.fromEntries(threadIds.map((threadId) => [
+      threadId,
+      parseExternalThreadRuntime(states[threadId]),
+    ]))
+  } catch {
+    return fallback
   }
 }
 
