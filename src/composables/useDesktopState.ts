@@ -4533,16 +4533,14 @@ export function useDesktopState() {
         }
       }
       setThreadInProgress(threadId, inProgress)
-      clearTransientTurnErrorForThread(threadId)
       if (activeTurnId) {
         activeTurnIdByThreadId.value = {
           ...activeTurnIdByThreadId.value,
           [threadId]: activeTurnId,
         }
-      } else if (activeTurnIdByThreadId.value[threadId] && !retainLocalInProgress) {
-        activeTurnIdByThreadId.value = omitKey(activeTurnIdByThreadId.value, threadId)
       }
       if (!inProgress) {
+        clearTransientTurnErrorForThread(threadId)
         clearCompletedTurnLiveState(threadId)
       }
       markThreadAsRead(threadId)
