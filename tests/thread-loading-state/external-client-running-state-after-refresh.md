@@ -80,6 +80,48 @@
       "$PROC_ROOT/$1/status" 2>/dev/null
   }
 
+  stable_proc_record() {
+    local pid="$1" starttime_before parent starttime_after
+    starttime_before="$(proc_starttime "$pid")" || return 1
+    parent="$(proc_ppid "$pid")" || return 1
+    starttime_after="$(proc_starttime "$pid")" || return 1
+    [[ $starttime_before == "$starttime_after" && $parent =~ ^[0-9]+$ ]] || return 1
+    printf '%s %s\n' "$starttime_before" "$parent"
+  }
+
+  stable_proc_uid() {
+    local pid="$1" starttime_before uid starttime_after
+    starttime_before="$(proc_starttime "$pid")" || return 1
+    uid="$(awk '$1 == "Uid:" { print $2; found=1; exit } END { if (!found) exit 1 }' \
+      "$PROC_ROOT/$pid/status" 2>/dev/null)" || return 1
+    starttime_after="$(proc_starttime "$pid")" || return 1
+    [[ $starttime_before == "$starttime_after" && $uid =~ ^[0-9]+$ ]] || return 1
+    printf '%s\n' "$uid"
+  }
+
+  stable_cmdline_snapshot() {
+    local pid="$1" destination="$2" record_before record_after
+    record_before="$(stable_proc_record "$pid")" || return 1
+    cp "$PROC_ROOT/$pid/cmdline" "$destination" || return 1
+    record_after="$(stable_proc_record "$pid")" || return 1
+    [[ $record_before == "$record_after" ]] || return 1
+    printf '%s\n' "$record_before"
+  }
+
+  revalidate_saved_process() {
+    local pid="$1" expected_starttime="$2" saved_cmdline="$3"
+    local current_cmdline record actual_starttime actual_parent result=0
+    current_cmdline="$(mktemp "$EVIDENCE_DIR/revalidate-${pid}.XXXXXX.cmdline")" || return 1
+    record="$(stable_cmdline_snapshot "$pid" "$current_cmdline")" || result=1
+    if ((result == 0)); then
+      read -r actual_starttime actual_parent <<< "$record"
+      [[ $actual_starttime == "$expected_starttime" && $actual_parent =~ ^[0-9]+$ ]] || result=1
+      cmp -s "$saved_cmdline" "$current_cmdline" || result=1
+    fi
+    rm -f -- "$current_cmdline"
+    return "$result"
+  }
+
   print_argv() {
     local pid="$1" index=0 arg
     while IFS= read -r -d '' arg; do
@@ -88,34 +130,37 @@
     done < "$PROC_ROOT/$pid/cmdline"
   }
 
-  is_codex_app_server() {
-    local pid="$1" saw_codex=0 arg
+  is_codex_app_server_file() {
+    local cmdline="$1" saw_codex=0 arg
     while IFS= read -r -d '' arg; do
       if ((saw_codex)) && [[ $arg == app-server ]]; then return 0; fi
       [[ ${arg##*/} == codex ]] && saw_codex=1
-    done < "$PROC_ROOT/$pid/cmdline" 2>/dev/null
+    done < "$cmdline" 2>/dev/null
     return 1
   }
 
-  has_argv_token() {
-    local pid="$1" expected="$2" arg
+  has_argv_token_file() {
+    local cmdline="$1" expected="$2" arg
     while IFS= read -r -d '' arg; do
       [[ $arg == "$expected" ]] && return 0
-    done < "$PROC_ROOT/$pid/cmdline" 2>/dev/null
+    done < "$cmdline" 2>/dev/null
     return 1
   }
 
   classify_ancestry() {
-    local current="$1" root="$2" depth parent
+    local current="$1" root="$2" root_starttime="$3" depth record starttime parent
     local -A seen=()
-    [[ $current =~ ^[0-9]+$ && $root =~ ^[0-9]+$ ]] || return 2
+    [[ $current =~ ^[0-9]+$ && $root =~ ^[0-9]+$ && $root_starttime =~ ^[0-9]+$ ]] || return 2
     for ((depth = 0; depth < 128; depth += 1)); do
-      [[ $current == "$root" ]] && return 0
-      ((current == 1)) && return 1
       [[ -z ${seen[$current]+present} ]] || return 2
       seen[$current]=1
-      parent="$(proc_ppid "$current")" || return 2
-      [[ $parent =~ ^[0-9]+$ ]] || return 2
+      record="$(stable_proc_record "$current")" || return 2
+      read -r starttime parent <<< "$record"
+      if [[ $current == "$root" ]]; then
+        [[ $starttime == "$root_starttime" ]] || return 2
+        return 0
+      fi
+      ((current == 1)) && return 1
       ((parent == 0)) && return 1
       current="$parent"
     done
@@ -124,13 +169,13 @@
 
   assert_descendant_of() {
     local result
-    if classify_ancestry "$1" "$2"; then return 0; else result=$?; fi
+    if classify_ancestry "$1" "$2" "$3"; then return 0; else result=$?; fi
     return "$result"
   }
 
   assert_not_descendant_of() {
     local result
-    if classify_ancestry "$1" "$2"; then
+    if classify_ancestry "$1" "$2" "$3"; then
       return 1
     else
       result=$?
@@ -140,14 +185,15 @@
   }
 
   show_ppid_chain() {
-    local current="$1" depth parent starttime
+    local current="$1" root="$2" root_starttime="$3" depth record parent starttime
     local -A seen=()
     for ((depth = 0; depth < 128; depth += 1)); do
       [[ $current =~ ^[0-9]+$ ]] || return 1
       [[ -z ${seen[$current]+present} ]] || return 1
       seen[$current]=1
-      starttime="$(proc_starttime "$current")" || return 1
-      parent="$(proc_ppid "$current")" || return 1
+      record="$(stable_proc_record "$current")" || return 1
+      read -r starttime parent <<< "$record"
+      if [[ $current == "$root" && $starttime != "$root_starttime" ]]; then return 1; fi
       printf 'pid=%s ppid=%s starttime=%s\n' "$current" "$parent" "$starttime"
       print_argv "$current" || return 1
       [[ $current == 1 || $parent == 0 ]] && return 0
@@ -158,51 +204,115 @@
   }
 
   rollout_writer_fds() {
-    local pid="$1" fd info position flags access found=1
-    for fd in "$PROC_ROOT/$pid/fd/"[0-9]*; do
-      [[ -e $fd ]] || continue
-      [[ $(stat -Lc '%d:%i' "$fd" 2>/dev/null) == "$ROLLOUT_IDENTITY" ]] || continue
+    local pid="$1" fd info fdinfo_snapshot identity_before identity_after
+    local position flags access target found=1 nullglob_was_set=0
+    local -a fd_paths=()
+    shopt -q nullglob && nullglob_was_set=1
+    shopt -s nullglob
+    fd_paths=("$PROC_ROOT/$pid/fd/"[0-9]*)
+    ((nullglob_was_set)) || shopt -u nullglob
+    for fd in "${fd_paths[@]}"; do
+      [[ -e $fd ]] || return 2
+      identity_before="$(stat -Lc '%d:%i' "$fd" 2>/dev/null)" || return 2
       info="$PROC_ROOT/$pid/fdinfo/${fd##*/}"
-      position="$(awk '$1 == "pos:" { print $2; exit }' "$info" 2>/dev/null)"
-      flags="$(awk '$1 == "flags:" { print $2; exit }' "$info" 2>/dev/null)"
-      [[ $position =~ ^[0-9]+$ && $flags =~ ^[0-7]+$ ]] || continue
+      fdinfo_snapshot="$(< "$info")" || return 2
+      target="$(readlink "$fd")" || return 2
+      identity_after="$(stat -Lc '%d:%i' "$fd" 2>/dev/null)" || return 2
+      [[ $identity_before == "$identity_after" ]] || return 2
+      [[ $identity_before == "$ROLLOUT_IDENTITY" ]] || continue
+      position="$(awk '$1 == "pos:" { print $2; exit }' <<< "$fdinfo_snapshot")"
+      flags="$(awk '$1 == "flags:" { print $2; exit }' <<< "$fdinfo_snapshot")"
+      [[ $position =~ ^[0-9]+$ && $flags =~ ^[0-7]+$ ]] || return 2
       access=$(( (8#$flags) & 3 ))
       printf 'pid=%s fd=%s pos=%s flags=%s target=%s\n' \
-        "$pid" "${fd##*/}" "$position" "$flags" "$(readlink "$fd")"
+        "$pid" "${fd##*/}" "$position" "$flags" "$target"
       if ((position > 0 && (access == 1 || access == 2))); then found=0; fi
     done
     return "$found"
+  }
+
+  classify_rollout_writer() {
+    local pid="$1" uid before_cmdline after_cmdline record_before record_after fd_result
+    uid="$(stable_proc_uid "$pid")" || return 2
+    [[ $uid == "$EUID" ]] || return 1
+    before_cmdline="$(mktemp "$EVIDENCE_DIR/candidate-${pid}.before.XXXXXX.cmdline")" || return 2
+    after_cmdline="$(mktemp "$EVIDENCE_DIR/candidate-${pid}.after.XXXXXX.cmdline")" || {
+      rm -f -- "$before_cmdline"
+      return 2
+    }
+    record_before="$(stable_cmdline_snapshot "$pid" "$before_cmdline")" || {
+      rm -f -- "$before_cmdline" "$after_cmdline"
+      return 2
+    }
+    if ! is_codex_app_server_file "$before_cmdline"; then
+      rm -f -- "$before_cmdline" "$after_cmdline"
+      return 1
+    fi
+    if rollout_writer_fds "$pid"; then fd_result=0; else fd_result=$?; fi
+    if [[ $fd_result == 2 ]]; then
+      rm -f -- "$before_cmdline" "$after_cmdline"
+      return 2
+    fi
+    record_after="$(stable_cmdline_snapshot "$pid" "$after_cmdline")" || {
+      rm -f -- "$before_cmdline" "$after_cmdline"
+      return 2
+    }
+    if [[ $record_before != "$record_after" ]] || ! cmp -s "$before_cmdline" "$after_cmdline"; then
+      rm -f -- "$before_cmdline" "$after_cmdline"
+      return 2
+    fi
+    rm -f -- "$before_cmdline" "$after_cmdline"
+    return "$fd_result"
   }
   ```
 
 ##### Steps
 1. Start or select a disposable desktop Client A whose app-server is launched in the production argv layout `codex -c features.code_mode_host=true app-server --listen unix://`. A bare app-server without its desktop JSON-RPC client cannot drive this check. In Client A, open `THREAD_ID`, submit a test-only prompt such as “run `sleep 300`, then report completion,” and confirm the turn is still running. Open the same thread in `codex-mobile-safe` so its own app-server resumes the rollout.
-2. Record the mobile service launcher directly from systemd, then enumerate qualifying processes that currently hold the exact rollout as a writable, positive-position FD:
+2. Record the mobile service launcher PID directly from systemd. Do not classify ancestry yet: the next step first binds this PID to a stable starttime.
 
    ```bash
    [[ $(systemctl --user show codex-mobile-safe.service -p ActiveState --value) == active ]] || exit 1
    MOBILE_LAUNCHER_PID="$(systemctl --user show codex-mobile-safe.service -p MainPID --value)"
    [[ $MOBILE_LAUNCHER_PID =~ ^[0-9]+$ ]] && ((MOBILE_LAUNCHER_PID > 1)) || exit 1
+   ```
 
-   mapfile -t WRITER_PIDS < <(
-     for proc_dir in "$PROC_ROOT/"[0-9]*; do
-       pid="${proc_dir##*/}"
-       if is_codex_app_server "$pid" && rollout_writer_fds "$pid" >/dev/null; then printf '%s\n' "$pid"; fi
-     done
-   )
+3. First capture the launcher's stable `(starttime, PPid)` record and raw argv, and verify systemd still names the same `MainPID`. Only then enumerate stable app-server command snapshots that hold the exact rollout through a stable descriptor/fdinfo snapshot. Every ancestry classification must use the recorded launcher starttime. Finally capture the selected native and desktop identities and raw argv before changing any process.
+
+   ```bash
+   launcher_record="$(stable_cmdline_snapshot \
+     "$MOBILE_LAUNCHER_PID" "$EVIDENCE_DIR/mobile-launcher.cmdline")" || exit 1
+   read -r MOBILE_LAUNCHER_STARTTIME MOBILE_LAUNCHER_PPID <<< "$launcher_record"
+   [[ $MOBILE_LAUNCHER_STARTTIME =~ ^[0-9]+$ && $MOBILE_LAUNCHER_PPID =~ ^[0-9]+$ ]] || exit 1
+   [[ $(systemctl --user show codex-mobile-safe.service -p MainPID --value) == "$MOBILE_LAUNCHER_PID" ]] || exit 1
+
+   WRITER_PIDS=()
+   for proc_dir in "$PROC_ROOT/"[0-9]*; do
+     pid="${proc_dir##*/}"
+     if classify_rollout_writer "$pid" >/dev/null; then
+       WRITER_PIDS+=("$pid")
+     else
+       writer_result=$?
+       if [[ $writer_result == 2 ]]; then
+         printf 'inconclusive writer snapshot for pid=%s\n' "$pid" >&2
+         exit 1
+       fi
+     fi
+   done
 
    MOBILE_WRITER_PIDS=()
    DESKTOP_CANDIDATES=()
    for pid in "${WRITER_PIDS[@]}"; do
-     if classify_ancestry "$pid" "$MOBILE_LAUNCHER_PID"; then
+     candidate_cmdline="$EVIDENCE_DIR/candidate-${pid}.cmdline"
+     stable_cmdline_snapshot "$pid" "$candidate_cmdline" >/dev/null || exit 1
+     if classify_ancestry "$pid" "$MOBILE_LAUNCHER_PID" "$MOBILE_LAUNCHER_STARTTIME"; then
        MOBILE_WRITER_PIDS+=("$pid")
      else
        ancestry_result=$?
        if [[ $ancestry_result == 1 ]]; then
-         if has_argv_token "$pid" 'features.code_mode_host=true' \
-           && has_argv_token "$pid" app-server \
-           && has_argv_token "$pid" --listen \
-           && has_argv_token "$pid" 'unix://'; then
+         if has_argv_token_file "$candidate_cmdline" 'features.code_mode_host=true' \
+           && has_argv_token_file "$candidate_cmdline" app-server \
+           && has_argv_token_file "$candidate_cmdline" --listen \
+           && has_argv_token_file "$candidate_cmdline" 'unix://'; then
            DESKTOP_CANDIDATES+=("$pid")
          fi
        else
@@ -214,33 +324,32 @@
 
    MOBILE_NATIVE_CANDIDATES=()
    for pid in "${MOBILE_WRITER_PIDS[@]}"; do
-     argv0="$(tr '\0' '\n' < "$PROC_ROOT/$pid/cmdline" | head -n 1)"
+     candidate_cmdline="$EVIDENCE_DIR/candidate-${pid}.cmdline"
+     stable_cmdline_snapshot "$pid" "$candidate_cmdline" >/dev/null || exit 1
+     IFS= read -r -d '' argv0 < "$candidate_cmdline" || exit 1
      [[ ${argv0##*/} == codex ]] && MOBILE_NATIVE_CANDIDATES+=("$pid")
    done
    ((${#MOBILE_NATIVE_CANDIDATES[@]} == 1)) || { printf 'ambiguous mobile native writers\n' >&2; exit 1; }
    ((${#DESKTOP_CANDIDATES[@]} == 1)) || { printf 'ambiguous desktop writers\n' >&2; exit 1; }
    MOBILE_NATIVE_PID="${MOBILE_NATIVE_CANDIDATES[0]}"
    DESKTOP_PID="${DESKTOP_CANDIDATES[0]}"
-   ```
 
-3. Capture PID identities and raw argv before changing any process. Inspect the complete native-child PPID chain and verify it reaches `MOBILE_LAUNCHER_PID`; inspect both matching rollout FDs. The desktop chain must not reach the mobile launcher.
-
-   ```bash
-   MOBILE_LAUNCHER_STARTTIME="$(proc_starttime "$MOBILE_LAUNCHER_PID")"
-   MOBILE_NATIVE_STARTTIME="$(proc_starttime "$MOBILE_NATIVE_PID")"
-   DESKTOP_STARTTIME="$(proc_starttime "$DESKTOP_PID")"
-   [[ $MOBILE_LAUNCHER_STARTTIME =~ ^[0-9]+$ ]] || exit 1
-   [[ $MOBILE_NATIVE_STARTTIME =~ ^[0-9]+$ ]] || exit 1
-   [[ $DESKTOP_STARTTIME =~ ^[0-9]+$ ]] || exit 1
-   cp "$PROC_ROOT/$MOBILE_LAUNCHER_PID/cmdline" "$EVIDENCE_DIR/mobile-launcher.cmdline" || exit 1
-   cp "$PROC_ROOT/$MOBILE_NATIVE_PID/cmdline" "$EVIDENCE_DIR/mobile-native.cmdline" || exit 1
-   cp "$PROC_ROOT/$DESKTOP_PID/cmdline" "$EVIDENCE_DIR/desktop.cmdline" || exit 1
+   native_record="$(stable_cmdline_snapshot \
+     "$MOBILE_NATIVE_PID" "$EVIDENCE_DIR/mobile-native.cmdline")" || exit 1
+   desktop_record="$(stable_cmdline_snapshot \
+     "$DESKTOP_PID" "$EVIDENCE_DIR/desktop.cmdline")" || exit 1
+   read -r MOBILE_NATIVE_STARTTIME MOBILE_NATIVE_PPID <<< "$native_record"
+   read -r DESKTOP_STARTTIME DESKTOP_PPID <<< "$desktop_record"
+   [[ $MOBILE_NATIVE_STARTTIME =~ ^[0-9]+$ && $MOBILE_NATIVE_PPID =~ ^[0-9]+$ ]] || exit 1
+   [[ $DESKTOP_STARTTIME =~ ^[0-9]+$ && $DESKTOP_PPID =~ ^[0-9]+$ ]] || exit 1
 
    printf 'mobile launcher PID=%s\nmobile native PID=%s\ndesktop PID=%s\n' \
      "$MOBILE_LAUNCHER_PID" "$MOBILE_NATIVE_PID" "$DESKTOP_PID"
-   show_ppid_chain "$MOBILE_NATIVE_PID" || exit 1
-   assert_descendant_of "$MOBILE_NATIVE_PID" "$MOBILE_LAUNCHER_PID" || exit 1
-   assert_not_descendant_of "$DESKTOP_PID" "$MOBILE_LAUNCHER_PID" || exit 1
+   show_ppid_chain "$MOBILE_NATIVE_PID" "$MOBILE_LAUNCHER_PID" "$MOBILE_LAUNCHER_STARTTIME" || exit 1
+   assert_descendant_of \
+     "$MOBILE_NATIVE_PID" "$MOBILE_LAUNCHER_PID" "$MOBILE_LAUNCHER_STARTTIME" || exit 1
+   assert_not_descendant_of \
+     "$DESKTOP_PID" "$MOBILE_LAUNCHER_PID" "$MOBILE_LAUNCHER_STARTTIME" || exit 1
    print_argv "$DESKTOP_PID" || exit 1
    rollout_writer_fds "$MOBILE_NATIVE_PID" || exit 1
    rollout_writer_fds "$DESKTOP_PID" || exit 1
@@ -280,16 +389,27 @@
    ```
 
    Expect an exact payload shape of `{"state":"running","turnId":"<turn-id>","interruptible":false,"source":"external-session-writer"}` and the mobile composer to show the disabled “Running in another client” stop control.
-5. Stop only the previously recorded desktop writer. Immediately before signalling, require the same starttime, byte-identical raw cmdline, qualifying command tokens, non-mobile ancestry, and matching rollout FD. If any check fails, abort without signalling. Never use `pkill`, `killall`, a PID rediscovered by name, or `systemctl stop/restart` for this step.
+5. Stop only the previously recorded desktop writer. Immediately before signalling, require the same desktop identity and command, revalidate that systemd still names the recorded mobile root and that its stable identity and command are unchanged, then require qualifying desktop command tokens, non-mobile ancestry bound to that root starttime, and a stable matching rollout FD. Repeat both process-identity validations after those checks and immediately before the single `TERM`. If any check fails, abort without signalling. Never use `pkill`, `killall`, a PID rediscovered by name, or `systemctl stop/restart` for this step.
 
    ```bash
    [[ $DESKTOP_PID =~ ^[0-9]+$ ]] && ((DESKTOP_PID > 1)) || exit 1
-   [[ $(proc_starttime "$DESKTOP_PID") == "$DESKTOP_STARTTIME" ]] || exit 1
-   cmp -s "$PROC_ROOT/$DESKTOP_PID/cmdline" "$EVIDENCE_DIR/desktop.cmdline" || exit 1
-   is_codex_app_server "$DESKTOP_PID" || exit 1
-   has_argv_token "$DESKTOP_PID" 'features.code_mode_host=true' || exit 1
-   assert_not_descendant_of "$DESKTOP_PID" "$MOBILE_LAUNCHER_PID" || exit 1
+   [[ $(systemctl --user show codex-mobile-safe.service -p MainPID --value) == "$MOBILE_LAUNCHER_PID" ]] || exit 1
+   revalidate_saved_process "$MOBILE_LAUNCHER_PID" "$MOBILE_LAUNCHER_STARTTIME" \
+     "$EVIDENCE_DIR/mobile-launcher.cmdline" || exit 1
+   revalidate_saved_process "$DESKTOP_PID" "$DESKTOP_STARTTIME" \
+     "$EVIDENCE_DIR/desktop.cmdline" || exit 1
+   is_codex_app_server_file "$EVIDENCE_DIR/desktop.cmdline" || exit 1
+   has_argv_token_file "$EVIDENCE_DIR/desktop.cmdline" 'features.code_mode_host=true' || exit 1
+   assert_not_descendant_of \
+     "$DESKTOP_PID" "$MOBILE_LAUNCHER_PID" "$MOBILE_LAUNCHER_STARTTIME" || exit 1
    rollout_writer_fds "$DESKTOP_PID" || exit 1
+   assert_not_descendant_of \
+     "$DESKTOP_PID" "$MOBILE_LAUNCHER_PID" "$MOBILE_LAUNCHER_STARTTIME" || exit 1
+   [[ $(systemctl --user show codex-mobile-safe.service -p MainPID --value) == "$MOBILE_LAUNCHER_PID" ]] || exit 1
+   revalidate_saved_process "$MOBILE_LAUNCHER_PID" "$MOBILE_LAUNCHER_STARTTIME" \
+     "$EVIDENCE_DIR/mobile-launcher.cmdline" || exit 1
+   revalidate_saved_process "$DESKTOP_PID" "$DESKTOP_STARTTIME" \
+     "$EVIDENCE_DIR/desktop.cmdline" || exit 1
    kill -TERM -- "$DESKTOP_PID" || exit 1
 
    for ((attempt = 0; attempt < 50; attempt += 1)); do
@@ -306,18 +426,22 @@
 6. Prove the mobile processes were neither stopped nor accepted as external evidence: require the original mobile launcher and native child identities and cmdlines to remain unchanged, require the native child still to descend from the launcher and still hold the rollout, require that no separate qualifying desktop writer remains, then query the endpoint again.
 
    ```bash
-   [[ $(proc_starttime "$MOBILE_LAUNCHER_PID") == "$MOBILE_LAUNCHER_STARTTIME" ]] || exit 1
-   [[ $(proc_starttime "$MOBILE_NATIVE_PID") == "$MOBILE_NATIVE_STARTTIME" ]] || exit 1
-   cmp -s "$PROC_ROOT/$MOBILE_LAUNCHER_PID/cmdline" "$EVIDENCE_DIR/mobile-launcher.cmdline" || exit 1
-   cmp -s "$PROC_ROOT/$MOBILE_NATIVE_PID/cmdline" "$EVIDENCE_DIR/mobile-native.cmdline" || exit 1
-   assert_descendant_of "$MOBILE_NATIVE_PID" "$MOBILE_LAUNCHER_PID" || exit 1
+   [[ $(systemctl --user show codex-mobile-safe.service -p MainPID --value) == "$MOBILE_LAUNCHER_PID" ]] || exit 1
+   revalidate_saved_process "$MOBILE_LAUNCHER_PID" "$MOBILE_LAUNCHER_STARTTIME" \
+     "$EVIDENCE_DIR/mobile-launcher.cmdline" || exit 1
+   revalidate_saved_process "$MOBILE_NATIVE_PID" "$MOBILE_NATIVE_STARTTIME" \
+     "$EVIDENCE_DIR/mobile-native.cmdline" || exit 1
+   assert_descendant_of \
+     "$MOBILE_NATIVE_PID" "$MOBILE_LAUNCHER_PID" "$MOBILE_LAUNCHER_STARTTIME" || exit 1
    rollout_writer_fds "$MOBILE_NATIVE_PID" || exit 1
+   assert_descendant_of \
+     "$MOBILE_NATIVE_PID" "$MOBILE_LAUNCHER_PID" "$MOBILE_LAUNCHER_STARTTIME" || exit 1
 
    for proc_dir in "$PROC_ROOT/"[0-9]*; do
      pid="${proc_dir##*/}"
-     if is_codex_app_server "$pid" \
-       && rollout_writer_fds "$pid" >/dev/null; then
-       if classify_ancestry "$pid" "$MOBILE_LAUNCHER_PID"; then
+     if classify_rollout_writer "$pid" >/dev/null; then
+       if classify_ancestry \
+         "$pid" "$MOBILE_LAUNCHER_PID" "$MOBILE_LAUNCHER_STARTTIME"; then
          :
        else
          ancestry_result=$?
@@ -326,6 +450,12 @@
          else
            printf 'cannot validate ancestry for remaining writer pid=%s\n' "$pid" >&2
          fi
+         exit 1
+       fi
+     else
+       writer_result=$?
+       if [[ $writer_result == 2 ]]; then
+         printf 'inconclusive remaining-writer snapshot pid=%s\n' "$pid" >&2
          exit 1
        fi
      fi
@@ -347,7 +477,7 @@
 ##### Expected Results
 - Command recognition treats `/proc/<pid>/cmdline` as NUL-delimited argv: an argv token whose basename is exactly `codex` must precede a later token that is exactly `app-server`. Options between those tokens are accepted; lookalike basenames, reversed ordering, and lookalike subcommands are rejected.
 - The mobile launcher PID and every native or Node descendant whose validated parent chain reaches that PID are excluded. Only a separate qualifying desktop app-server can supply external writer evidence.
-- Linux process identity is bound to `/proc/<pid>/stat` starttime while the process table and descriptor evidence are collected. PID reuse or a starttime change before or during descriptor enumeration makes the scan conservatively `unknown` instead of accepting stale writer evidence.
+- Linux process identity is bound to `/proc/<pid>/stat` starttime while the process table and descriptor evidence are collected. Each manual ancestry hop brackets its `status`/`PPid` read with matching starttime reads and binds the mobile root to its recorded starttime. Each rollout FD brackets one fdinfo snapshot with matching descriptor dev/ino reads. PID reuse, ancestry mutation, FD-number reuse, disappearance, or an inconclusive identity read aborts the manual procedure instead of accepting stale writer evidence.
 - Existing lifecycle, same-UID, exact rollout dev/ino, writable-descriptor, positive-position, canonical-path, and regular-file requirements remain in force.
 
 ##### Automated Acceptance
