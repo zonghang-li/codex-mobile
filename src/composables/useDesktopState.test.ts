@@ -23,6 +23,7 @@ const gatewayMocks = vi.hoisted(() => ({
   getThreadDetail: vi.fn(),
   getThreadGroupsPage: vi.fn(),
   getThreadRuntimeState: vi.fn(),
+  getThreadRuntimeStates: vi.fn(),
   getThreadQueueState: vi.fn(),
   getThreadTitleCache: vi.fn(),
   getWorkspaceRootsState: vi.fn(),
@@ -171,6 +172,30 @@ async function setupExternalRuntimeState() {
   }
 }
 
+async function setupBackgroundRuntimeState(selectedThreadId = 'thread-selected') {
+  vi.useFakeTimers()
+  installFakeTimerWindow({
+    'codex-web-local.thread-unread-cutoff.v1': '2026-01-01T00:00:00.000Z',
+  })
+  vi.stubGlobal('document', {
+    visibilityState: 'visible',
+    addEventListener: vi.fn(),
+    removeEventListener: vi.fn(),
+  })
+  gatewayMocks.getPendingServerRequests.mockResolvedValue([])
+  gatewayMocks.getThreadGroupsPage.mockResolvedValue({
+    groups: [{ projectName: 'Project', threads: [
+      { ...thread('thread-running', '/tmp/project'), updatedAtIso: '2026-07-14T00:00:00.000Z' },
+      thread(selectedThreadId, '/tmp/project'),
+    ] }],
+    nextCursor: null,
+  })
+  const state = useDesktopState()
+  state.primeSelectedThread(selectedThreadId)
+  await state.refreshAll({ includeSelectedThreadMessages: false })
+  return state
+}
+
 async function flushMicrotasks(): Promise<void> {
   for (let index = 0; index < 6; index += 1) {
     await Promise.resolve()
@@ -236,6 +261,7 @@ async function setupCodexDirectiveNotificationState(groups: UiProjectGroup[] = [
 beforeEach(() => {
   vi.clearAllMocks()
   gatewayMocks.getThreadQueueState.mockResolvedValue({})
+  gatewayMocks.getThreadRuntimeStates.mockResolvedValue({})
   gatewayMocks.setThreadQueueState.mockResolvedValue(undefined)
   gatewayMocks.getThreadTitleCache.mockResolvedValue({ titles: {} })
   gatewayMocks.getWorkspaceRootsState.mockRejectedValue(new Error('no workspace roots state'))
@@ -1241,6 +1267,364 @@ describe('turn completion lifecycle', () => {
 })
 
 describe('external runtime ownership', () => {
+  it('shows a non-selected unread desktop task as working after a running batch result', async () => {
+    const state = await setupBackgroundRuntimeState()
+    gatewayMocks.getThreadRuntimeStates.mockResolvedValue({
+      'thread-running': {
+        state: 'running',
+        turnId: 'turn-external',
+        interruptible: false,
+        source: 'external-session-writer',
+      },
+    })
+
+    expect(state.projectGroups.value[0]?.threads[0]).toMatchObject({
+      inProgress: false,
+      unread: true,
+    })
+    state.startPolling()
+    pollingCleanups.push(() => state.stopPolling())
+    await vi.advanceTimersByTimeAsync(0)
+    await flushMicrotasks()
+
+    expect(state.projectGroups.value[0]?.threads[0]).toMatchObject({
+      inProgress: true,
+      unread: false,
+    })
+    expect(gatewayMocks.getThreadRuntimeStates).toHaveBeenCalledWith(
+      ['thread-running'],
+      expect.any(AbortSignal),
+    )
+  })
+
+  it('clears an externally running background task on idle and refreshes its unread summary once', async () => {
+    const state = await setupBackgroundRuntimeState()
+    gatewayMocks.getThreadRuntimeStates
+      .mockResolvedValueOnce({
+        'thread-running': {
+          state: 'running',
+          turnId: 'turn-external',
+          interruptible: false,
+          source: 'external-session-writer',
+        },
+      })
+      .mockResolvedValueOnce({ 'thread-running': { state: 'idle' } })
+
+    state.startPolling()
+    pollingCleanups.push(() => state.stopPolling())
+    await vi.advanceTimersByTimeAsync(0)
+    await flushMicrotasks()
+    expect(state.projectGroups.value[0]?.threads[0]).toMatchObject({
+      inProgress: true,
+      unread: false,
+    })
+
+    gatewayMocks.getThreadGroupsPage.mockResolvedValue({
+      groups: [{ projectName: 'Project', threads: [
+        { ...thread('thread-running', '/tmp/project'), updatedAtIso: '2026-07-14T00:00:01.000Z' },
+        thread('thread-selected', '/tmp/project'),
+      ] }],
+      nextCursor: null,
+    })
+    await vi.advanceTimersByTimeAsync(2_000)
+    await flushMicrotasks()
+
+    expect(state.projectGroups.value[0]?.threads[0]).toMatchObject({
+      inProgress: false,
+      unread: true,
+    })
+    expect(gatewayMocks.getThreadGroupsPage).toHaveBeenCalledTimes(2)
+  })
+
+  it('refreshes the thread list only once when multiple external tasks become idle in one batch', async () => {
+    const state = await setupBackgroundRuntimeState()
+    const second = { ...thread('thread-second', '/tmp/project'), updatedAtIso: '2026-07-14T00:00:00.000Z' }
+    gatewayMocks.getThreadGroupsPage.mockResolvedValue({
+      groups: [{ projectName: 'Project', threads: [
+        { ...thread('thread-running', '/tmp/project'), updatedAtIso: '2026-07-14T00:00:00.000Z' },
+        second,
+        thread('thread-selected', '/tmp/project'),
+      ] }],
+      nextCursor: null,
+    })
+    await state.refreshAll({ includeSelectedThreadMessages: false, forceThreadRefresh: true })
+    gatewayMocks.getThreadRuntimeStates
+      .mockResolvedValueOnce({
+        'thread-running': { state: 'running', turnId: 'turn-1', interruptible: false, source: 'external' },
+        'thread-second': { state: 'running', turnId: 'turn-2', interruptible: false, source: 'external' },
+      })
+      .mockResolvedValueOnce({
+        'thread-running': { state: 'idle' },
+        'thread-second': { state: 'idle' },
+      })
+
+    state.startPolling()
+    pollingCleanups.push(() => state.stopPolling())
+    await vi.advanceTimersByTimeAsync(0)
+    await flushMicrotasks()
+    const callsBeforeIdle = gatewayMocks.getThreadGroupsPage.mock.calls.length
+    await vi.advanceTimersByTimeAsync(2_000)
+    await flushMicrotasks()
+
+    expect(gatewayMocks.getThreadGroupsPage).toHaveBeenCalledTimes(callsBeforeIdle + 1)
+  })
+
+  it('retains established external progress when a background batch returns unknown', async () => {
+    const state = await setupBackgroundRuntimeState()
+    gatewayMocks.getThreadRuntimeStates
+      .mockResolvedValueOnce({
+        'thread-running': {
+          state: 'running',
+          turnId: 'turn-external',
+          interruptible: false,
+          source: 'external-session-writer',
+        },
+      })
+      .mockResolvedValueOnce({ 'thread-running': { state: 'unknown' } })
+
+    state.startPolling()
+    pollingCleanups.push(() => state.stopPolling())
+    await vi.advanceTimersByTimeAsync(0)
+    await flushMicrotasks()
+    await vi.advanceTimersByTimeAsync(2_000)
+    await flushMicrotasks()
+
+    expect(state.projectGroups.value[0]?.threads[0]).toMatchObject({
+      inProgress: true,
+      unread: false,
+    })
+  })
+
+  it('ignores a deferred idle result after a background task is taken over locally', async () => {
+    let notificationHandler: ((notification: { method: string; params?: unknown }) => void) | undefined
+    gatewayMocks.subscribeCodexNotifications.mockImplementation((handler) => {
+      notificationHandler = handler as typeof notificationHandler
+      return vi.fn()
+    })
+    const state = await setupBackgroundRuntimeState()
+    const pending = deferred<Record<string, { state: 'idle' }>>()
+    gatewayMocks.getThreadRuntimeStates
+      .mockResolvedValueOnce({
+        'thread-running': {
+          state: 'running',
+          turnId: 'turn-external',
+          interruptible: false,
+          source: 'external-session-writer',
+        },
+      })
+      .mockReturnValueOnce(pending.promise)
+
+    state.startPolling()
+    pollingCleanups.push(() => state.stopPolling())
+    await vi.advanceTimersByTimeAsync(0)
+    await flushMicrotasks()
+    await vi.advanceTimersByTimeAsync(2_000)
+    expect(notificationHandler).toBeDefined()
+    notificationHandler!({
+      method: 'turn/started',
+      params: { threadId: 'thread-running', turn: { id: 'turn-local' } },
+    })
+    pending.resolve({ 'thread-running': { state: 'idle' } })
+    await flushMicrotasks()
+
+    expect(state.projectGroups.value[0]?.threads[0]).toMatchObject({
+      inProgress: true,
+      unread: false,
+    })
+  })
+
+  it('ignores a deferred background result for a thread selected during the request', async () => {
+    const state = await setupBackgroundRuntimeState()
+    const pending = deferred<Record<string, {
+      state: 'running'
+      turnId: string
+      interruptible: false
+      source: string
+    }>>()
+    gatewayMocks.getThreadRuntimeStates.mockReturnValue(pending.promise)
+
+    state.startPolling()
+    pollingCleanups.push(() => state.stopPolling())
+    await vi.advanceTimersByTimeAsync(0)
+    state.primeSelectedThread('thread-running')
+    pending.resolve({
+      'thread-running': {
+        state: 'running',
+        turnId: 'turn-external',
+        interruptible: false,
+        source: 'external-session-writer',
+      },
+    })
+    await flushMicrotasks()
+
+    expect(state.selectedThread.value).toMatchObject({
+      id: 'thread-running',
+      inProgress: false,
+    })
+  })
+
+  it('ignores a deferred background result after its thread is removed', async () => {
+    const state = await setupBackgroundRuntimeState()
+    const pending = deferred<Record<string, {
+      state: 'running'
+      turnId: string
+      interruptible: false
+      source: string
+    }>>()
+    gatewayMocks.getThreadRuntimeStates.mockReturnValue(pending.promise)
+
+    state.startPolling()
+    pollingCleanups.push(() => state.stopPolling())
+    await vi.advanceTimersByTimeAsync(0)
+    gatewayMocks.getThreadGroupsPage.mockResolvedValue({
+      groups: [{ projectName: 'Project', threads: [thread('thread-selected', '/tmp/project')] }],
+      nextCursor: null,
+    })
+    await state.archiveThreadById('thread-running')
+    pending.resolve({
+      'thread-running': {
+        state: 'running',
+        turnId: 'turn-external',
+        interruptible: false,
+        source: 'external-session-writer',
+      },
+    })
+    await flushMicrotasks()
+
+    expect(state.projectGroups.value[0]?.threads).toEqual([
+      expect.objectContaining({ id: 'thread-selected', inProgress: false }),
+    ])
+  })
+
+  it('polls the first 50 eligible loaded rows in group order', async () => {
+    vi.useFakeTimers()
+    installFakeTimerWindow()
+    vi.stubGlobal('document', {
+      visibilityState: 'visible',
+      addEventListener: vi.fn(),
+      removeEventListener: vi.fn(),
+    })
+    let notificationHandler: ((notification: { method: string; params?: unknown }) => void) | undefined
+    gatewayMocks.subscribeCodexNotifications.mockImplementation((handler) => {
+      notificationHandler = handler as typeof notificationHandler
+      return vi.fn()
+    })
+    const firstGroup = Array.from({ length: 28 }, (_, index) => thread(`thread-${index}`, '/tmp/project-a'))
+    const secondGroup = Array.from({ length: 27 }, (_, index) => thread(`thread-${index + 28}`, '/tmp/project-b'))
+    gatewayMocks.getPendingServerRequests.mockResolvedValue([])
+    gatewayMocks.getThreadGroupsPage.mockResolvedValue({
+      groups: [
+        { projectName: 'Project A', threads: [...firstGroup, thread('thread-local', '/tmp/project-a')] },
+        { projectName: 'Project B', threads: [thread('thread-selected', '/tmp/project-b'), ...secondGroup] },
+      ],
+      nextCursor: null,
+    })
+    const state = useDesktopState()
+    state.primeSelectedThread('thread-selected')
+    await state.refreshAll({ includeSelectedThreadMessages: false })
+    state.startPolling()
+    pollingCleanups.push(() => state.stopPolling())
+    expect(notificationHandler).toBeDefined()
+    notificationHandler!({
+      method: 'turn/started',
+      params: { threadId: 'thread-local', turn: { id: 'turn-local' } },
+    })
+
+    await vi.advanceTimersByTimeAsync(0)
+    await flushMicrotasks()
+
+    expect(gatewayMocks.getThreadRuntimeStates).toHaveBeenCalledWith(
+      Array.from({ length: 50 }, (_, index) => `thread-${index}`),
+      expect.any(AbortSignal),
+    )
+  })
+
+  it('keeps one background batch in flight and waits 2 seconds after settlement', async () => {
+    const state = await setupBackgroundRuntimeState()
+    const first = deferred<Record<string, { state: 'unknown' }>>()
+    gatewayMocks.getThreadRuntimeStates
+      .mockReturnValueOnce(first.promise)
+      .mockResolvedValue({ 'thread-running': { state: 'unknown' } })
+
+    state.startPolling()
+    pollingCleanups.push(() => state.stopPolling())
+    await vi.advanceTimersByTimeAsync(0)
+    await vi.advanceTimersByTimeAsync(6_000)
+    expect(gatewayMocks.getThreadRuntimeStates).toHaveBeenCalledTimes(1)
+
+    first.resolve({ 'thread-running': { state: 'unknown' } })
+    await flushMicrotasks()
+    await vi.advanceTimersByTimeAsync(1_999)
+    expect(gatewayMocks.getThreadRuntimeStates).toHaveBeenCalledTimes(1)
+    await vi.advanceTimersByTimeAsync(1)
+    expect(gatewayMocks.getThreadRuntimeStates).toHaveBeenCalledTimes(2)
+  })
+
+  it('aborts background polling while hidden and resumes immediately when visible', async () => {
+    const state = await setupBackgroundRuntimeState()
+    const first = deferred<Record<string, { state: 'unknown' }>>()
+    let signal: AbortSignal | undefined
+    gatewayMocks.getThreadRuntimeStates.mockImplementationOnce((_threadIds, nextSignal?: AbortSignal) => {
+      signal = nextSignal
+      return first.promise
+    })
+    state.startPolling()
+    pollingCleanups.push(() => state.stopPolling())
+    await vi.advanceTimersByTimeAsync(0)
+
+    const visibilityHandler = vi.mocked(document.addEventListener).mock.calls.find(
+      ([eventName]) => eventName === 'visibilitychange',
+    )?.[1] as EventListener
+    expect(visibilityHandler).toBeDefined()
+    Object.assign(document, { visibilityState: 'hidden' })
+    visibilityHandler(new Event('visibilitychange'))
+    expect(signal?.aborted).toBe(true)
+    await vi.advanceTimersByTimeAsync(6_000)
+    expect(gatewayMocks.getThreadRuntimeStates).toHaveBeenCalledTimes(1)
+
+    Object.assign(document, { visibilityState: 'visible' })
+    visibilityHandler(new Event('visibilitychange'))
+    await vi.advanceTimersByTimeAsync(0)
+    expect(gatewayMocks.getThreadRuntimeStates).toHaveBeenCalledTimes(2)
+  })
+
+  it('aborts and invalidates a background batch when polling stops', async () => {
+    const state = await setupBackgroundRuntimeState()
+    const pending = deferred<Record<string, {
+      state: 'running'
+      turnId: string
+      interruptible: false
+      source: string
+    }>>()
+    let signal: AbortSignal | undefined
+    gatewayMocks.getThreadRuntimeStates.mockImplementation((_threadIds, nextSignal?: AbortSignal) => {
+      signal = nextSignal
+      return pending.promise
+    })
+    state.startPolling()
+    await vi.advanceTimersByTimeAsync(0)
+
+    state.stopPolling()
+    pending.resolve({
+      'thread-running': {
+        state: 'running',
+        turnId: 'turn-external',
+        interruptible: false,
+        source: 'external-session-writer',
+      },
+    })
+    await flushMicrotasks()
+    await vi.advanceTimersByTimeAsync(6_000)
+
+    expect(signal?.aborted).toBe(true)
+    expect(gatewayMocks.getThreadRuntimeStates).toHaveBeenCalledTimes(1)
+    expect(state.projectGroups.value[0]?.threads[0]).toMatchObject({ inProgress: false })
+    expect(document.removeEventListener).toHaveBeenCalledWith(
+      'visibilitychange',
+      expect.any(Function),
+    )
+  })
+
   it('restores and polls an externally owned selected thread after 2 seconds', async () => {
     const { state } = await setupExternalRuntimeState()
     gatewayMocks.resumeThread.mockResolvedValue(externalDetail())

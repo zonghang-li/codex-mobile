@@ -12,6 +12,7 @@ import {
   getSkillsList,
   getThreadDetail,
   getThreadRuntimeState,
+  getThreadRuntimeStates,
   getOlderThreadMessages,
   getBackgroundThreadListLimit,
   interruptThreadTurn,
@@ -93,6 +94,8 @@ const EVENT_SYNC_DEBOUNCE_MS = 220
 const BACKGROUND_THREAD_PAGINATION_DELAY_MS = 10_000
 const RATE_LIMIT_REFRESH_DEBOUNCE_MS = 500
 const EXTERNAL_RUNTIME_POLL_MS = 2_000
+const BACKGROUND_RUNTIME_POLL_MS = 2_000
+const BACKGROUND_RUNTIME_BATCH_LIMIT = 50
 const TURN_START_FOLLOW_UP_SYNC_DELAY_MS = 3000
 const RECENT_THREAD_MESSAGE_LOAD_REUSE_MS = 2000
 const RECENT_THREAD_LIST_LOAD_REUSE_MS = 2000
@@ -1537,6 +1540,16 @@ export function useDesktopState() {
     controller: AbortController
   } | null = null
   let externalRuntimePollingEnabled = true
+  let backgroundRuntimeTimer: number | null = null
+  let backgroundRuntimeGeneration = 0
+  let backgroundRuntimeRequest: {
+    generation: number
+    controller: AbortController
+    promise: Promise<void>
+  } | null = null
+  let backgroundRuntimePollingEnabled = false
+  let backgroundRuntimeVisibilityListenerInstalled = false
+  const backgroundExternalThreadIds = new Set<string>()
   const delayedTurnSyncTimerByThreadId = new Map<string, number>()
   let loadThreadsPromise: Promise<void> | null = null
   const loadMessagePromiseByThreadId = new Map<string, Promise<void>>()
@@ -2278,6 +2291,9 @@ export function useDesktopState() {
 
   function pruneThreadScopedState(flatThreads: UiThread[]): void {
     const activeThreadIds = new Set(flatThreads.map((thread) => thread.id))
+    for (const threadId of backgroundExternalThreadIds) {
+      if (!activeThreadIds.has(threadId)) backgroundExternalThreadIds.delete(threadId)
+    }
     const currentThreadId = selectedThreadId.value.trim()
     if (currentThreadId) {
       activeThreadIds.add(currentThreadId)
@@ -2434,6 +2450,105 @@ export function useDesktopState() {
     const request = externalRuntimeRequest
     externalRuntimeRequest = null
     request?.controller.abort()
+  }
+
+  function backgroundRuntimeCandidateIds(): string[] {
+    const selectedId = selectedThreadId.value
+    const ids: string[] = []
+    for (const thread of flattenThreads(sourceGroups.value)) {
+      if (ids.length >= BACKGROUND_RUNTIME_BATCH_LIMIT) break
+      if (!thread.id || thread.id === selectedId) continue
+      const ownership = runtimeOwnershipByThreadId.value[thread.id] ?? 'idle'
+      const locallyRunning = inProgressById.value[thread.id] === true && ownership !== 'external'
+      if (ownership === 'local' || locallyRunning) continue
+      ids.push(thread.id)
+      if (ownership === 'external') backgroundExternalThreadIds.add(thread.id)
+    }
+    return ids
+  }
+
+  function cancelBackgroundRuntimeRequest(): void {
+    backgroundRuntimeGeneration += 1
+    if (backgroundRuntimeTimer !== null && typeof window !== 'undefined') {
+      window.clearTimeout(backgroundRuntimeTimer)
+    }
+    backgroundRuntimeTimer = null
+    backgroundRuntimeRequest?.controller.abort()
+    backgroundRuntimeRequest = null
+  }
+
+  function scheduleBackgroundRuntimePolling(delayMs = BACKGROUND_RUNTIME_POLL_MS): void {
+    if (!backgroundRuntimePollingEnabled || typeof window === 'undefined') return
+    if (typeof document !== 'undefined' && document.visibilityState === 'hidden') return
+    if (backgroundRuntimeTimer !== null || backgroundRuntimeRequest !== null) return
+    backgroundRuntimeTimer = window.setTimeout(() => {
+      backgroundRuntimeTimer = null
+      const threadIds = backgroundRuntimeCandidateIds()
+      if (threadIds.length === 0) {
+        scheduleBackgroundRuntimePolling()
+        return
+      }
+      const generation = backgroundRuntimeGeneration
+      const controller = new AbortController()
+      const promise = pollBackgroundRuntimeStates(threadIds, generation, controller.signal)
+      backgroundRuntimeRequest = { generation, controller, promise }
+      void promise.finally(() => {
+        if (backgroundRuntimeRequest?.promise !== promise) return
+        backgroundRuntimeRequest = null
+        if (generation === backgroundRuntimeGeneration) scheduleBackgroundRuntimePolling()
+      })
+    }, delayMs)
+  }
+
+  function onBackgroundRuntimeVisibilityChange(): void {
+    if (typeof document === 'undefined') return
+    cancelBackgroundRuntimeRequest()
+    if (document.visibilityState === 'visible') scheduleBackgroundRuntimePolling(0)
+  }
+
+  async function pollBackgroundRuntimeStates(
+    requestedThreadIds: readonly string[],
+    generation: number,
+    signal: AbortSignal,
+  ): Promise<void> {
+    let states: Awaited<ReturnType<typeof getThreadRuntimeStates>>
+    try {
+      states = await getThreadRuntimeStates(requestedThreadIds, signal)
+    } catch {
+      return
+    }
+    if (generation !== backgroundRuntimeGeneration) return
+    const loadedIds = new Set(flattenThreads(sourceGroups.value).map((thread) => thread.id))
+    let shouldRefreshThreads = false
+
+    for (const threadId of requestedThreadIds) {
+      if (!loadedIds.has(threadId) || selectedThreadId.value === threadId) continue
+      const ownership = runtimeOwnershipByThreadId.value[threadId] ?? 'idle'
+      const locallyRunning = inProgressById.value[threadId] === true && ownership !== 'external'
+      if (ownership === 'local' || locallyRunning) {
+        backgroundExternalThreadIds.delete(threadId)
+        continue
+      }
+      const runtime = states[threadId] ?? { state: 'unknown' }
+      if (runtime.state === 'running') {
+        backgroundExternalThreadIds.add(threadId)
+        setThreadRuntimeOwnership(threadId, 'external')
+        setThreadInProgress(threadId, true)
+        continue
+      }
+      if (runtime.state === 'idle' && backgroundExternalThreadIds.has(threadId)) {
+        backgroundExternalThreadIds.delete(threadId)
+        setThreadRuntimeOwnership(threadId, 'idle')
+        setThreadInProgress(threadId, false)
+        shouldRefreshThreads = true
+      }
+    }
+
+    if (shouldRefreshThreads) {
+      pendingThreadsRefresh = true
+      pendingThreadsRefreshForce = true
+      await syncFromNotifications()
+    }
   }
 
   function scheduleExternalRuntimePolling(threadId: string): void {
@@ -5836,6 +5951,12 @@ export function useDesktopState() {
     if (typeof window === 'undefined') return
 
     externalRuntimePollingEnabled = true
+    backgroundRuntimePollingEnabled = true
+    if (typeof document !== 'undefined' && !backgroundRuntimeVisibilityListenerInstalled) {
+      document.addEventListener('visibilitychange', onBackgroundRuntimeVisibilityChange)
+      backgroundRuntimeVisibilityListenerInstalled = true
+    }
+    scheduleBackgroundRuntimePolling(0)
     const selectedId = selectedThreadId.value
     if (selectedId && runtimeOwnershipByThreadId.value[selectedId] === 'external') {
       scheduleExternalRuntimePolling(selectedId)
@@ -5885,6 +6006,13 @@ export function useDesktopState() {
   function stopPolling(): void {
     externalRuntimePollingEnabled = false
     cancelExternalRuntimePolling()
+    backgroundRuntimePollingEnabled = false
+    cancelBackgroundRuntimeRequest()
+    backgroundExternalThreadIds.clear()
+    if (typeof document !== 'undefined' && backgroundRuntimeVisibilityListenerInstalled) {
+      document.removeEventListener('visibilitychange', onBackgroundRuntimeVisibilityChange)
+      backgroundRuntimeVisibilityListenerInstalled = false
+    }
     if (stopNotificationStream) {
       stopNotificationStream()
       stopNotificationStream = null
