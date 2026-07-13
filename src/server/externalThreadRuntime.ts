@@ -11,6 +11,7 @@ export type RuntimeFileIdentity = {
 
 export type RuntimeFdSnapshot = {
   pid: number
+  ancestorPids: number[]
   uid: number
   cmdline: string
   dev: string
@@ -48,8 +49,16 @@ type RegisteredThread = {
   cache: RuntimeParseCache | null
 }
 
+type LinuxProcessRecord = {
+  pid: number
+  parentPid: number
+  uid: number
+  cmdline: string
+}
+
 const READ_CHUNK_BYTES = 64 * 1024
 const CACHE_CHECKPOINT_BYTES = 256
+const MAX_PROCESS_ANCESTRY_DEPTH = 128
 const PROCESS_GONE_CODES = new Set(['ENOENT', 'ESRCH'])
 
 class InconclusiveRuntimeScanError extends Error {
@@ -142,6 +151,42 @@ function parseProcUid(status: string): number {
   return uid
 }
 
+function parseProcParentPid(status: string): number {
+  const match = /^PPid:\s+(\d+)/mu.exec(status)
+  if (!match) throw new InconclusiveRuntimeScanError('Cannot parse process parent PID')
+  const parentPid = Number.parseInt(match[1], 10)
+  if (!Number.isSafeInteger(parentPid) || parentPid < 0) {
+    throw new InconclusiveRuntimeScanError('Cannot parse process parent PID')
+  }
+  return parentPid
+}
+
+function collectAncestorPids(
+  pid: number,
+  processes: ReadonlyMap<number, LinuxProcessRecord>,
+): number[] {
+  const ancestors: number[] = []
+  const seen = new Set([pid])
+  let current = processes.get(pid)?.parentPid ?? 0
+  for (let depth = 0; current > 0 && depth < MAX_PROCESS_ANCESTRY_DEPTH; depth += 1) {
+    if (seen.has(current)) {
+      throw new InconclusiveRuntimeScanError('Process ancestry contains a cycle')
+    }
+    ancestors.push(current)
+    if (current === 1) return ancestors
+    seen.add(current)
+    const parent = processes.get(current)
+    if (!parent) {
+      throw new InconclusiveRuntimeScanError('Cannot resolve process ancestry')
+    }
+    current = parent.parentPid
+  }
+  if (current > 0) {
+    throw new InconclusiveRuntimeScanError('Process ancestry exceeds the depth limit')
+  }
+  return ancestors
+}
+
 function parseFdInfo(fdinfo: string): { position: number; flags: number } {
   const positionMatch = /^pos:\s+(\d+)/mu.exec(fdinfo)
   const flagsMatch = /^flags:\s+([0-7]+)/mu.exec(fdinfo)
@@ -178,6 +223,7 @@ async function* listLinuxFdSnapshots(ownUid: number | null): AsyncIterable<Runti
     throw new InconclusiveRuntimeScanError('Cannot inspect /proc')
   }
 
+  const processes = new Map<number, LinuxProcessRecord>()
   for (const entry of processEntries) {
     if (!/^\d+$/u.test(entry)) continue
     const pid = Number.parseInt(entry, 10)
@@ -187,12 +233,22 @@ async function* listLinuxFdSnapshots(ownUid: number | null): AsyncIterable<Runti
     const status = await readProcText(`${processRoot}/status`, `process ${pid} status`)
     if (status === null) continue
     const uid = parseProcUid(status)
-    if (uid !== ownUid) continue
+    const parentPid = parseProcParentPid(status)
 
-    const cmdline = await readProcText(`${processRoot}/cmdline`, `process ${pid} command`)
-    if (cmdline === null) continue
-    if (!isCodexAppServerCommand(cmdline)) continue
+    let cmdline = ''
+    if (uid === ownUid) {
+      const sameUidCmdline = await readProcText(`${processRoot}/cmdline`, `process ${pid} command`)
+      if (sameUidCmdline === null) continue
+      cmdline = sameUidCmdline
+    }
+    processes.set(pid, { pid, parentPid, uid, cmdline })
+  }
 
+  for (const process of processes.values()) {
+    const { pid, uid, cmdline } = process
+    if (uid !== ownUid || !isCodexAppServerCommand(cmdline)) continue
+    const ancestorPids = collectAncestorPids(pid, processes)
+    const processRoot = `/proc/${pid}`
     const fdEntries = await readProcDirectory(`${processRoot}/fd`, `process ${pid} descriptors`)
     if (fdEntries === null) continue
     for (const fd of fdEntries) {
@@ -208,6 +264,7 @@ async function* listLinuxFdSnapshots(ownUid: number | null): AsyncIterable<Runti
       if (!identity) continue
       yield {
         pid,
+        ancestorPids,
         uid,
         cmdline,
         dev: identity.dev,
@@ -320,12 +377,20 @@ function matchesWriter(
   const accessMode = fd.flags & 0b11
   const isWritable = accessMode === 1 || accessMode === 2
   return fd.uid === uid
-    && fd.pid !== excludedPid
+    && !belongsToExcludedProcessTree(fd, excludedPid)
     && isCodexAppServerCommand(fd.cmdline)
     && fd.dev === identity.dev
     && fd.ino === identity.ino
     && isWritable
     && fd.position > 0
+}
+
+function belongsToExcludedProcessTree(
+  fd: RuntimeFdSnapshot,
+  excludedPid: number | null,
+): boolean {
+  return excludedPid !== null
+    && (fd.pid === excludedPid || fd.ancestorPids.includes(excludedPid))
 }
 
 export class ExternalThreadRuntimeProbe {

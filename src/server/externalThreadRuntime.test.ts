@@ -29,6 +29,7 @@ function lifecycle(type: 'task_started' | 'task_complete' | 'turn_aborted', turn
 function writerFd(overrides: Partial<RuntimeFdSnapshot> = {}): RuntimeFdSnapshot {
   return {
     pid: 42,
+    ancestorPids: [],
     uid: 1000,
     cmdline: '/usr/local/bin/codex\0app-server\0',
     dev: '8',
@@ -159,6 +160,13 @@ function registeredProbe(system: ExternalRuntimeSystem): ExternalThreadRuntimePr
   return probe
 }
 
+type DefaultRuntimeProcessFixture = {
+  pid: number
+  parentPid: number
+  cmdline: string
+  fds: string[]
+}
+
 type DefaultRuntimeFixture = {
   log?: string
   openedLog?: string
@@ -170,6 +178,7 @@ type DefaultRuntimeFixture = {
   fdIno?: bigint
   status?: string
   fdinfo?: string
+  processes?: DefaultRuntimeProcessFixture[]
 }
 
 function defaultRuntimeProbe(fixture: DefaultRuntimeFixture = {}): ExternalThreadRuntimeProbe {
@@ -182,6 +191,12 @@ function defaultRuntimeProbe(fixture: DefaultRuntimeFixture = {}): ExternalThrea
   const fdDev = fixture.fdDev ?? rolloutDev
   const fdIno = fixture.fdIno ?? rolloutIno
   const uid = typeof process.getuid === 'function' ? process.getuid() : 1000
+  const processes = fixture.processes ?? [{
+    pid: 42,
+    parentPid: 1,
+    cmdline: '/usr/local/bin/codex\0app-server\0',
+    fds: ['7'],
+  }]
 
   nodeFs.realpath.mockImplementation(async (path: string) => path)
   nodeFs.stat.mockImplementation(async (path: string, options?: { bigint?: boolean }) => {
@@ -219,16 +234,20 @@ function defaultRuntimeProbe(fixture: DefaultRuntimeFixture = {}): ExternalThrea
     async close() {},
   })
   nodeFs.readdir.mockImplementation(async (path: string) => {
-    if (path === '/proc') return ['42']
-    if (path === '/proc/42/fd') return ['7']
+    if (path === '/proc') return processes.map(({ pid }) => `${pid}`)
+    const process = processes.find(({ pid }) => path === `/proc/${pid}/fd`)
+    if (process) return process.fds
     throw new Error(`Unexpected readdir: ${path}`)
   })
   nodeFs.readFile.mockImplementation(async (path: string) => {
-    if (path === '/proc/42/status') {
-      return fixture.status ?? `Name:\tcodex\nUid:\t${uid}\t${uid}\t${uid}\t${uid}\n`
+    const process = processes.find(({ pid }) => path.startsWith(`/proc/${pid}/`))
+    if (!process) throw new Error(`Unexpected readFile: ${path}`)
+    if (path === `/proc/${process.pid}/status`) {
+      return fixture.status
+        ?? `Name:\tcodex\nPPid:\t${process.parentPid}\nUid:\t${uid}\t${uid}\t${uid}\t${uid}\n`
     }
-    if (path === '/proc/42/cmdline') return '/usr/local/bin/codex\0app-server\0'
-    if (path === '/proc/42/fdinfo/7') {
+    if (path === `/proc/${process.pid}/cmdline`) return process.cmdline
+    if (process.fds.some((fd) => path === `/proc/${process.pid}/fdinfo/${fd}`)) {
       return fixture.fdinfo ?? 'pos:\t10\nflags:\t0100001\n'
     }
     throw new Error(`Unexpected readFile: ${path}`)
@@ -314,6 +333,30 @@ describe('ExternalThreadRuntimeProbe', () => {
 
     await expect(registeredProbe(system).inspect('thread-1', 42)).resolves.toEqual({
       state: 'idle',
+    })
+  })
+
+  it.each([
+    ['direct child', [99]],
+    ['deep descendant', [150, 120, 99, 1]],
+  ])('excludes a mobile launcher %s from writer evidence', async (_label, ancestorPids) => {
+    const system = fakeRuntimeSystem({
+      log: lifecycle('task_started', 'turn-a'),
+      fds: [writerFd({ pid: 200, ancestorPids })],
+    })
+
+    await expect(registeredProbe(system).inspect('thread-1', 99)).resolves.toEqual({ state: 'idle' })
+  })
+
+  it('accepts a separate desktop app-server whose ancestors do not include the mobile launcher', async () => {
+    const system = fakeRuntimeSystem({
+      log: lifecycle('task_started', 'turn-a'),
+      fds: [writerFd({ pid: 200, ancestorPids: [150, 1] })],
+    })
+
+    await expect(registeredProbe(system).inspect('thread-1', 99)).resolves.toMatchObject({
+      state: 'running',
+      turnId: 'turn-a',
     })
   })
 
@@ -626,6 +669,38 @@ describe('ExternalThreadRuntimeProbe', () => {
     })
 
     await expect(probe.inspect('thread-1', 99)).resolves.toEqual({ state: 'idle' })
+  })
+
+  it('excludes a native Codex process descended from the mobile Node launcher', async () => {
+    const probe = defaultRuntimeProbe({
+      processes: [
+        {
+          pid: 99,
+          parentPid: 1,
+          cmdline: '/usr/bin/node\0/usr/bin/codex\0app-server\0',
+          fds: [],
+        },
+        {
+          pid: 100,
+          parentPid: 99,
+          cmdline: '/opt/codex/bin/codex\0app-server\0',
+          fds: ['7'],
+        },
+      ],
+    })
+
+    await expect(probe.inspect('thread-1', 99)).resolves.toEqual({ state: 'idle' })
+  })
+
+  it('returns unknown when a candidate app-server ancestry contains a cycle', async () => {
+    const probe = defaultRuntimeProbe({
+      processes: [
+        { pid: 100, parentPid: 101, cmdline: '/opt/codex/bin/codex\0app-server\0', fds: ['7'] },
+        { pid: 101, parentPid: 100, cmdline: '/usr/bin/node\0worker.js\0', fds: [] },
+      ],
+    })
+
+    await expect(probe.inspect('thread-1', 99)).resolves.toEqual({ state: 'unknown' })
   })
 
   it('returns unknown when a proc status has a malformed UID', async () => {
