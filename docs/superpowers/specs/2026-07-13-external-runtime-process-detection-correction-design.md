@@ -1,6 +1,6 @@
 # External Runtime Process Detection Correction
 
-Date: 2026-07-13  
+Date: 2026-07-13
 Branch: `codex/fix-appserver-process-detection`
 
 ## Problem

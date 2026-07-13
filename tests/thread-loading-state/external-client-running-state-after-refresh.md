@@ -35,5 +35,30 @@
 - After the external turn reaches a terminal state, Client B removes the sidebar spinner, refreshes the completed conversation, replaces the disabled stop control with the normal idle send control, re-enables queue/composer interactions, and sends the follow-up normally.
 - The layout remains usable in Light and Dark appearance at both `375x812` and `768x1024`, with the composer and queue actions remaining visible and correctly disabled.
 
+#### Configured desktop command and launcher descendants
+
+##### Setup
+- Use Linux and keep `codex-mobile-safe` running through its normal Node launcher and native Codex app-server child.
+- Identify a thread whose rollout is shared by the desktop app-server and `codex-mobile-safe`, and make sure it is idle before the check.
+
+##### Steps
+1. Start the desktop app-server in the production layout `codex -c features.code_mode_host=true app-server --listen unix://` and begin a long-running turn.
+2. Open the same thread in `codex-mobile-safe`; confirm `/codex-api/thread-runtime-state` returns `running` and the composer shows the disabled “Running in another client” stop control.
+3. Confirm the mobile Node launcher and its native Codex child can both hold the rollout without being accepted as external evidence.
+4. Stop the separate desktop app-server while leaving the mobile service alive; after the terminal refresh the endpoint must become `idle` and the normal send control must return.
+
+##### Expected Results
+- Command recognition treats `/proc/<pid>/cmdline` as NUL-delimited argv: an argv token whose basename is exactly `codex` must precede a later token that is exactly `app-server`. Options between those tokens are accepted; lookalike basenames, reversed ordering, and lookalike subcommands are rejected.
+- The mobile launcher PID and every native or Node descendant whose validated parent chain reaches that PID are excluded. Only a separate qualifying desktop app-server can supply external writer evidence.
+- Linux process identity is bound to `/proc/<pid>/stat` starttime while the process table and descriptor evidence are collected. PID reuse or a starttime change before or during descriptor enumeration makes the scan conservatively `unknown` instead of accepting stale writer evidence.
+- Existing lifecycle, same-UID, exact rollout dev/ino, writable-descriptor, positive-position, canonical-path, and regular-file requirements remain in force.
+
+##### Automated Acceptance
+1. Run `pnpm vitest run src/server/externalThreadRuntime.test.ts src/server/externalThreadRuntimeBridge.test.ts`; both focused suites must pass.
+2. Run `pnpm test:unit`; the complete unit suite must pass.
+3. Run `pnpm build`; Vue type checking, Vite, and tsup must complete successfully.
+4. Run `node dist-cli/safe.js doctor`; it must print `codex-mobile-safe doctor: ok`.
+5. Run `git diff --check main..HEAD`; it must print nothing.
+
 #### Rollback/Cleanup
 - From Client A, stop the long-running turn if it is still active; after both clients show the terminal state, delete the prepared test-only queued row if it remains, restore Client B's original viewport and appearance, close Client B, and stop its Codex Mobile/app-server instance.
