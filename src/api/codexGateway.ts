@@ -57,6 +57,7 @@ import type {
   UiThreadAutomationStatus,
 } from '../types/codex'
 import { normalizePathForUi } from '../pathUtils.js'
+import type { ExternalThreadRuntime, ThreadDetailRuntime } from '../types/threadRuntime'
 
 type CurrentModelConfig = {
   model: string
@@ -443,6 +444,75 @@ function readStringArray(value: unknown): string[] {
   return Array.isArray(value) ? value.filter((item): item is string => typeof item === 'string' && item.length > 0) : []
 }
 
+function hasOnlyKeys(record: Record<string, unknown>, keys: string[]): boolean {
+  const recordKeys = Object.keys(record)
+  return recordKeys.length === keys.length && keys.every((key) => recordKeys.includes(key))
+}
+
+function parseExternalThreadRuntime(value: unknown): ExternalThreadRuntime {
+  const runtime = asRecord(value)
+  if (!runtime || typeof runtime.state !== 'string') return { state: 'unknown' }
+  if (runtime.state === 'idle' && hasOnlyKeys(runtime, ['state'])) return { state: 'idle' }
+  if (runtime.state === 'unknown' && hasOnlyKeys(runtime, ['state'])) return { state: 'unknown' }
+  if (
+    runtime.state === 'running'
+    && hasOnlyKeys(runtime, ['state', 'turnId', 'interruptible', 'source'])
+    && typeof runtime.turnId === 'string'
+    && runtime.turnId.trim().length > 0
+    && runtime.interruptible === false
+    && runtime.source === 'external-session-writer'
+  ) {
+    return {
+      state: 'running',
+      turnId: runtime.turnId.trim(),
+      interruptible: false,
+      source: 'external-session-writer',
+    }
+  }
+  return { state: 'unknown' }
+}
+
+function readExternalRuntime(payload: ThreadReadResponse): ExternalThreadRuntime {
+  return parseExternalThreadRuntime(asRecord(payload.thread)?.externalRuntime)
+}
+
+export function readThreadDetailRuntime(payload: ThreadReadResponse): ThreadDetailRuntime {
+  if (readThreadInProgressFromResponse(payload)) {
+    return {
+      inProgress: true,
+      activeTurnId: readActiveTurnIdFromResponse(payload),
+      ownership: 'local',
+      canInterrupt: true,
+    }
+  }
+  const external = readExternalRuntime(payload)
+  if (external.state === 'running') {
+    return {
+      inProgress: true,
+      activeTurnId: external.turnId,
+      ownership: 'external',
+      canInterrupt: false,
+    }
+  }
+  return {
+    inProgress: false,
+    activeTurnId: '',
+    ownership: 'idle',
+    canInterrupt: false,
+  }
+}
+
+export async function getThreadRuntimeState(threadId: string): Promise<ExternalThreadRuntime> {
+  const params = new URLSearchParams({ threadId })
+  try {
+    const response = await fetch(`/codex-api/thread-runtime-state?${params.toString()}`)
+    if (!response.ok) return { state: 'unknown' }
+    return parseExternalThreadRuntime(await response.json())
+  } catch {
+    return { state: 'unknown' }
+  }
+}
+
 function normalizeAccountUnavailableReason(value: unknown): UiAccountUnavailableReason | null {
   return value === 'payment_required' ? value : null
 }
@@ -769,6 +839,8 @@ async function getThreadDetailV2(threadId: string): Promise<{
   activeTurnId: string
   hasMoreOlder: boolean
   turnIndexByTurnId: ThreadTurnIndexById
+  ownership: ThreadDetailRuntime['ownership']
+  canInterrupt: boolean
 }> {
   const payload = await callRpc<ThreadReadResponse>('thread/read', {
     threadId,
@@ -776,12 +848,12 @@ async function getThreadDetailV2(threadId: string): Promise<{
   })
   const startTurnIndex = readThreadTurnStartIndex(payload)
   const normalized = normalizeThreadMessagesV2(payload, startTurnIndex)
+  const runtime = readThreadDetailRuntime(payload)
   return {
     model: normalizeThreadModelFromPayload(payload),
     modelProvider: normalizeThreadModelProviderFromPayload(payload),
     messages: normalized,
-    inProgress: readThreadInProgressFromResponse(payload),
-    activeTurnId: readActiveTurnIdFromResponse(payload),
+    ...runtime,
     hasMoreOlder: startTurnIndex > 0,
     turnIndexByTurnId: buildTurnIndexByTurnId(payload, startTurnIndex),
   }
@@ -864,6 +936,8 @@ export async function getThreadDetail(threadId: string): Promise<{
   activeTurnId: string
   hasMoreOlder: boolean
   turnIndexByTurnId: ThreadTurnIndexById
+  ownership: ThreadDetailRuntime['ownership']
+  canInterrupt: boolean
 }> {
   try {
     return await getThreadDetailV2(threadId)
@@ -1505,6 +1579,8 @@ export type ResumedThread = {
   activeTurnId: string
   hasMoreOlder: boolean
   turnIndexByTurnId: ThreadTurnIndexById
+  ownership: ThreadDetailRuntime['ownership']
+  canInterrupt: boolean
 }
 
 const RESUME_THREAD_COALESCE_TTL_MS = 30_000
@@ -1518,12 +1594,12 @@ export async function resumeThread(threadId: string): Promise<ResumedThread> {
     const payload = await callRpc<ThreadResumeResponse>('thread/resume', { threadId })
     const startTurnIndex = readThreadTurnStartIndex(payload)
     const messages = normalizeThreadMessagesV2(payload, startTurnIndex)
+    const runtime = readThreadDetailRuntime(payload)
     return {
       model: normalizeThreadModelFromPayload(payload),
       modelProvider: normalizeThreadModelProviderFromPayload(payload),
       messages,
-      inProgress: readThreadInProgressFromResponse(payload),
-      activeTurnId: readActiveTurnIdFromResponse(payload),
+      ...runtime,
       hasMoreOlder: startTurnIndex > 0,
       turnIndexByTurnId: buildTurnIndexByTurnId(payload, startTurnIndex),
     }

@@ -40,6 +40,7 @@ import {
 import { handleOpenRouterProxyRequest } from './openRouterProxy.js'
 import { handleZenProxyRequest } from './zenProxy.js'
 import { handleCustomEndpointProxyRequest } from './customEndpointProxy.js'
+import { ExternalThreadRuntimeProbe } from './externalThreadRuntime.js'
 import { ThreadTerminalManager } from './terminalManager.js'
 import { getSpawnInvocation } from '../utils/commandInvocation.js'
 import {
@@ -890,6 +891,46 @@ export async function sanitizeThreadTurnsInlinePayloads(method: string, result: 
     thread: {
       ...thread,
       turns: nextTurns,
+    },
+  }
+}
+
+type ThreadRuntimeProbe = Pick<ExternalThreadRuntimeProbe, 'registerThread' | 'inspect'>
+
+function readThreadResultInProgress(value: unknown): boolean {
+  const thread = asRecord(value)
+  if (!thread) return false
+  if (thread.inProgress === true || thread.status === 'inProgress' || thread.turnStatus === 'inProgress') {
+    return true
+  }
+  const statusType = readNonEmptyString(asRecord(thread.status)?.type)
+  if (statusType === 'active' || statusType === 'inProgress' || statusType === 'running') {
+    return true
+  }
+  const turns = Array.isArray(thread.turns) ? thread.turns : []
+  return readNonEmptyString(asRecord(turns.at(-1))?.status) === 'inProgress'
+}
+
+export async function augmentThreadResultWithExternalRuntime(
+  method: string,
+  result: unknown,
+  runtimeProbe: ThreadRuntimeProbe,
+  excludedPid: number | null,
+): Promise<unknown> {
+  if (method !== 'thread/read' && method !== 'thread/resume') return result
+  const record = asRecord(result)
+  const thread = asRecord(record?.thread)
+  const threadId = readNonEmptyString(thread?.id)
+  if (!record || !thread || !threadId) return result
+
+  runtimeProbe.registerThread(threadId, readNonEmptyString(thread.path))
+  if (readThreadResultInProgress(thread)) return result
+
+  return {
+    ...record,
+    thread: {
+      ...thread,
+      externalRuntime: await runtimeProbe.inspect(threadId, excludedPid),
     },
   }
 }
@@ -6873,6 +6914,10 @@ class AppServerProcess {
     return this.call(method, params)
   }
 
+  getPid(): number | null {
+    return this.process?.pid ?? null
+  }
+
   onNotification(listener: (value: { method: string; params: unknown }) => void): () => void {
     this.notificationListeners.add(listener)
     return () => {
@@ -7328,10 +7373,11 @@ type SharedBridgeState = {
   methodCatalog: MethodCatalog
   telegramBridge: TelegramThreadBridge
   backendQueueProcessor: BackendQueueProcessor
+  runtimeProbe: ExternalThreadRuntimeProbe
 }
 
 const SHARED_BRIDGE_KEY = '__codexRemoteSharedBridge__'
-const SHARED_BRIDGE_VERSION = 'experimental-api-v2'
+const SHARED_BRIDGE_VERSION = 'experimental-api-v3-external-runtime'
 
 function getSharedBridgeState(): SharedBridgeState {
   const globalScope = globalThis as typeof globalThis & {
@@ -7346,6 +7392,7 @@ function getSharedBridgeState(): SharedBridgeState {
     existing.appServer.dispose()
     existing.backendQueueProcessor?.dispose()
     existing.terminalManager?.dispose()
+    existing.runtimeProbe?.clear()
   }
 
   const appServer = new AppServerProcess()
@@ -7357,6 +7404,9 @@ function getSharedBridgeState(): SharedBridgeState {
     terminalManager,
     methodCatalog: new MethodCatalog(),
     backendQueueProcessor,
+    runtimeProbe: new ExternalThreadRuntimeProbe({
+      sessionsRoot: join(getCodexHomeDir(), 'sessions'),
+    }),
     telegramBridge: new TelegramThreadBridge(appServer, {
       onChatSeen: (chatId) => {
         void rememberTelegramChatId(chatId).catch(() => {})
@@ -7447,7 +7497,7 @@ export function createCodexBridgeMiddleware(options: {
   securityPolicy?: ServerSecurityPolicy
 } = {}): CodexBridgeMiddleware {
   const securityPolicy = options.securityPolicy ?? PERMISSIVE_SECURITY_POLICY
-  const { appServer, terminalManager, methodCatalog, telegramBridge, backendQueueProcessor } = getSharedBridgeState()
+  const { appServer, terminalManager, methodCatalog, telegramBridge, backendQueueProcessor, runtimeProbe } = getSharedBridgeState()
   let threadSearchIndex: ThreadSearchIndex | null = null
   let threadSearchIndexPromise: Promise<ThreadSearchIndex> | null = null
 
@@ -7529,6 +7579,16 @@ export function createCodexBridgeMiddleware(options: {
 
       if (securityPolicy.isRouteDisabled(req.method ?? 'GET', url.pathname)) {
         setJson(res, 403, { error: 'This integration is disabled by the active security policy.' })
+        return
+      }
+
+      if (req.method === 'GET' && url.pathname === '/codex-api/thread-runtime-state') {
+        const threadId = url.searchParams.get('threadId')?.trim() ?? ''
+        if (!threadId) {
+          setJson(res, 400, { error: 'Missing threadId' })
+          return
+        }
+        setJson(res, 200, await runtimeProbe.inspect(threadId, appServer.getPid()))
         return
       }
 
@@ -8013,16 +8073,23 @@ export function createCodexBridgeMiddleware(options: {
           ? await mergeSessionSkillInputsIntoThreadResult(sanitizedResult)
           : sanitizedResult
 
-	        if (THREAD_METHODS_WITH_THREAD_SNAPSHOT.has(body.method)) {
-	          const rpcRecord = asRecord(result)
-	          const rpcThread = asRecord(rpcRecord?.thread)
-	          const rpcThreadId = typeof rpcThread?.id === 'string' ? rpcThread.id : ''
+        if (THREAD_METHODS_WITH_THREAD_SNAPSHOT.has(body.method)) {
+          const rpcRecord = asRecord(result)
+          const rpcThread = asRecord(rpcRecord?.thread)
+          const rpcThreadId = typeof rpcThread?.id === 'string' ? rpcThread.id : ''
           if (rpcThreadId) {
             appServer.storeThreadReadSnapshot(rpcThreadId, result)
           }
         }
 
-        setJson(res, 200, { result })
+        const resultWithExternalRuntime = await augmentThreadResultWithExternalRuntime(
+          body.method,
+          result,
+          runtimeProbe,
+          appServer.getPid(),
+        )
+
+        setJson(res, 200, { result: resultWithExternalRuntime })
         return
       }
 
@@ -9653,6 +9720,7 @@ export function createCodexBridgeMiddleware(options: {
     telegramBridge.stop()
     terminalManager.dispose()
     backendQueueProcessor.dispose()
+    runtimeProbe.clear()
     appServer.dispose()
   }
   middleware.subscribeNotifications = (

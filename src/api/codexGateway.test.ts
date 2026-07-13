@@ -1,5 +1,18 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { getAvailableModelIds, getThreadDetail, listDirectoryComposioConnectors, resumeThread, startThreadTurn } from './codexGateway'
+import type { ThreadReadResponse } from './appServerDtos'
+import {
+  getAvailableModelIds,
+  getThreadDetail,
+  getThreadRuntimeState,
+  listDirectoryComposioConnectors,
+  readThreadDetailRuntime,
+  resumeThread,
+  startThreadTurn,
+} from './codexGateway'
+
+function runtimePayload(thread: Record<string, unknown>): ThreadReadResponse {
+  return { thread } as unknown as ThreadReadResponse
+}
 
 function mockRpcFetch(): { requests: Array<{ method: string, params: Record<string, unknown> }> } {
   const requests: Array<{ method: string, params: Record<string, unknown> }> = []
@@ -202,6 +215,48 @@ describe('getThreadDetail', () => {
 
     await expect(getThreadDetail('legacy-thread')).resolves.toMatchObject({
       modelProvider: 'opencode_zen',
+      ownership: 'idle',
+      canInterrupt: false,
+    })
+  })
+
+  it('reports externally running idle app-server threads as non-interruptible', () => {
+    const payload = runtimePayload({
+      id: 'thread-1',
+      turns: [],
+      externalRuntime: {
+        state: 'running',
+        turnId: 'turn-external',
+        interruptible: false,
+        source: 'external-session-writer',
+      },
+    })
+
+    expect(readThreadDetailRuntime(payload)).toMatchObject({
+      inProgress: true,
+      activeTurnId: 'turn-external',
+      ownership: 'external',
+      canInterrupt: false,
+    })
+  })
+
+  it('gives local app-server activity precedence over external metadata', () => {
+    const payload = runtimePayload({
+      id: 'thread-1',
+      turns: [{ id: 'turn-local', status: 'inProgress', items: [] }],
+      externalRuntime: {
+        state: 'running',
+        turnId: 'turn-external',
+        interruptible: false,
+        source: 'external-session-writer',
+      },
+    })
+
+    expect(readThreadDetailRuntime(payload)).toMatchObject({
+      inProgress: true,
+      activeTurnId: 'turn-local',
+      ownership: 'local',
+      canInterrupt: true,
     })
   })
 })
@@ -259,5 +314,82 @@ describe('resumeThread', () => {
       { method: 'thread/resume', params: { threadId: 'stalled-thread' } },
       { method: 'thread/resume', params: { threadId: 'stalled-thread' } },
     ])
+  })
+
+  it('returns explicit external ownership from thread/resume metadata', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({
+      result: {
+        thread: {
+          id: 'external-resume-thread',
+          modelProvider: 'openai',
+          turns: [],
+          externalRuntime: {
+            state: 'running',
+            turnId: 'turn-external',
+            interruptible: false,
+            source: 'external-session-writer',
+          },
+        },
+        model: 'gpt-5.4',
+        modelProvider: 'openai',
+      },
+    }), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' },
+    })))
+
+    await expect(resumeThread('external-resume-thread')).resolves.toMatchObject({
+      inProgress: true,
+      activeTurnId: 'turn-external',
+      ownership: 'external',
+      canInterrupt: false,
+    })
+  })
+})
+
+describe('getThreadRuntimeState', () => {
+  afterEach(() => {
+    vi.unstubAllGlobals()
+  })
+
+  it('requests the thread runtime endpoint with an encoded thread id', async () => {
+    const requests: string[] = []
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
+      requests.push(String(input))
+      return new Response(JSON.stringify({
+        state: 'running',
+        turnId: 'turn-external',
+        interruptible: false,
+        source: 'external-session-writer',
+      }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      })
+    }))
+
+    await expect(getThreadRuntimeState('thread 1')).resolves.toEqual({
+      state: 'running',
+      turnId: 'turn-external',
+      interruptible: false,
+      source: 'external-session-writer',
+    })
+    expect(requests).toEqual(['/codex-api/thread-runtime-state?threadId=thread+1'])
+  })
+
+  it.each([
+    null,
+    {},
+    { state: 'running' },
+    { state: 'running', turnId: '', interruptible: false, source: 'external-session-writer' },
+    { state: 'running', turnId: 'turn-1', interruptible: true, source: 'external-session-writer' },
+    { state: 'idle', turnId: 'unexpected' },
+    { state: 'other' },
+  ])('normalizes malformed polling payload %j to unknown', async (payload) => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify(payload), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' },
+    })))
+
+    await expect(getThreadRuntimeState('thread-1')).resolves.toEqual({ state: 'unknown' })
   })
 })
