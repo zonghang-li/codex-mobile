@@ -22,6 +22,7 @@ const gatewayMocks = vi.hoisted(() => ({
   getSkillsList: vi.fn(),
   getThreadDetail: vi.fn(),
   getThreadGroupsPage: vi.fn(),
+  getThreadRuntimeState: vi.fn(),
   getThreadQueueState: vi.fn(),
   getThreadTitleCache: vi.fn(),
   getWorkspaceRootsState: vi.fn(),
@@ -81,6 +82,82 @@ function installTestWindow(initialStorage: Record<string, string> = {}) {
   })
 }
 
+function installFakeTimerWindow(initialStorage: Record<string, string> = {}) {
+  installTestWindow(initialStorage)
+  vi.mocked(window.setTimeout).mockImplementation(globalThis.setTimeout as typeof window.setTimeout)
+  vi.mocked(window.clearTimeout).mockImplementation(globalThis.clearTimeout as typeof window.clearTimeout)
+}
+
+function externalDetail(turnId = 'turn-external') {
+  return {
+    model: '',
+    modelProvider: '',
+    messages: [],
+    inProgress: true,
+    activeTurnId: turnId,
+    hasMoreOlder: false,
+    turnIndexByTurnId: {},
+    ownership: 'external' as const,
+    canInterrupt: false,
+  }
+}
+
+function idleDetail() {
+  return {
+    model: '',
+    modelProvider: '',
+    messages: [],
+    inProgress: false,
+    activeTurnId: '',
+    hasMoreOlder: false,
+    turnIndexByTurnId: {},
+    ownership: 'idle' as const,
+    canInterrupt: false,
+  }
+}
+
+function deferred<T>() {
+  let resolve!: (value: T | PromiseLike<T>) => void
+  let reject!: (reason?: unknown) => void
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise
+    reject = rejectPromise
+  })
+  return { promise, resolve, reject }
+}
+
+async function setupExternalRuntimeState() {
+  vi.useFakeTimers()
+  installFakeTimerWindow()
+  let notificationHandler: ((notification: { method: string; params?: unknown }) => void) | undefined
+  gatewayMocks.subscribeCodexNotifications.mockImplementation((handler) => {
+    notificationHandler = handler as typeof notificationHandler
+    return vi.fn()
+  })
+  gatewayMocks.getPendingServerRequests.mockResolvedValue([])
+  gatewayMocks.getThreadGroupsPage.mockResolvedValue({
+    groups: [{ projectName: 'Project', threads: [
+      thread('thread-1', '/tmp/project'),
+      thread('thread-2', '/tmp/project'),
+    ] }],
+    nextCursor: null,
+  })
+
+  const state = useDesktopState()
+  await state.refreshAll({ includeSelectedThreadMessages: false })
+  state.primeSelectedThread('thread-1')
+  state.startPolling()
+  pollingCleanups.push(() => state.stopPolling())
+  expect(notificationHandler).toBeDefined()
+
+  return {
+    state,
+    emit(notification: { method: string; params?: unknown }) {
+      notificationHandler!(notification)
+    },
+  }
+}
+
 async function flushMicrotasks(): Promise<void> {
   for (let index = 0; index < 6; index += 1) {
     await Promise.resolve()
@@ -127,6 +204,7 @@ afterEach(() => {
   for (const cleanup of pollingCleanups.splice(0)) {
     cleanup()
   }
+  vi.useRealTimers()
   vi.unstubAllGlobals()
 })
 
@@ -669,12 +747,14 @@ describe('turn completion lifecycle', () => {
     gatewayMocks.interruptThreadTurn.mockResolvedValue(undefined)
 
     emit({ method: 'turn/started', params: { threadId: 'thread-1', turn: { id: 'turn-a' } } })
+    expect(state.selectedThreadRuntimeOwnership.value).toBe('local')
     await state.interruptSelectedThreadTurn()
 
     expect(gatewayMocks.interruptThreadTurn).toHaveBeenCalledWith('thread-1', 'turn-a')
     expect(state.projectGroups.value[0]?.threads[0]?.inProgress).toBe(true)
 
     emit({ method: 'turn/completed', params: { threadId: 'thread-1', turn: { id: 'turn-a', status: 'interrupted' } } })
+    expect(state.selectedThreadRuntimeOwnership.value).toBe('idle')
     expect(state.projectGroups.value[0]?.threads[0]?.inProgress).toBe(false)
   })
 
@@ -978,6 +1058,255 @@ describe('turn completion lifecycle', () => {
       })
     },
   )
+})
+
+describe('external runtime ownership', () => {
+  it('restores and polls an externally owned selected thread after 2 seconds', async () => {
+    const { state } = await setupExternalRuntimeState()
+    gatewayMocks.resumeThread.mockResolvedValue(externalDetail())
+    gatewayMocks.getThreadRuntimeState.mockResolvedValue({
+      state: 'running',
+      turnId: 'turn-external',
+      interruptible: false,
+      source: 'external-session-writer',
+    })
+
+    await state.loadMessages('thread-1')
+
+    expect(state.selectedThreadRuntimeOwnership.value).toBe('external')
+    expect(state.selectedThread.value?.inProgress).toBe(true)
+    expect(gatewayMocks.getThreadRuntimeState).not.toHaveBeenCalled()
+
+    await vi.advanceTimersByTimeAsync(1_999)
+    expect(gatewayMocks.getThreadRuntimeState).not.toHaveBeenCalled()
+    await vi.advanceTimersByTimeAsync(1)
+    expect(gatewayMocks.getThreadRuntimeState).toHaveBeenCalledTimes(1)
+    expect(gatewayMocks.getThreadRuntimeState).toHaveBeenCalledWith('thread-1')
+  })
+
+  it('keeps only one selected external runtime request in flight', async () => {
+    const { state } = await setupExternalRuntimeState()
+    const pending = deferred<{
+      state: 'running'
+      turnId: string
+      interruptible: false
+      source: 'external-session-writer'
+    }>()
+    gatewayMocks.resumeThread.mockResolvedValue(externalDetail())
+    gatewayMocks.getThreadRuntimeState.mockReturnValue(pending.promise)
+    await state.loadMessages('thread-1')
+
+    await vi.advanceTimersByTimeAsync(6_000)
+    expect(gatewayMocks.getThreadRuntimeState).toHaveBeenCalledTimes(1)
+
+    pending.resolve({
+      state: 'running',
+      turnId: 'turn-external',
+      interruptible: false,
+      source: 'external-session-writer',
+    })
+    await flushMicrotasks()
+    await vi.advanceTimersByTimeAsync(1_999)
+    expect(gatewayMocks.getThreadRuntimeState).toHaveBeenCalledTimes(1)
+    await vi.advanceTimersByTimeAsync(1)
+    expect(gatewayMocks.getThreadRuntimeState).toHaveBeenCalledTimes(2)
+  })
+
+  it('forces a detail refresh when external runtime becomes idle', async () => {
+    const { state } = await setupExternalRuntimeState()
+    gatewayMocks.resumeThread.mockResolvedValue(externalDetail())
+    gatewayMocks.getThreadRuntimeState.mockResolvedValue({ state: 'idle' })
+    gatewayMocks.getThreadDetail.mockResolvedValue({
+      ...idleDetail(),
+      messages: [{ id: 'persisted-after-idle', role: 'assistant', text: 'finished' }],
+    })
+    await state.loadMessages('thread-1')
+
+    await vi.advanceTimersByTimeAsync(2_000)
+    await flushMicrotasks()
+
+    expect(gatewayMocks.getThreadDetail).toHaveBeenCalledTimes(1)
+    expect(gatewayMocks.getThreadDetail).toHaveBeenCalledWith('thread-1')
+    expect(state.selectedThreadRuntimeOwnership.value).toBe('idle')
+    expect(state.selectedThread.value?.inProgress).toBe(false)
+    expect(state.messages.value).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: 'persisted-after-idle' }),
+    ]))
+  })
+
+  it.each([
+    ['unknown result', () => Promise.resolve({ state: 'unknown' as const })],
+    ['failed request', () => Promise.reject(new Error('runtime unavailable'))],
+  ])('retains established external ownership after an %s', async (_label, runtimeResult) => {
+    const { state } = await setupExternalRuntimeState()
+    gatewayMocks.resumeThread.mockResolvedValue(externalDetail())
+    gatewayMocks.getThreadRuntimeState.mockImplementation(runtimeResult)
+    await state.loadMessages('thread-1')
+
+    await vi.advanceTimersByTimeAsync(2_000)
+    await flushMicrotasks()
+
+    expect(state.selectedThreadRuntimeOwnership.value).toBe('external')
+    expect(state.selectedThread.value?.inProgress).toBe(true)
+    await vi.advanceTimersByTimeAsync(2_000)
+    expect(gatewayMocks.getThreadRuntimeState).toHaveBeenCalledTimes(2)
+  })
+
+  it('never lets stale external idle clear a local lease', async () => {
+    const { state, emit } = await setupExternalRuntimeState()
+    const pending = deferred<{ state: 'idle' }>()
+    gatewayMocks.resumeThread.mockResolvedValue(externalDetail())
+    gatewayMocks.getThreadRuntimeState.mockReturnValue(pending.promise)
+    await state.loadMessages('thread-1')
+    await vi.advanceTimersByTimeAsync(2_000)
+
+    emit({ method: 'turn/started', params: { threadId: 'thread-1', turn: { id: 'turn-local' } } })
+    pending.resolve({ state: 'idle' })
+    await flushMicrotasks()
+
+    expect(state.selectedThreadRuntimeOwnership.value).toBe('local')
+    expect(state.selectedThread.value?.inProgress).toBe(true)
+    expect(gatewayMocks.getThreadDetail).not.toHaveBeenCalled()
+  })
+
+  it('does not let a completion without a matching local lease clear external ownership', async () => {
+    const { state, emit } = await setupExternalRuntimeState()
+    gatewayMocks.resumeThread.mockResolvedValue(externalDetail())
+    await state.loadMessages('thread-1')
+
+    emit({
+      method: 'turn/completed',
+      params: { threadId: 'thread-1', turn: { id: 'turn-external', status: 'completed' } },
+    })
+
+    expect(state.selectedThreadRuntimeOwnership.value).toBe('external')
+    expect(state.selectedThread.value?.inProgress).toBe(true)
+  })
+
+  it('keeps local ownership when lagging external detail is loaded', async () => {
+    const { state, emit } = await setupExternalRuntimeState()
+    gatewayMocks.resumeThread.mockResolvedValue(externalDetail())
+    emit({ method: 'turn/started', params: { threadId: 'thread-1', turn: { id: 'turn-local' } } })
+
+    await state.loadMessages('thread-1')
+
+    expect(state.selectedThreadRuntimeOwnership.value).toBe('local')
+    expect(state.selectedThread.value?.inProgress).toBe(true)
+  })
+
+  it('rejects poll results after selection changes or polling stops', async () => {
+    const { state } = await setupExternalRuntimeState()
+    const selectionPending = deferred<{ state: 'idle' }>()
+    gatewayMocks.resumeThread.mockResolvedValue(externalDetail())
+    gatewayMocks.getThreadRuntimeState.mockReturnValueOnce(selectionPending.promise)
+    await state.loadMessages('thread-1')
+    await vi.advanceTimersByTimeAsync(2_000)
+
+    state.primeSelectedThread('thread-2')
+    selectionPending.resolve({ state: 'idle' })
+    await flushMicrotasks()
+
+    expect(gatewayMocks.getThreadDetail).not.toHaveBeenCalled()
+    state.primeSelectedThread('thread-1')
+    expect(state.selectedThreadRuntimeOwnership.value).toBe('external')
+
+    const stopPending = deferred<{ state: 'idle' }>()
+    gatewayMocks.getThreadRuntimeState.mockReturnValueOnce(stopPending.promise)
+    await vi.advanceTimersByTimeAsync(2_000)
+    state.stopPolling()
+    stopPending.resolve({ state: 'idle' })
+    await flushMicrotasks()
+
+    expect(gatewayMocks.getThreadDetail).not.toHaveBeenCalled()
+  })
+
+  it('cancels scheduled polling on stop and resumes it after reconnect', async () => {
+    const { state } = await setupExternalRuntimeState()
+    gatewayMocks.resumeThread.mockResolvedValue(externalDetail())
+    gatewayMocks.getThreadRuntimeState.mockResolvedValue({ state: 'unknown' })
+    await state.loadMessages('thread-1')
+
+    state.stopPolling()
+    await vi.advanceTimersByTimeAsync(4_000)
+    expect(gatewayMocks.getThreadRuntimeState).not.toHaveBeenCalled()
+
+    state.startPolling()
+    await vi.advanceTimersByTimeAsync(2_000)
+    expect(gatewayMocks.getThreadRuntimeState).toHaveBeenCalledTimes(1)
+  })
+
+  it('guards all selected-thread mutations while externally owned', async () => {
+    gatewayMocks.getThreadQueueState.mockResolvedValue({
+      'thread-1': [
+        {
+          id: 'queued-1',
+          text: 'first queued',
+          imageUrls: [],
+          skills: [],
+          fileAttachments: [],
+          collaborationMode: 'default',
+        },
+        {
+          id: 'queued-2',
+          text: 'second queued',
+          imageUrls: [],
+          skills: [],
+          fileAttachments: [],
+          collaborationMode: 'default',
+        },
+      ],
+    })
+    const { state, emit } = await setupExternalRuntimeState()
+    emit({ method: 'turn/started', params: { threadId: 'thread-1', turn: { id: 'turn-local' } } })
+    await flushMicrotasks()
+    emit({ method: 'turn/completed', params: { threadId: 'thread-1', turn: { id: 'turn-local', status: 'completed' } } })
+    await flushMicrotasks()
+    gatewayMocks.resumeThread.mockResolvedValue(externalDetail())
+    gatewayMocks.startThreadTurn.mockResolvedValue('turn-local')
+    await state.loadMessages('thread-1')
+    const queueBeforeMutations = state.selectedThreadQueuedMessages.value.map((message) => message.id)
+    const persistenceCallsBeforeMutations = gatewayMocks.setThreadQueueState.mock.calls.length
+
+    await state.interruptSelectedThreadTurn()
+    await state.sendMessageToSelectedThread('steer externally')
+    await state.sendMessageToSelectedThread('queue externally', [], [], 'queue')
+    state.removeQueuedMessage('queued-1')
+    state.reorderQueuedMessage('queued-1', 'queued-2')
+    state.steerQueuedMessage('queued-1')
+    await flushMicrotasks()
+
+    expect(gatewayMocks.interruptThreadTurn).not.toHaveBeenCalled()
+    expect(gatewayMocks.getThreadDetail).not.toHaveBeenCalled()
+    expect(gatewayMocks.startThreadTurn).not.toHaveBeenCalled()
+    expect(state.selectedThreadQueuedMessages.value.map((message) => message.id)).toEqual(queueBeforeMutations)
+    expect(gatewayMocks.setThreadQueueState).toHaveBeenCalledTimes(persistenceCallsBeforeMutations)
+  })
+
+  it('preserves local interrupt, send, and queue mutation behavior', async () => {
+    const { state, emit } = await setupExternalRuntimeState()
+    gatewayMocks.resumeThread.mockResolvedValue({
+      ...externalDetail('turn-local'),
+      ownership: 'local',
+      canInterrupt: true,
+    })
+    gatewayMocks.interruptThreadTurn.mockResolvedValue(undefined)
+    gatewayMocks.startThreadTurn.mockResolvedValue('turn-steer')
+    emit({ method: 'turn/started', params: { threadId: 'thread-1', turn: { id: 'turn-local' } } })
+    await state.loadMessages('thread-1')
+
+    await state.sendMessageToSelectedThread('queued one', [], [], 'queue')
+    await state.sendMessageToSelectedThread('queued two', [], [], 'queue')
+    const [first, second] = state.selectedThreadQueuedMessages.value
+    state.reorderQueuedMessage(first!.id, second!.id)
+    state.removeQueuedMessage(first!.id)
+    await state.sendMessageToSelectedThread('steer locally')
+    await state.interruptSelectedThreadTurn()
+    await flushMicrotasks()
+
+    expect(gatewayMocks.setThreadQueueState).toHaveBeenCalled()
+    expect(gatewayMocks.startThreadTurn).toHaveBeenCalled()
+    expect(gatewayMocks.interruptThreadTurn).toHaveBeenCalledWith('thread-1', expect.any(String))
+  })
 })
 
 describe('live error overlay', () => {

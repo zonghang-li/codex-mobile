@@ -11,6 +11,7 @@ import {
   getPendingServerRequests,
   getSkillsList,
   getThreadDetail,
+  getThreadRuntimeState,
   getOlderThreadMessages,
   getBackgroundThreadListLimit,
   interruptThreadTurn,
@@ -59,6 +60,7 @@ import type {
   UiTokenUsageBreakdown,
   UiThread,
 } from '../types/codex'
+import type { ThreadRuntimeOwnership } from '../types/threadRuntime'
 import { getPathParent, isProjectlessChatPath, normalizePathForUi, toProjectName } from '../pathUtils.js'
 import { resolveTurnCompletionDisposition, type TurnTerminalStatus } from './threadLifecycle'
 
@@ -88,6 +90,7 @@ const NEW_THREAD_PROVIDER_MODEL_CONTEXT_PREFIX = '__new-thread-provider__::'
 const EVENT_SYNC_DEBOUNCE_MS = 220
 const BACKGROUND_THREAD_PAGINATION_DELAY_MS = 10_000
 const RATE_LIMIT_REFRESH_DEBOUNCE_MS = 500
+const EXTERNAL_RUNTIME_POLL_MS = 2_000
 const TURN_START_FOLLOW_UP_SYNC_DELAY_MS = 3000
 const RECENT_THREAD_MESSAGE_LOAD_REUSE_MS = 2000
 const RECENT_THREAD_LIST_LOAD_REUSE_MS = 2000
@@ -1455,6 +1458,7 @@ export function useDesktopState() {
   const turnActivityByThreadId = ref<Record<string, TurnActivityState>>({})
   const turnErrorByThreadId = ref<Record<string, TurnErrorState>>({})
   const activeTurnIdByThreadId = ref<Record<string, string>>({})
+  const runtimeOwnershipByThreadId = ref<Record<string, ThreadRuntimeOwnership>>({})
   const interruptBlockedUntilPersistedByThreadId = ref<Record<string, boolean>>({})
   const threadListedByServerById = ref<Record<string, boolean>>({})
   const persistedUserMessageByThreadId = ref<Record<string, boolean>>({})
@@ -1514,6 +1518,10 @@ export function useDesktopState() {
   let stopNotificationStream: (() => void) | null = null
   let eventSyncTimer: number | null = null
   let rateLimitRefreshTimer: number | null = null
+  let externalRuntimeTimer: number | null = null
+  let externalRuntimeGeneration = 0
+  let externalRuntimeRequest: Promise<void> | null = null
+  let externalRuntimePollingEnabled = true
   const delayedTurnSyncTimerByThreadId = new Map<string, number>()
   let loadThreadsPromise: Promise<void> | null = null
   const loadMessagePromiseByThreadId = new Map<string, Promise<void>>()
@@ -1546,6 +1554,10 @@ export function useDesktopState() {
   const selectedThread = computed(() =>
     allThreads.value.find((thread) => thread.id === selectedThreadId.value) ?? null,
   )
+  const selectedThreadRuntimeOwnership = computed<ThreadRuntimeOwnership>(() => {
+    const threadId = selectedThreadId.value
+    return threadId ? runtimeOwnershipByThreadId.value[threadId] ?? 'idle' : 'idle'
+  })
   const selectedThreadTerminalOpen = computed(() => {
     const threadId = selectedThreadId.value
     return Boolean(threadId && terminalOpenByThreadId.value[threadId] === true)
@@ -1679,6 +1691,7 @@ export function useDesktopState() {
 
   function setSelectedThreadId(nextThreadId: string, options: { persist?: boolean } = {}): void {
     if (selectedThreadId.value === nextThreadId) return
+    cancelExternalRuntimePolling()
     selectedThreadId.value = nextThreadId
     if (options.persist !== false) {
       saveSelectedThreadId(nextThreadId)
@@ -1690,6 +1703,9 @@ export function useDesktopState() {
     )
     activeReasoningItemId = ''
     shouldAutoScrollOnNextAgentEvent = false
+    if (runtimeOwnershipByThreadId.value[nextThreadId] === 'external') {
+      scheduleExternalRuntimePolling(nextThreadId)
+    }
   }
 
   function setSelectedModelIdForThread(threadId: string, modelId: string): void {
@@ -1887,6 +1903,7 @@ export function useDesktopState() {
         label: 'Thinking',
         details: buildPendingTurnDetails(MODEL_FALLBACK_ID, pending.effort, pending.collaborationMode),
       })
+      setThreadRuntimeOwnership(threadId, 'local')
       setThreadInProgress(threadId, true)
 
       if (resumedThreadById.value[threadId] !== true) {
@@ -1918,6 +1935,7 @@ export function useDesktopState() {
           ...activeTurnIdByThreadId.value,
           [threadId]: fallbackTurnId,
         }
+        setThreadRuntimeOwnership(threadId, 'local')
         maybeUnblockInterruptForActiveTurn(threadId, fallbackTurnId)
       }
 
@@ -1928,6 +1946,7 @@ export function useDesktopState() {
       const errorMessage = unknownError instanceof Error ? unknownError.message : 'Unknown application error'
       setTurnErrorForThread(threadId, errorMessage)
       error.value = errorMessage
+      setThreadRuntimeOwnership(threadId, 'idle')
       setThreadInProgress(threadId, false)
       setTurnActivityForThread(threadId, null)
     } finally {
@@ -2271,6 +2290,7 @@ export function useDesktopState() {
     turnActivityByThreadId.value = pruneThreadStateMap(turnActivityByThreadId.value, activeThreadIds)
     turnErrorByThreadId.value = pruneThreadStateMap(turnErrorByThreadId.value, activeThreadIds)
     activeTurnIdByThreadId.value = pruneThreadStateMap(activeTurnIdByThreadId.value, activeThreadIds)
+    runtimeOwnershipByThreadId.value = pruneThreadStateMap(runtimeOwnershipByThreadId.value, activeThreadIds)
     interruptBlockedUntilPersistedByThreadId.value = pruneThreadStateMap(
       interruptBlockedUntilPersistedByThreadId.value,
       activeThreadIds,
@@ -2374,6 +2394,75 @@ export function useDesktopState() {
         turnSummaryByThreadId.value = omitKey(turnSummaryByThreadId.value, threadId)
       }
     }
+  }
+
+  function cancelExternalRuntimePolling(): void {
+    externalRuntimeGeneration += 1
+    if (externalRuntimeTimer !== null && typeof window !== 'undefined') {
+      window.clearTimeout(externalRuntimeTimer)
+    }
+    externalRuntimeTimer = null
+  }
+
+  function scheduleExternalRuntimePolling(threadId: string): void {
+    if (!externalRuntimePollingEnabled || typeof window === 'undefined') return
+    if (!threadId || selectedThreadId.value !== threadId) return
+    if (runtimeOwnershipByThreadId.value[threadId] !== 'external') return
+    if (externalRuntimeTimer !== null || externalRuntimeRequest !== null) return
+
+    externalRuntimeTimer = window.setTimeout(() => {
+      externalRuntimeTimer = null
+      const generation = externalRuntimeGeneration
+      const request = pollExternalRuntime(threadId, generation)
+      externalRuntimeRequest = request
+      void request.finally(() => {
+        if (externalRuntimeRequest === request) {
+          externalRuntimeRequest = null
+        }
+        const selectedId = selectedThreadId.value
+        if (selectedId && runtimeOwnershipByThreadId.value[selectedId] === 'external') {
+          scheduleExternalRuntimePolling(selectedId)
+        }
+      })
+    }, EXTERNAL_RUNTIME_POLL_MS)
+  }
+
+  async function pollExternalRuntime(threadId: string, generation: number): Promise<void> {
+    try {
+      const runtime = await getThreadRuntimeState(threadId)
+      if (generation !== externalRuntimeGeneration) return
+      if (selectedThreadId.value !== threadId) return
+      if (runtimeOwnershipByThreadId.value[threadId] !== 'external') return
+
+      if (runtime.state !== 'idle') return
+
+      setThreadRuntimeOwnership(threadId, 'idle')
+      setThreadInProgress(threadId, false)
+      await loadMessages(threadId, { silent: true, force: true })
+    } catch {
+      // Unknown runtime state retains an already-established external lease.
+    }
+  }
+
+  function setThreadRuntimeOwnership(threadId: string, ownership: ThreadRuntimeOwnership): void {
+    if (!threadId) return
+    const currentOwnership = runtimeOwnershipByThreadId.value[threadId] ?? 'idle'
+    if (currentOwnership !== ownership) {
+      runtimeOwnershipByThreadId.value = ownership === 'idle'
+        ? omitKey(runtimeOwnershipByThreadId.value, threadId)
+        : { ...runtimeOwnershipByThreadId.value, [threadId]: ownership }
+    }
+
+    if (selectedThreadId.value !== threadId) return
+    if (ownership === 'external') {
+      scheduleExternalRuntimePolling(threadId)
+    } else if (currentOwnership === 'external' || ownership === 'local') {
+      cancelExternalRuntimePolling()
+    }
+  }
+
+  function isExternallyOwned(threadId: string): boolean {
+    return runtimeOwnershipByThreadId.value[threadId] === 'external'
   }
 
   function setThreadInProgress(threadId: string, nextInProgress: boolean): void {
@@ -3843,6 +3932,7 @@ export function useDesktopState() {
         ...activeTurnIdByThreadId.value,
         [startedTurn.threadId]: startedTurn.turnId,
       }
+      setThreadRuntimeOwnership(startedTurn.threadId, 'local')
       maybeUnblockInterruptForActiveTurn(startedTurn.threadId, startedTurn.turnId)
       clearLivePlansForThread(startedTurn.threadId)
       clearLiveFileChangesForThread(startedTurn.threadId)
@@ -3865,13 +3955,15 @@ export function useDesktopState() {
       completedThreadModelId !== MODEL_FALLBACK_ID &&
       isUnsupportedChatGptModelError(new Error(turnErrorMessage))
     const completionDisposition = completedTurn
-      ? resolveTurnCompletionDisposition(
-          completedTurn.status,
-          shouldRetryWithFallback,
-          completedTurn.threadId === selectedThreadId.value,
-          activeTurnIdByThreadId.value[completedTurn.threadId] ?? '',
-          completedTurn.turnId,
-        )
+      ? isExternallyOwned(completedTurn.threadId)
+        ? { ownsActiveLease: false, keepRunning: true, markUnread: false }
+        : resolveTurnCompletionDisposition(
+            completedTurn.status,
+            shouldRetryWithFallback,
+            completedTurn.threadId === selectedThreadId.value,
+            activeTurnIdByThreadId.value[completedTurn.threadId] ?? '',
+            completedTurn.turnId,
+          )
       : null
     if (completedTurn && completionDisposition) {
       const pendingTurnRequest = pendingTurnRequestByThreadId.value[completedTurn.threadId]
@@ -3897,6 +3989,7 @@ export function useDesktopState() {
         if (activeTurnIdByThreadId.value[completedTurn.threadId]) {
           activeTurnIdByThreadId.value = omitKey(activeTurnIdByThreadId.value, completedTurn.threadId)
         }
+        setThreadRuntimeOwnership(completedTurn.threadId, 'idle')
         clearDelayedTurnSync(completedTurn.threadId)
         if (!shouldRetryWithFallback && completedTurn.status !== 'completed') {
           suppressUnreadForNonSuccessCompletion(completedTurn.threadId)
@@ -4432,13 +4525,17 @@ export function useDesktopState() {
     await loadThreadsPromise
   }
 
-  async function loadMessages(threadId: string, options: { silent?: boolean } = {}) {
+  async function loadMessages(threadId: string, options: { silent?: boolean; force?: boolean } = {}) {
     if (!threadId) {
       return
     }
     const recentLoadFailure =
       Date.now() - (lastMessageLoadFailureAtByThreadId.get(threadId) ?? 0) < RECENT_THREAD_MESSAGE_LOAD_REUSE_MS
-    if (turnErrorByThreadId.value[threadId]?.transient && (options.silent === true || recentLoadFailure)) {
+    if (
+      options.force !== true &&
+      turnErrorByThreadId.value[threadId]?.transient &&
+      (options.silent === true || recentLoadFailure)
+    ) {
       return
     }
 
@@ -4461,6 +4558,7 @@ export function useDesktopState() {
       const loadedRecently =
         Date.now() - (lastMessageLoadAtByThreadId.get(threadId) ?? 0) < RECENT_THREAD_MESSAGE_LOAD_REUSE_MS
       const canReuseLoadedMessages =
+        options.force !== true &&
         alreadyLoaded &&
         (
           loadedRecently ||
@@ -4494,13 +4592,19 @@ export function useDesktopState() {
 
       const { messages: nextMessages, inProgress: serverInProgress, activeTurnId, turnIndexByTurnId } = detail
       const localActiveTurnId = activeTurnIdByThreadId.value[threadId] ?? ''
-      const retainLocalInProgress =
+      const retainLocal =
         localActiveTurnId.length > 0 ||
         (
           inProgressById.value[threadId] === true &&
           pendingTurnRequestByThreadId.value[threadId]?.fallbackRetried === true
         )
-      const inProgress = serverInProgress || retainLocalInProgress
+      const detailOwnership: ThreadRuntimeOwnership = detail.ownership === 'external'
+        ? 'external'
+        : detail.ownership === 'local' || serverInProgress
+          ? 'local'
+          : 'idle'
+      const ownership = retainLocal ? 'local' : detailOwnership
+      const inProgress = retainLocal || detail.inProgress
       hasMoreOlderMessagesByThreadId.value = {
         ...hasMoreOlderMessagesByThreadId.value,
         [threadId]: detail.hasMoreOlder === true,
@@ -4537,8 +4641,9 @@ export function useDesktopState() {
           [threadId]: version,
         }
       }
+      setThreadRuntimeOwnership(threadId, ownership)
       setThreadInProgress(threadId, inProgress)
-      if (activeTurnId) {
+      if (ownership === 'local' && activeTurnId) {
         activeTurnIdByThreadId.value = {
           ...activeTurnIdByThreadId.value,
           [threadId]: activeTurnId,
@@ -4929,7 +5034,8 @@ export function useDesktopState() {
 
     const threadId = selectedThreadId.value
     const nextText = text.trim()
-    if (!threadId || (!nextText && imageUrls.length === 0 && fileAttachments.length === 0)) return
+    if (!threadId || isExternallyOwned(threadId)) return
+    if (!nextText && imageUrls.length === 0 && fileAttachments.length === 0) return
 
     if (await maybeReplyToPendingUserInputRequest(threadId, nextText, imageUrls, skills, fileAttachments)) {
       return
@@ -5000,6 +5106,7 @@ export function useDesktopState() {
       },
     )
     setTurnErrorForThread(threadId, null)
+    setThreadRuntimeOwnership(threadId, 'local')
     setThreadInProgress(threadId, true)
 
     try {
@@ -5013,6 +5120,7 @@ export function useDesktopState() {
       )
     } catch (unknownError) {
       shouldAutoScrollOnNextAgentEvent = false
+      setThreadRuntimeOwnership(threadId, 'idle')
       setThreadInProgress(threadId, false)
       setTurnActivityForThread(threadId, null)
       const errorMessage = unknownError instanceof Error ? unknownError.message : 'Unknown application error'
@@ -5084,6 +5192,7 @@ export function useDesktopState() {
         },
       )
       setTurnErrorForThread(threadId, null)
+      setThreadRuntimeOwnership(threadId, 'local')
       setThreadInProgress(threadId, true)
       const capturedThreadId = threadId
       const capturedCwd = targetCwd || null
@@ -5091,6 +5200,7 @@ export function useDesktopState() {
       void startTurnForThread(threadId, nextText, imageUrls, skills, fileAttachments, selectedMode)
         .catch((unknownError) => {
           shouldAutoScrollOnNextAgentEvent = false
+          setThreadRuntimeOwnership(threadId, 'idle')
           setThreadInProgress(threadId, false)
           setTurnActivityForThread(threadId, null)
           const errorMessage = unknownError instanceof Error ? unknownError.message : 'Unknown application error'
@@ -5105,6 +5215,7 @@ export function useDesktopState() {
     } catch (unknownError) {
       shouldAutoScrollOnNextAgentEvent = false
       if (threadId) {
+        setThreadRuntimeOwnership(threadId, 'idle')
         setThreadInProgress(threadId, false)
         setTurnActivityForThread(threadId, null)
       }
@@ -5214,6 +5325,7 @@ export function useDesktopState() {
           ...activeTurnIdByThreadId.value,
           [threadId]: startedTurnId,
         }
+        setThreadRuntimeOwnership(threadId, 'local')
         maybeUnblockInterruptForActiveTurn(threadId, startedTurnId)
       }
 
@@ -5250,7 +5362,7 @@ export function useDesktopState() {
 
   async function interruptSelectedThreadTurn(): Promise<void> {
     const threadId = selectedThreadId.value
-    if (!threadId) return
+    if (!threadId || isExternallyOwned(threadId)) return
     if (inProgressById.value[threadId] !== true) return
     if (interruptBlockedUntilPersistedByThreadId.value[threadId] === true) return
     let turnId = activeTurnIdByThreadId.value[threadId]
@@ -5262,6 +5374,7 @@ export function useDesktopState() {
           ...activeTurnIdByThreadId.value,
           [threadId]: turnId,
         }
+        setThreadRuntimeOwnership(threadId, 'local')
       }
     }
     if (!turnId) {
@@ -5591,6 +5704,11 @@ export function useDesktopState() {
   function startPolling(): void {
     if (typeof window === 'undefined') return
 
+    externalRuntimePollingEnabled = true
+    const selectedId = selectedThreadId.value
+    if (selectedId && runtimeOwnershipByThreadId.value[selectedId] === 'external') {
+      scheduleExternalRuntimePolling(selectedId)
+    }
     if (stopNotificationStream) return
     void loadPendingServerRequestsFromBridge()
     stopNotificationStream = subscribeCodexNotifications((notification) => {
@@ -5631,6 +5749,8 @@ export function useDesktopState() {
   }
 
   function stopPolling(): void {
+    externalRuntimePollingEnabled = false
+    cancelExternalRuntimePolling()
     if (stopNotificationStream) {
       stopNotificationStream()
       stopNotificationStream = null
@@ -5689,7 +5809,7 @@ export function useDesktopState() {
 
   function removeQueuedMessage(messageId: string): void {
     const threadId = selectedThreadId.value
-    if (!threadId) return
+    if (!threadId || isExternallyOwned(threadId)) return
     const queue = queuedMessagesByThreadId.value[threadId]
     if (!queue) return
     const next = queue.filter((m) => m.id !== messageId)
@@ -5701,7 +5821,7 @@ export function useDesktopState() {
 
   function reorderQueuedMessage(draggedId: string, targetId: string): void {
     const threadId = selectedThreadId.value
-    if (!threadId) return
+    if (!threadId || isExternallyOwned(threadId)) return
     const queue = queuedMessagesByThreadId.value[threadId]
     if (!queue) return
 
@@ -5721,7 +5841,7 @@ export function useDesktopState() {
 
   function steerQueuedMessage(messageId: string): void {
     const threadId = selectedThreadId.value
-    if (!threadId) return
+    if (!threadId || isExternallyOwned(threadId)) return
     const queue = queuedMessagesByThreadId.value[threadId]
     if (!queue) return
     const msg = queue.find((m) => m.id === messageId)
@@ -5739,6 +5859,7 @@ export function useDesktopState() {
     projectGroups,
     projectDisplayNameById,
     selectedThread,
+    selectedThreadRuntimeOwnership,
     selectedThreadTokenUsage,
     selectedThreadTerminalOpen,
     isSelectedThreadInterruptPending,
