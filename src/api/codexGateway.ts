@@ -477,21 +477,23 @@ function readExternalRuntime(payload: ThreadReadResponse): ExternalThreadRuntime
 }
 
 export function readThreadDetailRuntime(payload: ThreadReadResponse): ThreadDetailRuntime {
+  const external = readExternalRuntime(payload)
   if (readThreadInProgressFromResponse(payload)) {
     return {
       inProgress: true,
       activeTurnId: readActiveTurnIdFromResponse(payload),
       ownership: 'local',
       canInterrupt: true,
+      externalRuntimeState: external.state,
     }
   }
-  const external = readExternalRuntime(payload)
   if (external.state === 'running') {
     return {
       inProgress: true,
       activeTurnId: external.turnId,
       ownership: 'external',
       canInterrupt: false,
+      externalRuntimeState: external.state,
     }
   }
   return {
@@ -499,6 +501,7 @@ export function readThreadDetailRuntime(payload: ThreadReadResponse): ThreadDeta
     activeTurnId: '',
     ownership: 'idle',
     canInterrupt: false,
+    externalRuntimeState: external.state,
   }
 }
 
@@ -841,6 +844,7 @@ async function getThreadDetailV2(threadId: string): Promise<{
   turnIndexByTurnId: ThreadTurnIndexById
   ownership: ThreadDetailRuntime['ownership']
   canInterrupt: boolean
+  externalRuntimeState: ThreadDetailRuntime['externalRuntimeState']
 }> {
   const payload = await callRpc<ThreadReadResponse>('thread/read', {
     threadId,
@@ -938,6 +942,7 @@ export async function getThreadDetail(threadId: string): Promise<{
   turnIndexByTurnId: ThreadTurnIndexById
   ownership: ThreadDetailRuntime['ownership']
   canInterrupt: boolean
+  externalRuntimeState: ThreadDetailRuntime['externalRuntimeState']
 }> {
   try {
     return await getThreadDetailV2(threadId)
@@ -1581,6 +1586,7 @@ export type ResumedThread = {
   turnIndexByTurnId: ThreadTurnIndexById
   ownership: ThreadDetailRuntime['ownership']
   canInterrupt: boolean
+  externalRuntimeState: ThreadDetailRuntime['externalRuntimeState']
 }
 
 const RESUME_THREAD_COALESCE_TTL_MS = 30_000

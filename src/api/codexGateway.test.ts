@@ -217,6 +217,7 @@ describe('getThreadDetail', () => {
       modelProvider: 'opencode_zen',
       ownership: 'idle',
       canInterrupt: false,
+      externalRuntimeState: 'unknown',
     })
   })
 
@@ -237,6 +238,23 @@ describe('getThreadDetail', () => {
       activeTurnId: 'turn-external',
       ownership: 'external',
       canInterrupt: false,
+      externalRuntimeState: 'running',
+    })
+  })
+
+  it('preserves inconclusive external runtime evidence without establishing ownership', () => {
+    const payload = runtimePayload({
+      id: 'thread-1',
+      turns: [],
+      externalRuntime: { state: 'unknown' },
+    })
+
+    expect(readThreadDetailRuntime(payload)).toEqual({
+      inProgress: false,
+      activeTurnId: '',
+      ownership: 'idle',
+      canInterrupt: false,
+      externalRuntimeState: 'unknown',
     })
   })
 
@@ -343,6 +361,7 @@ describe('resumeThread', () => {
       activeTurnId: 'turn-external',
       ownership: 'external',
       canInterrupt: false,
+      externalRuntimeState: 'running',
     })
   })
 })

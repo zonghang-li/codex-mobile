@@ -15,4 +15,5 @@ export type ThreadDetailRuntime = {
   activeTurnId: string
   ownership: ThreadRuntimeOwnership
   canInterrupt: boolean
+  externalRuntimeState: ExternalThreadRuntime['state']
 }

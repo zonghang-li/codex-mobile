@@ -1709,6 +1709,13 @@ export function useDesktopState() {
   }
 
   function setSelectedModelIdForThread(threadId: string, modelId: string): void {
+    const normalizedThreadId = threadId.trim()
+    if (
+      normalizedThreadId &&
+      normalizedThreadId === selectedThreadId.value.trim() &&
+      isExternallyOwned(normalizedThreadId)
+    ) return
+
     const normalizedModelId = modelId.trim()
     const contextId = toThreadContextId(threadId)
     const normalizedProviderId = normalizeProviderContextId(activeProviderId.value)
@@ -4541,8 +4548,18 @@ export function useDesktopState() {
 
     const existingLoad = loadMessagePromiseByThreadId.get(threadId)
     if (existingLoad) {
-      await existingLoad
-      return
+      try {
+        await existingLoad
+      } catch (existingLoadError) {
+        if (options.force !== true) throw existingLoadError
+      }
+      if (options.force !== true) return
+
+      const replacementLoad = loadMessagePromiseByThreadId.get(threadId)
+      if (replacementLoad && replacementLoad !== existingLoad) {
+        await replacementLoad
+        return
+      }
     }
 
     const alreadyLoaded = loadedMessagesByThreadId.value[threadId] === true
@@ -4603,8 +4620,17 @@ export function useDesktopState() {
         : detail.ownership === 'local' || serverInProgress
           ? 'local'
           : 'idle'
-      const ownership = retainLocal ? 'local' : detailOwnership
-      const inProgress = retainLocal || detail.inProgress
+      const retainEstablishedExternal =
+        !retainLocal &&
+        runtimeOwnershipByThreadId.value[threadId] === 'external' &&
+        detailOwnership === 'idle' &&
+        detail.externalRuntimeState === 'unknown'
+      const ownership = retainLocal
+        ? 'local'
+        : retainEstablishedExternal
+          ? 'external'
+          : detailOwnership
+      const inProgress = retainLocal || retainEstablishedExternal || detail.inProgress
       hasMoreOlderMessagesByThreadId.value = {
         ...hasMoreOlderMessagesByThreadId.value,
         [threadId]: detail.hasMoreOlder === true,
