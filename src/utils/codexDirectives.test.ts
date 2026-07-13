@@ -136,6 +136,16 @@ describe('parseCodexDirectiveText', () => {
     expect(parseCodexDirectiveText(source)).toEqual({ text: source, directives: [] })
   })
 
+  it('does not open a backtick fence when its info string contains a backtick', () => {
+    expect(parseCodexDirectiveText([
+      '```text`invalid',
+      '::git-stage{cwd="/tmp/repo"}',
+    ].join('\n'))).toEqual({
+      text: '```text`invalid',
+      directives: [{ kind: 'git-stage', cwd: '/tmp/repo' }],
+    })
+  })
+
   it('preserves prose before and after a recognized directive', () => {
     expect(parseCodexDirectiveText([
       'Before.',
@@ -162,6 +172,20 @@ describe('parseCodexDirectiveText', () => {
     expect(parseCodexDirectiveText('Done.\n::git-push{cwd="/tmp/repo"', {
       suppressIncompleteTrailingDirective: true,
     })).toEqual({ text: 'Done.', directives: [] })
+  })
+
+  it('does not treat a closing brace inside a quoted value as the directive closing brace', () => {
+    expect(parseCodexDirectiveText('Done.\n::git-push{cwd="/tmp/}repo"', {
+      suppressIncompleteTrailingDirective: true,
+    })).toEqual({ text: 'Done.', directives: [] })
+
+    expect(parseCodexDirectiveText(
+      'Done.\n::git-push{cwd="/tmp/}repo" branch="main"}',
+      { suppressIncompleteTrailingDirective: true },
+    )).toEqual({
+      text: 'Done.',
+      directives: [{ kind: 'git-push', cwd: '/tmp/}repo', branch: 'main' }],
+    })
   })
 
   it('does not withhold an incomplete unsupported directive in live mode', () => {

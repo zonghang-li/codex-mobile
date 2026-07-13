@@ -162,11 +162,37 @@ type FenceState = { marker: '`' | '~'; length: number }
 function readFenceRun(line: string): { marker: '`' | '~'; length: number; rest: string } | null {
   const match = /^ {0,3}(`{3,}|~{3,})(.*)$/u.exec(line)
   if (!match) return null
+  const marker = match[1][0] as '`' | '~'
+  const rest = match[2]
+  if (marker === '`' && rest.includes('`')) return null
   return {
-    marker: match[1][0] as '`' | '~',
+    marker,
     length: match[1].length,
-    rest: match[2],
+    rest,
   }
+}
+
+function hasStructuralClosingBrace(value: string): boolean {
+  let insideQuotes = false
+  let escaped = false
+
+  for (const character of value) {
+    if (escaped) {
+      escaped = false
+      continue
+    }
+    if (insideQuotes && character === '\\') {
+      escaped = true
+      continue
+    }
+    if (character === '"') {
+      insideQuotes = !insideQuotes
+      continue
+    }
+    if (!insideQuotes && character === '}') return true
+  }
+
+  return false
 }
 
 function isIncompleteSupportedDirective(line: string): boolean {
@@ -174,7 +200,10 @@ function isIncompleteSupportedDirective(line: string): boolean {
   if (!trimmed.startsWith('::')) return false
   return SUPPORTED_DIRECTIVE_NAMES.some((name) => {
     const opening = `::${name}{`
-    return opening.startsWith(trimmed) || (trimmed.startsWith(opening) && !trimmed.includes('}'))
+    return opening.startsWith(trimmed) || (
+      trimmed.startsWith(opening) &&
+      !hasStructuralClosingBrace(trimmed.slice(opening.length))
+    )
   })
 }
 
