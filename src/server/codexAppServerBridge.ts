@@ -895,7 +895,19 @@ export async function sanitizeThreadTurnsInlinePayloads(method: string, result: 
   }
 }
 
-type ThreadRuntimeProbe = Pick<ExternalThreadRuntimeProbe, 'registerThread' | 'inspect'>
+type ThreadRuntimeProbe = Pick<
+  ExternalThreadRuntimeProbe,
+  'registerThread' | 'inspect' | 'inspectMany'
+>
+
+function readRuntimeBatchThreadIds(value: unknown): string[] | null {
+  const body = asRecord(value)
+  if (!body || Object.keys(body).length !== 1 || !Array.isArray(body.threadIds)) return null
+  if (body.threadIds.length < 1 || body.threadIds.length > 50) return null
+  if (!body.threadIds.every((id) => typeof id === 'string' && id.trim() === id && id.length > 0)) return null
+  const ids = body.threadIds as string[]
+  return new Set(ids).size === ids.length ? ids : null
+}
 
 function readThreadResultInProgress(value: unknown): boolean {
   const thread = asRecord(value)
@@ -917,6 +929,17 @@ export async function augmentThreadResultWithExternalRuntime(
   runtimeProbe: ThreadRuntimeProbe,
   excludedPid: number | null,
 ): Promise<unknown> {
+  if (method === 'thread/list') {
+    const record = asRecord(result)
+    const rows = Array.isArray(record?.data) ? record.data : []
+    for (const row of rows) {
+      const thread = asRecord(row)
+      const threadId = readNonEmptyString(thread?.id)
+      const rolloutPath = readNonEmptyString(thread?.path)
+      if (threadId && rolloutPath) runtimeProbe.registerThread(threadId, rolloutPath)
+    }
+    return result
+  }
   if (method !== 'thread/read' && method !== 'thread/resume') return result
   const record = asRecord(result)
   const thread = asRecord(record?.thread)
@@ -7012,7 +7035,7 @@ export class BackendQueueProcessor {
 
   constructor(
     private readonly appServer: AppServerProcess,
-    private readonly runtimeProbe: ThreadRuntimeProbe | null = null,
+    private readonly runtimeProbe: Pick<ThreadRuntimeProbe, 'registerThread' | 'inspect'> | null = null,
   ) {
     this.unsubscribe = appServer.onNotification((notification) => {
       if (!isTurnCompletedNotification(notification)) return
@@ -7594,6 +7617,24 @@ export function createCodexBridgeMiddleware(options: {
           return
         }
         setJson(res, 200, await runtimeProbe.inspect(threadId, appServer.getPid()))
+        return
+      }
+
+      if (req.method === 'POST' && url.pathname === '/codex-api/thread-runtime-states') {
+        let payload: unknown
+        try {
+          payload = await readJsonBody(req)
+        } catch {
+          setJson(res, 400, { error: 'Invalid JSON body' })
+          return
+        }
+        const threadIds = readRuntimeBatchThreadIds(payload)
+        if (!threadIds) {
+          setJson(res, 400, { error: 'Expected 1-50 unique non-empty threadIds' })
+          return
+        }
+        const states = await runtimeProbe.inspectMany(threadIds, appServer.getPid())
+        setJson(res, 200, { states })
         return
       }
 

@@ -15,6 +15,12 @@ function fakeProbe(runtime: ExternalThreadRuntime) {
       _threadId: string,
       _excludedPid: number | null,
     ): Promise<ExternalThreadRuntime> => runtime),
+    inspectMany: vi.fn(async (
+      threadIds: readonly string[],
+      _excludedPid: number | null,
+    ): Promise<Record<string, ExternalThreadRuntime>> => Object.fromEntries(
+      threadIds.map((threadId) => [threadId, runtime]),
+    )),
   }
 }
 
@@ -84,39 +90,67 @@ describe('external thread runtime bridge augmentation', () => {
     expect(probe.inspect).not.toHaveBeenCalled()
     expect(payload.thread).not.toHaveProperty('externalRuntime')
   })
+
+  it('registers thread-list rollout paths without inspecting them', async () => {
+    const probe = fakeProbe({ state: 'idle' })
+    const payload = {
+      data: [
+        { id: 'thread-a', path: '/sessions/a.jsonl' },
+        { id: 'thread-b', path: '/sessions/b.jsonl' },
+        { id: '', path: '/sessions/invalid.jsonl' },
+      ],
+    }
+
+    await expect(augmentThreadResultWithExternalRuntime(
+      'thread/list', payload, probe, 4242,
+    )).resolves.toBe(payload)
+    expect(probe.registerThread.mock.calls).toEqual([
+      ['thread-a', '/sessions/a.jsonl'],
+      ['thread-b', '/sessions/b.jsonl'],
+    ])
+    expect(probe.inspect).not.toHaveBeenCalled()
+    expect(probe.inspectMany).not.toHaveBeenCalled()
+  })
 })
 
-describe('GET /codex-api/thread-runtime-state', () => {
-  const disposers: Array<() => void> = []
+const disposers: Array<() => void> = []
 
-  afterEach(() => {
-    for (const dispose of disposers.splice(0)) dispose()
-    vi.restoreAllMocks()
-  })
+afterEach(() => {
+  for (const dispose of disposers.splice(0)) dispose()
+  vi.restoreAllMocks()
+})
 
-  function sharedBridgeForTest() {
-    return (globalThis as typeof globalThis & {
-      __codexRemoteSharedBridge__: {
-        runtimeProbe: { inspect: (threadId: string, excludedPid: number | null) => Promise<ExternalThreadRuntime> }
-        appServer: { getPid: () => number | null }
+function sharedBridgeForTest() {
+  return (globalThis as typeof globalThis & {
+    __codexRemoteSharedBridge__: {
+      runtimeProbe: {
+        inspect: (threadId: string, excludedPid: number | null) => Promise<ExternalThreadRuntime>
+        inspectMany: (
+          threadIds: readonly string[],
+          excludedPid: number | null,
+        ) => Promise<Record<string, ExternalThreadRuntime>>
       }
-    }).__codexRemoteSharedBridge__
-  }
+      appServer: { getPid: () => number | null }
+    }
+  }).__codexRemoteSharedBridge__
+}
 
-  async function listenWithMiddleware(middleware: ReturnType<typeof createCodexBridgeMiddleware>) {
-    const server = createServer((req, res) => {
-      void middleware(req, res, () => {
-        res.statusCode = 404
-        res.end()
-      })
+async function listenWithMiddleware(middleware: ReturnType<typeof createCodexBridgeMiddleware>) {
+  const server = createServer((req, res) => {
+    void middleware(req, res, () => {
+      res.statusCode = 404
+      res.end()
     })
-    disposers.push(() => {
-      middleware.dispose()
-      server.close()
-    })
-    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve))
-    return (server.address() as AddressInfo).port
-  }
+  })
+  disposers.push(() => {
+    middleware.dispose()
+    server.close()
+  })
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve))
+  return (server.address() as AddressInfo).port
+}
+
+describe('GET /codex-api/thread-runtime-state', () => {
 
   it('returns a successful runtime payload and excludes the mobile child PID', async () => {
     const middleware = createCodexBridgeMiddleware()
@@ -166,5 +200,89 @@ describe('GET /codex-api/thread-runtime-state', () => {
 
     expect(response.status).toBe(400)
     await expect(response.json()).resolves.toEqual({ error: 'Missing threadId' })
+  })
+})
+
+describe('POST /codex-api/thread-runtime-states', () => {
+  it('returns runtime states for a validated batch and excludes the mobile child PID', async () => {
+    const middleware = createCodexBridgeMiddleware()
+    const shared = sharedBridgeForTest()
+    vi.spyOn(shared.appServer, 'getPid').mockReturnValue(4242)
+    const inspectMany = vi.spyOn(shared.runtimeProbe, 'inspectMany').mockResolvedValue({
+      'thread-a': {
+        state: 'running',
+        turnId: 'turn-a',
+        interruptible: false,
+        source: 'external-session-writer',
+      },
+      'thread-b': { state: 'idle' },
+    })
+    const port = await listenWithMiddleware(middleware)
+
+    const response = await fetch(`http://127.0.0.1:${port}/codex-api/thread-runtime-states`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ threadIds: ['thread-a', 'thread-b'] }),
+    })
+
+    expect(response.status).toBe(200)
+    await expect(response.json()).resolves.toEqual({
+      states: {
+        'thread-a': {
+          state: 'running',
+          turnId: 'turn-a',
+          interruptible: false,
+          source: 'external-session-writer',
+        },
+        'thread-b': { state: 'idle' },
+      },
+    })
+    expect(inspectMany).toHaveBeenCalledWith(['thread-a', 'thread-b'], 4242)
+  })
+
+  it.each([
+    ['null body', null],
+    ['missing threadIds', {}],
+    ['empty threadIds', { threadIds: [] }],
+    ['more than 50 threadIds', { threadIds: Array.from({ length: 51 }, (_, index) => `thread-${index}`) }],
+    ['duplicate threadIds', { threadIds: ['thread-a', 'thread-a'] }],
+    ['empty threadId', { threadIds: [''] }],
+    ['whitespace threadId', { threadIds: [' thread-a'] }],
+    ['non-string threadId', { threadIds: [123] }],
+    ['extra body property', { threadIds: ['thread-a'], extra: true }],
+  ])('rejects %s without inspecting runtimes', async (_label, payload) => {
+    const middleware = createCodexBridgeMiddleware()
+    const shared = sharedBridgeForTest()
+    const inspectMany = vi.spyOn(shared.runtimeProbe, 'inspectMany')
+    const port = await listenWithMiddleware(middleware)
+
+    const response = await fetch(`http://127.0.0.1:${port}/codex-api/thread-runtime-states`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    })
+
+    expect(response.status).toBe(400)
+    expect(inspectMany).not.toHaveBeenCalled()
+  })
+
+  it('applies route security policy before invoking the batch runtime handler', async () => {
+    const isRouteDisabled = vi.fn(() => true)
+    const middleware = createCodexBridgeMiddleware({
+      securityPolicy: { ...PERMISSIVE_SECURITY_POLICY, isRouteDisabled, backgroundIntegrationsEnabled: false },
+    })
+    const shared = sharedBridgeForTest()
+    const inspectMany = vi.spyOn(shared.runtimeProbe, 'inspectMany')
+    const port = await listenWithMiddleware(middleware)
+
+    const response = await fetch(`http://127.0.0.1:${port}/codex-api/thread-runtime-states`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ threadIds: ['thread-a'] }),
+    })
+
+    expect(response.status).toBe(403)
+    expect(isRouteDisabled).toHaveBeenCalledWith('POST', '/codex-api/thread-runtime-states')
+    expect(inspectMany).not.toHaveBeenCalled()
   })
 })
