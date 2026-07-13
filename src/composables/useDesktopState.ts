@@ -3830,7 +3830,7 @@ export function useDesktopState() {
 
     const notificationThreadId = extractThreadIdFromNotification(notification)
     const notificationErrorState = readNotificationErrorState(notification)
-    if (!notificationErrorState && notificationThreadId) {
+    if (!notificationErrorState && notificationThreadId && notification.method !== 'turn/completed') {
       clearTransientTurnErrorForThread(notificationThreadId)
     }
 
@@ -3864,7 +3864,16 @@ export function useDesktopState() {
       Boolean(turnErrorMessage) &&
       completedThreadModelId !== MODEL_FALLBACK_ID &&
       isUnsupportedChatGptModelError(new Error(turnErrorMessage))
-    if (completedTurn) {
+    const completionDisposition = completedTurn
+      ? resolveTurnCompletionDisposition(
+          completedTurn.status,
+          shouldRetryWithFallback,
+          completedTurn.threadId === selectedThreadId.value,
+          activeTurnIdByThreadId.value[completedTurn.threadId] ?? '',
+          completedTurn.turnId,
+        )
+      : null
+    if (completedTurn && completionDisposition) {
       const pendingTurnRequest = pendingTurnRequestByThreadId.value[completedTurn.threadId]
       const startedTurnState = pendingTurnStartsById.get(completedTurn.turnId)
       if (startedTurnState) {
@@ -3880,45 +3889,44 @@ export function useDesktopState() {
         (startedTurnState ? completedTurn.completedAtMs - startedTurnState.startedAtMs : null)
 
       const durationMs = typeof rawDurationMs === 'number' ? Math.max(0, rawDurationMs) : 0
-      setTurnSummaryForThread(completedTurn.threadId, {
-        turnId: completedTurn.turnId,
-        durationMs,
-      })
-      if (activeTurnIdByThreadId.value[completedTurn.threadId]) {
-        activeTurnIdByThreadId.value = omitKey(activeTurnIdByThreadId.value, completedTurn.threadId)
-      }
-      clearDelayedTurnSync(completedTurn.threadId)
-      const disposition = resolveTurnCompletionDisposition(
-        completedTurn.status,
-        shouldRetryWithFallback,
-        completedTurn.threadId === selectedThreadId.value,
-      )
-      if (!shouldRetryWithFallback && completedTurn.status !== 'completed') {
-        suppressUnreadForNonSuccessCompletion(completedTurn.threadId)
-      }
-      if (!disposition.keepRunning) {
-        setThreadInProgress(completedTurn.threadId, false)
-        setTurnActivityForThread(completedTurn.threadId, null)
-      }
-      if (disposition.markUnread) {
-        markThreadUnreadByEvent(completedTurn.threadId)
-      }
-      if (!shouldRetryWithFallback) {
-        clearPendingTurnRequest(completedTurn.threadId)
-        scheduleQueueStateRefresh(completedTurn.threadId)
+      if (completionDisposition.ownsActiveLease) {
+        setTurnSummaryForThread(completedTurn.threadId, {
+          turnId: completedTurn.turnId,
+          durationMs,
+        })
+        if (activeTurnIdByThreadId.value[completedTurn.threadId]) {
+          activeTurnIdByThreadId.value = omitKey(activeTurnIdByThreadId.value, completedTurn.threadId)
+        }
+        clearDelayedTurnSync(completedTurn.threadId)
+        if (!shouldRetryWithFallback && completedTurn.status !== 'completed') {
+          suppressUnreadForNonSuccessCompletion(completedTurn.threadId)
+        }
+        if (!completionDisposition.keepRunning) {
+          setThreadInProgress(completedTurn.threadId, false)
+          setTurnActivityForThread(completedTurn.threadId, null)
+        }
+        if (completionDisposition.markUnread) {
+          markThreadUnreadByEvent(completedTurn.threadId)
+        }
+        if (!shouldRetryWithFallback) {
+          clearPendingTurnRequest(completedTurn.threadId)
+          scheduleQueueStateRefresh(completedTurn.threadId)
+        }
       }
     }
 
     if (turnErrorMessage) {
       const failedThreadId = completedTurn?.threadId || extractThreadIdFromNotification(notification)
-      if (failedThreadId) {
-        setTurnErrorForThread(failedThreadId, turnErrorMessage)
+      if (completionDisposition?.ownsActiveLease !== false) {
+        if (failedThreadId) {
+          setTurnErrorForThread(failedThreadId, turnErrorMessage)
+        }
+        error.value = turnErrorMessage
+        if (failedThreadId && shouldRetryWithFallback) {
+          void retryPendingTurnWithFallback(failedThreadId)
+        }
       }
-      error.value = turnErrorMessage
-      if (failedThreadId && shouldRetryWithFallback) {
-        void retryPendingTurnWithFallback(failedThreadId)
-      }
-    } else if (completedTurn) {
+    } else if (completedTurn && completionDisposition?.ownsActiveLease) {
       setTurnErrorForThread(completedTurn.threadId, null)
     }
 
@@ -4046,7 +4054,7 @@ export function useDesktopState() {
       clearLiveReasoningForThread(notificationThreadId)
     }
 
-    if (notification.method === 'turn/completed') {
+    if (notification.method === 'turn/completed' && completionDisposition?.ownsActiveLease !== false) {
       activeReasoningItemId = ''
       shouldAutoScrollOnNextAgentEvent = false
       clearLiveReasoningForThread(notificationThreadId)
@@ -4485,9 +4493,8 @@ export function useDesktopState() {
       }
 
       const { messages: nextMessages, inProgress: serverInProgress, activeTurnId, turnIndexByTurnId } = detail
-      const retainLocalInProgress =
-        inProgressById.value[threadId] === true &&
-        pendingTurnRequestByThreadId.value[threadId]?.fallbackRetried === true
+      const localActiveTurnId = activeTurnIdByThreadId.value[threadId] ?? ''
+      const retainLocalInProgress = localActiveTurnId.length > 0
       const inProgress = serverInProgress || retainLocalInProgress
       hasMoreOlderMessagesByThreadId.value = {
         ...hasMoreOlderMessagesByThreadId.value,

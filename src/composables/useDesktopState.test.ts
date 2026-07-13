@@ -659,6 +659,70 @@ describe('startup request deduplication', () => {
 })
 
 describe('turn completion lifecycle', () => {
+  it('retains an event-established turn across a lagging idle detail', async () => {
+    const { state, emit } = await setupTurnLifecycleNotificationState('thread-1')
+    gatewayMocks.resumeThread.mockResolvedValue({
+      messages: [], inProgress: false, activeTurnId: '', hasMoreOlder: false, turnIndexByTurnId: {},
+    })
+    gatewayMocks.interruptThreadTurn.mockRejectedValue(new Error('expected stop probe'))
+
+    emit({ method: 'turn/started', params: { threadId: 'thread-1', turn: { id: 'turn-a' } } })
+    await state.loadMessages('thread-1', { silent: true })
+
+    expect(state.projectGroups.value[0]?.threads[0]?.inProgress).toBe(true)
+    await state.interruptSelectedThreadTurn()
+    expect(gatewayMocks.interruptThreadTurn).toHaveBeenCalledWith('thread-1', 'turn-a')
+  })
+
+  it('ignores an older completion while a newer turn owns the running lease', async () => {
+    const { state, emit } = await setupTurnLifecycleNotificationState('thread-1')
+    gatewayMocks.interruptThreadTurn.mockRejectedValue(new Error('expected stop probe'))
+    emit({ method: 'turn/started', params: { threadId: 'thread-1', turn: { id: 'turn-a' } } })
+    emit({ method: 'turn/started', params: { threadId: 'thread-1', turn: { id: 'turn-b' } } })
+    emit({
+      method: 'turn/completed',
+      params: { threadId: 'thread-1', turn: { id: 'turn-a', status: 'failed', error: { message: 'stale failure' } } },
+    })
+
+    expect(state.projectGroups.value[0]?.threads[0]).toMatchObject({ inProgress: true, unread: false })
+    expect(state.messages.value.some((message) => message.messageType === 'worked')).toBe(false)
+    expect(state.selectedLiveOverlay.value?.errorText).toBe('')
+    await state.interruptSelectedThreadTurn()
+    expect(gatewayMocks.interruptThreadTurn).toHaveBeenCalledWith('thread-1', 'turn-b')
+
+    emit({ method: 'turn/completed', params: { threadId: 'thread-1', turn: { id: 'turn-b', status: 'completed' } } })
+    expect(state.projectGroups.value[0]?.threads[0]?.inProgress).toBe(false)
+  })
+
+  it('preserves the current turn error when an older turn completes', async () => {
+    const { state, emit } = await setupTurnLifecycleNotificationState('thread-1')
+    emit({ method: 'turn/started', params: { threadId: 'thread-1', turn: { id: 'turn-a' } } })
+    emit({ method: 'turn/started', params: { threadId: 'thread-1', turn: { id: 'turn-b' } } })
+    emit({
+      method: 'error',
+      params: { threadId: 'thread-1', message: 'current transient error', willRetry: true },
+    })
+
+    emit({
+      method: 'turn/completed',
+      params: { threadId: 'thread-1', turn: { id: 'turn-a', status: 'failed', error: { message: 'stale failure' } } },
+    })
+
+    expect(state.selectedLiveOverlay.value?.errorText).toBe('current transient error')
+  })
+
+  it.each([
+    [true, 'turn-server', true],
+    [false, '', false],
+  ])('uses backend running=%s when no local lease exists', async (serverInProgress, activeTurnId, expected) => {
+    const { state } = await setupTurnLifecycleNotificationState('thread-1')
+    gatewayMocks.resumeThread.mockResolvedValue({
+      messages: [], inProgress: serverInProgress, activeTurnId, hasMoreOlder: false, turnIndexByTurnId: {},
+    })
+    await state.loadMessages('thread-1', { silent: true })
+    expect(state.projectGroups.value[0]?.threads[0]?.inProgress).toBe(expected)
+  })
+
   it('keeps a thread running and unread false while fallback retry starts', async () => {
     const { state, emit } = await setupTurnLifecycleNotificationState('thread-1')
     gatewayMocks.resumeThread.mockResolvedValue({
