@@ -26,6 +26,51 @@ function threadReadResponseWithContent(content: ThreadReadResponse['thread']['tu
 }
 
 describe('normalizeThreadMessagesV2', () => {
+  it('extracts persisted Codex directives from assistant messages only', () => {
+    const response = threadReadResponseWithContent([
+      {
+        type: 'agentMessage',
+        id: 'assistant-1',
+        text: 'Done.\n\n::git-push{cwd="/tmp/repo" branch="main"}',
+      },
+      {
+        type: 'userMessage',
+        id: 'user-1',
+        content: [{
+          type: 'text',
+          text: '::git-push{cwd="/tmp/repo" branch="user-content"}',
+          text_elements: [],
+        }],
+      },
+    ])
+
+    const messages = normalizeThreadMessagesV2(response)
+    expect(messages[0]).toMatchObject({
+      text: 'Done.',
+      directives: [{ kind: 'git-push', branch: 'main' }],
+    })
+    expect(messages[1]).toMatchObject({
+      text: '::git-push{cwd="/tmp/repo" branch="user-content"}',
+    })
+    expect(messages[1].directives).toBeUndefined()
+  })
+
+  it('preserves directive-only assistant messages as structured messages', () => {
+    const messages = normalizeThreadMessagesV2(threadReadResponseWithContent([{
+      type: 'agentMessage',
+      id: 'assistant-directive-only',
+      text: '::git-stage{cwd="/tmp/repo"}',
+    }]))
+
+    expect(messages).toEqual([expect.objectContaining({
+      id: 'assistant-directive-only',
+      role: 'assistant',
+      text: '',
+      directives: [{ kind: 'git-stage', cwd: '/tmp/repo' }],
+      messageType: 'agentMessage',
+    })])
+  })
+
   it('preserves selected skill inputs on the rendered user message', () => {
     const messages = normalizeThreadMessagesV2(threadReadResponseWithContent([{
       type: 'userMessage',

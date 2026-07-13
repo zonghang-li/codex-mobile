@@ -18,6 +18,7 @@ import type {
   UiThread,
 } from '../../types/codex'
 import { normalizePathForComparison, normalizePathForUi, toProjectName } from '../../pathUtils.js'
+import { parseCodexDirectiveText } from '../../utils/codexDirectives'
 
 function toIso(seconds: number): string {
   return new Date(seconds * 1000).toISOString()
@@ -401,11 +402,13 @@ export function toUiFileChanges(changes: unknown): UiFileChange[] {
 
 function toUiMessages(item: ThreadItem): UiMessage[] {
   if (item.type === 'agentMessage') {
+    const parsed = parseCodexDirectiveText(typeof item.text === 'string' ? item.text : '')
     return [
       {
         id: item.id,
         role: 'assistant',
-        text: item.text,
+        text: parsed.text,
+        directives: parsed.directives.length > 0 ? parsed.directives : undefined,
         messageType: item.type,
       },
     ]

@@ -48,6 +48,7 @@ import type {
   ReasoningEffort,
   SpeedMode,
   UiFileChange,
+  UiCodexDirective,
   UiLiveOverlay,
   UiMessage,
   UiPlanData,
@@ -62,6 +63,7 @@ import type {
 } from '../types/codex'
 import type { ThreadRuntimeOwnership } from '../types/threadRuntime'
 import { getPathParent, isProjectlessChatPath, normalizePathForUi, toProjectName } from '../pathUtils.js'
+import { parseCodexDirectiveText } from '../utils/codexDirectives'
 import { resolveTurnCompletionDisposition, type TurnTerminalStatus } from './threadLifecycle'
 
 function flattenThreads(groups: UiProjectGroup[]): UiThread[] {
@@ -630,6 +632,17 @@ function arePlanDataEqual(first?: UiPlanData, second?: UiPlanData): boolean {
   )
 }
 
+function areCodexDirectivesEqual(
+  first?: UiCodexDirective[],
+  second?: UiCodexDirective[],
+): boolean {
+  if (!first && !second) return true
+  if (!first || !second || first.length !== second.length) return false
+  return first.every((directive, index) =>
+    JSON.stringify(directive) === JSON.stringify(second[index]),
+  )
+}
+
 function isUnsupportedChatGptModelError(error: unknown): boolean {
   if (!(error instanceof Error)) return false
   const message = error.message.toLowerCase()
@@ -645,6 +658,7 @@ function areMessageFieldsEqual(first: UiMessage, second: UiMessage): boolean {
     first.id === second.id &&
     first.role === second.role &&
     first.text === second.text &&
+    areCodexDirectivesEqual(first.directives, second.directives) &&
     areStringArraysEqual(first.images, second.images) &&
     areUiFileChangesEqual(first.fileChanges, second.fileChanges) &&
     first.fileChangeStatus === second.fileChangeStatus &&
@@ -772,15 +786,11 @@ function removeRedundantLiveAgentMessages(previous: UiMessage[], incoming: UiMes
       .filter((text) => text.length > 0),
   )
 
-  if (incomingAssistantTexts.size === 0) {
-    return previous
-  }
-
   const next = previous.filter((message) => {
     if (message.messageType !== 'agentMessage.live') return true
     if (incomingMessageIds.has(message.id)) return false
     const normalized = normalizeMessageText(message.text)
-    if (normalized.length === 0) return false
+    if (normalized.length === 0) return (message.directives?.length ?? 0) > 0
     return !incomingAssistantTexts.has(normalized)
   })
 
@@ -1401,6 +1411,7 @@ export function useDesktopState() {
   const persistedMessagesByThreadId = ref<Record<string, UiMessage[]>>({})
   const livePlanMessagesByThreadId = ref<Record<string, UiMessage[]>>({})
   const liveAgentMessagesByThreadId = ref<Record<string, UiMessage[]>>({})
+  const liveAgentRawTextByThreadId = new Map<string, Map<string, string>>()
   const liveReasoningTextByThreadId = ref<Record<string, string>>({})
   const liveCommandsByThreadId = ref<Record<string, UiMessage[]>>({})
   const liveFileChangeMessagesByThreadId = ref<Record<string, UiMessage[]>>({})
@@ -2299,6 +2310,7 @@ export function useDesktopState() {
     resumedThreadById.value = pruneThreadStateMap(resumedThreadById.value, activeThreadIds)
     turnIndexByTurnIdByThreadId.value = pruneThreadStateMap(turnIndexByTurnIdByThreadId.value, activeThreadIds)
     persistedMessagesByThreadId.value = pruneThreadStateMap(persistedMessagesByThreadId.value, activeThreadIds)
+    pruneLiveAgentRawText(activeThreadIds)
     liveAgentMessagesByThreadId.value = pruneThreadStateMap(liveAgentMessagesByThreadId.value, activeThreadIds)
     liveReasoningTextByThreadId.value = pruneThreadStateMap(liveReasoningTextByThreadId.value, activeThreadIds)
     liveCommandsByThreadId.value = pruneThreadStateMap(liveCommandsByThreadId.value, activeThreadIds)
@@ -2722,6 +2734,41 @@ export function useDesktopState() {
     setPersistedMessagesForThread(threadId, [...existing, nextMessage])
   }
 
+  function readLiveAgentRawText(threadId: string, messageId: string, fallback: string): string {
+    const threadMessages = liveAgentRawTextByThreadId.get(threadId)
+    return threadMessages?.has(messageId) ? threadMessages.get(messageId) ?? '' : fallback
+  }
+
+  function writeLiveAgentRawText(threadId: string, messageId: string, text: string): void {
+    let threadMessages = liveAgentRawTextByThreadId.get(threadId)
+    if (!threadMessages) {
+      threadMessages = new Map<string, string>()
+      liveAgentRawTextByThreadId.set(threadId, threadMessages)
+    }
+    threadMessages.set(messageId, text)
+  }
+
+  function clearLiveAgentRawText(threadId: string, messageId: string): void {
+    const threadMessages = liveAgentRawTextByThreadId.get(threadId)
+    if (!threadMessages) return
+    threadMessages.delete(messageId)
+    if (threadMessages.size === 0) {
+      liveAgentRawTextByThreadId.delete(threadId)
+    }
+  }
+
+  function clearLiveAgentRawTextForThread(threadId: string): void {
+    liveAgentRawTextByThreadId.delete(threadId)
+  }
+
+  function pruneLiveAgentRawText(activeThreadIds: Set<string>): void {
+    for (const threadId of liveAgentRawTextByThreadId.keys()) {
+      if (!activeThreadIds.has(threadId)) {
+        liveAgentRawTextByThreadId.delete(threadId)
+      }
+    }
+  }
+
   function setLiveAgentMessagesForThread(threadId: string, nextMessages: UiMessage[]): void {
     const previous = liveAgentMessagesByThreadId.value[threadId] ?? []
     if (areMessageArraysEqual(previous, nextMessages)) return
@@ -2733,6 +2780,7 @@ export function useDesktopState() {
 
   function clearLiveAgentMessagesForThread(threadId: string): void {
     if (!threadId) return
+    clearLiveAgentRawTextForThread(threadId)
     if (!(threadId in liveAgentMessagesByThreadId.value)) return
     liveAgentMessagesByThreadId.value = omitKey(liveAgentMessagesByThreadId.value, threadId)
   }
@@ -3697,10 +3745,12 @@ export function useDesktopState() {
       const id = readString(item.id)
       const text = readString(item.text)
       if (!id || !text) return null
+      const parsed = parseCodexDirectiveText(text)
       return {
         id,
         role: 'assistant',
-        text,
+        text: parsed.text,
+        directives: parsed.directives.length > 0 ? parsed.directives : undefined,
         messageType: 'agentMessage.live',
       }
     }
@@ -4106,11 +4156,21 @@ export function useDesktopState() {
     if (liveAgentMessageDelta) {
       const existing = (liveAgentMessagesByThreadId.value[notificationThreadId] ?? [])
         .find((message) => message.id === liveAgentMessageDelta.messageId)
-      const nextText = `${existing?.text ?? ''}${liveAgentMessageDelta.delta}`
+      const previousRawText = readLiveAgentRawText(
+        notificationThreadId,
+        liveAgentMessageDelta.messageId,
+        existing?.text ?? '',
+      )
+      const nextRawText = `${previousRawText}${liveAgentMessageDelta.delta}`
+      writeLiveAgentRawText(notificationThreadId, liveAgentMessageDelta.messageId, nextRawText)
+      const parsed = parseCodexDirectiveText(nextRawText, {
+        suppressIncompleteTrailingDirective: true,
+      })
       upsertLiveAgentMessage(notificationThreadId, {
         id: liveAgentMessageDelta.messageId,
         role: 'assistant',
-        text: nextText,
+        text: parsed.text,
+        directives: parsed.directives.length > 0 ? parsed.directives : undefined,
         messageType: 'agentMessage.live',
       })
     }
@@ -4118,6 +4178,7 @@ export function useDesktopState() {
     const completedAgentMessage = readAgentMessageCompleted(notification)
     if (completedAgentMessage) {
       upsertLiveAgentMessage(notificationThreadId, completedAgentMessage)
+      clearLiveAgentRawText(notificationThreadId, completedAgentMessage.id)
     }
 
     const completedImageView = readCompletedImageView(notification)
@@ -5853,6 +5914,7 @@ export function useDesktopState() {
     persistedMessagesByThreadId.value = {}
     livePlanMessagesByThreadId.value = {}
     liveAgentMessagesByThreadId.value = {}
+    liveAgentRawTextByThreadId.clear()
     liveReasoningTextByThreadId.value = {}
     liveCommandsByThreadId.value = {}
     liveFileChangeMessagesByThreadId.value = {}

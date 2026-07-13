@@ -204,10 +204,28 @@ export type UiPlanData = {
   isStreaming?: boolean
 }
 
+export type UiCodexDirective =
+  | { kind: 'git-stage'; cwd: string }
+  | { kind: 'git-commit'; cwd: string }
+  | { kind: 'git-create-branch'; cwd: string; branch: string }
+  | { kind: 'git-push'; cwd: string; branch: string }
+  | { kind: 'git-create-pr'; cwd: string; branch: string; url: string; isDraft: boolean }
+  | { kind: 'created-thread'; threadId?: string; clientThreadId?: string }
+  | {
+      kind: 'code-comment'
+      title: string
+      body: string
+      file: string
+      start?: number
+      end?: number
+      priority?: number
+    }
+
 export type UiMessage = {
   id: string
   role: 'user' | 'assistant' | 'system'
   text: string
+  directives?: UiCodexDirective[]
   images?: string[]
   skills?: Array<{ name: string; path: string }>
   fileAttachments?: UiFileAttachment[]
