@@ -7,7 +7,21 @@ describe('external thread runtime read-only wiring', () => {
 
     expect(appSource).toContain(':runtime-ownership="selectedThreadRuntimeOwnership"')
     expect(appSource).toContain(':disabled="selectedThreadRuntimeOwnership === \'external\'"')
+    expect(appSource).toContain(':read-only="selectedThreadRuntimeOwnership === \'external\'"')
     expect(appSource).toMatch(/function onEditQueuedMessage\(messageId: string\): void \{\n  if \(selectedThreadRuntimeOwnership\.value === 'external'\) return/u)
+  })
+
+  it('hides conversation mutations and disables pending responses while externally owned', async () => {
+    const conversationSource = await readFile(new URL('./ThreadConversation.vue', import.meta.url), 'utf8')
+    const pendingRequestSource = await readFile(new URL('./ThreadPendingRequestPanel.vue', import.meta.url), 'utf8')
+
+    expect(conversationSource).toContain('readOnly?: boolean')
+    expect(conversationSource).toMatch(/function showEditMessageButton\(message: UiMessage\): boolean \{\n  if \(props\.readOnly\) return false/u)
+    expect(conversationSource).toMatch(/async function runFileChangeAction\(summary: TurnFileChangeSummary \| null, action: 'undo' \| 'redo'\): Promise<void> \{\n  if \(props\.readOnly\) return/u)
+    expect(conversationSource).toMatch(/function implementPlan\(message: UiMessage\): void \{\n  if \(props\.readOnly\) return/u)
+    expect(pendingRequestSource).toContain('disabled?: boolean')
+    expect(pendingRequestSource).toContain('<fieldset')
+    expect(pendingRequestSource).toContain(':disabled="disabled"')
   })
 
   it('makes an externally owned composer read-only while retaining a labelled stop control', async () => {

@@ -2449,8 +2449,6 @@ export function useDesktopState() {
 
       if (runtime.state !== 'idle') return
 
-      setThreadRuntimeOwnership(threadId, 'idle')
-      setThreadInProgress(threadId, false)
       await loadMessages(threadId, { silent: true, force: true })
     } catch {
       // Unknown runtime state retains an already-established external lease.
@@ -5443,7 +5441,7 @@ export function useDesktopState() {
 
   async function rollbackSelectedThread(turnId: string): Promise<void> {
     const threadId = selectedThreadId.value
-    if (!threadId) return
+    if (!threadId || isExternallyOwned(threadId)) return
     if (isRollingBack.value) return
     if (!turnId.trim()) return
 
@@ -5779,6 +5777,8 @@ export function useDesktopState() {
   }
 
   async function respondToPendingServerRequest(reply: UiServerRequestReply): Promise<boolean> {
+    const threadId = selectedThreadId.value
+    if (threadId && isExternallyOwned(threadId)) return false
     try {
       await replyToServerRequest(reply.id, {
         result: reply.result,

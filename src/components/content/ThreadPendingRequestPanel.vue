@@ -1,6 +1,7 @@
 <template>
   <section v-if="request" class="thread-pending-request">
-    <article
+    <fieldset
+      :disabled="disabled"
       class="thread-pending-request-shell"
       :class="{ 'thread-pending-request-shell--no-top-radius': hasQueueAbove }"
     >
@@ -229,7 +230,7 @@
           </button>
         </section>
       </template>
-    </article>
+    </fieldset>
   </section>
 </template>
 
@@ -275,6 +276,7 @@ const props = defineProps<{
   request: UiServerRequest | null
   requestCount?: number
   hasQueueAbove?: boolean
+  disabled?: boolean
 }>()
 
 const emit = defineEmits<{
@@ -990,6 +992,8 @@ function onRejectUnknownRequest(request: UiServerRequest): void {
 
 .thread-pending-request-shell {
   @apply w-full rounded-[1.75rem] border border-zinc-700 bg-zinc-900 px-4 py-4 sm:px-5 sm:py-4 text-zinc-100 shadow-xl;
+  min-width: 0;
+  margin: 0;
 }
 
 .thread-pending-request-shell--no-top-radius {

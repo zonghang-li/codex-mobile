@@ -980,6 +980,7 @@
                 <div class="content-thread">
                   <ThreadConversation ref="threadConversationRef" :messages="filteredMessages" :is-loading="isLoadingMessages"
                     :active-thread-id="composerThreadContextId" :cwd="composerCwd"
+                    :read-only="selectedThreadRuntimeOwnership === 'external'"
                     :live-overlay="liveOverlay"
                     :pending-requests="selectedThreadServerRequests"
                     :has-more-persisted-above="hasMoreOlderMessages"
@@ -1016,6 +1017,7 @@
                   <ThreadPendingRequestPanel
                     v-if="selectedThreadPendingRequest"
                     :request="selectedThreadPendingRequest"
+                    :disabled="selectedThreadRuntimeOwnership === 'external'"
                     :request-count="selectedThreadServerRequests.length"
                     :has-queue-above="selectedThreadQueuedMessages.length > 0"
                     @respond-server-request="onRespondServerRequest"

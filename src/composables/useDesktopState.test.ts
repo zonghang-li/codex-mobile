@@ -1229,6 +1229,52 @@ describe('external runtime ownership', () => {
     ]))
   })
 
+  it('keeps the external lease until a delayed terminal detail refresh completes', async () => {
+    const { state } = await setupExternalRuntimeState()
+    const terminalDetail = deferred<ReturnType<typeof idleDetail>>()
+    gatewayMocks.resumeThread.mockResolvedValue(externalDetail())
+    gatewayMocks.getThreadRuntimeState.mockResolvedValue({ state: 'idle' })
+    gatewayMocks.getThreadDetail.mockReturnValue(terminalDetail.promise)
+    gatewayMocks.startThreadTurn.mockResolvedValue('turn-follow-up')
+    await state.loadMessages('thread-1')
+
+    await vi.advanceTimersByTimeAsync(2_000)
+    await flushMicrotasks()
+    expect(gatewayMocks.getThreadDetail).toHaveBeenCalledWith('thread-1')
+
+    const blockedSend = state.sendMessageToSelectedThread('must wait for terminal detail')
+    await flushMicrotasks()
+    expect(gatewayMocks.startThreadTurn).not.toHaveBeenCalled()
+    expect(state.selectedThreadRuntimeOwnership.value).toBe('external')
+
+    terminalDetail.resolve(idleDetail())
+    await flushMicrotasks()
+    await blockedSend
+    expect(state.selectedThreadRuntimeOwnership.value).toBe('idle')
+
+    void state.sendMessageToSelectedThread('safe follow-up')
+    await flushMicrotasks()
+    expect(gatewayMocks.startThreadTurn).toHaveBeenCalledTimes(1)
+  })
+
+  it('does not let a delayed terminal detail clear a newer local lease', async () => {
+    const { state, emit } = await setupExternalRuntimeState()
+    const terminalDetail = deferred<ReturnType<typeof idleDetail>>()
+    gatewayMocks.resumeThread.mockResolvedValue(externalDetail())
+    gatewayMocks.getThreadRuntimeState.mockResolvedValue({ state: 'idle' })
+    gatewayMocks.getThreadDetail.mockReturnValue(terminalDetail.promise)
+    await state.loadMessages('thread-1')
+
+    await vi.advanceTimersByTimeAsync(2_000)
+    await flushMicrotasks()
+    emit({ method: 'turn/started', params: { threadId: 'thread-1', turn: { id: 'turn-new-local' } } })
+    terminalDetail.resolve(idleDetail())
+    await flushMicrotasks()
+
+    expect(state.selectedThreadRuntimeOwnership.value).toBe('local')
+    expect(state.selectedThread.value?.inProgress).toBe(true)
+  })
+
   it('runs a fresh forced detail request after an existing stale load settles', async () => {
     const { state } = await setupExternalRuntimeState()
     const staleLoad = deferred<ReturnType<typeof externalDetail>>()
@@ -1393,8 +1439,20 @@ describe('external runtime ownership', () => {
     await flushMicrotasks()
     emit({ method: 'turn/completed', params: { threadId: 'thread-1', turn: { id: 'turn-local', status: 'completed' } } })
     await flushMicrotasks()
-    gatewayMocks.resumeThread.mockResolvedValue(externalDetail())
+    gatewayMocks.resumeThread.mockResolvedValue({
+      ...externalDetail(),
+      messages: [{
+        id: 'external-user-message',
+        role: 'user',
+        text: 'external prompt',
+        turnId: 'turn-external',
+        turnIndex: 0,
+      }],
+    })
     gatewayMocks.startThreadTurn.mockResolvedValue('turn-local')
+    gatewayMocks.revertThreadFileChanges.mockResolvedValue({ success: true })
+    gatewayMocks.rollbackThread.mockResolvedValue([])
+    gatewayMocks.replyToServerRequest.mockResolvedValue(undefined)
     await state.loadMessages('thread-1')
     const queueBeforeMutations = state.selectedThreadQueuedMessages.value.map((message) => message.id)
     const persistenceCallsBeforeMutations = gatewayMocks.setThreadQueueState.mock.calls.length
@@ -1405,13 +1463,45 @@ describe('external runtime ownership', () => {
     state.removeQueuedMessage('queued-1')
     state.reorderQueuedMessage('queued-1', 'queued-2')
     state.steerQueuedMessage('queued-1')
+    await state.rollbackSelectedThread('turn-external')
+    const replied = await state.respondToPendingServerRequest({ id: 99, result: {} })
     await flushMicrotasks()
 
     expect(gatewayMocks.interruptThreadTurn).not.toHaveBeenCalled()
     expect(gatewayMocks.getThreadDetail).not.toHaveBeenCalled()
     expect(gatewayMocks.startThreadTurn).not.toHaveBeenCalled()
+    expect(gatewayMocks.revertThreadFileChanges).not.toHaveBeenCalled()
+    expect(gatewayMocks.rollbackThread).not.toHaveBeenCalled()
+    expect(gatewayMocks.replyToServerRequest).not.toHaveBeenCalled()
+    expect(replied).toBe(false)
     expect(state.selectedThreadQueuedMessages.value.map((message) => message.id)).toEqual(queueBeforeMutations)
     expect(gatewayMocks.setThreadQueueState).toHaveBeenCalledTimes(persistenceCallsBeforeMutations)
+  })
+
+  it('keeps rollback and pending-request replies available for an idle selected thread', async () => {
+    const { state } = await setupExternalRuntimeState()
+    gatewayMocks.resumeThread.mockResolvedValue({
+      ...idleDetail(),
+      messages: [{
+        id: 'idle-user-message',
+        role: 'user',
+        text: 'editable prompt',
+        turnId: 'turn-idle',
+        turnIndex: 0,
+      }],
+    })
+    gatewayMocks.revertThreadFileChanges.mockResolvedValue({ success: true })
+    gatewayMocks.rollbackThread.mockResolvedValue([])
+    gatewayMocks.replyToServerRequest.mockResolvedValue(undefined)
+    await state.loadMessages('thread-1')
+
+    await state.rollbackSelectedThread('turn-idle')
+    const replied = await state.respondToPendingServerRequest({ id: 101, result: {} })
+
+    expect(gatewayMocks.revertThreadFileChanges).toHaveBeenCalledWith('thread-1', 'turn-idle', '/tmp/project')
+    expect(gatewayMocks.rollbackThread).toHaveBeenCalledWith('thread-1', 1)
+    expect(gatewayMocks.replyToServerRequest).toHaveBeenCalledWith(101, { result: {}, error: undefined })
+    expect(replied).toBe(true)
   })
 
   it('guards user-facing model setters while preserving server detail reconciliation', async () => {

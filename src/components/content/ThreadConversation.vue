@@ -185,7 +185,7 @@
                         </span>
                       </li>
                     </ul>
-                    <div v-if="isFileChangeActionable(readStandaloneFileChangeSummary(message))" class="file-change-actions">
+                    <div v-if="!readOnly && isFileChangeActionable(readStandaloneFileChangeSummary(message))" class="file-change-actions">
                       <p v-if="fileChangeActionErrorText(readStandaloneFileChangeSummary(message))" class="file-change-action-error">
                         {{ fileChangeActionErrorText(readStandaloneFileChangeSummary(message)) }}
                       </p>
@@ -679,7 +679,7 @@
                         </span>
                       </li>
                     </ul>
-                    <div v-if="isFileChangeActionable(readAnchoredFileChangeSummary(message))" class="file-change-actions">
+                    <div v-if="!readOnly && isFileChangeActionable(readAnchoredFileChangeSummary(message))" class="file-change-actions">
                       <p v-if="fileChangeActionErrorText(readAnchoredFileChangeSummary(message))" class="file-change-action-error">
                         {{ fileChangeActionErrorText(readAnchoredFileChangeSummary(message)) }}
                       </p>
@@ -1058,13 +1058,15 @@ function buildPlanMessageText(explanation: string, steps: UiPlanStep[]): string 
 }
 
 function showImplementPlanButton(message: UiMessage): boolean {
-  return isPlanMessage(message)
+  return !props.readOnly
+    && isPlanMessage(message)
     && message.messageType !== 'plan.live'
     && message.role === 'assistant'
     && Boolean(message.turnId)
 }
 
 function implementPlan(message: UiMessage): void {
+  if (props.readOnly) return
   const turnId = message.turnId?.trim() ?? ''
   if (!turnId) return
   emit('implementPlan', { turnId })
@@ -1332,6 +1334,7 @@ const props = defineProps<{
   isLoading: boolean
   activeThreadId: string
   cwd: string
+  readOnly?: boolean
   hasMorePersistedAbove?: boolean
   isLoadingPersistedAbove?: boolean
   loadEarlierMessages?: (threadId: string) => Promise<void>
@@ -2056,6 +2059,7 @@ function fileChangeActionLabel(summary: TurnFileChangeSummary | null): string {
 }
 
 async function runFileChangeAction(summary: TurnFileChangeSummary | null, action: 'undo' | 'redo'): Promise<void> {
+  if (props.readOnly) return
   const key = fileChangeActionKey(summary)
   if (!summary || !key || !props.activeThreadId || !props.cwd) return
   const previousState = fileChangeActionStatus(summary)
@@ -2398,10 +2402,12 @@ const editableTurnIdByMessageId = computed<Record<string, string>>(() => {
 })
 
 function showEditMessageButton(message: UiMessage): boolean {
+  if (props.readOnly) return false
   return typeof editableTurnIdByMessageId.value[message.id] === 'string'
 }
 
 function editMessage(messageId: string): void {
+  if (props.readOnly) return
   const turnId = editableTurnIdByMessageId.value[messageId]
   if (!turnId) return
   emit('rollback', { turnId })
