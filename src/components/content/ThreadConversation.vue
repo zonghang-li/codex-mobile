@@ -442,7 +442,14 @@
                     </blockquote>
                     <ul v-else-if="block.kind === 'unorderedList'" class="message-list message-list-unordered">
                       <li v-for="(item, itemIndex) in block.items" :key="`ul-${blockIndex}-${itemIndex}`" class="message-list-item">
-                        <div class="message-list-item-content" v-html="renderListItemContentAsHtml(item)" />
+                        <div class="message-list-item-content">
+                          <MessageBlockRenderer
+                            :item="item"
+                            :render-inline-html="renderInlineSegmentsAsHtml"
+                            :render-block-html="renderMessageBlockAsHtml"
+                            :render-highlighted-code-html="renderCachedHighlightedCodeAsHtml"
+                          />
+                        </div>
                       </li>
                     </ul>
                     <ul v-else-if="block.kind === 'taskList'" class="message-list message-task-list">
@@ -485,7 +492,14 @@
                       :start="block.start"
                     >
                       <li v-for="(item, itemIndex) in block.items" :key="`ol-${blockIndex}-${itemIndex}`" class="message-list-item">
-                        <div class="message-list-item-content" v-html="renderListItemContentAsHtml(item)" />
+                        <div class="message-list-item-content">
+                          <MessageBlockRenderer
+                            :item="item"
+                            :render-inline-html="renderInlineSegmentsAsHtml"
+                            :render-block-html="renderMessageBlockAsHtml"
+                            :render-highlighted-code-html="renderCachedHighlightedCodeAsHtml"
+                          />
+                        </div>
                       </li>
                     </ol>
                     <div v-else-if="block.kind === 'table'" class="message-table-wrap">
@@ -569,8 +583,10 @@
                       </table>
                     </div>
                     <div v-else-if="block.kind === 'codeBlock'" class="message-code-block">
-                      <div v-if="block.language" class="message-code-language">{{ block.language }}</div>
-                      <pre class="message-code-pre"><code class="hljs" v-html="renderCachedHighlightedCodeAsHtml(block.language, block.value)"></code></pre>
+                      <CopyableOutputBlock :copy-text="block.value" label="Copy code block">
+                        <div v-if="block.language" class="message-code-language">{{ block.language }}</div>
+                        <pre class="message-code-pre"><code class="hljs" v-html="renderCachedHighlightedCodeAsHtml(block.language, block.value)"></code></pre>
+                      </CopyableOutputBlock>
                     </div>
                     <hr v-else-if="block.kind === 'thematicBreak'" class="message-divider" />
                     <p v-else-if="isMarkdownImageFailed(message.id, blockIndex)" class="message-text">{{ block.markdown }}</p>
@@ -736,12 +752,7 @@
           <div class="message-stack">
             <article class="live-overlay-inline" aria-live="polite">
               <p class="live-overlay-label">{{ liveOverlay.activityLabel }}</p>
-              <p
-                v-if="liveOverlay.reasoningText"
-                class="live-overlay-reasoning"
-              >
-                {{ liveOverlay.reasoningText }}
-              </p>
+              <p v-if="liveOverlay.reasoningText" class="live-overlay-reasoning">{{ liveOverlay.reasoningText }}</p>
               <div v-if="liveOverlay.errorText" class="live-overlay-error">
                 <span>{{ liveOverlay.errorText }}</span>
                 <a class="live-overlay-feedback" :href="feedbackMailto" @click="prepareLiveErrorFeedback($event, liveOverlay.errorText)">Send feedback</a>
@@ -928,7 +939,10 @@ import {
   filterRenderableThreadMessages,
   latestThreadRenderWindowStart,
 } from './threadConversationWindow'
+import type { ListItem, MessageBlock, TableAlignment, TaskListItem } from './messageBlockTypes'
 
+import CopyableOutputBlock from './CopyableOutputBlock.vue'
+import MessageBlockRenderer from './MessageBlockRenderer.vue'
 import IconTablerArrowBackUp from '../icons/IconTablerArrowBackUp.vue'
 import IconTablerArrowUp from '../icons/IconTablerArrowUp.vue'
 import IconTablerCopy from '../icons/IconTablerCopy.vue'
@@ -1366,27 +1380,6 @@ type InlineSegment =
   | { kind: 'code'; value: string }
   | { kind: 'url'; value: string; href: string }
   | { kind: 'file'; value: string; path: string; displayPath: string; downloadName: string }
-type TaskListItem = {
-  text: string
-  checked: boolean
-}
-type TableAlignment = 'left' | 'center' | 'right' | null
-type ListItem = {
-  paragraphs: string[]
-  children?: MessageBlock[]
-}
-type MessageBlock =
-  | { kind: 'paragraph'; value: string }
-  | { kind: 'heading'; level: number; value: string }
-  | { kind: 'blockquote'; value: string }
-  | { kind: 'unorderedList'; items: ListItem[] }
-  | { kind: 'taskList'; items: TaskListItem[] }
-  | { kind: 'orderedList'; items: ListItem[]; start: number }
-  | { kind: 'table'; headers: string[]; rows: string[][]; alignments: TableAlignment[] }
-  | { kind: 'codeBlock'; language: string; value: string }
-  | { kind: 'thematicBreak' }
-  | { kind: 'image'; url: string; alt: string; markdown: string }
-
 let conversationScrollFrame = 0
 let bottomLockFrame = 0
 let bottomLockFramesLeft = 0

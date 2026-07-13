@@ -1,5 +1,5 @@
 import { execFile } from 'node:child_process'
-import { chmod, mkdtemp, readFile, writeFile } from 'node:fs/promises'
+import { chmod, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -32,6 +32,8 @@ describe('local installation packaging', () => {
   it('keeps plaintext passwords out of the restartable systemd unit', async () => {
     const unit = await readRepoFile('packaging/systemd/codex-mobile-safe.service.in')
     expect(unit).toContain('Restart=on-failure')
+    expect(unit).toContain('--sandbox-mode danger-full-access')
+    expect(unit).toContain('--approval-policy never')
     expect(unit).toContain('--password-file %h/.codex/codex-mobile-safe-password')
     expect(unit).toContain('--no-open')
     expect(unit).not.toMatch(/--password(?:=|\s)/u)
@@ -43,6 +45,63 @@ describe('local installation packaging', () => {
     expect(unit).not.toContain('--ntfy-url-file')
     expect(unit).not.toContain('NTFY_')
     expect(unit).not.toMatch(/^Environment=/mu)
+  })
+
+  it('renders the installed safe unit and password through the isolated installer path', async () => {
+    const temporaryRoot = await mkdtemp(join(tmpdir(), 'codex-mobile-service-test-'))
+    try {
+      const homeDirectory = join(temporaryRoot, 'home')
+      const configDirectory = join(temporaryRoot, 'config')
+      const prefix = join(temporaryRoot, 'prefix')
+      const binDirectory = join(temporaryRoot, 'bin')
+      const commandLog = join(temporaryRoot, 'commands.log')
+      await execFileAsync('mkdir', ['-p', binDirectory])
+
+      const commandStub = '#!/bin/sh\nprintf "%s\\n" "$0 $*" >> "$COMMAND_LOG"\nexit 0\n'
+      const stubCommands = ['pnpm', 'npm', 'systemd-analyze', 'systemctl', 'loginctl']
+      await Promise.all(stubCommands.map(async (command) => {
+        const path = join(binDirectory, command)
+        await writeFile(path, commandStub)
+        await chmod(path, 0o755)
+      }))
+
+      await execFileAsync('sh', [fileURLToPath(new URL('../../scripts/install-user-service.sh', import.meta.url))], {
+        env: {
+          ...process.env,
+          PATH: `${binDirectory}:${process.env.PATH ?? ''}`,
+          HOME: homeDirectory,
+          XDG_CONFIG_HOME: configDirectory,
+          PREFIX: prefix,
+          CODEX_MOBILE_PREFIX: '',
+          CODEX_MOBILE_SERVICE_INSTALL_TEST_MODE: '1',
+          COMMAND_LOG: commandLog,
+          USER: 'codex-mobile-test',
+        },
+      })
+
+      const unitPath = join(configDirectory, 'systemd/user/codex-mobile-safe.service')
+      const passwordPath = join(homeDirectory, '.codex/codex-mobile-safe-password')
+      const unit = await readFile(unitPath, 'utf8')
+      const repoRoot = fileURLToPath(new URL('../..', import.meta.url)).replace(/\/$/u, '')
+      const expectedExecStart = `ExecStart=${prefix}/bin/codex-mobile-safe start ${repoRoot} --port 5900 --password-file %h/.codex/codex-mobile-safe-password --no-open --no-login --sandbox-mode danger-full-access --approval-policy never`
+
+      expect(unit).not.toMatch(/@[A-Z_]+@/u)
+      expect(unit.split('\n')).toContain(expectedExecStart)
+      expect(unit).toContain('--port 5900')
+      expect(unit).toContain('--password-file %h/.codex/codex-mobile-safe-password')
+      expect(unit).toContain('--sandbox-mode danger-full-access')
+      expect(unit).toContain('--approval-policy never')
+      expect(unit).toContain('UMask=0077')
+      expect(unit).not.toMatch(/--password(?:=|\s)/u)
+      expect(unit).not.toContain('--lan')
+      expect(unit.toLowerCase()).not.toContain('cloudflared')
+      expect(unit.toLowerCase()).not.toContain('funnel')
+      expect((await stat(unitPath)).mode & 0o777).toBe(0o600)
+      expect((await stat(passwordPath)).mode & 0o777).toBe(0o600)
+      expect((await readFile(commandLog, 'utf8').catch(() => '')).trim()).toBe('')
+    } finally {
+      await rm(temporaryRoot, { force: true, recursive: true })
+    }
   })
 
   it('installs from the current clone and verifies the user unit', async () => {

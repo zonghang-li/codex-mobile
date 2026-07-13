@@ -1,8 +1,8 @@
 import { delimiter, resolve } from 'node:path'
 
 export type ExternalExposure = 'disabled' | 'tailscale'
-export type SafeSandboxMode = 'read-only' | 'workspace-write'
-export type SafeApprovalPolicy = 'untrusted' | 'on-failure' | 'on-request'
+export type SafeSandboxMode = 'read-only' | 'workspace-write' | 'danger-full-access'
+export type SafeApprovalPolicy = 'untrusted' | 'on-failure' | 'on-request' | 'never'
 
 export type SafeRuntimeConfig = {
   bindHost: string
@@ -57,14 +57,31 @@ function readAllowedRoots(value: string | undefined): string[] {
 }
 
 function readSandboxMode(value: string | undefined): SafeSandboxMode {
-  return value?.trim().toLowerCase() === 'read-only' ? 'read-only' : DEFAULT_SAFE_RUNTIME_CONFIG.sandboxMode
+  const normalized = value?.trim().toLowerCase()
+  return normalized === 'read-only' || normalized === 'danger-full-access'
+    ? normalized
+    : DEFAULT_SAFE_RUNTIME_CONFIG.sandboxMode
 }
 
 function readApprovalPolicy(value: string | undefined): SafeApprovalPolicy {
   const normalized = value?.trim().toLowerCase()
-  return normalized === 'untrusted' || normalized === 'on-failure' || normalized === 'on-request'
+  return normalized === 'untrusted' || normalized === 'on-failure' || normalized === 'on-request' || normalized === 'never'
     ? normalized
     : DEFAULT_SAFE_RUNTIME_CONFIG.approvalPolicy
+}
+
+export function parseSafeSandboxMode(value: string | undefined): SafeSandboxMode {
+  const normalized = value?.trim().toLowerCase()
+  if (!normalized || normalized === 'workspace-write') return 'workspace-write'
+  if (normalized === 'read-only' || normalized === 'danger-full-access') return normalized
+  throw new Error(`Invalid safe sandbox mode: ${value}`)
+}
+
+export function parseSafeApprovalPolicy(value: string | undefined): SafeApprovalPolicy {
+  const normalized = value?.trim().toLowerCase()
+  if (!normalized || normalized === 'on-request') return 'on-request'
+  if (normalized === 'untrusted' || normalized === 'on-failure' || normalized === 'never') return normalized
+  throw new Error(`Invalid safe approval policy: ${value}`)
 }
 
 export function loadSafeRuntimeConfig(env: NodeJS.ProcessEnv = process.env): SafeRuntimeConfig {

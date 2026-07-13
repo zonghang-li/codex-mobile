@@ -60,6 +60,7 @@ import type {
   UiThread,
 } from '../types/codex'
 import { getPathParent, isProjectlessChatPath, normalizePathForUi, toProjectName } from '../pathUtils.js'
+import { resolveTurnCompletionDisposition, type TurnTerminalStatus } from './threadLifecycle'
 
 function flattenThreads(groups: UiProjectGroup[]): UiThread[] {
   return groups.flatMap((group) => group.threads)
@@ -829,6 +830,7 @@ type TurnStartedInfo = {
 type TurnCompletedInfo = {
   threadId: string
   turnId: string
+  status: TurnTerminalStatus
   completedAtMs: number
   startedAtMs?: number
 }
@@ -1537,6 +1539,7 @@ export function useDesktopState() {
   let shouldAutoScrollOnNextAgentEvent = false
   const pendingTurnStartsById = new Map<string, TurnStartedInfo>()
   const fallbackRetryInFlightThreadIds = new Set<string>()
+  const nonSuccessCompletionReadBaselineByThreadId = new Map<string, string>()
 
 
   const allThreads = computed(() => flattenThreads(projectGroups.value))
@@ -1900,7 +1903,7 @@ export function useDesktopState() {
         }
       }
 
-      await startThreadTurn(
+      const fallbackTurnId = await startThreadTurn(
         threadId,
         pending.text,
         pending.imageUrls,
@@ -1910,6 +1913,13 @@ export function useDesktopState() {
         pending.fileAttachments,
         pending.collaborationMode,
       )
+      if (fallbackTurnId) {
+        activeTurnIdByThreadId.value = {
+          ...activeTurnIdByThreadId.value,
+          [threadId]: fallbackTurnId,
+        }
+        maybeUnblockInterruptForActiveTurn(threadId, fallbackTurnId)
+      }
 
       scheduleRateLimitRefresh()
       pendingThreadMessageRefresh.add(threadId)
@@ -2298,6 +2308,55 @@ export function useDesktopState() {
       eventUnreadByThreadId.value = omitKey(eventUnreadByThreadId.value, threadId)
     }
     applyThreadFlags()
+  }
+
+  function suppressUnreadForNonSuccessCompletion(threadId: string): void {
+    const thread = flattenThreads(sourceGroups.value).find((row) => row.id === threadId)
+    const currentUpdatedAtIso = thread?.updatedAtIso ?? ''
+    if (currentUpdatedAtIso) {
+      readStateByThreadId.value = {
+        ...readStateByThreadId.value,
+        [threadId]: currentUpdatedAtIso,
+      }
+      saveReadStateMap(readStateByThreadId.value)
+    }
+    nonSuccessCompletionReadBaselineByThreadId.set(threadId, currentUpdatedAtIso)
+  }
+
+  function syncNonSuccessCompletionReadWatermarks(
+    incomingGroups: UiProjectGroup[],
+    activeThreadIds: Set<string>,
+  ): void {
+    if (nonSuccessCompletionReadBaselineByThreadId.size === 0) return
+
+    let nextReadState = readStateByThreadId.value
+    let readStateChanged = false
+    for (const thread of flattenThreads(incomingGroups)) {
+      const baseline = nonSuccessCompletionReadBaselineByThreadId.get(thread.id)
+      if (baseline === undefined) continue
+      const summaryAdvanced = baseline
+        ? isThreadUpdatedAfterCutoff(thread.updatedAtIso, baseline)
+        : Boolean(thread.updatedAtIso)
+      if (!summaryAdvanced) continue
+      if (nextReadState[thread.id] !== thread.updatedAtIso) {
+        nextReadState = {
+          ...nextReadState,
+          [thread.id]: thread.updatedAtIso,
+        }
+        readStateChanged = true
+      }
+      nonSuccessCompletionReadBaselineByThreadId.delete(thread.id)
+    }
+
+    for (const threadId of nonSuccessCompletionReadBaselineByThreadId.keys()) {
+      if (!activeThreadIds.has(threadId)) {
+        nonSuccessCompletionReadBaselineByThreadId.delete(threadId)
+      }
+    }
+    if (readStateChanged) {
+      readStateByThreadId.value = nextReadState
+      saveReadStateMap(nextReadState)
+    }
   }
 
   function setTurnSummaryForThread(threadId: string, summary: TurnSummaryState | null): void {
@@ -3335,6 +3394,7 @@ export function useDesktopState() {
     return {
       threadId,
       turnId,
+      status: readString(turnPayload?.status),
       completedAtMs,
       startedAtMs,
     }
@@ -3776,6 +3836,7 @@ export function useDesktopState() {
 
     const startedTurn = readTurnStartedInfo(notification)
     if (startedTurn) {
+      nonSuccessCompletionReadBaselineByThreadId.delete(startedTurn.threadId)
       pendingTurnStartsById.set(startedTurn.turnId, startedTurn)
       setTurnIndexForThread(startedTurn.threadId, startedTurn.turnId, inferNextTurnIndex(startedTurn.threadId))
       activeTurnIdByThreadId.value = {
@@ -3826,9 +3887,22 @@ export function useDesktopState() {
       if (activeTurnIdByThreadId.value[completedTurn.threadId]) {
         activeTurnIdByThreadId.value = omitKey(activeTurnIdByThreadId.value, completedTurn.threadId)
       }
-      setThreadInProgress(completedTurn.threadId, false)
-      setTurnActivityForThread(completedTurn.threadId, null)
-      markThreadUnreadByEvent(completedTurn.threadId)
+      clearDelayedTurnSync(completedTurn.threadId)
+      const disposition = resolveTurnCompletionDisposition(
+        completedTurn.status,
+        shouldRetryWithFallback,
+        completedTurn.threadId === selectedThreadId.value,
+      )
+      if (!shouldRetryWithFallback && completedTurn.status !== 'completed') {
+        suppressUnreadForNonSuccessCompletion(completedTurn.threadId)
+      }
+      if (!disposition.keepRunning) {
+        setThreadInProgress(completedTurn.threadId, false)
+        setTurnActivityForThread(completedTurn.threadId, null)
+      }
+      if (disposition.markUnread) {
+        markThreadUnreadByEvent(completedTurn.threadId)
+      }
       if (!shouldRetryWithFallback) {
         clearPendingTurnRequest(completedTurn.threadId)
         scheduleQueueStateRefresh(completedTurn.threadId)
@@ -3978,17 +4052,6 @@ export function useDesktopState() {
       clearLiveReasoningForThread(notificationThreadId)
       if (liveCommandsByThreadId.value[notificationThreadId]) {
         liveCommandsByThreadId.value = omitKey(liveCommandsByThreadId.value, notificationThreadId)
-      }
-      const completedThreadId = extractThreadIdFromNotification(notification)
-      if (completedThreadId) {
-        clearDelayedTurnSync(completedThreadId)
-        setThreadInProgress(completedThreadId, false)
-        setTurnActivityForThread(completedThreadId, null)
-        markThreadUnreadByEvent(completedThreadId)
-        if (!shouldRetryWithFallback) {
-          clearPendingTurnRequest(completedThreadId)
-          scheduleQueueStateRefresh(completedThreadId)
-        }
       }
     }
 
@@ -4169,9 +4232,11 @@ export function useDesktopState() {
       inProgressById.value,
     )
     sourceGroups.value = mergeThreadGroups(sourceGroups.value, mergedWithInProgress)
+    const activeThreadIds = new Set(flattenThreads(sourceGroups.value).map((thread) => thread.id))
+    syncNonSuccessCompletionReadWatermarks(orderedGroups, activeThreadIds)
     inProgressById.value = pruneThreadStateMap(
       inProgressById.value,
-      new Set(flattenThreads(sourceGroups.value).map((thread) => thread.id)),
+      activeThreadIds,
     )
     applyThreadFlags()
   }
@@ -4419,7 +4484,11 @@ export function useDesktopState() {
         }
       }
 
-      const { messages: nextMessages, inProgress, activeTurnId, turnIndexByTurnId } = detail
+      const { messages: nextMessages, inProgress: serverInProgress, activeTurnId, turnIndexByTurnId } = detail
+      const retainLocalInProgress =
+        inProgressById.value[threadId] === true &&
+        pendingTurnRequestByThreadId.value[threadId]?.fallbackRetried === true
+      const inProgress = serverInProgress || retainLocalInProgress
       hasMoreOlderMessagesByThreadId.value = {
         ...hasMoreOlderMessagesByThreadId.value,
         [threadId]: detail.hasMoreOlder === true,
@@ -4463,7 +4532,7 @@ export function useDesktopState() {
           ...activeTurnIdByThreadId.value,
           [threadId]: activeTurnId,
         }
-      } else if (activeTurnIdByThreadId.value[threadId]) {
+      } else if (activeTurnIdByThreadId.value[threadId] && !retainLocalInProgress) {
         activeTurnIdByThreadId.value = omitKey(activeTurnIdByThreadId.value, threadId)
       }
       if (!inProgress) {
@@ -5566,6 +5635,7 @@ export function useDesktopState() {
     pendingThreadsRefresh = false
     pendingThreadMessageRefresh.clear()
     pendingTurnStartsById.clear()
+    nonSuccessCompletionReadBaselineByThreadId.clear()
     if (eventSyncTimer !== null && typeof window !== 'undefined') {
       window.clearTimeout(eventSyncTimer)
       eventSyncTimer = null

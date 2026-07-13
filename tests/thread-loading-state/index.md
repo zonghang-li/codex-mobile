@@ -27,7 +27,7 @@ Return to the [manual test index](../../tests.md).
 | [Thread detail load avoids duplicate live-state history fetch](thread-detail-load-avoids-duplicate-live-state-history-fetch.md) |
 | [Thread message cache skips unchanged refetches](thread-message-cache-skips-unchanged-refetches.md) |
 | [Thread selection keeps sidebar list stable during refresh](thread-selection-keeps-sidebar-list-stable-during-refresh.md) |
-| [Sidebar thread row edge click selects thread](sidebar-thread-row-edge-click-selects-thread.md) |
+| [Sidebar thread main target selects thread](sidebar-thread-row-edge-click-selects-thread.md) |
 | [Sidebar thread inline delete confirmation and menu pin action](sidebar-thread-inline-delete-confirmation-and-menu-pin-action.md) |
 | [Active thread switches after delete](active-thread-switches-after-delete.md) |
 | [Thread open always autoscrolls to latest](thread-open-always-autoscrolls-to-latest.md) |

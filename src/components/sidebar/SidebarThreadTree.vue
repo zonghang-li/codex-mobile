@@ -28,7 +28,6 @@
             :data-pinned="isPinned(thread.id)"
             :data-menu-open="isThreadMenuOpen(thread.id) ? 'true' : 'false'"
             :force-right-hover="isThreadMenuOpen(thread.id)"
-            @click="onSelect(thread.id)"
             @mouseleave="onThreadRowLeave(thread.id, $event)"
             @contextmenu="onThreadRowContextMenu($event, thread.id)"
           >
@@ -47,7 +46,7 @@
                 </button>
               </span>
             </template>
-            <button class="thread-main-button" type="button" @click.stop="onSelect(thread.id)">
+            <button class="thread-main-button" type="button" @click.stop="onThreadMainClick(thread.id)">
               <span class="thread-row-title-wrap">
                 <span class="thread-row-title-line">
                   <span class="thread-row-title">{{ thread.title }}</span>
@@ -81,7 +80,7 @@
                   class="thread-menu-trigger"
                   type="button"
                   title="thread_menu"
-                  @click.stop="toggleThreadMenu(thread.id)"
+                  @click.stop="onThreadOverflowClick(thread.id)"
                 >
                   <IconTablerDots class="thread-icon" />
                 </button>
@@ -192,7 +191,6 @@
           :data-pinned="isPinned(thread.id)"
           :data-menu-open="isThreadMenuOpen(thread.id) ? 'true' : 'false'"
           :force-right-hover="isThreadMenuOpen(thread.id)"
-          @click="onSelect(thread.id)"
           @mouseleave="onThreadRowLeave(thread.id, $event)"
           @contextmenu="onThreadRowContextMenu($event, thread.id)"
         >
@@ -215,7 +213,7 @@
               </button>
             </span>
           </template>
-          <button class="thread-main-button" type="button" @click.stop="onSelect(thread.id)">
+          <button class="thread-main-button" type="button" @click.stop="onThreadMainClick(thread.id)">
             <span class="thread-row-title-wrap">
               <span class="thread-row-title-line">
                 <span class="thread-row-title">{{ thread.title }}</span>
@@ -249,7 +247,7 @@
                 class="thread-menu-trigger"
                 type="button"
                 title="thread_menu"
-                @click.stop="toggleThreadMenu(thread.id)"
+                @click.stop="onThreadOverflowClick(thread.id)"
               >
                 <IconTablerDots class="thread-icon" />
               </button>
@@ -397,7 +395,6 @@
                 :data-pinned="isPinned(thread.id)"
                 :data-menu-open="isThreadMenuOpen(thread.id) ? 'true' : 'false'"
                 :force-right-hover="isThreadMenuOpen(thread.id)"
-                @click="onSelect(thread.id)"
                 @mouseleave="onThreadRowLeave(thread.id, $event)"
                 @contextmenu="onThreadRowContextMenu($event, thread.id)"
               >
@@ -420,7 +417,7 @@
                     </button>
                   </span>
                 </template>
-                <button class="thread-main-button" type="button" @click.stop="onSelect(thread.id)">
+                <button class="thread-main-button" type="button" @click.stop="onThreadMainClick(thread.id)">
                   <span class="thread-row-title-wrap">
                     <span class="thread-row-title-line">
                       <span class="thread-row-title">{{ thread.title }}</span>
@@ -454,7 +451,7 @@
                       class="thread-menu-trigger"
                       type="button"
                       title="thread_menu"
-                      @click.stop="toggleThreadMenu(thread.id)"
+                      @click.stop="onThreadOverflowClick(thread.id)"
                     >
                       <IconTablerDots class="thread-icon" />
                     </button>
@@ -526,7 +523,6 @@
             :data-pinned="isPinned(thread.id)"
             :data-menu-open="isThreadMenuOpen(thread.id) ? 'true' : 'false'"
             :force-right-hover="isThreadMenuOpen(thread.id)"
-            @click="onSelect(thread.id)"
             @mouseleave="onThreadRowLeave(thread.id, $event)"
             @contextmenu="onThreadRowContextMenu($event, thread.id)"
           >
@@ -549,7 +545,7 @@
                 </button>
               </span>
             </template>
-            <button class="thread-main-button" type="button" @click.stop="onSelect(thread.id)">
+            <button class="thread-main-button" type="button" @click.stop="onThreadMainClick(thread.id)">
               <span class="thread-row-title-wrap">
                 <span class="thread-row-title-line">
                   <span class="thread-row-title">{{ thread.title }}</span>
@@ -583,7 +579,7 @@
                   class="thread-menu-trigger"
                   type="button"
                   title="thread_menu"
-                  @click.stop="toggleThreadMenu(thread.id)"
+                  @click.stop="onThreadOverflowClick(thread.id)"
                 >
                   <IconTablerDots class="thread-icon" />
                 </button>
@@ -904,6 +900,7 @@ import { getPathLeafName, getPathParent, isAbsoluteLikePath, isProjectlessChatPa
 import ComposerDropdown from '../content/ComposerDropdown.vue'
 import SidebarMenuRow from './SidebarMenuRow.vue'
 import { reconcilePinnedThreadIds } from './pinnedThreadUtils'
+import { dispatchThreadRowInteraction } from './threadRowInteraction'
 
 const props = defineProps<{
   groups: UiProjectGroup[]
@@ -1783,6 +1780,19 @@ function toggleThreadMenu(threadId: string): void {
   nextTick(() => {
     updateOpenThreadMenuPlacement(threadId)
   })
+}
+
+const threadRowInteractionHandlers = {
+  onOverflow: toggleThreadMenu,
+  onSelect,
+}
+
+function onThreadMainClick(threadId: string): void {
+  dispatchThreadRowInteraction('main', threadId, threadRowInteractionHandlers)
+}
+
+function onThreadOverflowClick(threadId: string): void {
+  dispatchThreadRowInteraction('overflow', threadId, threadRowInteractionHandlers)
 }
 
 function onThreadRowContextMenu(event: MouseEvent, threadId: string): void {
@@ -3340,12 +3350,6 @@ onBeforeUnmount(() => {
   @apply bg-zinc-200;
 }
 
-.thread-row:hover .thread-delete-button,
-.thread-row:focus-within .thread-delete-button,
-.thread-delete-button[data-confirming='true'] {
-  @apply opacity-100 pointer-events-auto;
-}
-
 .thread-status-indicator[data-state='unread'] {
   width: 6.6667px;
   height: 6.6667px;
@@ -3364,15 +3368,22 @@ onBeforeUnmount(() => {
   @apply bg-sky-500;
 }
 
-.thread-row:hover .thread-status-indicator[data-state='unread'],
-.thread-row:hover .thread-status-indicator[data-state='working'],
-.thread-row:hover .thread-status-indicator[data-state='awaiting-approval'],
-.thread-row:hover .thread-status-indicator[data-state='awaiting-response'],
-.thread-row:focus-within .thread-status-indicator[data-state='unread'],
-.thread-row:focus-within .thread-status-indicator[data-state='working'],
-.thread-row:focus-within .thread-status-indicator[data-state='awaiting-approval'],
-.thread-row:focus-within .thread-status-indicator[data-state='awaiting-response'] {
-  @apply opacity-0;
+@media (hover: hover) and (pointer: fine) {
+  .thread-row:hover .thread-delete-button,
+  .thread-row:focus-within .thread-delete-button {
+    @apply opacity-100 pointer-events-auto;
+  }
+
+  .thread-row:hover .thread-status-indicator[data-state='unread'],
+  .thread-row:hover .thread-status-indicator[data-state='working'],
+  .thread-row:hover .thread-status-indicator[data-state='awaiting-approval'],
+  .thread-row:hover .thread-status-indicator[data-state='awaiting-response'],
+  .thread-row:focus-within .thread-status-indicator[data-state='unread'],
+  .thread-row:focus-within .thread-status-indicator[data-state='working'],
+  .thread-row:focus-within .thread-status-indicator[data-state='awaiting-approval'],
+  .thread-row:focus-within .thread-status-indicator[data-state='awaiting-response'] {
+    @apply opacity-0;
+  }
 }
 
 .rename-thread-overlay {
