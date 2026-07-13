@@ -261,7 +261,11 @@
                 </a>
               </div>
 
-              <article v-if="message.text.length > 0" class="message-card" :data-role="message.role">
+              <article
+                v-if="message.text.length > 0 || (message.directives?.length ?? 0) > 0"
+                class="message-card"
+                :data-role="message.role"
+              >
                 <div v-if="message.isAutomationRun" class="automation-message-label">
                   <span>Sent via automation</span>
                   <code v-if="message.automationDisplayName">{{ message.automationDisplayName }}</code>
@@ -606,6 +610,10 @@
                     </button>
                   </template>
                 </div>
+                <CodexDirectiveNotices
+                  v-if="message.directives && message.directives.length > 0"
+                  :directives="message.directives"
+                />
                 <a
                   v-if="isTurnErrorMessage(message)"
                   class="turn-error-feedback"
@@ -942,6 +950,7 @@ import {
 import type { ListItem, MessageBlock, TableAlignment, TaskListItem } from './messageBlockTypes'
 
 import CopyableOutputBlock from './CopyableOutputBlock.vue'
+import CodexDirectiveNotices from './CodexDirectiveNotices.vue'
 import MessageBlockRenderer from './MessageBlockRenderer.vue'
 import IconTablerArrowBackUp from '../icons/IconTablerArrowBackUp.vue'
 import IconTablerArrowUp from '../icons/IconTablerArrowUp.vue'

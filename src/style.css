@@ -657,6 +657,68 @@
   @apply bg-zinc-700;
 }
 
+.codex-directive-list {
+  @apply mt-2 flex min-w-0 flex-col gap-1.5;
+}
+
+.codex-directive-notice {
+  @apply flex min-w-0 items-start gap-2 rounded-lg border border-slate-200 bg-slate-50/90 px-2.5 py-2 text-slate-700;
+}
+
+.codex-directive-icon {
+  @apply mt-0.5 inline-flex h-4 w-4 shrink-0 items-center justify-center rounded-full bg-emerald-100 text-[11px] font-semibold leading-none text-emerald-700;
+}
+
+.codex-directive-content {
+  @apply min-w-0 flex-1;
+}
+
+.codex-directive-title,
+.codex-directive-meta,
+.codex-directive-body {
+  overflow-wrap: anywhere;
+}
+
+.codex-directive-title {
+  @apply block text-[13px] font-medium leading-5 text-slate-800;
+}
+
+a.codex-directive-title {
+  @apply underline decoration-slate-300 underline-offset-2 hover:text-slate-950 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-sky-500;
+}
+
+.codex-directive-meta {
+  @apply mt-0.5 block text-[12px] leading-4 text-slate-500;
+}
+
+.codex-directive-body {
+  @apply mb-0 mt-1 whitespace-pre-wrap text-[13px] leading-5 text-slate-700;
+}
+
+:root.dark .codex-directive-notice {
+  @apply border-zinc-700 bg-zinc-800/80 text-zinc-300;
+}
+
+:root.dark .codex-directive-icon {
+  @apply bg-emerald-500/15 text-emerald-300;
+}
+
+:root.dark .codex-directive-title {
+  @apply text-zinc-100;
+}
+
+:root.dark a.codex-directive-title {
+  @apply decoration-zinc-600 hover:text-white;
+}
+
+:root.dark .codex-directive-meta {
+  @apply text-zinc-400;
+}
+
+:root.dark .codex-directive-body {
+  @apply text-zinc-300;
+}
+
 :root.dark .automation-message-label {
   @apply text-zinc-400;
 }
@@ -1877,6 +1939,10 @@
 }
 
 @media (max-width: 768px) {
+  .codex-directive-notice {
+    @apply gap-1.5 px-2 py-1.5;
+  }
+
   .thread-composer-input,
   .composer-dropdown-search-input,
   .search-dropdown-search,
