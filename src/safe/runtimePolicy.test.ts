@@ -1,6 +1,11 @@
 import { delimiter, resolve } from 'node:path'
 import { describe, expect, it } from 'vitest'
-import { DEFAULT_SAFE_RUNTIME_CONFIG, loadSafeRuntimeConfig } from './runtimePolicy'
+import {
+  DEFAULT_SAFE_RUNTIME_CONFIG,
+  loadSafeRuntimeConfig,
+  parseSafeApprovalPolicy,
+  parseSafeSandboxMode,
+} from './runtimePolicy'
 
 describe('safe runtime policy', () => {
   it('uses loopback, authenticated, non-exposed defaults', () => {
@@ -26,14 +31,33 @@ describe('safe runtime policy', () => {
     })
   })
 
-  it('falls back from dangerous sandbox and approval values', () => {
+  it('accepts an explicit unrestricted no-approval profile', () => {
     expect(loadSafeRuntimeConfig({
       CODEX_MOBILE_SAFE_SANDBOX_MODE: 'danger-full-access',
       CODEX_MOBILE_SAFE_APPROVAL_POLICY: 'never',
     })).toMatchObject({
+      sandboxMode: 'danger-full-access',
+      approvalPolicy: 'never',
+    })
+  })
+
+  it('falls back from unknown sandbox and approval values', () => {
+    expect(loadSafeRuntimeConfig({
+      CODEX_MOBILE_SAFE_SANDBOX_MODE: 'unknown',
+      CODEX_MOBILE_SAFE_APPROVAL_POLICY: 'unknown',
+    })).toMatchObject({
       sandboxMode: 'workspace-write',
       approvalPolicy: 'on-request',
     })
+  })
+
+  it('strictly parses CLI execution profiles', () => {
+    expect(parseSafeSandboxMode(undefined)).toBe('workspace-write')
+    expect(parseSafeApprovalPolicy(undefined)).toBe('on-request')
+    expect(parseSafeSandboxMode('danger-full-access')).toBe('danger-full-access')
+    expect(parseSafeApprovalPolicy('never')).toBe('never')
+    expect(() => parseSafeSandboxMode('unknown')).toThrow('Invalid safe sandbox mode')
+    expect(() => parseSafeApprovalPolicy('unknown')).toThrow('Invalid safe approval policy')
   })
 
   it('normalizes and de-duplicates allowed roots', () => {

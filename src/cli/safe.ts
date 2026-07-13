@@ -15,7 +15,11 @@ import {
   unexposeTailscale,
 } from '../safe/exposure.js'
 import { readSecurePasswordFile } from '../safe/passwordFile.js'
-import { loadSafeRuntimeConfig } from '../safe/runtimePolicy.js'
+import {
+  loadSafeRuntimeConfig,
+  parseSafeApprovalPolicy,
+  parseSafeSandboxMode,
+} from '../safe/runtimePolicy.js'
 import {
   clearManagedState,
   getCurrentCommandMarker,
@@ -103,20 +107,6 @@ async function resolvePassword(options: {
   return { password, generatedPath: await persistGeneratedPassword(password) }
 }
 
-function parseSafeSandboxMode(value: string | undefined): 'read-only' | 'workspace-write' {
-  const normalized = value?.trim().toLowerCase()
-  if (!normalized || normalized === 'workspace-write') return 'workspace-write'
-  if (normalized === 'read-only') return 'read-only'
-  throw new Error(`Invalid safe sandbox mode: ${value}`)
-}
-
-function parseSafeApprovalPolicy(value: string | undefined): 'untrusted' | 'on-failure' | 'on-request' {
-  const normalized = value?.trim().toLowerCase()
-  if (!normalized || normalized === 'on-request') return 'on-request'
-  if (normalized === 'untrusted' || normalized === 'on-failure') return normalized
-  throw new Error(`Invalid safe approval policy: ${value}`)
-}
-
 program.command('start')
   .argument('[projectPath]', 'project directory to open on launch')
   .option('-p, --port <port>', 'port to listen on', '5900')
@@ -130,8 +120,8 @@ program.command('start')
   .option('--no-login', 'skip Codex authentication check')
   .option('--memories', 'enable Codex memories for spawned app-server processes', true)
   .option('--no-memories', 'disable Codex memories for spawned app-server processes')
-  .option('--sandbox-mode <mode>', 'Codex sandbox mode: read-only, workspace-write')
-  .option('--approval-policy <policy>', 'Codex approval policy: untrusted, on-failure, on-request')
+  .option('--sandbox-mode <mode>', 'Codex sandbox mode: read-only, workspace-write, danger-full-access')
+  .option('--approval-policy <policy>', 'Codex approval policy: untrusted, on-failure, on-request, never')
   .action(async (projectPath: string | undefined, options: {
     port: string
     password: string | boolean

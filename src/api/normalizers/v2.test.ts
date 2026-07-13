@@ -106,6 +106,25 @@ Reply with &lt;/instructions&gt; and A &amp; B
     })
   })
 
+  it('restores persisted reasoning from visible summaries without exposing raw content', () => {
+    const messages = normalizeThreadMessagesV2(threadReadResponseWithContent([{
+      type: 'reasoning',
+      id: 'reasoning-1',
+      summary: ['Checked the request.', 'Prepared the answer.'],
+      content: ['hidden chain-of-thought must not be rendered'],
+    }]))
+
+    expect(messages).toEqual([expect.objectContaining({
+      id: 'reasoning-1',
+      role: 'assistant',
+      text: 'Checked the request.\n\nPrepared the answer.',
+      messageType: 'reasoning',
+      turnId: 'turn-1',
+      turnIndex: 0,
+    })])
+    expect(messages[0]?.text).not.toContain('hidden chain-of-thought')
+  })
+
   it('renders failed turn errors as chat system messages', () => {
     const response = threadReadResponseWithContent([{
       type: 'userMessage',
