@@ -40,6 +40,11 @@ describe('local installation packaging', () => {
     expect(unit).not.toContain('--lan')
     expect(unit).not.toContain('cloudflared')
     expect(unit).not.toContain('funnel')
+    expect(unit).not.toContain('ntfy.sh')
+    expect(unit).not.toContain('codex-mobile-safe-ntfy-url')
+    expect(unit).not.toContain('--ntfy-url-file')
+    expect(unit).not.toContain('NTFY_')
+    expect(unit).not.toMatch(/^Environment=/mu)
   })
 
   it('renders the installed safe unit and password through the isolated installer path', async () => {

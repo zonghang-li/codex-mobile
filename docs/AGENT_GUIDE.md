@@ -13,10 +13,13 @@ This repository maintains the upstream-compatible `codex-mobile` command and a h
 - `src/safe/featureGate.ts`: HTTP route and app-server RPC allowlists.
 - `src/safe/pathPolicy.ts`: canonical allowed-root filesystem checks.
 - `src/safe/passwordFile.ts`: password-file ownership, type, mode, and content validation.
+- `src/safe/ntfyConfig.ts`: optional current-user mode-`0600` ntfy URL-file loader and strict `https://ntfy.sh/<single-topic>` validation.
+- `src/safe/ntfyState.ts`: private atomic notifier state with bounded active, pending, and sent collections.
 - `src/safe/state.ts`: PID-validated managed process state.
 - `src/safe/exposure.ts`: Tailscale Serve lifecycle; Funnel is rejected.
 - `src/safe/doctor.ts`: static security-invariant diagnostics.
 - `src/server/securityPolicy.ts`: policy interface injected into HTTP and app-server bridges.
+- `src/server/ntfyCompletionNotifier.ts`: asynchronous ten-minute turn qualification, deterministic summaries, logical deduplication, and bounded ntfy delivery.
 - `packaging/systemd/`: template for the safe Linux user service.
 - `scripts/install-local.sh` and `scripts/*user-service.sh`: repeatable local installation and service lifecycle.
 
@@ -30,6 +33,10 @@ This repository maintains the upstream-compatible `codex-mobile` command and a h
 6. Restrict HTTP features and app-server RPC methods through `featureGate.ts`; new methods or routes are denied until deliberately reviewed and allowlisted.
 7. Canonicalize filesystem paths and keep them under the configured project root. Reject symlink escapes and missing paths.
 8. Do not commit secrets, password files, runtime state, generated units, `.tgz` packages, or Tailnet credentials.
+9. Treat the ntfy topic as a credential. Read it only from the default `~/.codex/codex-mobile-safe-ntfy-url` file or an explicit `--ntfy-url-file` path. Require a current-user-owned regular file with mode `0600` or stricter and exactly one `https://ntfy.sh/<single-topic>` URL. Never place the URL/topic in Git, process arguments, systemd `Environment=`, managed notifier state, response bodies, or logs.
+10. Keep notifications outbound-only and optional. Missing default configuration must create no notification subscription or network work. Do not enable Telegram, background integrations, incoming commands, Cloudflare/public tunnels, Tailscale Funnel, LAN binding, or a Tailscale authentication bypass while adding or operating ntfy notifications.
+11. Preserve notification behavior: threshold exactly `600_000` ms; exact success/failure/interruption titles; deterministic first non-empty assistant sentence capped at 180 characters; no extra AI call; five-second request timeout; three immediate attempts per pending record per drain; active/pending/sent collections capped at 256.
+12. Preserve one logical notification per turn through local pending/sent suppression and a stable bounded ASCII ntfy sequence ID. Do not claim transport-level exactly-once delivery: an ambiguous timeout or a crash after remote acceptance but before the local sent-state commit may re-alert.
 
 The original command may retain upstream behavior. Do not weaken safe mode to make both commands identical; move genuinely shared mechanics into `src/cli/shared` or the server layer and inject the policy difference.
 
@@ -75,6 +82,9 @@ Instantiate the service template in a temporary location and run `systemd-analyz
 | HTTP/RPC policy | `src/server/securityPolicy.test.ts`, bridge security tests, and relevant route tests |
 | Filesystem access | `src/safe/pathPolicy.test.ts` plus the affected HTTP route test |
 | Password/state lifecycle | matching `src/safe/*test.ts`, stale PID and permissions cases |
+| ntfy config/state | `src/safe/ntfyConfig.test.ts`, `src/safe/ntfyState.test.ts`, ownership/mode/symlink/atomic-write cases |
+| ntfy qualification/delivery | `src/server/ntfyCompletionNotifier.test.ts`, including 599,999/600,000 ms, all terminal statuses, real default headers, restart, retry, and redaction |
+| ntfy CLI/server wiring | safe entry, doctor, packaging, and server security-policy tests; verify disabled mode has no subscription/network |
 | Tailscale exposure | `src/safe/exposure.test.ts`; confirm Serve only and no Funnel |
 | CLI/build/package | launcher and safe entry tests, production build, both help commands, temporary-prefix install |
 | systemd scripts/template | packaging test, `sh -n`, `systemd-analyze --user verify`, restart recovery |
@@ -101,7 +111,42 @@ pnpm run service:restart
 journalctl --user -u codex-mobile-safe -n 100
 ```
 
+The systemd service auto-detects the optional default ntfy file and intentionally has no ntfy argument or secret environment variable. Configure it locally with:
+
+```bash
+install -d -m 700 ~/.codex
+install -m 600 /dev/null ~/.codex/codex-mobile-safe-ntfy-url
+read -r NTFY_TOPIC
+printf 'https://ntfy.sh/%s\n' "$NTFY_TOPIC" > ~/.codex/codex-mobile-safe-ntfy-url
+unset NTFY_TOPIC
+chmod 600 ~/.codex/codex-mobile-safe-ntfy-url
+pnpm run service:restart
+```
+
+Never put a real topic in a test fixture, issue, PR, shell transcript, generated unit, or log. Valid topics use one `[A-Za-z0-9_-]+` path segment on the fixed `https://ntfy.sh` origin; credentials, query, fragment, extra path segments, alternate origins, non-regular files, wrong ownership, and group/other permissions are rejected. Deleting the file and restarting disables notification subscriptions and delivery:
+
+```bash
+rm ~/.codex/codex-mobile-safe-ntfy-url
+pnpm run service:restart
+```
+
+Operational checks must use redacted surfaces:
+
+```bash
+codex-mobile-safe doctor
+codex-mobile-safe status
+codex-mobile-safe urls
+pnpm run service:status
+journalctl --user -u codex-mobile-safe -n 100 --no-pager
+```
+
+`doctor` is a static packaged-invariant check, not proof that an optional topic is configured or that a phone received an alert. A qualifying notification requires a turn duration of at least 10 minutes (`600_000` ms). Completed, failed, and interrupted turns use `Codex 任务完成`, `Codex 任务失败`, and `Codex 任务已中断`; the body is the deterministic first non-empty final-assistant sentence or a fixed fallback. The notifier retains only bounded timing/outbox/deduplication state under the safe home and never conversation history or the publish URL.
+
+When notification delivery fails, check the redacted journal for `Unable to ... long-task notification` messages, confirm ordinary HTTPS egress to `ntfy.sh`, confirm the URL file mode/owner without printing its contents, and run the focused tests. Do not print the file, add debug logging of request objects, or relax the URL validator. Pending records are retried on startup and later notification events. Stable sequence IDs provide logical replacement on supported clients, but ambiguous remote acceptance may still re-alert.
+
 An HTTP 502 from a mobile RPC request means the HTTPS proxy received the request but could not obtain a valid response from the loopback backend. Check, in order: service state and journal, listener on `127.0.0.1:5900`, `codex-mobile-safe doctor`, `tailscale serve status`, then authentication. Do not solve a 502 by opening the listener to the LAN.
+
+Remote operation remains Tailnet-only: keep the backend on loopback, enable only `codex-mobile-safe expose tailscale`, verify `tailscale serve status`, and keep password authentication. The ntfy outbound POST does not authorize LAN/public exposure. Never use the compatibility command's Telegram or Cloudflare features for a safe service.
 
 To remove the user service, run `pnpm run service:uninstall`. This removes the unit and managed state but intentionally leaves the password file for explicit user handling.
 
@@ -111,13 +156,14 @@ Keep remotes named `origin` for `zonghang-li/codex-mobile` and `upstream` for `f
 
 ```bash
 git fetch origin upstream
-git switch -c codex/<topic> origin/main
+git switch -c codex/ntfy-docs origin/main
 git rebase upstream/main
 ```
 
 Resolve conflicts deliberately. In particular, preserve and revalidate:
 
 - `src/safe/` and its tests;
+- ntfy URL validation, durable state, notifier logic, and optional lifecycle wiring;
 - `src/server/securityPolicy.ts` and policy injection points;
 - the `safe` build entry and package bin mapping;
 - `packaging/systemd/` and installer scripts;
