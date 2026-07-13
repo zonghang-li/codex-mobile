@@ -237,7 +237,25 @@ describe('POST /codex-api/thread-runtime-states', () => {
         'thread-b': { state: 'idle' },
       },
     })
+    expect(inspectMany).toHaveBeenCalledTimes(1)
     expect(inspectMany).toHaveBeenCalledWith(['thread-a', 'thread-b'], 4242)
+  })
+
+  it('rejects malformed JSON without inspecting runtimes', async () => {
+    const middleware = createCodexBridgeMiddleware()
+    const shared = sharedBridgeForTest()
+    const inspectMany = vi.spyOn(shared.runtimeProbe, 'inspectMany')
+    const port = await listenWithMiddleware(middleware)
+
+    const response = await fetch(`http://127.0.0.1:${port}/codex-api/thread-runtime-states`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: '{"threadIds":',
+    })
+
+    expect(response.status).toBe(400)
+    await expect(response.json()).resolves.toEqual({ error: 'Invalid JSON body' })
+    expect(inspectMany).not.toHaveBeenCalled()
   })
 
   it.each([
