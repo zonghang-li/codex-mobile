@@ -403,11 +403,13 @@ git add tests/thread-loading-state/external-client-running-state-after-refresh.m
 git commit -m "test: cover configured desktop runtime detection"
 ```
 
-- [ ] **Step 5: Merge, install, and restart only after review approval**
+## Controller integration after all task reviews and the final branch review
+
+- [ ] **Step 1: Merge, install, and restart only after review approval**
 
 From the main worktree, fetch and confirm `main == origin/main`, fast-forward merge `codex/fix-appserver-process-detection`, rerun `pnpm test:unit && pnpm build`, push `main`, run `pnpm install:local`, and restart `codex-mobile-safe.service`.
 
-- [ ] **Step 6: Verify the affected production thread and mobile UI**
+- [ ] **Step 2: Verify the affected production thread and mobile UI**
 
 For the affected thread `019f50f7-b8d9-72a3-9861-5ca7c3a0ea1e`, authenticate without printing the password and require a running endpoint result:
 
@@ -435,7 +437,7 @@ jq -e '.textareaDisabled == true and .stopDisabled == true and .stopTitle == "Ru
 
 Expected: `true`.
 
-- [ ] **Step 7: Verify safety and repository state**
+- [ ] **Step 3: Verify safety and repository state**
 
 Run:
 
