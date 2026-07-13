@@ -49,6 +49,7 @@ type FakeRuntimeOptions = {
   regular?: boolean
   scanError?: Error
   replacementDuringRead?: { log: string; ino: string }
+  abaReplacementDuringRead?: { log: string; dev: string; ino: string }
 }
 
 class FakeRuntimeSystem implements ExternalRuntimeSystem {
@@ -64,6 +65,7 @@ class FakeRuntimeSystem implements ExternalRuntimeSystem {
   private readonly regular: boolean
   private readonly scanError: Error | undefined
   private replacementDuringRead: { log: string; ino: string } | undefined
+  private abaReplacementDuringRead: { log: string; dev: string; ino: string } | undefined
   private dev = '8'
   private ino = '21'
 
@@ -79,6 +81,7 @@ class FakeRuntimeSystem implements ExternalRuntimeSystem {
     this.regular = options.regular ?? true
     this.scanError = options.scanError
     this.replacementDuringRead = options.replacementDuringRead
+    this.abaReplacementDuringRead = options.abaReplacementDuringRead
   }
 
   async realpath(path: string): Promise<string> {
@@ -95,8 +98,25 @@ class FakeRuntimeSystem implements ExternalRuntimeSystem {
     }
   }
 
-  async readRange(path: string, offset: number, length: number): Promise<Buffer> {
+  async readRange(
+    path: string,
+    offset: number,
+    length: number,
+    expectedIdentity: RuntimeFileIdentity,
+  ): Promise<Buffer> {
     this.readCalls.push({ path, offset, length })
+    if (this.abaReplacementDuringRead) {
+      const replacement = this.abaReplacementDuringRead
+      this.abaReplacementDuringRead = undefined
+      if (
+        replacement.dev !== expectedIdentity.dev
+        || replacement.ino !== expectedIdentity.ino
+      ) {
+        throw new Error('Opened rollout identity does not match expected identity')
+      }
+      const replacementBytes = Buffer.from(replacement.log)
+      return replacementBytes.subarray(offset, Math.min(offset + length, replacementBytes.length))
+    }
     if (this.replacementDuringRead) {
       const replacement = this.replacementDuringRead
       this.replacementDuringRead = undefined
@@ -486,6 +506,22 @@ describe('ExternalThreadRuntimeProbe', () => {
     })
 
     await expect(probe.inspect('thread-1', 99)).resolves.toEqual({
+      state: 'unknown',
+    })
+  })
+
+  it('rejects an ABA replacement that is consistent only during readRange', async () => {
+    const system = fakeRuntimeSystem({
+      log: lifecycle('task_started', 'turn-a'),
+      fds: [writerFd({ dev: '8', ino: '21' })],
+      abaReplacementDuringRead: {
+        log: lifecycle('task_started', 'turn-b'),
+        dev: '8',
+        ino: '22',
+      },
+    })
+
+    await expect(registeredProbe(system).inspect('thread-1', 99)).resolves.toEqual({
       state: 'unknown',
     })
   })

@@ -24,7 +24,12 @@ export interface ExternalRuntimeSystem {
   readonly uid: number | null
   realpath(path: string): Promise<string>
   statFile(path: string): Promise<RuntimeFileIdentity & { regular: boolean }>
-  readRange(path: string, offset: number, length: number): Promise<Buffer>
+  readRange(
+    path: string,
+    offset: number,
+    length: number,
+    expectedIdentity: RuntimeFileIdentity,
+  ): Promise<Buffer>
   listFdSnapshots(): AsyncIterable<RuntimeFdSnapshot>
 }
 
@@ -226,18 +231,16 @@ function createDefaultSystem(): ExternalRuntimeSystem {
         regular: identity.isFile(),
       }
     },
-    async readRange(path, offset, length) {
+    async readRange(path, offset, length, expectedIdentity) {
       const handle = await open(path, 'r')
       try {
-        const [openedIdentity, pathIdentity] = await Promise.all([
-          handle.stat({ bigint: true }),
-          stat(path, { bigint: true }),
-        ])
+        const openedIdentity = await handle.stat({ bigint: true })
         if (
-          openedIdentity.dev !== pathIdentity.dev
-          || openedIdentity.ino !== pathIdentity.ino
+          path !== expectedIdentity.path
+          || `${openedIdentity.dev}` !== expectedIdentity.dev
+          || `${openedIdentity.ino}` !== expectedIdentity.ino
         ) {
-          throw new InconclusiveRuntimeScanError('Rollout path changed while opening')
+          throw new InconclusiveRuntimeScanError('Opened rollout identity does not match expected')
         }
         const buffer = Buffer.allocUnsafe(length)
         const { bytesRead } = await handle.read(buffer, 0, length, offset)
@@ -361,7 +364,12 @@ export class ExternalThreadRuntimeProbe {
 
       while (nextCache.offset < identity.size) {
         const length = Math.min(READ_CHUNK_BYTES, identity.size - nextCache.offset)
-        const bytes = await this.system.readRange(resolvedPath, nextCache.offset, length)
+        const bytes = await this.system.readRange(
+          resolvedPath,
+          nextCache.offset,
+          length,
+          identity,
+        )
         const chunk = bytes.subarray(0, length)
         if (chunk.length === 0) return { state: 'unknown' }
         applyChunk(nextCache, chunk)
