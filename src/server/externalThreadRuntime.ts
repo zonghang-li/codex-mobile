@@ -54,6 +54,7 @@ type LinuxProcessRecord = {
   parentPid: number
   uid: number
   cmdline: string
+  startTime: string
 }
 
 const READ_CHUNK_BYTES = 64 * 1024
@@ -161,6 +162,42 @@ function parseProcParentPid(status: string): number {
   return parentPid
 }
 
+function parseProcStartTime(stat: string, expectedPid: number): string {
+  const openParen = stat.indexOf('(')
+  const closeParen = stat.lastIndexOf(')')
+  if (openParen <= 0 || closeParen <= openParen) {
+    throw new InconclusiveRuntimeScanError('Cannot parse process identity')
+  }
+
+  const pidToken = stat.slice(0, openParen).trim()
+  const pid = /^\d+$/u.test(pidToken) ? Number.parseInt(pidToken, 10) : Number.NaN
+  const fieldsFromState = stat.slice(closeParen + 1).trim().split(/\s+/u)
+  const startTime = fieldsFromState[19]
+  if (
+    !Number.isSafeInteger(pid)
+    || pid !== expectedPid
+    || !/^\S$/u.test(fieldsFromState[0] ?? '')
+    || !/^\d+$/u.test(startTime ?? '')
+  ) {
+    throw new InconclusiveRuntimeScanError('Cannot parse process identity')
+  }
+  return BigInt(startTime).toString()
+}
+
+async function readProcStartTime(processRoot: string, pid: number): Promise<string | null> {
+  const stat = await readProcText(`${processRoot}/stat`, `process ${pid} identity`)
+  return stat === null ? null : parseProcStartTime(stat, pid)
+}
+
+function assertStableProcessIdentity(
+  expectedStartTime: string,
+  actualStartTime: string,
+): void {
+  if (actualStartTime !== expectedStartTime) {
+    throw new InconclusiveRuntimeScanError('Process identity changed during inspection')
+  }
+}
+
 function collectAncestorPids(
   pid: number,
   processes: ReadonlyMap<number, LinuxProcessRecord>,
@@ -230,6 +267,8 @@ async function* listLinuxFdSnapshots(ownUid: number | null): AsyncIterable<Runti
     if (!Number.isSafeInteger(pid)) continue
 
     const processRoot = `/proc/${entry}`
+    const startTime = await readProcStartTime(processRoot, pid)
+    if (startTime === null) continue
     const status = await readProcText(`${processRoot}/status`, `process ${pid} status`)
     if (status === null) continue
     const uid = parseProcUid(status)
@@ -241,16 +280,23 @@ async function* listLinuxFdSnapshots(ownUid: number | null): AsyncIterable<Runti
       if (sameUidCmdline === null) continue
       cmdline = sameUidCmdline
     }
-    processes.set(pid, { pid, parentPid, uid, cmdline })
+    const confirmedStartTime = await readProcStartTime(processRoot, pid)
+    if (confirmedStartTime === null) continue
+    assertStableProcessIdentity(startTime, confirmedStartTime)
+    processes.set(pid, { pid, parentPid, uid, cmdline, startTime })
   }
 
   for (const process of processes.values()) {
-    const { pid, uid, cmdline } = process
+    const { pid, uid, cmdline, startTime } = process
     if (uid !== ownUid || !isCodexAppServerCommand(cmdline)) continue
-    const ancestorPids = collectAncestorPids(pid, processes)
     const processRoot = `/proc/${pid}`
+    const startTimeBeforeDescriptors = await readProcStartTime(processRoot, pid)
+    if (startTimeBeforeDescriptors === null) continue
+    assertStableProcessIdentity(startTime, startTimeBeforeDescriptors)
+    const ancestorPids = collectAncestorPids(pid, processes)
     const fdEntries = await readProcDirectory(`${processRoot}/fd`, `process ${pid} descriptors`)
     if (fdEntries === null) continue
+    const snapshots: RuntimeFdSnapshot[] = []
     for (const fd of fdEntries) {
       if (!/^\d+$/u.test(fd)) continue
       const fdPath = `${processRoot}/fd/${fd}`
@@ -262,7 +308,7 @@ async function* listLinuxFdSnapshots(ownUid: number | null): AsyncIterable<Runti
       const descriptor = parseFdInfo(fdinfo)
       const identity = await statProcFd(fdPath)
       if (!identity) continue
-      yield {
+      snapshots.push({
         pid,
         ancestorPids,
         uid,
@@ -271,8 +317,12 @@ async function* listLinuxFdSnapshots(ownUid: number | null): AsyncIterable<Runti
         ino: identity.ino,
         position: descriptor.position,
         flags: descriptor.flags,
-      }
+      })
     }
+    const startTimeAfterDescriptors = await readProcStartTime(processRoot, pid)
+    if (startTimeAfterDescriptors === null) continue
+    assertStableProcessIdentity(startTime, startTimeAfterDescriptors)
+    yield* snapshots
   }
 }
 

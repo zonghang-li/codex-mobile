@@ -165,6 +165,7 @@ type DefaultRuntimeProcessFixture = {
   parentPid: number
   cmdline: string
   fds: string[]
+  statStartTimes?: bigint[]
 }
 
 type DefaultRuntimeFixture = {
@@ -179,6 +180,14 @@ type DefaultRuntimeFixture = {
   status?: string
   fdinfo?: string
   processes?: DefaultRuntimeProcessFixture[]
+}
+
+function procStat(process: DefaultRuntimeProcessFixture, startTime: bigint): string {
+  const fieldsFromStateThroughStartTime = Array<string>(20).fill('0')
+  fieldsFromStateThroughStartTime[0] = 'S'
+  fieldsFromStateThroughStartTime[1] = `${process.parentPid}`
+  fieldsFromStateThroughStartTime[19] = `${startTime}`
+  return `${process.pid} (codex worker (native)) ${fieldsFromStateThroughStartTime.join(' ')}\n`
 }
 
 function defaultRuntimeProbe(fixture: DefaultRuntimeFixture = {}): ExternalThreadRuntimeProbe {
@@ -197,6 +206,7 @@ function defaultRuntimeProbe(fixture: DefaultRuntimeFixture = {}): ExternalThrea
     cmdline: '/usr/local/bin/codex\0app-server\0',
     fds: ['7'],
   }]
+  const statReadCounts = new Map<number, number>()
 
   nodeFs.realpath.mockImplementation(async (path: string) => path)
   nodeFs.stat.mockImplementation(async (path: string, options?: { bigint?: boolean }) => {
@@ -245,6 +255,12 @@ function defaultRuntimeProbe(fixture: DefaultRuntimeFixture = {}): ExternalThrea
     if (path === `/proc/${process.pid}/status`) {
       return fixture.status
         ?? `Name:\tcodex\nPPid:\t${process.parentPid}\nUid:\t${uid}\t${uid}\t${uid}\t${uid}\n`
+    }
+    if (path === `/proc/${process.pid}/stat`) {
+      const readCount = statReadCounts.get(process.pid) ?? 0
+      statReadCounts.set(process.pid, readCount + 1)
+      const startTimes = process.statStartTimes ?? [BigInt(process.pid) * 1_000n]
+      return procStat(process, startTimes[Math.min(readCount, startTimes.length - 1)])
     }
     if (path === `/proc/${process.pid}/cmdline`) return process.cmdline
     if (process.fds.some((fd) => path === `/proc/${process.pid}/fdinfo/${fd}`)) {
@@ -698,6 +714,41 @@ describe('ExternalThreadRuntimeProbe', () => {
         { pid: 100, parentPid: 101, cmdline: '/opt/codex/bin/codex\0app-server\0', fds: ['7'] },
         { pid: 101, parentPid: 100, cmdline: '/usr/bin/node\0worker.js\0', fds: [] },
       ],
+    })
+
+    await expect(probe.inspect('thread-1', 99)).resolves.toEqual({ state: 'unknown' })
+  })
+
+  it('accepts descriptor evidence when the candidate process identity stays stable', async () => {
+    const probe = defaultRuntimeProbe({
+      processes: [{
+        pid: 100,
+        parentPid: 1,
+        cmdline: '/opt/codex/bin/codex\0app-server\0',
+        fds: ['7'],
+        statStartTimes: [9_007_199_254_740_993n],
+      }],
+    })
+
+    await expect(probe.inspect('thread-1', 99)).resolves.toMatchObject({
+      state: 'running',
+      turnId: 'turn-a',
+    })
+    expect(nodeFs.readFile.mock.calls.filter(([path]) => path === '/proc/100/stat')).toHaveLength(4)
+  })
+
+  it.each([
+    ['before descriptor enumeration', [101n, 101n, 202n]],
+    ['during descriptor enumeration', [101n, 101n, 101n, 202n]],
+  ])('returns unknown when PID replacement occurs %s', async (_label, statStartTimes) => {
+    const probe = defaultRuntimeProbe({
+      processes: [{
+        pid: 100,
+        parentPid: 1,
+        cmdline: '/opt/codex/bin/codex\0app-server\0',
+        fds: ['7'],
+        statStartTimes,
+      }],
     })
 
     await expect(probe.inspect('thread-1', 99)).resolves.toEqual({ state: 'unknown' })
