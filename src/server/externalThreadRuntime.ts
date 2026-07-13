@@ -123,26 +123,35 @@ async function readProcDirectory(path: string, context: string): Promise<string[
   }
 }
 
-function parseProcUid(status: string): number | null {
+function parseProcUid(status: string): number {
   const match = /^Uid:\s+(\d+)/mu.exec(status)
-  if (!match) return null
+  if (!match) {
+    throw new InconclusiveRuntimeScanError('Cannot parse process UID')
+  }
   const uid = Number.parseInt(match[1], 10)
-  return Number.isSafeInteger(uid) ? uid : null
+  if (!Number.isSafeInteger(uid)) {
+    throw new InconclusiveRuntimeScanError('Cannot parse process UID')
+  }
+  return uid
 }
 
-function parseFdInfo(fdinfo: string): { position: number; flags: number } | null {
+function parseFdInfo(fdinfo: string): { position: number; flags: number } {
   const positionMatch = /^pos:\s+(\d+)/mu.exec(fdinfo)
   const flagsMatch = /^flags:\s+([0-7]+)/mu.exec(fdinfo)
-  if (!positionMatch || !flagsMatch) return null
+  if (!positionMatch || !flagsMatch) {
+    throw new InconclusiveRuntimeScanError('Cannot parse descriptor evidence')
+  }
   const position = Number.parseInt(positionMatch[1], 10)
   const flags = Number.parseInt(flagsMatch[1], 8)
-  if (!Number.isSafeInteger(position) || !Number.isSafeInteger(flags)) return null
+  if (!Number.isSafeInteger(position) || !Number.isSafeInteger(flags)) {
+    throw new InconclusiveRuntimeScanError('Cannot parse descriptor evidence')
+  }
   return { position, flags }
 }
 
 async function statProcFd(path: string): Promise<{ dev: string; ino: string } | null> {
   try {
-    const identity = await stat(path)
+    const identity = await stat(path, { bigint: true })
     return { dev: `${identity.dev}`, ino: `${identity.ino}` }
   } catch (error) {
     if (isProcessGone(error)) return null
@@ -150,7 +159,11 @@ async function statProcFd(path: string): Promise<{ dev: string; ino: string } | 
   }
 }
 
-async function* listLinuxFdSnapshots(): AsyncIterable<RuntimeFdSnapshot> {
+function isCodexAppServerCommand(cmdline: string): boolean {
+  return /(?:^|[\s/])codex(?:\s+app-server|$)/u.test(cmdline.replace(/\0/g, ' '))
+}
+
+async function* listLinuxFdSnapshots(ownUid: number | null): AsyncIterable<RuntimeFdSnapshot> {
   const processEntries = await readProcDirectory('/proc', '/proc')
   if (!processEntries) {
     throw new InconclusiveRuntimeScanError('Cannot inspect /proc')
@@ -165,10 +178,11 @@ async function* listLinuxFdSnapshots(): AsyncIterable<RuntimeFdSnapshot> {
     const status = await readProcText(`${processRoot}/status`, `process ${pid} status`)
     if (status === null) continue
     const uid = parseProcUid(status)
-    if (uid === null) continue
+    if (uid !== ownUid) continue
 
     const cmdline = await readProcText(`${processRoot}/cmdline`, `process ${pid} command`)
     if (cmdline === null) continue
+    if (!isCodexAppServerCommand(cmdline)) continue
 
     const fdEntries = await readProcDirectory(`${processRoot}/fd`, `process ${pid} descriptors`)
     if (fdEntries === null) continue
@@ -181,7 +195,6 @@ async function* listLinuxFdSnapshots(): AsyncIterable<RuntimeFdSnapshot> {
       )
       if (fdinfo === null) continue
       const descriptor = parseFdInfo(fdinfo)
-      if (!descriptor) continue
       const identity = await statProcFd(fdPath)
       if (!identity) continue
       yield {
@@ -198,23 +211,34 @@ async function* listLinuxFdSnapshots(): AsyncIterable<RuntimeFdSnapshot> {
 }
 
 function createDefaultSystem(): ExternalRuntimeSystem {
+  const uid = typeof process.getuid === 'function' ? process.getuid() : null
   return {
     platform: process.platform,
-    uid: typeof process.getuid === 'function' ? process.getuid() : null,
+    uid,
     realpath,
     async statFile(path) {
-      const identity = await stat(path)
+      const identity = await stat(path, { bigint: true })
       return {
         path,
         dev: `${identity.dev}`,
         ino: `${identity.ino}`,
-        size: identity.size,
+        size: Number(identity.size),
         regular: identity.isFile(),
       }
     },
     async readRange(path, offset, length) {
       const handle = await open(path, 'r')
       try {
+        const [openedIdentity, pathIdentity] = await Promise.all([
+          handle.stat({ bigint: true }),
+          stat(path, { bigint: true }),
+        ])
+        if (
+          openedIdentity.dev !== pathIdentity.dev
+          || openedIdentity.ino !== pathIdentity.ino
+        ) {
+          throw new InconclusiveRuntimeScanError('Rollout path changed while opening')
+        }
         const buffer = Buffer.allocUnsafe(length)
         const { bytesRead } = await handle.read(buffer, 0, length, offset)
         return buffer.subarray(0, bytesRead)
@@ -222,7 +246,7 @@ function createDefaultSystem(): ExternalRuntimeSystem {
         await handle.close()
       }
     },
-    listFdSnapshots: listLinuxFdSnapshots,
+    listFdSnapshots: () => listLinuxFdSnapshots(uid),
   }
 }
 
@@ -279,7 +303,7 @@ function matchesWriter(
   const isWritable = accessMode === 1 || accessMode === 2
   return fd.uid === uid
     && fd.pid !== excludedPid
-    && /(?:^|[\s/])codex(?:\s+app-server|$)/u.test(fd.cmdline.replace(/\0/g, ' '))
+    && isCodexAppServerCommand(fd.cmdline)
     && fd.dev === identity.dev
     && fd.ino === identity.ino
     && isWritable
@@ -342,6 +366,17 @@ export class ExternalThreadRuntimeProbe {
         if (chunk.length === 0) return { state: 'unknown' }
         applyChunk(nextCache, chunk)
         nextCache.offset += chunk.length
+      }
+
+      const revalidatedIdentity = await this.system.statFile(resolvedPath)
+      if (
+        !revalidatedIdentity.regular
+        || revalidatedIdentity.path !== identity.path
+        || revalidatedIdentity.dev !== identity.dev
+        || revalidatedIdentity.ino !== identity.ino
+        || revalidatedIdentity.size < nextCache.offset
+      ) {
+        return { state: 'unknown' }
       }
       thread.cache = nextCache
 

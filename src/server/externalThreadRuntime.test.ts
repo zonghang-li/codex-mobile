@@ -1,10 +1,20 @@
-import { describe, expect, it } from 'vitest'
+import { beforeEach, describe, expect, it, vi } from 'vitest'
 import {
   ExternalThreadRuntimeProbe,
   type ExternalRuntimeSystem,
   type RuntimeFdSnapshot,
   type RuntimeFileIdentity,
 } from './externalThreadRuntime'
+
+const nodeFs = vi.hoisted(() => ({
+  open: vi.fn(),
+  readdir: vi.fn(),
+  readFile: vi.fn(),
+  realpath: vi.fn(),
+  stat: vi.fn(),
+}))
+
+vi.mock('node:fs/promises', () => nodeFs)
 
 const sessionsRoot = '/sessions'
 const rolloutPath = '/sessions/2026/07/rollout-thread-1.jsonl'
@@ -38,6 +48,7 @@ type FakeRuntimeOptions = {
   resolvedRolloutPath?: string
   regular?: boolean
   scanError?: Error
+  replacementDuringRead?: { log: string; ino: string }
 }
 
 class FakeRuntimeSystem implements ExternalRuntimeSystem {
@@ -52,6 +63,7 @@ class FakeRuntimeSystem implements ExternalRuntimeSystem {
   private readonly resolvedRolloutPath: string
   private readonly regular: boolean
   private readonly scanError: Error | undefined
+  private replacementDuringRead: { log: string; ino: string } | undefined
   private dev = '8'
   private ino = '21'
 
@@ -66,6 +78,7 @@ class FakeRuntimeSystem implements ExternalRuntimeSystem {
     this.resolvedRolloutPath = options.resolvedRolloutPath ?? rolloutPath
     this.regular = options.regular ?? true
     this.scanError = options.scanError
+    this.replacementDuringRead = options.replacementDuringRead
   }
 
   async realpath(path: string): Promise<string> {
@@ -84,6 +97,12 @@ class FakeRuntimeSystem implements ExternalRuntimeSystem {
 
   async readRange(path: string, offset: number, length: number): Promise<Buffer> {
     this.readCalls.push({ path, offset, length })
+    if (this.replacementDuringRead) {
+      const replacement = this.replacementDuringRead
+      this.replacementDuringRead = undefined
+      this.bytes = Buffer.from(replacement.log)
+      this.ino = replacement.ino
+    }
     return this.bytes.subarray(offset, Math.min(offset + length, this.bytes.length))
   }
 
@@ -120,7 +139,91 @@ function registeredProbe(system: ExternalRuntimeSystem): ExternalThreadRuntimePr
   return probe
 }
 
+type DefaultRuntimeFixture = {
+  log?: string
+  openedLog?: string
+  rolloutDev?: bigint
+  rolloutIno?: bigint
+  openedDev?: bigint
+  openedIno?: bigint
+  fdDev?: bigint
+  fdIno?: bigint
+  status?: string
+  fdinfo?: string
+}
+
+function defaultRuntimeProbe(fixture: DefaultRuntimeFixture = {}): ExternalThreadRuntimeProbe {
+  const log = Buffer.from(fixture.log ?? lifecycle('task_started', 'turn-a'))
+  const openedLog = Buffer.from(fixture.openedLog ?? log)
+  const rolloutDev = fixture.rolloutDev ?? 8n
+  const rolloutIno = fixture.rolloutIno ?? 21n
+  const openedDev = fixture.openedDev ?? rolloutDev
+  const openedIno = fixture.openedIno ?? rolloutIno
+  const fdDev = fixture.fdDev ?? rolloutDev
+  const fdIno = fixture.fdIno ?? rolloutIno
+  const uid = typeof process.getuid === 'function' ? process.getuid() : 1000
+
+  nodeFs.realpath.mockImplementation(async (path: string) => path)
+  nodeFs.stat.mockImplementation(async (path: string, options?: { bigint?: boolean }) => {
+    const dev = path === rolloutPath ? rolloutDev : fdDev
+    const ino = path === rolloutPath ? rolloutIno : fdIno
+    if (options?.bigint) {
+      return {
+        dev,
+        ino,
+        size: BigInt(log.length),
+        isFile: () => true,
+      }
+    }
+    return {
+      dev: Number(dev),
+      ino: Number(ino),
+      size: log.length,
+      isFile: () => true,
+    }
+  })
+  nodeFs.open.mockResolvedValue({
+    async read(buffer: Buffer, bufferOffset: number, length: number, position: number) {
+      const bytes = openedLog.subarray(position, position + length)
+      bytes.copy(buffer, bufferOffset)
+      return { bytesRead: bytes.length, buffer }
+    },
+    async stat() {
+      return {
+        dev: openedDev,
+        ino: openedIno,
+        size: BigInt(openedLog.length),
+        isFile: () => true,
+      }
+    },
+    async close() {},
+  })
+  nodeFs.readdir.mockImplementation(async (path: string) => {
+    if (path === '/proc') return ['42']
+    if (path === '/proc/42/fd') return ['7']
+    throw new Error(`Unexpected readdir: ${path}`)
+  })
+  nodeFs.readFile.mockImplementation(async (path: string) => {
+    if (path === '/proc/42/status') {
+      return fixture.status ?? `Name:\tcodex\nUid:\t${uid}\t${uid}\t${uid}\t${uid}\n`
+    }
+    if (path === '/proc/42/cmdline') return '/usr/local/bin/codex\0app-server\0'
+    if (path === '/proc/42/fdinfo/7') {
+      return fixture.fdinfo ?? 'pos:\t10\nflags:\t0100001\n'
+    }
+    throw new Error(`Unexpected readFile: ${path}`)
+  })
+
+  const probe = new ExternalThreadRuntimeProbe({ sessionsRoot })
+  probe.registerThread('thread-1', rolloutPath)
+  return probe
+}
+
 describe('ExternalThreadRuntimeProbe', () => {
+  beforeEach(() => {
+    vi.resetAllMocks()
+  })
+
   it('requires an unmatched start and a live external writer', async () => {
     const system = fakeRuntimeSystem({
       log: lifecycle('task_started', 'turn-a'),
@@ -356,6 +459,62 @@ describe('ExternalThreadRuntimeProbe', () => {
       turnId: 'turn-b',
     })
     expect(system.readCalls.at(-1)?.offset).toBe(0)
+  })
+
+  it('does not combine replacement bytes with writer evidence from the old inode', async () => {
+    const system = fakeRuntimeSystem({
+      log: lifecycle('task_started', 'turn-a'),
+      fds: [writerFd({ ino: '21' })],
+      replacementDuringRead: {
+        log: lifecycle('task_started', 'turn-b'),
+        ino: '22',
+      },
+    })
+
+    await expect(registeredProbe(system).inspect('thread-1', 99)).resolves.toEqual({
+      state: 'unknown',
+    })
+  })
+
+  it('rejects bytes from a reopened descriptor even when the path identity changes back', async () => {
+    const probe = defaultRuntimeProbe({
+      log: lifecycle('task_started', 'turn-a'),
+      openedLog: lifecycle('task_started', 'turn-b'),
+      rolloutIno: 21n,
+      openedIno: 22n,
+      fdIno: 21n,
+    })
+
+    await expect(probe.inspect('thread-1', 99)).resolves.toEqual({
+      state: 'unknown',
+    })
+  })
+
+  it('keeps distinct large bigint file identities distinct', async () => {
+    const firstLargeInode = 9_007_199_254_740_992n
+    const nextLargeInode = firstLargeInode + 1n
+    const probe = defaultRuntimeProbe({
+      rolloutIno: firstLargeInode,
+      fdIno: nextLargeInode,
+    })
+
+    await expect(probe.inspect('thread-1', 99)).resolves.toEqual({ state: 'idle' })
+  })
+
+  it('returns unknown when a proc status has a malformed UID', async () => {
+    const probe = defaultRuntimeProbe({
+      status: 'Name:\tcodex\nUid:\tnot-a-number\n',
+    })
+
+    await expect(probe.inspect('thread-1', 99)).resolves.toEqual({ state: 'unknown' })
+  })
+
+  it('returns unknown when proc fdinfo has malformed descriptor evidence', async () => {
+    const probe = defaultRuntimeProbe({
+      fdinfo: 'pos:\t10\nflags:\tnot-octal\n',
+    })
+
+    await expect(probe.inspect('thread-1', 99)).resolves.toEqual({ state: 'unknown' })
   })
 
   it('returns unknown when descriptor scanning is inconclusive', async () => {
