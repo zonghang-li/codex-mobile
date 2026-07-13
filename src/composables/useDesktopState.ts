@@ -1551,6 +1551,7 @@ export function useDesktopState() {
   let backgroundRuntimeVisibilityListenerInstalled = false
   const backgroundExternalThreadIds = new Set<string>()
   const localRuntimeAuthorityVersionByThreadId = new Map<string, number>()
+  const selectionVersionByThreadId = new Map<string, number>()
   const delayedTurnSyncTimerByThreadId = new Map<string, number>()
   let loadThreadsPromise: Promise<void> | null = null
   const loadMessagePromiseByThreadId = new Map<string, Promise<void>>()
@@ -1721,6 +1722,12 @@ export function useDesktopState() {
   function setSelectedThreadId(nextThreadId: string, options: { persist?: boolean } = {}): void {
     if (selectedThreadId.value === nextThreadId) return
     cancelExternalRuntimePolling()
+    if (nextThreadId) {
+      selectionVersionByThreadId.set(
+        nextThreadId,
+        (selectionVersionByThreadId.get(nextThreadId) ?? 0) + 1,
+      )
+    }
     selectedThreadId.value = nextThreadId
     if (options.persist !== false) {
       saveSelectedThreadId(nextThreadId)
@@ -2298,6 +2305,9 @@ export function useDesktopState() {
     for (const threadId of localRuntimeAuthorityVersionByThreadId.keys()) {
       if (!activeThreadIds.has(threadId)) localRuntimeAuthorityVersionByThreadId.delete(threadId)
     }
+    for (const threadId of selectionVersionByThreadId.keys()) {
+      if (!activeThreadIds.has(threadId)) selectionVersionByThreadId.delete(threadId)
+    }
     const currentThreadId = selectedThreadId.value.trim()
     if (currentThreadId) {
       activeThreadIds.add(currentThreadId)
@@ -2500,9 +2510,16 @@ export function useDesktopState() {
           localRuntimeAuthorityVersionByThreadId.get(threadId) ?? 0,
         ]),
       )
+      const selectionVersions = new Map(
+        threadIds.map((threadId) => [
+          threadId,
+          selectionVersionByThreadId.get(threadId) ?? 0,
+        ]),
+      )
       const promise = pollBackgroundRuntimeStates(
         threadIds,
         localAuthorityVersions,
+        selectionVersions,
         generation,
         controller.signal,
       )
@@ -2524,6 +2541,7 @@ export function useDesktopState() {
   async function pollBackgroundRuntimeStates(
     requestedThreadIds: readonly string[],
     requestedLocalAuthorityVersions: ReadonlyMap<string, number>,
+    requestedSelectionVersions: ReadonlyMap<string, number>,
     generation: number,
     signal: AbortSignal,
   ): Promise<void> {
@@ -2539,6 +2557,9 @@ export function useDesktopState() {
 
     for (const threadId of requestedThreadIds) {
       if (!loadedIds.has(threadId) || selectedThreadId.value === threadId) continue
+      const requestedSelectionVersion = requestedSelectionVersions.get(threadId) ?? 0
+      const currentSelectionVersion = selectionVersionByThreadId.get(threadId) ?? 0
+      if (currentSelectionVersion !== requestedSelectionVersion) continue
       const requestedLocalAuthorityVersion = requestedLocalAuthorityVersions.get(threadId) ?? 0
       const currentLocalAuthorityVersion = localRuntimeAuthorityVersionByThreadId.get(threadId) ?? 0
       if (currentLocalAuthorityVersion !== requestedLocalAuthorityVersion) {
@@ -6039,6 +6060,7 @@ export function useDesktopState() {
     cancelBackgroundRuntimeRequest()
     backgroundExternalThreadIds.clear()
     localRuntimeAuthorityVersionByThreadId.clear()
+    selectionVersionByThreadId.clear()
     if (typeof document !== 'undefined' && backgroundRuntimeVisibilityListenerInstalled) {
       document.removeEventListener('visibilitychange', onBackgroundRuntimeVisibilityChange)
       backgroundRuntimeVisibilityListenerInstalled = false

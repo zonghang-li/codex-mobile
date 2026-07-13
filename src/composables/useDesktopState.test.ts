@@ -1528,6 +1528,97 @@ describe('external runtime ownership', () => {
     })
   })
 
+  it('ignores stale running after selected idle reconciliation and deselection', async () => {
+    const state = await setupBackgroundRuntimeState()
+    gatewayMocks.getThreadGroupsPage.mockResolvedValue({
+      groups: [{ projectName: 'Project', threads: [
+        { ...thread('thread-running', '/tmp/project'), updatedAtIso: '2026-07-14T00:00:00.000Z' },
+        thread('thread-unrelated', '/tmp/project'),
+        thread('thread-selected', '/tmp/project'),
+      ] }],
+      nextCursor: null,
+    })
+    await state.refreshAll({ includeSelectedThreadMessages: false, forceThreadRefresh: true })
+    const pending = deferred<Record<string, {
+      state: 'running'
+      turnId: string
+      interruptible: false
+      source: string
+    }>>()
+    gatewayMocks.getThreadRuntimeStates.mockReturnValue(pending.promise)
+    gatewayMocks.resumeThread.mockResolvedValue(idleDetail())
+
+    state.startPolling()
+    pollingCleanups.push(() => state.stopPolling())
+    await vi.advanceTimersByTimeAsync(0)
+    state.primeSelectedThread('thread-running')
+    await state.loadMessages('thread-running')
+    expect(state.selectedThread.value).toMatchObject({
+      id: 'thread-running',
+      inProgress: false,
+    })
+    state.primeSelectedThread('thread-selected')
+
+    pending.resolve({
+      'thread-running': {
+        state: 'running',
+        turnId: 'turn-stale',
+        interruptible: false,
+        source: 'external-session-writer',
+      },
+      'thread-unrelated': {
+        state: 'running',
+        turnId: 'turn-unrelated',
+        interruptible: false,
+        source: 'external-session-writer',
+      },
+    })
+    await flushMicrotasks()
+
+    expect(state.projectGroups.value[0]?.threads.find((row) => row.id === 'thread-running')).toMatchObject({
+      inProgress: false,
+    })
+    expect(state.projectGroups.value[0]?.threads.find((row) => row.id === 'thread-unrelated')).toMatchObject({
+      inProgress: true,
+    })
+  })
+
+  it('ignores stale idle after selected external reconciliation and deselection', async () => {
+    const state = await setupBackgroundRuntimeState()
+    const pendingIdle = deferred<Record<string, { state: 'idle' }>>()
+    gatewayMocks.getThreadRuntimeStates
+      .mockResolvedValueOnce({
+        'thread-running': {
+          state: 'running',
+          turnId: 'turn-background',
+          interruptible: false,
+          source: 'external-session-writer',
+        },
+      })
+      .mockReturnValueOnce(pendingIdle.promise)
+    gatewayMocks.resumeThread.mockResolvedValue(externalDetail('turn-selected-newer'))
+
+    state.startPolling()
+    pollingCleanups.push(() => state.stopPolling())
+    await vi.advanceTimersByTimeAsync(0)
+    await flushMicrotasks()
+    await vi.advanceTimersByTimeAsync(2_000)
+    state.primeSelectedThread('thread-running')
+    await state.loadMessages('thread-running')
+    expect(state.selectedThread.value).toMatchObject({
+      id: 'thread-running',
+      inProgress: true,
+    })
+    state.primeSelectedThread('thread-selected')
+
+    pendingIdle.resolve({ 'thread-running': { state: 'idle' } })
+    await flushMicrotasks()
+
+    expect(state.projectGroups.value[0]?.threads.find((row) => row.id === 'thread-running')).toMatchObject({
+      inProgress: true,
+    })
+  })
+
   it('ignores a deferred background result after its thread is removed', async () => {
     const state = await setupBackgroundRuntimeState()
     const pending = deferred<Record<string, {
