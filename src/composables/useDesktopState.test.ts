@@ -1430,6 +1430,54 @@ describe('external runtime ownership', () => {
     expect(state.readModelIdForThread('thread-1')).toBe('server-model')
   })
 
+  it('guards user-facing collaboration, reasoning, and speed setters while externally owned', async () => {
+    const { state } = await setupExternalRuntimeState()
+    gatewayMocks.resumeThread.mockResolvedValue(externalDetail())
+    await state.loadMessages('thread-1')
+    const initialMode = state.selectedCollaborationMode.value
+    const initialEffort = state.selectedReasoningEffort.value
+    const initialSpeed = state.selectedSpeedMode.value
+
+    state.setSelectedCollaborationMode(initialMode === 'plan' ? 'default' : 'plan')
+    state.setSelectedReasoningEffort(initialEffort === 'high' ? 'low' : 'high')
+    await state.updateSelectedSpeedMode(initialSpeed === 'fast' ? 'standard' : 'fast')
+
+    expect(state.selectedCollaborationMode.value).toBe(initialMode)
+    expect(state.selectedReasoningEffort.value).toBe(initialEffort)
+    expect(state.selectedSpeedMode.value).toBe(initialSpeed)
+    expect(gatewayMocks.setCodexSpeedMode).not.toHaveBeenCalled()
+  })
+
+  it('keeps collaboration, reasoning, and speed setters available for local, idle, and home contexts', async () => {
+    const { state, emit } = await setupExternalRuntimeState()
+    gatewayMocks.setCodexSpeedMode.mockResolvedValue(undefined)
+    emit({ method: 'turn/started', params: { threadId: 'thread-1', turn: { id: 'turn-local' } } })
+
+    state.setSelectedCollaborationMode('plan')
+    state.setSelectedReasoningEffort('high')
+    await state.updateSelectedSpeedMode('fast')
+    expect(state.selectedCollaborationMode.value).toBe('plan')
+    expect(state.selectedReasoningEffort.value).toBe('high')
+    expect(state.selectedSpeedMode.value).toBe('fast')
+
+    state.primeSelectedThread('thread-2')
+    state.setSelectedCollaborationMode('default')
+    state.setSelectedReasoningEffort('low')
+    await state.updateSelectedSpeedMode('standard')
+    expect(state.selectedCollaborationMode.value).toBe('default')
+    expect(state.selectedReasoningEffort.value).toBe('low')
+    expect(state.selectedSpeedMode.value).toBe('standard')
+
+    state.primeSelectedThread('', { persist: false })
+    state.setSelectedCollaborationMode('plan')
+    state.setSelectedReasoningEffort('minimal')
+    await state.updateSelectedSpeedMode('fast')
+    expect(state.selectedCollaborationMode.value).toBe('plan')
+    expect(state.selectedReasoningEffort.value).toBe('minimal')
+    expect(state.selectedSpeedMode.value).toBe('fast')
+    expect(gatewayMocks.setCodexSpeedMode).toHaveBeenCalledTimes(3)
+  })
+
   it('keeps model setters available for local, idle, and home contexts', async () => {
     const { state, emit } = await setupExternalRuntimeState()
     emit({ method: 'turn/started', params: { threadId: 'thread-1', turn: { id: 'turn-local' } } })

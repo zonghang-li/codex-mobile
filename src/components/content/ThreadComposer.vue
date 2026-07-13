@@ -426,6 +426,11 @@ import IconTablerMinimize from '../icons/IconTablerMinimize.vue'
 import IconTablerPlayerStopFilled from '../icons/IconTablerPlayerStopFilled.vue'
 import ComposerDropdown from './ComposerDropdown.vue'
 import ComposerSearchDropdown from './ComposerSearchDropdown.vue'
+import {
+  applyExternalRuntimeTakeover,
+  canApplyAttachmentMutation,
+  canApplyThreadUiMutation,
+} from './externalThreadRuntimeUi'
 
 type SkillSourceBadge = {
   badge: string
@@ -542,6 +547,7 @@ const {
 } = useDictation({
   getLanguage: () => props.dictationLanguage ?? 'auto',
   onTranscript: (text) => {
+    if (!canApplyThreadUiMutation(props.runtimeOwnership)) return
     draft.value = draft.value ? `${draft.value}\n${text}` : text
     dictationFeedback.value = ''
     if (props.dictationAutoSend !== false) {
@@ -552,11 +558,13 @@ const {
     nextTick(() => inputRef.value?.focus())
   },
   onEmpty: () => {
+    if (!canApplyThreadUiMutation(props.runtimeOwnership)) return
     dictationFeedback.value = props.dictationClickToToggle
       ? 'No speech detected. Click again after speaking.'
       : 'No speech detected. Hold the mic and speak.'
   },
   onError: (error) => {
+    if (!canApplyThreadUiMutation(props.runtimeOwnership)) return
     if (error instanceof DOMException && error.name === 'NotAllowedError') {
       dictationFeedback.value = 'Microphone access was denied.'
       return
@@ -1277,13 +1285,13 @@ function formatAttachmentFileCount(count: number): string {
 }
 
 function beginAttachmentWork(sessionToken: number): boolean {
-  if (sessionToken !== attachmentSessionToken) return false
+  if (!canApplyAttachmentMutation(props.runtimeOwnership, sessionToken, attachmentSessionToken)) return false
   pendingAttachmentCount.value += 1
   return true
 }
 
 function finishAttachmentWork(sessionToken: number): void {
-  if (sessionToken !== attachmentSessionToken) return
+  if (!canApplyAttachmentMutation(props.runtimeOwnership, sessionToken, attachmentSessionToken)) return
   pendingAttachmentCount.value = Math.max(0, pendingAttachmentCount.value - 1)
 }
 
@@ -1357,7 +1365,7 @@ async function attachImageFile(file: File, sessionToken: number): Promise<void> 
   try {
     const normalizedFile = ensureFileName(file)
     const serverPath = await uploadFile(normalizedFile)
-    if (sessionToken !== attachmentSessionToken) return
+    if (!canApplyAttachmentMutation(props.runtimeOwnership, sessionToken, attachmentSessionToken)) return
     if (!serverPath) {
       recordAttachmentBatchResult('failure')
       return
@@ -1372,7 +1380,7 @@ async function attachImageFile(file: File, sessionToken: number): Promise<void> 
     ]
     recordAttachmentBatchResult('success')
   } catch {
-    if (sessionToken === attachmentSessionToken) {
+    if (canApplyAttachmentMutation(props.runtimeOwnership, sessionToken, attachmentSessionToken)) {
       recordAttachmentBatchResult('failure')
     }
   } finally {
@@ -1384,7 +1392,7 @@ async function attachUploadedFile(file: File, sessionToken: number): Promise<voi
   if (!beginAttachmentWork(sessionToken)) return
   try {
     const serverPath = await uploadFile(file)
-    if (sessionToken !== attachmentSessionToken) return
+    if (!canApplyAttachmentMutation(props.runtimeOwnership, sessionToken, attachmentSessionToken)) return
     if (!serverPath) {
       recordAttachmentBatchResult('failure')
       return
@@ -1392,7 +1400,7 @@ async function attachUploadedFile(file: File, sessionToken: number): Promise<voi
     addFileAttachment(serverPath)
     recordAttachmentBatchResult('success')
   } catch {
-    if (sessionToken === attachmentSessionToken) {
+    if (canApplyAttachmentMutation(props.runtimeOwnership, sessionToken, attachmentSessionToken)) {
       recordAttachmentBatchResult('failure')
     }
   } finally {
@@ -1431,6 +1439,7 @@ async function addFolderFiles(files: FileList | null): Promise<void> {
   if (isInteractionDisabled.value) return
   if (!files || files.length === 0) return
   const generation = draftGeneration.value
+  const sessionToken = attachmentSessionToken
   const rows = Array.from(files)
   const firstRelativePath = (rows[0] as File & { webkitRelativePath?: string }).webkitRelativePath || rows[0].name
   const folderName = firstRelativePath.split('/').filter(Boolean)[0] || 'Folder'
@@ -1449,6 +1458,7 @@ async function addFolderFiles(files: FileList | null): Promise<void> {
 
   const updateGroup = (updater: (group: FolderUploadGroup) => FolderUploadGroup): void => {
     if (generation !== draftGeneration.value) return
+    if (!canApplyAttachmentMutation(props.runtimeOwnership, sessionToken, attachmentSessionToken)) return
     folderUploadGroups.value = folderUploadGroups.value.map((group) => (
       group.id === groupId ? updater(group) : group
     ))
@@ -1458,6 +1468,7 @@ async function addFolderFiles(files: FileList | null): Promise<void> {
     try {
       const serverPath = await uploadFile(file)
       if (generation !== draftGeneration.value) return
+      if (!canApplyAttachmentMutation(props.runtimeOwnership, sessionToken, attachmentSessionToken)) return
       if (serverPath) {
         const relativePath = (file as File & { webkitRelativePath?: string }).webkitRelativePath || file.name
         addFileAttachment(serverPath, relativePath)
@@ -1470,6 +1481,7 @@ async function addFolderFiles(files: FileList | null): Promise<void> {
       }
       updateGroup((group) => ({ ...group, processed: group.processed + 1 }))
     } catch {
+      if (!canApplyAttachmentMutation(props.runtimeOwnership, sessionToken, attachmentSessionToken)) return
       updateGroup((group) => ({ ...group, processed: group.processed + 1 }))
     }
   }
@@ -1674,6 +1686,7 @@ async function queueFileMentionSearch(): Promise<void> {
 }
 
 function applyFileMention(suggestion: ComposerFileSuggestion): void {
+  if (isInteractionDisabled.value) return
   const input = inputRef.value
   const start = mentionStartIndex.value
   if (start !== null && input) {
@@ -1686,6 +1699,7 @@ function applyFileMention(suggestion: ComposerFileSuggestion): void {
 }
 
 function hydrateDraft(payload: ComposerDraftPayload): void {
+  if (isExternallyOwned.value) return
   cancelDictation()
   replaceDraftState(payload)
   void nextTick(() => {
@@ -1695,6 +1709,7 @@ function hydrateDraft(payload: ComposerDraftPayload): void {
 }
 
 function appendTextToDraft(text: string): void {
+  if (isExternallyOwned.value) return
   const nextText = text.trim()
   if (!nextText) return
   cancelDictation()
@@ -1828,6 +1843,18 @@ function onDocumentClick(event: MouseEvent): void {
   isAttachMenuOpen.value = false
 }
 
+function invalidatePendingAttachments(): void {
+  attachmentSessionToken += 1
+  pendingAttachmentCount.value = 0
+  attachmentBatchStats.value = null
+  folderUploadGroups.value = folderUploadGroups.value.map((group) => (
+    group.isUploading ? { ...group, isUploading: false } : group
+  ))
+  isAttachMenuOpen.value = false
+  closeFileMention()
+  resetDragState()
+}
+
 onMounted(() => {
   document.addEventListener('click', onDocumentClick)
   window.addEventListener('drop', onWindowDragCleanup)
@@ -1889,6 +1916,19 @@ watch(
     if (isFileMentionOpen.value) {
       void queueFileMentionSearch()
     }
+  },
+)
+
+watch(
+  () => props.runtimeOwnership,
+  (ownership, previousOwnership) => {
+    applyExternalRuntimeTakeover(previousOwnership, ownership, {
+      cancelDictation: () => {
+        cancelDictation()
+        dictationFeedback.value = ''
+      },
+      invalidateAttachments: invalidatePendingAttachments,
+    })
   },
 )
 

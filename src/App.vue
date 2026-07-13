@@ -3434,6 +3434,7 @@ function onSubmitThreadMessage(payload: { text: string; imageUrls: string[]; fil
 }
 
 function onEditQueuedMessage(messageId: string): void {
+  if (selectedThreadRuntimeOwnership.value === 'external') return
   const queueIndex = selectedThreadQueuedMessages.value.findIndex((item) => item.id === messageId)
   const message = queueIndex >= 0 ? selectedThreadQueuedMessages.value[queueIndex] : undefined
   const composer = threadComposerRef.value

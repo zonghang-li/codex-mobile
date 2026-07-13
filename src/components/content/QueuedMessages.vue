@@ -33,9 +33,9 @@
       </svg>
       <span class="queued-row-text">{{ getMessagePreview(msg) }}</span>
       <div class="queued-row-actions">
-        <button class="queued-row-edit" type="button" :title="t('Edit queued message')" :disabled="disabled" @click="$emit('edit', msg.id)">{{ t('Edit') }}</button>
-        <button class="queued-row-steer" type="button" :title="t('Send now without interrupting work')" :disabled="disabled" @click="$emit('steer', msg.id)">{{ t('Steer') }}</button>
-        <button class="queued-row-delete" type="button" :aria-label="t('Delete queued message')" :title="t('Delete queued message')" :disabled="disabled" @click="$emit('delete', msg.id)">
+        <button class="queued-row-edit" type="button" :title="t('Edit queued message')" :disabled="disabled" @click="onEdit(msg.id)">{{ t('Edit') }}</button>
+        <button class="queued-row-steer" type="button" :title="t('Send now without interrupting work')" :disabled="disabled" @click="onSteer(msg.id)">{{ t('Steer') }}</button>
+        <button class="queued-row-delete" type="button" :aria-label="t('Delete queued message')" :title="t('Delete queued message')" :disabled="disabled" @click="onDelete(msg.id)">
           <svg xmlns="http://www.w3.org/2000/svg" width="1em" height="1em" viewBox="0 0 24 24" aria-hidden="true">
             <path fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
               d="M4 7h16M10 11v6M14 11v6M5 7l1 12a2 2 0 0 0 2 2h8a2 2 0 0 0 2-2l1-12M9 7V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v3" />
@@ -74,6 +74,21 @@ const emit = defineEmits<{
 const { t } = useUiLanguage()
 const draggedMessageId = ref('')
 const dropTargetMessageId = ref('')
+
+function onEdit(messageId: string): void {
+  if (props.disabled) return
+  emit('edit', messageId)
+}
+
+function onSteer(messageId: string): void {
+  if (props.disabled) return
+  emit('steer', messageId)
+}
+
+function onDelete(messageId: string): void {
+  if (props.disabled) return
+  emit('delete', messageId)
+}
 
 function onDragStart(event: DragEvent, messageId: string): void {
   if (props.disabled) return

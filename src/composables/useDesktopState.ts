@@ -1824,6 +1824,8 @@ export function useDesktopState() {
   }
 
   function setSelectedCollaborationMode(mode: CollaborationModeKind): void {
+    const threadId = selectedThreadId.value.trim()
+    if (threadId && isExternallyOwned(threadId)) return
     const nextMode: CollaborationModeKind = mode === 'plan' ? 'plan' : 'default'
     const contextId = toThreadContextId(selectedThreadId.value)
     const currentMode = readSelectedCollaborationMode(selectedCollaborationModeByContext.value, selectedThreadId.value)
@@ -1962,6 +1964,8 @@ export function useDesktopState() {
   }
 
   function setSelectedReasoningEffort(effort: ReasoningEffort | ''): void {
+    const threadId = selectedThreadId.value.trim()
+    if (threadId && isExternallyOwned(threadId)) return
     if (effort && !REASONING_EFFORT_OPTIONS.includes(effort)) {
       return
     }
@@ -1969,6 +1973,8 @@ export function useDesktopState() {
   }
 
   async function updateSelectedSpeedMode(mode: SpeedMode): Promise<void> {
+    const threadId = selectedThreadId.value.trim()
+    if (threadId && isExternallyOwned(threadId)) return
     const nextMode: SpeedMode = mode === 'fast' ? 'fast' : 'standard'
     if (isUpdatingSpeedMode.value || selectedSpeedMode.value === nextMode) {
       return
@@ -1994,7 +2000,7 @@ export function useDesktopState() {
       const modes = await getAvailableCollaborationModes()
       availableCollaborationModes.value = modes
       if (!modes.some((mode) => mode.value === selectedCollaborationMode.value)) {
-        setSelectedCollaborationMode('default')
+        setSelectedCollaborationModeForThread(selectedThreadId.value, 'default')
       }
     } catch {
       // Keep the last known collaboration mode choices on transient failures.
