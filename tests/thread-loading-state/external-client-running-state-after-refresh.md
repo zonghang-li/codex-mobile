@@ -37,15 +37,253 @@
 
 #### Configured desktop command and launcher descendants
 
-##### Setup
-- Use Linux and keep `codex-mobile-safe` running through its normal Node launcher and native Codex app-server child.
-- Identify a thread whose rollout is shared by the desktop app-server and `codex-mobile-safe`, and make sure it is idle before the check.
+##### Prerequisites and evidence helpers
+- Run this procedure in a disposable test thread on Linux, as the same unprivileged user that owns `codex-mobile-safe.service`. Do not use `sudo`, a production thread, or a password literal in any command.
+- Run the commands below in one dedicated Bash shell. Export the test thread ID, locate its single canonical rollout, and create temporary evidence files:
+
+  ```bash
+  set -u -o pipefail
+  export THREAD_ID='<test-thread-id>'
+  SERVICE_URL='http://127.0.0.1:5900'
+  SESSIONS_ROOT="$(realpath "${CODEX_HOME:-$HOME/.codex}/sessions")"
+  mapfile -t ROLLOUT_MATCHES < <(find "$SESSIONS_ROOT" -type f -name "rollout-*-${THREAD_ID}.jsonl" -print)
+  ((${#ROLLOUT_MATCHES[@]} == 1)) || { printf 'expected one rollout, found %s\n' "${#ROLLOUT_MATCHES[@]}" >&2; exit 1; }
+  ROLLOUT="$(realpath "${ROLLOUT_MATCHES[0]}")"
+  ROLLOUT_IDENTITY="$(stat -Lc '%d:%i' "$ROLLOUT")"
+  EVIDENCE_DIR="$(mktemp -d)"
+  COOKIE_JAR="$EVIDENCE_DIR/cookies"
+  cleanup_runtime_evidence() {
+    unset CODEX_MOBILE_PASSWORD
+    rm -f -- "$EVIDENCE_DIR/cookies" "$EVIDENCE_DIR/"*.cmdline "$EVIDENCE_DIR/"*.json
+    rmdir -- "$EVIDENCE_DIR"
+  }
+  trap cleanup_runtime_evidence EXIT
+  printf 'thread=%s\nrollout=%s\ndev:ino=%s\n' "$THREAD_ID" "$ROLLOUT" "$ROLLOUT_IDENTITY"
+  ```
+
+- Define helpers that preserve argv token boundaries, validate PID identity with `/proc/<pid>/stat` field 22, walk PPID links, and accept only a writable positive-position FD whose dev/ino matches the selected rollout:
+
+  ```bash
+  proc_starttime() {
+    local stat_line tail
+    IFS= read -r stat_line < "/proc/$1/stat" || return 1
+    tail="${stat_line##*) }"
+    set -- $tail
+    [[ ${20:-} =~ ^[0-9]+$ ]] || return 1
+    printf '%s\n' "${20}"
+  }
+
+  proc_ppid() {
+    awk '$1 == "PPid:" { print $2; exit }' "/proc/$1/status" 2>/dev/null
+  }
+
+  print_argv() {
+    local pid="$1" index=0 arg
+    while IFS= read -r -d '' arg; do
+      printf 'pid=%s argv[%s]=%q\n' "$pid" "$index" "$arg"
+      ((index += 1))
+    done < "/proc/$pid/cmdline"
+  }
+
+  is_codex_app_server() {
+    local pid="$1" saw_codex=0 arg
+    while IFS= read -r -d '' arg; do
+      if ((saw_codex)) && [[ $arg == app-server ]]; then return 0; fi
+      [[ ${arg##*/} == codex ]] && saw_codex=1
+    done < "/proc/$pid/cmdline" 2>/dev/null
+    return 1
+  }
+
+  has_argv_token() {
+    local pid="$1" expected="$2" arg
+    while IFS= read -r -d '' arg; do
+      [[ $arg == "$expected" ]] && return 0
+    done < "/proc/$pid/cmdline" 2>/dev/null
+    return 1
+  }
+
+  is_descendant_of() {
+    local current="$1" root="$2" depth parent
+    for ((depth = 0; depth < 128; depth += 1)); do
+      [[ $current == "$root" ]] && return 0
+      [[ $current =~ ^[0-9]+$ ]] && ((current > 1)) || return 1
+      parent="$(proc_ppid "$current")" || return 1
+      [[ $parent =~ ^[0-9]+$ ]] || return 1
+      current="$parent"
+    done
+    return 1
+  }
+
+  show_ppid_chain() {
+    local current="$1" depth parent starttime
+    for ((depth = 0; depth < 128; depth += 1)); do
+      starttime="$(proc_starttime "$current")" || return 1
+      parent="$(proc_ppid "$current")" || return 1
+      printf 'pid=%s ppid=%s starttime=%s\n' "$current" "$parent" "$starttime"
+      print_argv "$current"
+      [[ $current == 1 || $parent == 0 ]] && return 0
+      current="$parent"
+    done
+    return 1
+  }
+
+  rollout_writer_fds() {
+    local pid="$1" fd info position flags access found=1
+    for fd in "/proc/$pid/fd/"[0-9]*; do
+      [[ -e $fd ]] || continue
+      [[ $(stat -Lc '%d:%i' "$fd" 2>/dev/null) == "$ROLLOUT_IDENTITY" ]] || continue
+      info="/proc/$pid/fdinfo/${fd##*/}"
+      position="$(awk '$1 == "pos:" { print $2; exit }' "$info" 2>/dev/null)"
+      flags="$(awk '$1 == "flags:" { print $2; exit }' "$info" 2>/dev/null)"
+      [[ $position =~ ^[0-9]+$ && $flags =~ ^[0-7]+$ ]] || continue
+      access=$(( (8#$flags) & 3 ))
+      printf 'pid=%s fd=%s pos=%s flags=%s target=%s\n' \
+        "$pid" "${fd##*/}" "$position" "$flags" "$(readlink "$fd")"
+      if ((position > 0 && (access == 1 || access == 2))); then found=0; fi
+    done
+    return "$found"
+  }
+  ```
 
 ##### Steps
-1. Start the desktop app-server in the production layout `codex -c features.code_mode_host=true app-server --listen unix://` and begin a long-running turn.
-2. Open the same thread in `codex-mobile-safe`; confirm `/codex-api/thread-runtime-state` returns `running` and the composer shows the disabled “Running in another client” stop control.
-3. Confirm the mobile Node launcher and its native Codex child can both hold the rollout without being accepted as external evidence.
-4. Stop the separate desktop app-server while leaving the mobile service alive; after the terminal refresh the endpoint must become `idle` and the normal send control must return.
+1. Start or select a disposable desktop Client A whose app-server is launched in the production argv layout `codex -c features.code_mode_host=true app-server --listen unix://`. A bare app-server without its desktop JSON-RPC client cannot drive this check. In Client A, open `THREAD_ID`, submit a test-only prompt such as “run `sleep 300`, then report completion,” and confirm the turn is still running. Open the same thread in `codex-mobile-safe` so its own app-server resumes the rollout.
+2. Record the mobile service launcher directly from systemd, then enumerate qualifying processes that currently hold the exact rollout as a writable, positive-position FD:
+
+   ```bash
+   [[ $(systemctl --user show codex-mobile-safe.service -p ActiveState --value) == active ]] || exit 1
+   MOBILE_LAUNCHER_PID="$(systemctl --user show codex-mobile-safe.service -p MainPID --value)"
+   [[ $MOBILE_LAUNCHER_PID =~ ^[0-9]+$ ]] && ((MOBILE_LAUNCHER_PID > 1)) || exit 1
+
+   mapfile -t WRITER_PIDS < <(
+     for proc_dir in /proc/[0-9]*; do
+       pid="${proc_dir##*/}"
+       if is_codex_app_server "$pid" && rollout_writer_fds "$pid" >/dev/null; then printf '%s\n' "$pid"; fi
+     done
+   )
+
+   MOBILE_WRITER_PIDS=()
+   DESKTOP_CANDIDATES=()
+   for pid in "${WRITER_PIDS[@]}"; do
+     if is_descendant_of "$pid" "$MOBILE_LAUNCHER_PID"; then
+       MOBILE_WRITER_PIDS+=("$pid")
+     elif has_argv_token "$pid" 'features.code_mode_host=true' \
+       && has_argv_token "$pid" app-server \
+       && has_argv_token "$pid" --listen \
+       && has_argv_token "$pid" 'unix://'; then
+       DESKTOP_CANDIDATES+=("$pid")
+     fi
+   done
+
+   MOBILE_NATIVE_CANDIDATES=()
+   for pid in "${MOBILE_WRITER_PIDS[@]}"; do
+     argv0="$(tr '\0' '\n' < "/proc/$pid/cmdline" | head -n 1)"
+     [[ ${argv0##*/} == codex ]] && MOBILE_NATIVE_CANDIDATES+=("$pid")
+   done
+   ((${#MOBILE_NATIVE_CANDIDATES[@]} == 1)) || { printf 'ambiguous mobile native writers\n' >&2; exit 1; }
+   ((${#DESKTOP_CANDIDATES[@]} == 1)) || { printf 'ambiguous desktop writers\n' >&2; exit 1; }
+   MOBILE_NATIVE_PID="${MOBILE_NATIVE_CANDIDATES[0]}"
+   DESKTOP_PID="${DESKTOP_CANDIDATES[0]}"
+   ```
+
+3. Capture PID identities and raw argv before changing any process. Inspect the complete native-child PPID chain and verify it reaches `MOBILE_LAUNCHER_PID`; inspect both matching rollout FDs. The desktop chain must not reach the mobile launcher.
+
+   ```bash
+   MOBILE_LAUNCHER_STARTTIME="$(proc_starttime "$MOBILE_LAUNCHER_PID")"
+   MOBILE_NATIVE_STARTTIME="$(proc_starttime "$MOBILE_NATIVE_PID")"
+   DESKTOP_STARTTIME="$(proc_starttime "$DESKTOP_PID")"
+   cp "/proc/$MOBILE_LAUNCHER_PID/cmdline" "$EVIDENCE_DIR/mobile-launcher.cmdline"
+   cp "/proc/$MOBILE_NATIVE_PID/cmdline" "$EVIDENCE_DIR/mobile-native.cmdline"
+   cp "/proc/$DESKTOP_PID/cmdline" "$EVIDENCE_DIR/desktop.cmdline"
+
+   printf 'mobile launcher PID=%s\nmobile native PID=%s\ndesktop PID=%s\n' \
+     "$MOBILE_LAUNCHER_PID" "$MOBILE_NATIVE_PID" "$DESKTOP_PID"
+   show_ppid_chain "$MOBILE_NATIVE_PID"
+   is_descendant_of "$MOBILE_NATIVE_PID" "$MOBILE_LAUNCHER_PID"
+   ! is_descendant_of "$DESKTOP_PID" "$MOBILE_LAUNCHER_PID"
+   print_argv "$DESKTOP_PID"
+   rollout_writer_fds "$MOBILE_NATIVE_PID"
+   rollout_writer_fds "$DESKTOP_PID"
+   ```
+
+4. Authenticate without placing the password in argv or the document, then query the runtime endpoint with an encoded thread ID. The synthetic Host header prevents the trusted-localhost shortcut, so this checks the authenticated path.
+
+   ```bash
+   read -rsp 'Codex Mobile password: ' CODEX_MOBILE_PASSWORD; printf '\n'
+   export CODEX_MOBILE_PASSWORD
+   node -e 'process.stdout.write(JSON.stringify({password:process.env.CODEX_MOBILE_PASSWORD}))' \
+     | curl -fsS -o /dev/null -c "$COOKIE_JAR" \
+         -H 'Host: codex-mobile.test' -H 'Content-Type: application/json' \
+         --data-binary @- "$SERVICE_URL/auth/login"
+   unset CODEX_MOBILE_PASSWORD
+
+   curl -fsS -b "$COOKIE_JAR" -H 'Host: codex-mobile.test' --get \
+     --data-urlencode "threadId=$THREAD_ID" \
+     "$SERVICE_URL/codex-api/thread-runtime-state" > "$EVIDENCE_DIR/running.json"
+   jq -e '
+     .state == "running"
+     and .interruptible == false
+     and .source == "external-session-writer"
+     and (.turnId | type == "string" and length > 0)
+     and (keys | sort == ["interruptible", "source", "state", "turnId"])
+   ' "$EVIDENCE_DIR/running.json"
+   ```
+
+   Expect an exact payload shape of `{"state":"running","turnId":"<turn-id>","interruptible":false,"source":"external-session-writer"}` and the mobile composer to show the disabled “Running in another client” stop control.
+5. Stop only the previously recorded desktop writer. Immediately before signalling, require the same starttime, byte-identical raw cmdline, qualifying command tokens, non-mobile ancestry, and matching rollout FD. If any check fails, abort without signalling. Never use `pkill`, `killall`, a PID rediscovered by name, or `systemctl stop/restart` for this step.
+
+   ```bash
+   [[ $DESKTOP_PID =~ ^[0-9]+$ ]] && ((DESKTOP_PID > 1)) || exit 1
+   [[ $(proc_starttime "$DESKTOP_PID") == "$DESKTOP_STARTTIME" ]] || exit 1
+   cmp -s "/proc/$DESKTOP_PID/cmdline" "$EVIDENCE_DIR/desktop.cmdline" || exit 1
+   is_codex_app_server "$DESKTOP_PID" || exit 1
+   has_argv_token "$DESKTOP_PID" 'features.code_mode_host=true' || exit 1
+   ! is_descendant_of "$DESKTOP_PID" "$MOBILE_LAUNCHER_PID" || exit 1
+   rollout_writer_fds "$DESKTOP_PID" || exit 1
+   kill -TERM -- "$DESKTOP_PID"
+
+   for ((attempt = 0; attempt < 50; attempt += 1)); do
+     current_starttime="$(proc_starttime "$DESKTOP_PID" 2>/dev/null || true)"
+     [[ $current_starttime != "$DESKTOP_STARTTIME" ]] && break
+     sleep 0.1
+   done
+   [[ $(proc_starttime "$DESKTOP_PID" 2>/dev/null || true) != "$DESKTOP_STARTTIME" ]] || {
+     printf 'desktop PID did not exit; do not escalate to SIGKILL\n' >&2
+     exit 1
+   }
+   ```
+
+6. Prove the mobile processes were neither stopped nor accepted as external evidence: require the original mobile launcher and native child identities and cmdlines to remain unchanged, require the native child still to descend from the launcher and still hold the rollout, require that no separate qualifying desktop writer remains, then query the endpoint again.
+
+   ```bash
+   [[ $(proc_starttime "$MOBILE_LAUNCHER_PID") == "$MOBILE_LAUNCHER_STARTTIME" ]] || exit 1
+   [[ $(proc_starttime "$MOBILE_NATIVE_PID") == "$MOBILE_NATIVE_STARTTIME" ]] || exit 1
+   cmp -s "/proc/$MOBILE_LAUNCHER_PID/cmdline" "$EVIDENCE_DIR/mobile-launcher.cmdline" || exit 1
+   cmp -s "/proc/$MOBILE_NATIVE_PID/cmdline" "$EVIDENCE_DIR/mobile-native.cmdline" || exit 1
+   is_descendant_of "$MOBILE_NATIVE_PID" "$MOBILE_LAUNCHER_PID" || exit 1
+   rollout_writer_fds "$MOBILE_NATIVE_PID" || exit 1
+
+   for proc_dir in /proc/[0-9]*; do
+     pid="${proc_dir##*/}"
+     if is_codex_app_server "$pid" \
+       && rollout_writer_fds "$pid" >/dev/null \
+       && ! is_descendant_of "$pid" "$MOBILE_LAUNCHER_PID"; then
+       printf 'unexpected non-mobile rollout writer pid=%s\n' "$pid" >&2
+       exit 1
+     fi
+   done
+
+   curl -fsS -b "$COOKIE_JAR" -H 'Host: codex-mobile.test' --get \
+     --data-urlencode "threadId=$THREAD_ID" \
+     "$SERVICE_URL/codex-api/thread-runtime-state" > "$EVIDENCE_DIR/idle.json"
+   jq -e '. == {"state":"idle"}' "$EVIDENCE_DIR/idle.json"
+   ```
+
+   Expect exactly `{"state":"idle"}`. After the terminal detail refresh, the normal send control must return. The before/after pair proves that the separate desktop writer supplied the earlier `running` evidence while the still-live mobile descendant writer was excluded.
+
+##### Cleanup
+- If the procedure aborts before step 5, stop the test turn with Client A's normal stop control. If the recorded desktop PID still exists, repeat every identity check from step 5 before sending it `TERM`; never signal an unverified or reused PID and never escalate to `SIGKILL`.
+- Close the disposable desktop and mobile test clients, remove any test-only queued message, and archive or delete the test thread through the normal UI if appropriate. Do not stop or restart `codex-mobile-safe.service` as cleanup.
+- Exit the dedicated shell so its trap deletes the cookie jar, saved cmdlines, and JSON evidence, removes the now-empty evidence directory, and unsets the password variable.
 
 ##### Expected Results
 - Command recognition treats `/proc/<pid>/cmdline` as NUL-delimited argv: an argv token whose basename is exactly `codex` must precede a later token that is exactly `app-server`. Options between those tokens are accepted; lookalike basenames, reversed ordering, and lookalike subcommands are rejected.
