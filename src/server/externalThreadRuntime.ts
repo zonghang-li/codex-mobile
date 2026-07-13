@@ -325,21 +325,34 @@ async function readStableFdSnapshot(
   const fdPath = `${processRoot}/fd/${fd}`
   const identityBefore = await statProcFd(fdPath)
   if (!identityBefore) return null
-  const fdinfo = await readProcText(
+  const fdinfoBefore = await readProcText(
     `${processRoot}/fdinfo/${fd}`,
     `process ${pid} descriptor ${fd}`,
   )
-  if (fdinfo === null) return null
-  const descriptor = parseFdInfo(fdinfo)
+  if (fdinfoBefore === null) return null
+  const descriptorBefore = parseFdInfo(fdinfoBefore)
+  const identityBetween = await statProcFd(fdPath)
+  if (!identityBetween) return null
+  const fdinfoAfter = await readProcText(
+    `${processRoot}/fdinfo/${fd}`,
+    `process ${pid} descriptor ${fd}`,
+  )
+  if (fdinfoAfter === null) return null
+  const descriptorAfter = parseFdInfo(fdinfoAfter)
   const identityAfter = await statProcFd(fdPath)
   if (!identityAfter) return null
   if (
-    identityBefore.dev !== identityAfter.dev
-    || identityBefore.ino !== identityAfter.ino
+    identityBefore.dev !== identityBetween.dev
+    || identityBefore.ino !== identityBetween.ino
+    || identityBetween.dev !== identityAfter.dev
+    || identityBetween.ino !== identityAfter.ino
   ) {
     throw new InconclusiveRuntimeScanError('Descriptor identity changed during inspection')
   }
-  return { ...identityAfter, ...descriptor }
+  if (descriptorBefore.flags !== descriptorAfter.flags) {
+    throw new InconclusiveRuntimeScanError('Descriptor flags changed during inspection')
+  }
+  return { ...identityAfter, ...descriptorAfter }
 }
 
 function isCodexAppServerCommand(cmdline: string): boolean {

@@ -182,7 +182,9 @@ type DefaultRuntimeFixture = {
   fdIno?: bigint
   status?: string
   fdinfo?: string
+  fdinfoReads?: string[]
   fdIdentities?: Array<{ dev: bigint; ino: bigint }>
+  fdStatGoneAt?: number[]
   processes?: DefaultRuntimeProcessFixture[]
 }
 
@@ -214,6 +216,7 @@ function defaultRuntimeProbe(fixture: DefaultRuntimeFixture = {}): ExternalThrea
   const statusReadCounts = new Map<number, number>()
   const cmdlineReadCounts = new Map<number, number>()
   let fdIdentityReadCount = 0
+  let fdinfoReadCount = 0
 
   function readSequence<T>(values: T[], index: number): T {
     return values[Math.min(index, values.length - 1)]
@@ -221,8 +224,13 @@ function defaultRuntimeProbe(fixture: DefaultRuntimeFixture = {}): ExternalThrea
 
   nodeFs.realpath.mockImplementation(async (path: string) => path)
   nodeFs.stat.mockImplementation(async (path: string, options?: { bigint?: boolean }) => {
-    const fdIdentity = path.startsWith('/proc/') && fixture.fdIdentities
-      ? readSequence(fixture.fdIdentities, fdIdentityReadCount++)
+    const isProcFd = path.startsWith('/proc/')
+    const identityReadIndex = isProcFd ? fdIdentityReadCount++ : -1
+    if (isProcFd && fixture.fdStatGoneAt?.includes(identityReadIndex)) {
+      throw Object.assign(new Error('descriptor disappeared'), { code: 'ENOENT' })
+    }
+    const fdIdentity = isProcFd && fixture.fdIdentities
+      ? readSequence(fixture.fdIdentities, identityReadIndex)
       : null
     const dev = path === rolloutPath ? rolloutDev : (fdIdentity?.dev ?? fdDev)
     const ino = path === rolloutPath ? rolloutIno : (fdIdentity?.ino ?? fdIno)
@@ -287,7 +295,8 @@ function defaultRuntimeProbe(fixture: DefaultRuntimeFixture = {}): ExternalThrea
       return readSequence(reads, readCount)
     }
     if (process.fds.some((fd) => path === `/proc/${process.pid}/fdinfo/${fd}`)) {
-      return fixture.fdinfo ?? 'pos:\t10\nflags:\t0100001\n'
+      const reads = fixture.fdinfoReads ?? [fixture.fdinfo ?? 'pos:\t10\nflags:\t0100001\n']
+      return readSequence(reads, fdinfoReadCount++)
     }
     throw new Error(`Unexpected readFile: ${path}`)
   })
@@ -912,6 +921,66 @@ describe('ExternalThreadRuntimeProbe', () => {
     })
 
     await expect(probe.inspect('thread-1', 99)).resolves.toEqual({ state: 'unknown' })
+  })
+
+  it('returns unknown when a same-file FD changes from writable to read-only', async () => {
+    const probe = defaultRuntimeProbe({
+      fdIdentities: [
+        { dev: 8n, ino: 21n },
+        { dev: 8n, ino: 21n },
+        { dev: 8n, ino: 21n },
+      ],
+      fdinfoReads: [
+        'pos:\t10\nflags:\t0100001\n',
+        'pos:\t0\nflags:\t0100000\n',
+      ],
+    })
+
+    await expect(probe.inspect('thread-1', 99)).resolves.toEqual({ state: 'unknown' })
+  })
+
+  it('uses a stable writable FD latest zero position as non-writer evidence', async () => {
+    const probe = defaultRuntimeProbe({
+      fdIdentities: [
+        { dev: 8n, ino: 21n },
+        { dev: 8n, ino: 21n },
+        { dev: 8n, ino: 21n },
+      ],
+      fdinfoReads: [
+        'pos:\t10\nflags:\t0100001\n',
+        'pos:\t0\nflags:\t0100001\n',
+      ],
+    })
+
+    await expect(probe.inspect('thread-1', 99)).resolves.toEqual({ state: 'idle' })
+  })
+
+  it('accepts a stable writable FD whose position advances during inspection', async () => {
+    const probe = defaultRuntimeProbe({
+      fdIdentities: [
+        { dev: 8n, ino: 21n },
+        { dev: 8n, ino: 21n },
+        { dev: 8n, ino: 21n },
+      ],
+      fdinfoReads: [
+        'pos:\t10\nflags:\t0100001\n',
+        'pos:\t20\nflags:\t0100001\n',
+      ],
+    })
+
+    await expect(probe.inspect('thread-1', 99)).resolves.toMatchObject({
+      state: 'running',
+      turnId: 'turn-a',
+    })
+  })
+
+  it.each([
+    ['between fdinfo reads', 1],
+    ['after the second fdinfo read', 2],
+  ])('skips a descriptor that disappears %s', async (_label, goneAt) => {
+    const probe = defaultRuntimeProbe({ fdStatGoneAt: [goneAt] })
+
+    await expect(probe.inspect('thread-1', 99)).resolves.toEqual({ state: 'idle' })
   })
 
   it('returns unknown when a proc status has a malformed parent PID', async () => {
