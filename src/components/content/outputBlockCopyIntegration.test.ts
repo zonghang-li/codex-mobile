@@ -2,26 +2,19 @@ import { readFile } from 'node:fs/promises'
 import { describe, expect, it } from 'vitest'
 
 describe('ThreadConversation per-block copy integration', () => {
-  it('covers structured message, command, reasoning, plan, and error output', async () => {
+  it('adds copy controls only to fenced Markdown code blocks', async () => {
     const source = await readFile(new URL('./ThreadConversation.vue', import.meta.url), 'utf8')
-    expect(source).toContain('CopyableOutputBlock')
-    expect(source).toContain(':copy-text="messageBlockCopyText(message, block)"')
-    expect(source).toContain(':label="messageBlockCopyLabel(message)"')
-    expect(source).toContain('label="Copy command output"')
-    expect(source).toContain('label="Copy reasoning"')
-    expect(source).toContain('label="Copy plan explanation"')
-    expect(source).toContain('label="Copy plan step"')
-    expect(source).toContain('label="Copy error"')
+    expect(source.match(/<CopyableOutputBlock\b/gu)).toHaveLength(1)
+    expect(source).toContain(':copy-text="block.value"')
+    expect(source).toContain('label="Copy code block"')
+    expect(source).not.toContain('messageBlockCopyText')
+    expect(source).not.toContain('messageBlockCopyLabel')
   })
 
-  it('passes exact raw output payloads and excludes image and visual diff controls', async () => {
+  it('does not add controls to prose, lists, plans, reasoning, errors, commands, images, or diffs', async () => {
     const source = await readFile(new URL('./ThreadConversation.vue', import.meta.url), 'utf8')
-    expect(source).toContain(':copy-text="cmd.commandExecution?.aggregatedOutput ?? \'\'"')
-    expect(source).toContain(':copy-text="message.commandExecution?.aggregatedOutput ?? \'\'"')
-    expect(source).toContain(':copy-text="liveOverlay.reasoningText"')
-    expect(source).toContain(':copy-text="step.step"')
-    expect(source).not.toMatch(/CopyableOutputBlock[^>]+(?:block\.markdown|block\.url)/u)
-    expect(source).not.toMatch(/diff-viewer[\s\S]{0,300}CopyableOutputBlock/u)
+    expect(source).not.toMatch(/CopyableOutputBlock[^>]+(?:message\.text|step\.step|reasoningText|errorText|aggregatedOutput|block\.markdown|block\.url)/u)
+    expect(source).not.toMatch(/(?:cmd-output|plan-card|live-overlay|diff-viewer)[\s\S]{0,240}<CopyableOutputBlock/u)
   })
 })
 

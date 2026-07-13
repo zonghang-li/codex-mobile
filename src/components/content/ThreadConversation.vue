@@ -71,16 +71,11 @@
                     :class="{ 'cmd-output-visible': isCommandExpanded(cmd) }"
                   >
                     <div class="cmd-output-inner">
-                      <CopyableOutputBlock
-                        :copy-text="cmd.commandExecution?.aggregatedOutput ?? ''"
-                        label="Copy command output"
-                      >
-                        <pre
-                          class="cmd-output"
-                          :class="{ 'cmd-output-condensed': isCommandOutputCondensed(cmd) }"
-                          v-text="cmd.commandExecution?.aggregatedOutput || '(no output)'"
-                        ></pre>
-                      </CopyableOutputBlock>
+                      <pre
+                        class="cmd-output"
+                        :class="{ 'cmd-output-condensed': isCommandOutputCondensed(cmd) }"
+                        v-text="cmd.commandExecution?.aggregatedOutput || '(no output)'"
+                      ></pre>
                     </div>
                   </div>
                 </div>
@@ -108,16 +103,11 @@
                 :class="{ 'cmd-output-visible': isCommandExpanded(message) }"
               >
                 <div class="cmd-output-inner">
-                  <CopyableOutputBlock
-                    :copy-text="message.commandExecution?.aggregatedOutput ?? ''"
-                    label="Copy command output"
-                  >
-                    <pre
-                      class="cmd-output"
-                      :class="{ 'cmd-output-condensed': isCommandOutputCondensed(message) }"
-                      v-text="message.commandExecution?.aggregatedOutput || '(no output)'"
-                    ></pre>
-                  </CopyableOutputBlock>
+                  <pre
+                    class="cmd-output"
+                    :class="{ 'cmd-output-condensed': isCommandOutputCondensed(message) }"
+                    v-text="message.commandExecution?.aggregatedOutput || '(no output)'"
+                  ></pre>
                 </div>
               </div>
             </template>
@@ -310,16 +300,11 @@
                         :class="{ 'cmd-output-visible': isCommandExpanded(cmd) }"
                       >
                         <div class="cmd-output-inner">
-                          <CopyableOutputBlock
-                            :copy-text="cmd.commandExecution?.aggregatedOutput ?? ''"
-                            label="Copy command output"
-                          >
-                            <pre
-                              class="cmd-output"
-                              :class="{ 'cmd-output-condensed': isCommandOutputCondensed(cmd) }"
-                              v-text="cmd.commandExecution?.aggregatedOutput || '(no output)'"
-                            ></pre>
-                          </CopyableOutputBlock>
+                          <pre
+                            class="cmd-output"
+                            :class="{ 'cmd-output-condensed': isCommandOutputCondensed(cmd) }"
+                            v-text="cmd.commandExecution?.aggregatedOutput || '(no output)'"
+                          ></pre>
                         </div>
                       </div>
                     </div>
@@ -330,16 +315,11 @@
                     <p class="plan-card-title">Plan</p>
                     <span v-if="message.messageType === 'plan.live'" class="plan-card-badge">Updating</span>
                   </div>
-                  <CopyableOutputBlock
+                  <div
                     v-if="readPlanExplanation(message)"
-                    :copy-text="readPlanExplanation(message)"
-                    label="Copy plan explanation"
-                  >
-                    <div
-                      class="plan-card-explanation plan-card-markdown"
-                      v-html="renderMarkdownBlocksAsHtml(readPlanExplanation(message))"
-                    />
-                  </CopyableOutputBlock>
+                    class="plan-card-explanation plan-card-markdown"
+                    v-html="renderMarkdownBlocksAsHtml(readPlanExplanation(message))"
+                  />
                   <ol v-if="readPlanSteps(message).length > 0" class="plan-step-list">
                     <li
                       v-for="(step, stepIndex) in readPlanSteps(message)"
@@ -348,14 +328,10 @@
                       :data-status="step.status"
                     >
                       <span class="plan-step-status" :data-status="step.status">{{ planStepStatusIcon(step.status) }}</span>
-                      <CopyableOutputBlock :copy-text="step.step" label="Copy plan step">
-                        <div class="plan-step-text plan-card-markdown" v-html="renderMarkdownBlocksAsHtml(step.step)" />
-                      </CopyableOutputBlock>
+                      <div class="plan-step-text plan-card-markdown" v-html="renderMarkdownBlocksAsHtml(step.step)" />
                     </li>
                   </ol>
-                  <CopyableOutputBlock v-else :copy-text="message.text" label="Copy plan explanation">
-                    <div class="plan-card-markdown" v-html="renderMarkdownBlocksAsHtml(message.text)" />
-                  </CopyableOutputBlock>
+                  <div v-else class="plan-card-markdown" v-html="renderMarkdownBlocksAsHtml(message.text)" />
                   <div v-if="showImplementPlanButton(message)" class="plan-card-actions">
                     <button
                       type="button"
@@ -372,11 +348,6 @@
                   v-memo="[message.id, message.text, props.cwd, highlightCacheVersion, markdownImageFailureVersion]"
                 >
                   <template v-for="(block, blockIndex) in getMessageBlocks(message)" :key="`block-${blockIndex}`">
-                    <CopyableOutputBlock
-                      v-if="block.kind !== 'thematicBreak' && block.kind !== 'image'"
-                      :copy-text="messageBlockCopyText(message, block)"
-                      :label="messageBlockCopyLabel(message)"
-                    >
                     <p v-if="block.kind === 'paragraph'" class="message-text">
                       <template v-for="(segment, segmentIndex) in getInlineSegments(block.value)" :key="`seg-${blockIndex}-${segmentIndex}`">
                         <span v-if="segment.kind === 'text'">{{ segment.value }}</span>
@@ -598,10 +569,11 @@
                       </table>
                     </div>
                     <div v-else-if="block.kind === 'codeBlock'" class="message-code-block">
-                      <div v-if="block.language" class="message-code-language">{{ block.language }}</div>
-                      <pre class="message-code-pre"><code class="hljs" v-html="renderCachedHighlightedCodeAsHtml(block.language, block.value)"></code></pre>
+                      <CopyableOutputBlock :copy-text="block.value" label="Copy code block">
+                        <div v-if="block.language" class="message-code-language">{{ block.language }}</div>
+                        <pre class="message-code-pre"><code class="hljs" v-html="renderCachedHighlightedCodeAsHtml(block.language, block.value)"></code></pre>
+                      </CopyableOutputBlock>
                     </div>
-                    </CopyableOutputBlock>
                     <hr v-else-if="block.kind === 'thematicBreak'" class="message-divider" />
                     <p v-else-if="isMarkdownImageFailed(message.id, blockIndex)" class="message-text">{{ block.markdown }}</p>
                     <button
@@ -766,17 +738,9 @@
           <div class="message-stack">
             <article class="live-overlay-inline" aria-live="polite">
               <p class="live-overlay-label">{{ liveOverlay.activityLabel }}</p>
-              <CopyableOutputBlock
-                v-if="liveOverlay.reasoningText"
-                :copy-text="liveOverlay.reasoningText"
-                label="Copy reasoning"
-              >
-                <p class="live-overlay-reasoning">{{ liveOverlay.reasoningText }}</p>
-              </CopyableOutputBlock>
+              <p v-if="liveOverlay.reasoningText" class="live-overlay-reasoning">{{ liveOverlay.reasoningText }}</p>
               <div v-if="liveOverlay.errorText" class="live-overlay-error">
-                <CopyableOutputBlock :copy-text="liveOverlay.errorText" label="Copy error">
-                  <span>{{ liveOverlay.errorText }}</span>
-                </CopyableOutputBlock>
+                <span>{{ liveOverlay.errorText }}</span>
                 <a class="live-overlay-feedback" :href="feedbackMailto" @click="prepareLiveErrorFeedback($event, liveOverlay.errorText)">Send feedback</a>
               </div>
             </article>
@@ -962,7 +926,6 @@ import {
   latestThreadRenderWindowStart,
 } from './threadConversationWindow'
 import type { ListItem, MessageBlock, TableAlignment, TaskListItem } from './messageBlockTypes'
-import { messageBlockCopyLabel, messageBlockCopyText } from './outputBlockCopy'
 
 import CopyableOutputBlock from './CopyableOutputBlock.vue'
 import IconTablerArrowBackUp from '../icons/IconTablerArrowBackUp.vue'
