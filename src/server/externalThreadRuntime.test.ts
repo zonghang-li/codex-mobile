@@ -165,7 +165,10 @@ type DefaultRuntimeProcessFixture = {
   parentPid: number
   cmdline: string
   fds: string[]
+  uid?: number
   statStartTimes?: bigint[]
+  statusReads?: string[]
+  cmdlineReads?: string[]
 }
 
 type DefaultRuntimeFixture = {
@@ -179,6 +182,7 @@ type DefaultRuntimeFixture = {
   fdIno?: bigint
   status?: string
   fdinfo?: string
+  fdIdentities?: Array<{ dev: bigint; ino: bigint }>
   processes?: DefaultRuntimeProcessFixture[]
 }
 
@@ -207,11 +211,21 @@ function defaultRuntimeProbe(fixture: DefaultRuntimeFixture = {}): ExternalThrea
     fds: ['7'],
   }]
   const statReadCounts = new Map<number, number>()
+  const statusReadCounts = new Map<number, number>()
+  const cmdlineReadCounts = new Map<number, number>()
+  let fdIdentityReadCount = 0
+
+  function readSequence<T>(values: T[], index: number): T {
+    return values[Math.min(index, values.length - 1)]
+  }
 
   nodeFs.realpath.mockImplementation(async (path: string) => path)
   nodeFs.stat.mockImplementation(async (path: string, options?: { bigint?: boolean }) => {
-    const dev = path === rolloutPath ? rolloutDev : fdDev
-    const ino = path === rolloutPath ? rolloutIno : fdIno
+    const fdIdentity = path.startsWith('/proc/') && fixture.fdIdentities
+      ? readSequence(fixture.fdIdentities, fdIdentityReadCount++)
+      : null
+    const dev = path === rolloutPath ? rolloutDev : (fdIdentity?.dev ?? fdDev)
+    const ino = path === rolloutPath ? rolloutIno : (fdIdentity?.ino ?? fdIno)
     if (options?.bigint) {
       return {
         dev,
@@ -253,8 +267,12 @@ function defaultRuntimeProbe(fixture: DefaultRuntimeFixture = {}): ExternalThrea
     const process = processes.find(({ pid }) => path.startsWith(`/proc/${pid}/`))
     if (!process) throw new Error(`Unexpected readFile: ${path}`)
     if (path === `/proc/${process.pid}/status`) {
-      return fixture.status
-        ?? `Name:\tcodex\nPPid:\t${process.parentPid}\nUid:\t${uid}\t${uid}\t${uid}\t${uid}\n`
+      const processUid = process.uid ?? uid
+      const reads = process.statusReads ?? [fixture.status
+        ?? `Name:\tcodex\nPPid:\t${process.parentPid}\nUid:\t${processUid}\t${processUid}\t${processUid}\t${processUid}\n`]
+      const readCount = statusReadCounts.get(process.pid) ?? 0
+      statusReadCounts.set(process.pid, readCount + 1)
+      return readSequence(reads, readCount)
     }
     if (path === `/proc/${process.pid}/stat`) {
       const readCount = statReadCounts.get(process.pid) ?? 0
@@ -262,7 +280,12 @@ function defaultRuntimeProbe(fixture: DefaultRuntimeFixture = {}): ExternalThrea
       const startTimes = process.statStartTimes ?? [BigInt(process.pid) * 1_000n]
       return procStat(process, startTimes[Math.min(readCount, startTimes.length - 1)])
     }
-    if (path === `/proc/${process.pid}/cmdline`) return process.cmdline
+    if (path === `/proc/${process.pid}/cmdline`) {
+      const reads = process.cmdlineReads ?? [process.cmdline]
+      const readCount = cmdlineReadCounts.get(process.pid) ?? 0
+      cmdlineReadCounts.set(process.pid, readCount + 1)
+      return readSequence(reads, readCount)
+    }
     if (process.fds.some((fd) => path === `/proc/${process.pid}/fdinfo/${fd}`)) {
       return fixture.fdinfo ?? 'pos:\t10\nflags:\t0100001\n'
     }
@@ -734,12 +757,12 @@ describe('ExternalThreadRuntimeProbe', () => {
       state: 'running',
       turnId: 'turn-a',
     })
-    expect(nodeFs.readFile.mock.calls.filter(([path]) => path === '/proc/100/stat')).toHaveLength(4)
+    expect(nodeFs.readFile.mock.calls.filter(([path]) => path === '/proc/100/stat')).toHaveLength(6)
   })
 
   it.each([
     ['before descriptor enumeration', [101n, 101n, 202n]],
-    ['during descriptor enumeration', [101n, 101n, 101n, 202n]],
+    ['during descriptor enumeration', [101n, 101n, 101n, 101n, 202n]],
   ])('returns unknown when PID replacement occurs %s', async (_label, statStartTimes) => {
     const probe = defaultRuntimeProbe({
       processes: [{
@@ -752,6 +775,222 @@ describe('ExternalThreadRuntimeProbe', () => {
     })
 
     await expect(probe.inspect('thread-1', 99)).resolves.toEqual({ state: 'unknown' })
+  })
+
+  it.each([
+    [
+      'UID before descriptor enumeration',
+      {
+        statusReads: [
+          `Name:\tcodex\nPPid:\t1\nUid:\t${typeof process.getuid === 'function' ? process.getuid() : 1000}\n`,
+          'Name:\tcodex\nPPid:\t1\nUid:\t2000\n',
+        ],
+      },
+    ],
+    [
+      'UID after descriptor enumeration',
+      {
+        statusReads: [
+          `Name:\tcodex\nPPid:\t1\nUid:\t${typeof process.getuid === 'function' ? process.getuid() : 1000}\n`,
+          `Name:\tcodex\nPPid:\t1\nUid:\t${typeof process.getuid === 'function' ? process.getuid() : 1000}\n`,
+          'Name:\tcodex\nPPid:\t1\nUid:\t2000\n',
+        ],
+      },
+    ],
+    [
+      'parent PID before descriptor enumeration',
+      {
+        statusReads: [
+          `Name:\tcodex\nPPid:\t1\nUid:\t${typeof process.getuid === 'function' ? process.getuid() : 1000}\n`,
+          `Name:\tcodex\nPPid:\t99\nUid:\t${typeof process.getuid === 'function' ? process.getuid() : 1000}\n`,
+        ],
+      },
+    ],
+    [
+      'parent PID after descriptor enumeration',
+      {
+        statusReads: [
+          `Name:\tcodex\nPPid:\t1\nUid:\t${typeof process.getuid === 'function' ? process.getuid() : 1000}\n`,
+          `Name:\tcodex\nPPid:\t1\nUid:\t${typeof process.getuid === 'function' ? process.getuid() : 1000}\n`,
+          `Name:\tcodex\nPPid:\t99\nUid:\t${typeof process.getuid === 'function' ? process.getuid() : 1000}\n`,
+        ],
+      },
+    ],
+    [
+      'command line before descriptor enumeration',
+      {
+        cmdlineReads: [
+          '/opt/codex/bin/codex\0app-server\0',
+          '/usr/bin/node\0worker.js\0',
+        ],
+      },
+    ],
+    [
+      'command line after descriptor enumeration',
+      {
+        cmdlineReads: [
+          '/opt/codex/bin/codex\0app-server\0',
+          '/opt/codex/bin/codex\0app-server\0',
+          '/usr/bin/node\0worker.js\0',
+        ],
+      },
+    ],
+  ])('returns unknown when candidate %s changes with a constant starttime', async (_label, mutation) => {
+    const probe = defaultRuntimeProbe({
+      processes: [{
+        pid: 100,
+        parentPid: 1,
+        cmdline: '/opt/codex/bin/codex\0app-server\0',
+        fds: ['7'],
+        statStartTimes: [101n],
+        ...mutation,
+      }],
+    })
+
+    await expect(probe.inspect('thread-1', 999)).resolves.toEqual({ state: 'unknown' })
+  })
+
+  it.each([
+    ['before descriptor enumeration', [99n, 99n, 199n]],
+    ['after descriptor enumeration', [99n, 99n, 99n, 99n, 199n]],
+  ])('returns unknown when an ancestor is replaced with the same PID %s', async (_label, statStartTimes) => {
+    const probe = defaultRuntimeProbe({
+      processes: [
+        {
+          pid: 100,
+          parentPid: 99,
+          cmdline: '/opt/codex/bin/codex\0app-server\0',
+          fds: ['7'],
+          statStartTimes: [100n],
+        },
+        {
+          pid: 99,
+          parentPid: 1,
+          cmdline: '/usr/bin/node\0launcher.js\0',
+          fds: [],
+          statStartTimes,
+        },
+      ],
+    })
+
+    await expect(probe.inspect('thread-1', 999)).resolves.toEqual({ state: 'unknown' })
+  })
+
+  it('returns unknown when an ancestor parent PID changes during inspection', async () => {
+    const uid = typeof process.getuid === 'function' ? process.getuid() : 1000
+    const probe = defaultRuntimeProbe({
+      processes: [
+        {
+          pid: 100,
+          parentPid: 99,
+          cmdline: '/opt/codex/bin/codex\0app-server\0',
+          fds: ['7'],
+        },
+        {
+          pid: 99,
+          parentPid: 1,
+          cmdline: '/usr/bin/node\0launcher.js\0',
+          fds: [],
+          statusReads: [
+            `Name:\tnode\nPPid:\t1\nUid:\t${uid}\n`,
+            `Name:\tnode\nPPid:\t1\nUid:\t${uid}\n`,
+            `Name:\tnode\nPPid:\t500\nUid:\t${uid}\n`,
+          ],
+        },
+      ],
+    })
+
+    await expect(probe.inspect('thread-1', 999)).resolves.toEqual({ state: 'unknown' })
+  })
+
+  it('returns unknown when an FD number is reused between fdinfo and identity reads', async () => {
+    const probe = defaultRuntimeProbe({
+      fdIdentities: [
+        { dev: 8n, ino: 21n },
+        { dev: 8n, ino: 22n },
+      ],
+    })
+
+    await expect(probe.inspect('thread-1', 99)).resolves.toEqual({ state: 'unknown' })
+  })
+
+  it('returns unknown when a proc status has a malformed parent PID', async () => {
+    const probe = defaultRuntimeProbe({
+      status: 'Name:\tcodex\nPPid:\tnot-a-number\nUid:\t1000\n',
+    })
+
+    await expect(probe.inspect('thread-1', 99)).resolves.toEqual({ state: 'unknown' })
+  })
+
+  it('returns unknown when a candidate process parent is missing from the process table', async () => {
+    const probe = defaultRuntimeProbe({
+      processes: [{
+        pid: 100,
+        parentPid: 99,
+        cmdline: '/opt/codex/bin/codex\0app-server\0',
+        fds: ['7'],
+      }],
+    })
+
+    await expect(probe.inspect('thread-1', 999)).resolves.toEqual({ state: 'unknown' })
+  })
+
+  it('returns unknown when process ancestry exceeds 128 hops', async () => {
+    const uid = typeof process.getuid === 'function' ? process.getuid() : 1000
+    const processes: DefaultRuntimeProcessFixture[] = Array.from({ length: 130 }, (_, index) => ({
+      pid: 1_000 + index,
+      parentPid: index === 129 ? 1 : 1_001 + index,
+      uid: index === 0 ? uid : uid + 1,
+      cmdline: index === 0 ? '/opt/codex/bin/codex\0app-server\0' : '',
+      fds: index === 0 ? ['7'] : [],
+    }))
+    const probe = defaultRuntimeProbe({ processes })
+
+    await expect(probe.inspect('thread-1', 999)).resolves.toEqual({ state: 'unknown' })
+  })
+
+  it('accepts process ancestry at the 128-hop limit', async () => {
+    const uid = typeof process.getuid === 'function' ? process.getuid() : 1000
+    const processes: DefaultRuntimeProcessFixture[] = Array.from({ length: 128 }, (_, index) => ({
+      pid: 1_000 + index,
+      parentPid: index === 127 ? 1 : 1_001 + index,
+      uid: index === 0 ? uid : uid + 1,
+      cmdline: index === 0 ? '/opt/codex/bin/codex\0app-server\0' : '',
+      fds: index === 0 ? ['7'] : [],
+    }))
+    const probe = defaultRuntimeProbe({ processes })
+
+    await expect(probe.inspect('thread-1', 999)).resolves.toMatchObject({
+      state: 'running',
+      turnId: 'turn-a',
+    })
+  })
+
+  it('uses a cross-UID parent when validating candidate ancestry', async () => {
+    const uid = typeof process.getuid === 'function' ? process.getuid() : 1000
+    const probe = defaultRuntimeProbe({
+      processes: [
+        {
+          pid: 100,
+          parentPid: 99,
+          uid,
+          cmdline: '/opt/codex/bin/codex\0app-server\0',
+          fds: ['7'],
+        },
+        {
+          pid: 99,
+          parentPid: 1,
+          uid: uid + 1,
+          cmdline: '/usr/bin/foreign-parent\0',
+          fds: [],
+        },
+      ],
+    })
+
+    await expect(probe.inspect('thread-1', 999)).resolves.toMatchObject({
+      state: 'running',
+      turnId: 'turn-a',
+    })
   })
 
   it('returns unknown when a proc status has a malformed UID', async () => {

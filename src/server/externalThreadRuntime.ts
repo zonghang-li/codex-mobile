@@ -198,6 +198,75 @@ function assertStableProcessIdentity(
   }
 }
 
+async function readStableProcessRecord(
+  processRoot: string,
+  pid: number,
+  commandUid: number | null,
+): Promise<LinuxProcessRecord | null> {
+  const startTime = await readProcStartTime(processRoot, pid)
+  if (startTime === null) return null
+  const status = await readProcText(`${processRoot}/status`, `process ${pid} status`)
+  if (status === null) return null
+  const uid = parseProcUid(status)
+  const parentPid = parseProcParentPid(status)
+
+  let cmdline = ''
+  if (commandUid !== null && uid === commandUid) {
+    const value = await readProcText(`${processRoot}/cmdline`, `process ${pid} command`)
+    if (value === null) return null
+    cmdline = value
+  }
+
+  const confirmedStartTime = await readProcStartTime(processRoot, pid)
+  if (confirmedStartTime === null) return null
+  assertStableProcessIdentity(startTime, confirmedStartTime)
+  return { pid, parentPid, uid, cmdline, startTime }
+}
+
+function assertStableProcessRecord(
+  expected: LinuxProcessRecord,
+  actual: LinuxProcessRecord,
+  includeCandidateMetadata: boolean,
+): void {
+  if (
+    actual.pid !== expected.pid
+    || actual.startTime !== expected.startTime
+    || actual.parentPid !== expected.parentPid
+    || (includeCandidateMetadata
+      && (actual.uid !== expected.uid || actual.cmdline !== expected.cmdline))
+  ) {
+    throw new InconclusiveRuntimeScanError('Process metadata changed during inspection')
+  }
+}
+
+async function validateProcessChain(
+  candidate: LinuxProcessRecord,
+  ancestorPids: readonly number[],
+  processes: ReadonlyMap<number, LinuxProcessRecord>,
+): Promise<boolean> {
+  const records = [
+    candidate,
+    ...ancestorPids
+      .filter((pid) => pid !== 1)
+      .map((pid) => processes.get(pid)),
+  ]
+  if (records.some((record) => !record)) {
+    throw new InconclusiveRuntimeScanError('Cannot resolve process ancestry')
+  }
+
+  for (const [index, expected] of records.entries()) {
+    if (!expected) continue
+    const actual = await readStableProcessRecord(
+      `/proc/${expected.pid}`,
+      expected.pid,
+      index === 0 ? candidate.uid : null,
+    )
+    if (!actual) return false
+    assertStableProcessRecord(expected, actual, index === 0)
+  }
+  return true
+}
+
 function collectAncestorPids(
   pid: number,
   processes: ReadonlyMap<number, LinuxProcessRecord>,
@@ -248,6 +317,31 @@ async function statProcFd(path: string): Promise<{ dev: string; ino: string } | 
   }
 }
 
+async function readStableFdSnapshot(
+  processRoot: string,
+  pid: number,
+  fd: string,
+): Promise<({ dev: string; ino: string } & { position: number; flags: number }) | null> {
+  const fdPath = `${processRoot}/fd/${fd}`
+  const identityBefore = await statProcFd(fdPath)
+  if (!identityBefore) return null
+  const fdinfo = await readProcText(
+    `${processRoot}/fdinfo/${fd}`,
+    `process ${pid} descriptor ${fd}`,
+  )
+  if (fdinfo === null) return null
+  const descriptor = parseFdInfo(fdinfo)
+  const identityAfter = await statProcFd(fdPath)
+  if (!identityAfter) return null
+  if (
+    identityBefore.dev !== identityAfter.dev
+    || identityBefore.ino !== identityAfter.ino
+  ) {
+    throw new InconclusiveRuntimeScanError('Descriptor identity changed during inspection')
+  }
+  return { ...identityAfter, ...descriptor }
+}
+
 function isCodexAppServerCommand(cmdline: string): boolean {
   const argv = cmdline.split('\0').filter((value) => value.length > 0)
   const codexIndex = argv.findIndex((value) => basename(value) === 'codex')
@@ -266,62 +360,35 @@ async function* listLinuxFdSnapshots(ownUid: number | null): AsyncIterable<Runti
     const pid = Number.parseInt(entry, 10)
     if (!Number.isSafeInteger(pid)) continue
 
-    const processRoot = `/proc/${entry}`
-    const startTime = await readProcStartTime(processRoot, pid)
-    if (startTime === null) continue
-    const status = await readProcText(`${processRoot}/status`, `process ${pid} status`)
-    if (status === null) continue
-    const uid = parseProcUid(status)
-    const parentPid = parseProcParentPid(status)
-
-    let cmdline = ''
-    if (uid === ownUid) {
-      const sameUidCmdline = await readProcText(`${processRoot}/cmdline`, `process ${pid} command`)
-      if (sameUidCmdline === null) continue
-      cmdline = sameUidCmdline
-    }
-    const confirmedStartTime = await readProcStartTime(processRoot, pid)
-    if (confirmedStartTime === null) continue
-    assertStableProcessIdentity(startTime, confirmedStartTime)
-    processes.set(pid, { pid, parentPid, uid, cmdline, startTime })
+    const process = await readStableProcessRecord(`/proc/${entry}`, pid, ownUid)
+    if (process) processes.set(pid, process)
   }
 
   for (const process of processes.values()) {
-    const { pid, uid, cmdline, startTime } = process
+    const { pid, uid, cmdline } = process
     if (uid !== ownUid || !isCodexAppServerCommand(cmdline)) continue
     const processRoot = `/proc/${pid}`
-    const startTimeBeforeDescriptors = await readProcStartTime(processRoot, pid)
-    if (startTimeBeforeDescriptors === null) continue
-    assertStableProcessIdentity(startTime, startTimeBeforeDescriptors)
     const ancestorPids = collectAncestorPids(pid, processes)
+    if (!(await validateProcessChain(process, ancestorPids, processes))) continue
     const fdEntries = await readProcDirectory(`${processRoot}/fd`, `process ${pid} descriptors`)
     if (fdEntries === null) continue
     const snapshots: RuntimeFdSnapshot[] = []
     for (const fd of fdEntries) {
       if (!/^\d+$/u.test(fd)) continue
-      const fdPath = `${processRoot}/fd/${fd}`
-      const fdinfo = await readProcText(
-        `${processRoot}/fdinfo/${fd}`,
-        `process ${pid} descriptor ${fd}`,
-      )
-      if (fdinfo === null) continue
-      const descriptor = parseFdInfo(fdinfo)
-      const identity = await statProcFd(fdPath)
-      if (!identity) continue
+      const descriptor = await readStableFdSnapshot(processRoot, pid, fd)
+      if (!descriptor) continue
       snapshots.push({
         pid,
         ancestorPids,
         uid,
         cmdline,
-        dev: identity.dev,
-        ino: identity.ino,
+        dev: descriptor.dev,
+        ino: descriptor.ino,
         position: descriptor.position,
         flags: descriptor.flags,
       })
     }
-    const startTimeAfterDescriptors = await readProcStartTime(processRoot, pid)
-    if (startTimeAfterDescriptors === null) continue
-    assertStableProcessIdentity(startTime, startTimeAfterDescriptors)
+    if (!(await validateProcessChain(process, ancestorPids, processes))) continue
     yield* snapshots
   }
 }
