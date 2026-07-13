@@ -572,7 +572,7 @@ function readThreadInProgress(summary: Thread): boolean {
   const status = rawSummary.status
   if (status && typeof status === 'object') {
     const statusType = (status as Record<string, unknown>).type
-    if (statusType === 'active' || statusType === 'inProgress') return true
+    if (statusType === 'active' || statusType === 'inProgress' || statusType === 'running') return true
   }
 
   const turns = Array.isArray(summary.turns) ? summary.turns : []

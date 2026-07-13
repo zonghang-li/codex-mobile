@@ -414,7 +414,7 @@ describe('ExternalThreadRuntimeProbe', () => {
     })
   })
 
-  it('reads only appended bytes after the initial parse', async () => {
+  it('validates a bounded checkpoint and then reads only appended bytes after the initial parse', async () => {
     const initial = lifecycle('task_started', 'turn-a')
     const appended = lifecycle('task_complete', 'turn-a')
     const system = fakeRuntimeSystem({ log: initial, fds: [writerFd()] })
@@ -425,6 +425,7 @@ describe('ExternalThreadRuntimeProbe', () => {
     await expect(probe.inspect('thread-1', 99)).resolves.toEqual({ state: 'idle' })
 
     expect(system.readCalls).toEqual([
+      { path: rolloutPath, offset: 0, length: Buffer.byteLength(initial) },
       { path: rolloutPath, offset: 0, length: Buffer.byteLength(initial) },
       {
         path: rolloutPath,
@@ -449,6 +450,24 @@ describe('ExternalThreadRuntimeProbe', () => {
     expect(system.readCalls.every(({ length }) => length <= 64 * 1024)).toBe(true)
   })
 
+  it('revalidates an unchanged large cache with one bounded boundary read', async () => {
+    const log = `${JSON.stringify({ type: 'ignored', padding: 'x'.repeat(70_000) })}\n${lifecycle('task_started', 'turn-a')}`
+    const system = fakeRuntimeSystem({ log, fds: [writerFd()] })
+    const probe = registeredProbe(system)
+    await probe.inspect('thread-1', 99)
+    system.readCalls.splice(0)
+
+    await expect(probe.inspect('thread-1', 99)).resolves.toMatchObject({
+      state: 'running',
+      turnId: 'turn-a',
+    })
+    expect(system.readCalls).toEqual([{
+      path: rolloutPath,
+      offset: Buffer.byteLength(log) - 256,
+      length: 256,
+    }])
+  })
+
   it('resets cached parsing when the file is truncated', async () => {
     const initial = `${JSON.stringify({ type: 'ignored', padding: 'x'.repeat(256) })}\n${lifecycle('task_started', 'turn-a')}`
     const system = fakeRuntimeSystem({ log: initial, fds: [writerFd()] })
@@ -462,6 +481,40 @@ describe('ExternalThreadRuntimeProbe', () => {
       turnId: 'turn-b',
     })
     expect(system.readCalls.at(-1)?.offset).toBe(0)
+  })
+
+  it('resets cached parsing after same-inode copytruncate regrows past the cached offset', async () => {
+    const initial = lifecycle('task_started', 'turn-a')
+    const system = fakeRuntimeSystem({ log: initial, fds: [writerFd()] })
+    const probe = registeredProbe(system)
+    await expect(probe.inspect('thread-1', 99)).resolves.toMatchObject({
+      state: 'running',
+      turnId: 'turn-a',
+    })
+
+    system.truncate(`${lifecycle('task_started', 'turn-b')}${JSON.stringify({ type: 'ignored', padding: 'x'.repeat(initial.length) })}\n`)
+
+    await expect(probe.inspect('thread-1', 99)).resolves.toMatchObject({
+      state: 'running',
+      turnId: 'turn-b',
+    })
+    expect(system.readCalls.some(({ offset }) => offset === 0)).toBe(true)
+  })
+
+  it('resets cached parsing after a cross-poll ABA replacement reuses the same inode', async () => {
+    const initial = lifecycle('task_started', 'turn-a')
+    const system = fakeRuntimeSystem({ log: initial, fds: [writerFd()] })
+    const probe = registeredProbe(system)
+    await probe.inspect('thread-1', 99)
+    const readsBeforeReplacement = system.readCalls.length
+
+    system.replace(lifecycle('task_started', 'turn-b'), '21')
+
+    await expect(probe.inspect('thread-1', 99)).resolves.toMatchObject({
+      state: 'running',
+      turnId: 'turn-b',
+    })
+    expect(system.readCalls.slice(readsBeforeReplacement).some(({ offset }) => offset === 0)).toBe(true)
   })
 
   it('resets cached parsing when the file inode is replaced', async () => {

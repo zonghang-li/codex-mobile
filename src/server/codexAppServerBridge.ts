@@ -7010,7 +7010,10 @@ export class BackendQueueProcessor {
   private readonly queueDrainDueAtByThreadId = new Map<string, number>()
   private readonly unsubscribe: () => void
 
-  constructor(private readonly appServer: AppServerProcess) {
+  constructor(
+    private readonly appServer: AppServerProcess,
+    private readonly runtimeProbe: ThreadRuntimeProbe | null = null,
+  ) {
     this.unsubscribe = appServer.onNotification((notification) => {
       if (!isTurnCompletedNotification(notification)) return
       const threadId = extractThreadIdFromNotificationParams(notification.params)
@@ -7103,13 +7106,14 @@ export class BackendQueueProcessor {
     const response = asRecord(await this.appServer.rpc('thread/read', { threadId, includeTurns: true }))
     const thread = asRecord(response?.thread)
     if (!thread) return false
+    if (readThreadResultInProgress(thread)) return false
 
-    const status = asRecord(thread.status)
-    const statusType = readNonEmptyString(status?.type)
-    if (statusType === 'inProgress' || statusType === 'running' || statusType === 'active') return false
+    const rolloutPath = readNonEmptyString(thread.path)
+    if (!this.runtimeProbe || process.platform !== 'linux' || !rolloutPath) return true
 
-    const turns = Array.isArray(thread.turns) ? thread.turns : []
-    return !turns.some((turn) => readNonEmptyString(asRecord(turn)?.status) === 'inProgress')
+    this.runtimeProbe.registerThread(threadId, rolloutPath)
+    const externalRuntime = await this.runtimeProbe.inspect(threadId, this.appServer.getPid())
+    return externalRuntime.state === 'idle'
   }
 
   private async popNextQueuedTurn(threadId: string): Promise<BackendQueuedTurn | null> {
@@ -7397,16 +7401,17 @@ function getSharedBridgeState(): SharedBridgeState {
 
   const appServer = new AppServerProcess()
   const terminalManager = new ThreadTerminalManager()
-  const backendQueueProcessor = new BackendQueueProcessor(appServer)
+  const runtimeProbe = new ExternalThreadRuntimeProbe({
+    sessionsRoot: join(getCodexHomeDir(), 'sessions'),
+  })
+  const backendQueueProcessor = new BackendQueueProcessor(appServer, runtimeProbe)
   const created: SharedBridgeState = {
     version: SHARED_BRIDGE_VERSION,
     appServer,
     terminalManager,
     methodCatalog: new MethodCatalog(),
     backendQueueProcessor,
-    runtimeProbe: new ExternalThreadRuntimeProbe({
-      sessionsRoot: join(getCodexHomeDir(), 'sessions'),
-    }),
+    runtimeProbe,
     telegramBridge: new TelegramThreadBridge(appServer, {
       onChatSeen: (chatId) => {
         void rememberTelegramChatId(chatId).catch(() => {})

@@ -277,6 +277,26 @@ describe('getThreadDetail', () => {
       canInterrupt: true,
     })
   })
+
+  it('treats nested running thread status as local activity before external metadata', () => {
+    const payload = runtimePayload({
+      id: 'thread-1',
+      status: { type: 'running' },
+      turns: [{ id: 'turn-local', status: 'completed', items: [] }],
+      externalRuntime: {
+        state: 'running',
+        turnId: 'turn-external',
+        interruptible: false,
+        source: 'external-session-writer',
+      },
+    })
+
+    expect(readThreadDetailRuntime(payload)).toMatchObject({
+      inProgress: true,
+      ownership: 'local',
+      canInterrupt: true,
+    })
+  })
 })
 
 describe('resumeThread', () => {
@@ -401,6 +421,7 @@ describe('getThreadRuntimeState', () => {
     { state: 'running' },
     { state: 'running', turnId: '', interruptible: false, source: 'external-session-writer' },
     { state: 'running', turnId: 'turn-1', interruptible: true, source: 'external-session-writer' },
+    { state: 'running', turnId: 'turn-1', interruptible: false, source: 'external-session-writer', extra: true },
     { state: 'idle', turnId: 'unexpected' },
     { state: 'other' },
   ])('normalizes malformed polling payload %j to unknown', async (payload) => {
@@ -408,6 +429,26 @@ describe('getThreadRuntimeState', () => {
       status: 200,
       headers: { 'Content-Type': 'application/json' },
     })))
+
+    await expect(getThreadRuntimeState('thread-1')).resolves.toEqual({ state: 'unknown' })
+  })
+
+  it('normalizes a non-OK runtime response to unknown', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response('unavailable', { status: 503 })))
+
+    await expect(getThreadRuntimeState('thread-1')).resolves.toEqual({ state: 'unknown' })
+  })
+
+  it('normalizes invalid runtime JSON to unknown', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response('{not-json', { status: 200 })))
+
+    await expect(getThreadRuntimeState('thread-1')).resolves.toEqual({ state: 'unknown' })
+  })
+
+  it('normalizes a rejected runtime request to unknown', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => {
+      throw new Error('network unavailable')
+    }))
 
     await expect(getThreadRuntimeState('thread-1')).resolves.toEqual({ state: 'unknown' })
   })

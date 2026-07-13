@@ -40,6 +40,7 @@ type RuntimeParseCache = {
   offset: number
   trailingBytes: Buffer
   unmatchedTurnId: string
+  checkpointBytes: Buffer
 }
 
 type RegisteredThread = {
@@ -48,6 +49,7 @@ type RegisteredThread = {
 }
 
 const READ_CHUNK_BYTES = 64 * 1024
+const CACHE_CHECKPOINT_BYTES = 256
 const PROCESS_GONE_CODES = new Set(['ENOENT', 'ESRCH'])
 
 class InconclusiveRuntimeScanError extends Error {
@@ -269,6 +271,7 @@ function resetCache(identity: RuntimeFileIdentity): RuntimeParseCache {
     offset: 0,
     trailingBytes: Buffer.alloc(0),
     unmatchedTurnId: '',
+    checkpointBytes: Buffer.alloc(0),
   }
 }
 
@@ -276,7 +279,17 @@ function copyCache(cache: RuntimeParseCache): RuntimeParseCache {
   return {
     ...cache,
     trailingBytes: Buffer.from(cache.trailingBytes),
+    checkpointBytes: Buffer.from(cache.checkpointBytes),
   }
+}
+
+function appendCheckpointBytes(cache: RuntimeParseCache, chunk: Buffer): void {
+  const combined = cache.checkpointBytes.length > 0
+    ? Buffer.concat([cache.checkpointBytes, chunk])
+    : chunk
+  cache.checkpointBytes = Buffer.from(combined.subarray(
+    Math.max(0, combined.length - CACHE_CHECKPOINT_BYTES),
+  ))
 }
 
 function applyChunk(cache: RuntimeParseCache, chunk: Buffer): void {
@@ -355,12 +368,24 @@ export class ExternalThreadRuntimeProbe {
       }
 
       const cached = thread.cache
-      const mustReset = !cached
+      let mustReset = !cached
         || cached.path !== identity.path
         || cached.dev !== identity.dev
         || cached.ino !== identity.ino
         || identity.size < cached.offset
-      const nextCache = mustReset ? resetCache(identity) : copyCache(cached)
+      if (!mustReset && cached && cached.checkpointBytes.length > 0) {
+        const checkpointOffset = cached.offset - cached.checkpointBytes.length
+        const currentCheckpoint = await this.system.readRange(
+          resolvedPath,
+          checkpointOffset,
+          cached.checkpointBytes.length,
+          identity,
+        )
+        if (!currentCheckpoint.equals(cached.checkpointBytes)) {
+          mustReset = true
+        }
+      }
+      const nextCache = mustReset || !cached ? resetCache(identity) : copyCache(cached)
 
       while (nextCache.offset < identity.size) {
         const length = Math.min(READ_CHUNK_BYTES, identity.size - nextCache.offset)
@@ -372,6 +397,7 @@ export class ExternalThreadRuntimeProbe {
         )
         const chunk = bytes.subarray(0, length)
         if (chunk.length === 0) return { state: 'unknown' }
+        appendCheckpointBytes(nextCache, chunk)
         applyChunk(nextCache, chunk)
         nextCache.offset += chunk.length
       }

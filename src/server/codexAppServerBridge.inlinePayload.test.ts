@@ -1,4 +1,7 @@
 import { existsSync } from 'node:fs'
+import { mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import {
   BackendQueueProcessor,
@@ -374,6 +377,130 @@ describe('backend queue scheduling', () => {
     expect(processThreadQueue).toHaveBeenCalledTimes(1)
 
     processor.dispose()
+  })
+
+  it('keeps a recovered persistent queue blocked while an external app-server owns the thread', async () => {
+    vi.useFakeTimers()
+    const originalCodexHome = process.env.CODEX_HOME
+    const codexHome = await mkdtemp(join(tmpdir(), 'codex-mobile-external-queue-'))
+    process.env.CODEX_HOME = codexHome
+    await writeFile(join(codexHome, '.codex-global-state.json'), JSON.stringify({
+      'thread-queue-state': {
+        'thread-1': [{
+          id: 'queued-1',
+          text: 'do not start concurrently',
+          imageUrls: [],
+          skills: [],
+          fileAttachments: [],
+          collaborationMode: 'default',
+        }],
+      },
+    }))
+    const rpc = vi.fn(async (method: string) => {
+      if (method === 'thread/read') {
+        return {
+          thread: {
+            id: 'thread-1',
+            path: join(codexHome, 'sessions', 'rollout-thread-1.jsonl'),
+            status: { type: 'idle' },
+            turns: [{ id: 'completed-turn', status: 'completed' }],
+          },
+        }
+      }
+      if (method === 'config/read') return { config: { model: 'gpt-test' } }
+      return {}
+    })
+    const runtimeProbe = {
+      registerThread: vi.fn(),
+      inspect: vi.fn(async () => ({
+        state: 'running' as const,
+        turnId: 'external-turn',
+        interruptible: false as const,
+        source: 'external-session-writer' as const,
+      })),
+    }
+    const processor = new BackendQueueProcessor({
+      rpc,
+      getPid: () => 31337,
+      onNotification: () => () => undefined,
+    } as never, runtimeProbe)
+
+    try {
+      await processor.scheduleAllQueuedThreads(0)
+      await vi.advanceTimersByTimeAsync(0)
+      await Promise.resolve()
+      await Promise.resolve()
+
+      expect(runtimeProbe.registerThread).toHaveBeenCalledWith(
+        'thread-1',
+        join(codexHome, 'sessions', 'rollout-thread-1.jsonl'),
+      )
+      expect(runtimeProbe.inspect).toHaveBeenCalledWith('thread-1', 31337)
+      expect(rpc).not.toHaveBeenCalledWith('thread/resume', expect.anything())
+      expect(rpc).not.toHaveBeenCalledWith('turn/start', expect.anything())
+    } finally {
+      processor.dispose()
+      if (originalCodexHome === undefined) delete process.env.CODEX_HOME
+      else process.env.CODEX_HOME = originalCodexHome
+      await rm(codexHome, { recursive: true, force: true })
+    }
+  })
+
+  it('conservatively blocks a Linux queue when external runtime evidence is inconclusive', async () => {
+    const runtimeProbe = {
+      registerThread: vi.fn(),
+      inspect: vi.fn(async () => ({ state: 'unknown' as const })),
+    }
+    const processor = new BackendQueueProcessor({
+      rpc: vi.fn(async () => ({
+        thread: {
+          id: 'thread-1',
+          path: '/home/user/.codex/sessions/rollout-thread-1.jsonl',
+          status: { type: 'idle' },
+          turns: [],
+        },
+      })),
+      getPid: () => 31337,
+      onNotification: () => () => undefined,
+    } as never, runtimeProbe)
+
+    try {
+      const canStart = await (processor as unknown as {
+        canStartQueuedTurn: (threadId: string) => Promise<boolean>
+      }).canStartQueuedTurn('thread-1')
+
+      expect(canStart).toBe(process.platform !== 'linux')
+      if (process.platform === 'linux') {
+        expect(runtimeProbe.registerThread).toHaveBeenCalledOnce()
+        expect(runtimeProbe.inspect).toHaveBeenCalledWith('thread-1', 31337)
+      }
+    } finally {
+      processor.dispose()
+    }
+  })
+
+  it('preserves idle queue draining when thread/read has no trusted rollout path', async () => {
+    const runtimeProbe = {
+      registerThread: vi.fn(),
+      inspect: vi.fn(async () => ({ state: 'unknown' as const })),
+    }
+    const processor = new BackendQueueProcessor({
+      rpc: vi.fn(async () => ({
+        thread: { id: 'thread-1', status: { type: 'idle' }, turns: [] },
+      })),
+      getPid: () => 31337,
+      onNotification: () => () => undefined,
+    } as never, runtimeProbe)
+
+    try {
+      await expect((processor as unknown as {
+        canStartQueuedTurn: (threadId: string) => Promise<boolean>
+      }).canStartQueuedTurn('thread-1')).resolves.toBe(true)
+      expect(runtimeProbe.registerThread).not.toHaveBeenCalled()
+      expect(runtimeProbe.inspect).not.toHaveBeenCalled()
+    } finally {
+      processor.dispose()
+    }
   })
 })
 
