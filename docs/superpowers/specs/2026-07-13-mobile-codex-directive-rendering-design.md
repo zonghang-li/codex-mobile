@@ -43,7 +43,7 @@ Only a syntactically valid directive occupying its own physical line and outside
 
 ## Parsing and data model
 
-Add a small shared parser that accepts assistant text and returns:
+Add a small shared parser that accepts assistant text and an optional live-stream mode, then returns:
 
 ```ts
 type ParsedCodexDirectiveText = {
@@ -56,7 +56,9 @@ type ParsedCodexDirectiveText = {
 
 The parser scans line by line while tracking fenced code blocks. Recognized standalone lines are removed from the visible prose and converted to structured directives. Surrounding blank lines are normalized so removing a directive does not leave a large empty gap.
 
-`UiMessage` gains an optional `directives` array. `normalizeThreadMessagesV2()` parses only `agentMessage` text and attaches the result. User messages are never interpreted as directives.
+In live-stream mode, an incomplete trailing line that is still a prefix of a whitelisted directive is temporarily withheld instead of flashing raw protocol syntax. Once the name is known to be unsupported, the line is visible again. The live notification path retains the unmodified cumulative agent text in a private, non-rendered buffer so parsing a delta never loses withheld characters. Completed and refreshed messages use the same parser without incomplete-line suppression.
+
+`UiMessage` gains an optional `directives` array. `normalizeThreadMessagesV2()` parses only `agentMessage` text and attaches the result. The realtime `item/agentMessage/delta` and `item/completed` path applies the same parser to its private cumulative buffer. User messages are never interpreted as directives.
 
 ## Presentation
 
@@ -98,12 +100,15 @@ Unit tests must cover:
 
 - every supported directive and its visible fields;
 - multiple directives appended to one assistant message;
+- incomplete whitelisted trailing directives being withheld only in live mode, then resolving into a notice;
+- unsupported trailing directive names becoming visible during live streaming;
 - directive-only assistant messages;
 - prose before and after a directive;
 - fenced and inline examples remaining visible;
 - unknown and malformed directives remaining visible;
 - escaped quoted attributes;
 - `normalizeThreadMessagesV2()` attaching directives only to assistant messages;
+- realtime agent-message wiring retaining raw cumulative deltas while rendering parsed text/directives;
 - renderer wiring for status notices and safe links;
 - thread export producing readable status lines without raw `::name{...}` syntax.
 
