@@ -1,5 +1,5 @@
 import { open, readdir, readFile, realpath, stat } from 'node:fs/promises'
-import { isAbsolute, relative, sep } from 'node:path'
+import { basename, isAbsolute, relative, sep } from 'node:path'
 import type { ExternalThreadRuntime } from '../types/threadRuntime'
 
 export type RuntimeFileIdentity = {
@@ -167,7 +167,9 @@ async function statProcFd(path: string): Promise<{ dev: string; ino: string } | 
 }
 
 function isCodexAppServerCommand(cmdline: string): boolean {
-  return /(?:^|[\s/])codex(?:\s+app-server|$)/u.test(cmdline.replace(/\0/g, ' '))
+  const argv = cmdline.split('\0').filter((value) => value.length > 0)
+  const codexIndex = argv.findIndex((value) => basename(value) === 'codex')
+  return codexIndex >= 0 && argv.slice(codexIndex + 1).includes('app-server')
 }
 
 async function* listLinuxFdSnapshots(ownUid: number | null): AsyncIterable<RuntimeFdSnapshot> {

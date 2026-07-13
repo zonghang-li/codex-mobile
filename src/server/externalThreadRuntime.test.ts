@@ -348,6 +348,44 @@ describe('ExternalThreadRuntimeProbe', () => {
     },
   )
 
+  it.each([
+    [
+      'direct app-server subcommand',
+      '/usr/local/bin/codex\0app-server\0-c\0approval_policy="never"\0',
+    ],
+    [
+      'desktop options before app-server',
+      '/usr/lib/node_modules/@openai/codex/bin/codex\0-c\0features.code_mode_host=true\0app-server\0--listen\0unix://\0',
+    ],
+    [
+      'Node launcher with a Codex script argument',
+      '/usr/bin/node\0/usr/bin/codex\0-c\0sandbox_mode="danger-full-access"\0app-server\0',
+    ],
+  ])('accepts writer evidence from a %s command', async (_label, cmdline) => {
+    const system = fakeRuntimeSystem({
+      log: lifecycle('task_started', 'turn-a'),
+      fds: [writerFd({ cmdline })],
+    })
+
+    await expect(registeredProbe(system).inspect('thread-1', 99)).resolves.toMatchObject({
+      state: 'running',
+      turnId: 'turn-a',
+    })
+  })
+
+  it.each([
+    ['codex-like basename', '/usr/bin/my-codex\0app-server\0'],
+    ['app-server before codex', 'app-server\0/usr/bin/codex\0'],
+    ['missing app-server token', '/usr/bin/codex\0-c\0app-server-like\0'],
+  ])('rejects writer evidence from a %s command', async (_label, cmdline) => {
+    const system = fakeRuntimeSystem({
+      log: lifecycle('task_started', 'turn-a'),
+      fds: [writerFd({ cmdline })],
+    })
+
+    await expect(registeredProbe(system).inspect('thread-1', 99)).resolves.toEqual({ state: 'idle' })
+  })
+
   it('accepts a writable read-write descriptor', async () => {
     const system = fakeRuntimeSystem({
       log: lifecycle('task_started', 'turn-a'),
