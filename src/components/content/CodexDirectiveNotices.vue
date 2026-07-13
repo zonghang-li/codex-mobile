@@ -17,7 +17,7 @@
         >{{ codexDirectiveLabel(directive, t) }}</a>
         <span v-else class="codex-directive-title">{{ codexDirectiveLabel(directive, t) }}</span>
         <template v-if="directive.kind === 'code-comment'">
-          <span class="codex-directive-meta">{{ directive.file }}<template v-if="directive.start">:{{ directive.start }}</template></span>
+          <span class="codex-directive-meta">{{ codexDirectiveLocation(directive) }}</span>
           <p class="codex-directive-body">{{ directive.body }}</p>
         </template>
       </div>
@@ -28,7 +28,7 @@
 <script setup lang="ts">
 import type { UiCodexDirective } from '../../types/codex'
 import { useUiLanguage } from '../../composables/useUiLanguage'
-import { codexDirectiveHref, codexDirectiveLabel } from '../../utils/codexDirectives'
+import { codexDirectiveHref, codexDirectiveLabel, codexDirectiveLocation } from '../../utils/codexDirectives'
 
 defineProps<{ directives: UiCodexDirective[] }>()
 

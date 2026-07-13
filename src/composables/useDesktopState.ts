@@ -3744,7 +3744,7 @@ export function useDesktopState() {
       if (!item || item.type !== 'agentMessage') return null
       const id = readString(item.id)
       const text = readString(item.text)
-      if (!id || !text) return null
+      if (!id) return null
       const parsed = parseCodexDirectiveText(text)
       return {
         id,
@@ -4145,6 +4145,11 @@ export function useDesktopState() {
       })
     }
 
+    const completedAgentMessage = readAgentMessageCompleted(notification)
+    if (notificationThreadId && completedAgentMessage) {
+      clearLiveAgentRawText(notificationThreadId, completedAgentMessage.id)
+    }
+
     if (!notificationThreadId || notificationThreadId !== selectedThreadId.value) return
 
     const startedAgentMessageId = readAgentMessageStartedId(notification)
@@ -4175,10 +4180,8 @@ export function useDesktopState() {
       })
     }
 
-    const completedAgentMessage = readAgentMessageCompleted(notification)
     if (completedAgentMessage) {
       upsertLiveAgentMessage(notificationThreadId, completedAgentMessage)
-      clearLiveAgentRawText(notificationThreadId, completedAgentMessage.id)
     }
 
     const completedImageView = readCompletedImageView(notification)

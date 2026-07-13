@@ -205,6 +205,34 @@ async function setupTurnLifecycleNotificationState(selectedThreadId: string) {
   }
 }
 
+async function setupCodexDirectiveNotificationState(groups: UiProjectGroup[] = [{
+  projectName: 'Project',
+  threads: [thread('thread-1', '/tmp/project')],
+}]) {
+  installTestWindow()
+  let notificationHandler: ((notification: { method: string; params?: unknown }) => void) | undefined
+  gatewayMocks.subscribeCodexNotifications.mockImplementation((handler) => {
+    notificationHandler = handler as typeof notificationHandler
+    return vi.fn()
+  })
+  gatewayMocks.getPendingServerRequests.mockResolvedValue([])
+  gatewayMocks.getThreadGroupsPage.mockResolvedValue({ groups, nextCursor: null })
+
+  const state = useDesktopState()
+  await state.refreshAll({ includeSelectedThreadMessages: false })
+  state.primeSelectedThread('thread-1')
+  state.startPolling()
+  pollingCleanups.push(() => state.stopPolling())
+
+  return {
+    state,
+    emit(notification: { method: string; params?: unknown }) {
+      expect(notificationHandler).toBeDefined()
+      notificationHandler!(notification)
+    },
+  }
+}
+
 beforeEach(() => {
   vi.clearAllMocks()
   gatewayMocks.getThreadQueueState.mockResolvedValue({})
@@ -219,6 +247,93 @@ afterEach(() => {
   }
   vi.useRealTimers()
   vi.unstubAllGlobals()
+})
+
+describe('Codex directive notification state', () => {
+  it('accumulates split deltas until an incomplete directive resolves', async () => {
+    const { state, emit } = await setupCodexDirectiveNotificationState()
+
+    emit({
+      method: 'item/agentMessage/delta',
+      params: { threadId: 'thread-1', itemId: 'agent-1', delta: 'Done.\n\n::git-pu' },
+    })
+    expect(state.messages.value.at(-1)).toMatchObject({
+      id: 'agent-1',
+      text: 'Done.',
+    })
+
+    emit({
+      method: 'item/agentMessage/delta',
+      params: {
+        threadId: 'thread-1',
+        itemId: 'agent-1',
+        delta: 'sh{cwd="/tmp/repo" branch="main"}',
+      },
+    })
+    expect(state.messages.value.at(-1)).toMatchObject({
+      id: 'agent-1',
+      text: 'Done.',
+      directives: [{ kind: 'git-push', cwd: '/tmp/repo', branch: 'main' }],
+    })
+  })
+
+  it('clears raw delta state when an empty agent message completes', async () => {
+    const { state, emit } = await setupCodexDirectiveNotificationState()
+
+    emit({
+      method: 'item/agentMessage/delta',
+      params: { threadId: 'thread-1', itemId: 'agent-1', delta: 'stale' },
+    })
+    emit({
+      method: 'item/completed',
+      params: { threadId: 'thread-1', item: { id: 'agent-1', type: 'agentMessage', text: '' } },
+    })
+    expect(state.messages.value.at(-1)).toMatchObject({ id: 'agent-1', text: '' })
+
+    emit({
+      method: 'item/agentMessage/delta',
+      params: { threadId: 'thread-1', itemId: 'agent-1', delta: 'fresh' },
+    })
+    expect(state.messages.value.at(-1)).toMatchObject({ id: 'agent-1', text: 'fresh' })
+  })
+
+  it('prunes raw delta state when a thread becomes inactive', async () => {
+    const { state, emit } = await setupCodexDirectiveNotificationState([
+      { projectName: 'Project One', threads: [thread('thread-1', '/tmp/project-one')] },
+      { projectName: 'Project Two', threads: [thread('thread-2', '/tmp/project-two')] },
+    ])
+
+    emit({
+      method: 'item/agentMessage/delta',
+      params: { threadId: 'thread-1', itemId: 'agent-1', delta: 'stale' },
+    })
+    state.primeSelectedThread('thread-2')
+    await state.removeProject('Project One')
+    state.primeSelectedThread('thread-1')
+    emit({
+      method: 'item/agentMessage/delta',
+      params: { threadId: 'thread-1', itemId: 'agent-1', delta: 'fresh' },
+    })
+
+    expect(state.messages.value.at(-1)).toMatchObject({ id: 'agent-1', text: 'fresh' })
+  })
+
+  it('clears all raw delta state when notification polling stops', async () => {
+    const { state, emit } = await setupCodexDirectiveNotificationState()
+
+    emit({
+      method: 'item/agentMessage/delta',
+      params: { threadId: 'thread-1', itemId: 'agent-1', delta: 'stale' },
+    })
+    state.stopPolling()
+    state.startPolling()
+    emit({
+      method: 'item/agentMessage/delta',
+      params: { threadId: 'thread-1', itemId: 'agent-1', delta: 'fresh' },
+    })
+
+    expect(state.messages.value.at(-1)).toMatchObject({ id: 'agent-1', text: 'fresh' })
+  })
 })
 
 describe('filterGroupsByWorkspaceRoots', () => {

@@ -3,6 +3,7 @@ import {
   codexDirectiveExportLines,
   codexDirectiveHref,
   codexDirectiveLabel,
+  codexDirectiveLocation,
   parseCodexDirectiveText,
 } from './codexDirectives'
 
@@ -10,6 +11,12 @@ const translate = (message: string, params?: Record<string, string | number>): s
   message.replace(/\{(\w+)\}/gu, (_, key: string) => String(params?.[key] ?? `{${key}}`))
 
 describe('parseCodexDirectiveText', () => {
+  it('preserves ordinary assistant Markdown byte-for-byte', () => {
+    const source = '\n  Intro with intentional indentation.\n\n    const code = true\n    return code\n\n'
+
+    expect(parseCodexDirectiveText(source)).toEqual({ text: source, directives: [] })
+  })
+
   it('extracts the production git-push form from assistant prose', () => {
     expect(parseCodexDirectiveText([
       'Deployment complete.',
@@ -157,6 +164,20 @@ describe('parseCodexDirectiveText', () => {
     })
   })
 
+  it('normalizes only blank-line separators around removed directives', () => {
+    expect(parseCodexDirectiveText([
+      '  Before.',
+      '',
+      '::git-stage{cwd="/tmp/repo"}',
+      '',
+      '    indented prose',
+      '  trailing spaces  ',
+    ].join('\n'))).toEqual({
+      text: '  Before.\n\n    indented prose\n  trailing spaces  ',
+      directives: [{ kind: 'git-stage', cwd: '/tmp/repo' }],
+    })
+  })
+
   it('withholds an incomplete supported directive only in live mode', () => {
     expect(parseCodexDirectiveText('Done.\n\n::git-pu', {
       suppressIncompleteTrailingDirective: true,
@@ -203,6 +224,14 @@ describe('parseCodexDirectiveText', () => {
 })
 
 describe('directive presentation helpers', () => {
+  it.each([
+    ['file only', { kind: 'code-comment' as const, title: 'Title', body: 'Body', file: 'src/a.ts' }, 'src/a.ts'],
+    ['single line', { kind: 'code-comment' as const, title: 'Title', body: 'Body', file: 'src/a.ts', start: 4 }, 'src/a.ts:4'],
+    ['line range', { kind: 'code-comment' as const, title: 'Title', body: 'Body', file: 'src/a.ts', start: 4, end: 7 }, 'src/a.ts:4-7'],
+  ])('formats a code-comment %s location', (_name, directive, expected) => {
+    expect(codexDirectiveLocation(directive)).toBe(expected)
+  })
+
   it('builds translated directive labels', () => {
     expect(codexDirectiveLabel(
       { kind: 'git-push', cwd: '/tmp/repo', branch: 'main' },

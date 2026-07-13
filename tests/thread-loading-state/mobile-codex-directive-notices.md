@@ -20,7 +20,9 @@ Recognized Codex directives render as localized notices and export as readable M
 5. Assert the page body and copied thread Markdown do not contain the recognized raw prefix `::git-push{`.
 6. Verify a fenced literal example remains visible.
 7. Verify an unknown standalone `::future-directive{value="kept"}` remains visible.
-8. Check 375×812 and 768×1024 in light and dark appearance.
+8. Verify ordinary assistant Markdown retains leading/trailing whitespace and four-space indented code.
+9. Verify code-comment notices show `file`, `file:start`, and `file:start-end` for their respective location forms.
+10. Check 375×812 and 768×1024 in light and dark appearance.
 
 #### Expected Results
 
@@ -28,6 +30,8 @@ Recognized Codex directives render as localized notices and export as readable M
 - Chinese displays `已推送 main`; English displays `Pushed main`.
 - Recognized raw directive syntax appears in neither the rendered page nor copied thread Markdown.
 - Fenced literals and unknown or malformed directive-like prose remain visible.
+- Assistant whitespace is unchanged unless a recognized directive line and its separator gap are removed.
+- Code-comment locations include an end line when the directive supplies one.
 - The notice remains compact and readable at every listed viewport in light and dark appearance.
 
 #### Rollback/Cleanup

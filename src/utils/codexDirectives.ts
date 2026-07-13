@@ -212,7 +212,7 @@ export function parseCodexDirectiveText(
   options: { suppressIncompleteTrailingDirective?: boolean } = {},
 ): ParsedCodexDirectiveText {
   const lines = value.split('\n')
-  const visibleLines: string[] = []
+  const removedLineIndexes = new Set<number>()
   const directives: UiCodexDirective[] = []
   let fence: FenceState | null = null
 
@@ -221,7 +221,6 @@ export function parseCodexDirectiveText(
     const fenceRun = readFenceRun(line)
 
     if (fence) {
-      visibleLines.push(line)
       if (
         fenceRun &&
         fenceRun.marker === fence.marker &&
@@ -235,7 +234,6 @@ export function parseCodexDirectiveText(
 
     if (fenceRun) {
       fence = { marker: fenceRun.marker, length: fenceRun.length }
-      visibleLines.push(line)
       continue
     }
 
@@ -245,19 +243,57 @@ export function parseCodexDirectiveText(
       options.suppressIncompleteTrailingDirective === true &&
       isIncompleteSupportedDirective(line)
     ) {
+      removedLineIndexes.add(index)
       continue
     }
 
     const directive = readDirective(line)
     if (directive) {
       directives.push(directive)
-    } else {
-      visibleLines.push(line)
+      removedLineIndexes.add(index)
+    }
+  }
+
+  if (removedLineIndexes.size === 0) {
+    return { text: value, directives }
+  }
+
+  const visibleLines: string[] = []
+  let hasVisibleContent = false
+  let index = 0
+  while (index < lines.length) {
+    if (!removedLineIndexes.has(index) && lines[index].trim().length > 0) {
+      visibleLines.push(lines[index])
+      hasVisibleContent = true
+      index += 1
+      continue
+    }
+
+    const regionStart = index
+    let containsRemovedLine = false
+    let containsBlankLine = false
+    while (
+      index < lines.length
+      && (removedLineIndexes.has(index) || lines[index].trim().length === 0)
+    ) {
+      if (removedLineIndexes.has(index)) containsRemovedLine = true
+      else containsBlankLine = true
+      index += 1
+    }
+
+    if (!containsRemovedLine) {
+      visibleLines.push(...lines.slice(regionStart, index))
+      continue
+    }
+
+    const hasVisibleContentAfter = index < lines.length
+    if (containsBlankLine && hasVisibleContent && hasVisibleContentAfter) {
+      visibleLines.push('')
     }
   }
 
   return {
-    text: visibleLines.join('\n').trim(),
+    text: visibleLines.join('\n'),
     directives,
   }
 }
@@ -292,6 +328,14 @@ export function codexDirectiveHref(directive: UiCodexDirective): string | null {
     return `/#/thread/${encodeURIComponent(directive.threadId)}`
   }
   return null
+}
+
+export function codexDirectiveLocation(
+  directive: Extract<UiCodexDirective, { kind: 'code-comment' }>,
+): string {
+  if (directive.start === undefined) return directive.file
+  if (directive.end === undefined) return `${directive.file}:${directive.start}`
+  return `${directive.file}:${directive.start}-${directive.end}`
 }
 
 function escapeMarkdown(value: string | number): string {
