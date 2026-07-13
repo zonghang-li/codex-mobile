@@ -42,6 +42,7 @@ function writerFd(overrides: Partial<RuntimeFdSnapshot> = {}): RuntimeFdSnapshot
 
 type FakeRuntimeOptions = {
   log?: string | Buffer
+  rollouts?: FakeRollout[]
   fds?: RuntimeFdSnapshot[]
   platform?: NodeJS.Platform
   uid?: number | null
@@ -53,13 +54,22 @@ type FakeRuntimeOptions = {
   abaReplacementDuringRead?: { log: string; dev: string; ino: string }
 }
 
+type FakeRollout = {
+  path: string
+  log: string
+  dev: string
+  ino: string
+}
+
+type MutableFakeRollout = Omit<FakeRollout, 'log'> & { bytes: Buffer }
+
 class FakeRuntimeSystem implements ExternalRuntimeSystem {
   readonly platform: NodeJS.Platform
   readonly uid: number | null
   readonly readCalls: Array<{ path: string; offset: number; length: number }> = []
   scanCount = 0
 
-  private bytes: Buffer
+  private readonly rollouts: Map<string, MutableFakeRollout>
   private readonly fds: RuntimeFdSnapshot[]
   private readonly resolvedSessionsRoot: string
   private readonly resolvedRolloutPath: string
@@ -67,18 +77,29 @@ class FakeRuntimeSystem implements ExternalRuntimeSystem {
   private readonly scanError: Error | undefined
   private replacementDuringRead: { log: string; ino: string } | undefined
   private abaReplacementDuringRead: { log: string; dev: string; ino: string } | undefined
-  private dev = '8'
-  private ino = '21'
 
   constructor(options: FakeRuntimeOptions = {}) {
     this.platform = options.platform ?? 'linux'
     this.uid = options.uid === undefined ? 1000 : options.uid
-    this.bytes = Buffer.isBuffer(options.log)
-      ? Buffer.from(options.log)
-      : Buffer.from(options.log ?? '')
     this.fds = options.fds ?? []
     this.resolvedSessionsRoot = options.resolvedSessionsRoot ?? sessionsRoot
     this.resolvedRolloutPath = options.resolvedRolloutPath ?? rolloutPath
+    const rollouts: MutableFakeRollout[] = options.rollouts
+      ? options.rollouts.map((rollout) => ({
+          path: rollout.path,
+          bytes: Buffer.from(rollout.log),
+          dev: rollout.dev,
+          ino: rollout.ino,
+        }))
+      : [{
+          path: this.resolvedRolloutPath,
+          bytes: Buffer.isBuffer(options.log)
+            ? Buffer.from(options.log)
+            : Buffer.from(options.log ?? ''),
+          dev: '8',
+          ino: '21',
+        }]
+    this.rollouts = new Map(rollouts.map((rollout) => [rollout.path, rollout]))
     this.regular = options.regular ?? true
     this.scanError = options.scanError
     this.replacementDuringRead = options.replacementDuringRead
@@ -86,15 +107,17 @@ class FakeRuntimeSystem implements ExternalRuntimeSystem {
   }
 
   async realpath(path: string): Promise<string> {
-    return path === sessionsRoot ? this.resolvedSessionsRoot : this.resolvedRolloutPath
+    if (path === sessionsRoot) return this.resolvedSessionsRoot
+    return this.rollouts.has(path) ? path : this.resolvedRolloutPath
   }
 
   async statFile(path: string): Promise<RuntimeFileIdentity & { regular: boolean }> {
+    const rollout = this.rollout(path)
     return {
       path,
-      dev: this.dev,
-      ino: this.ino,
-      size: this.bytes.length,
+      dev: rollout.dev,
+      ino: rollout.ino,
+      size: rollout.bytes.length,
       regular: this.regular,
     }
   }
@@ -106,6 +129,7 @@ class FakeRuntimeSystem implements ExternalRuntimeSystem {
     expectedIdentity: RuntimeFileIdentity,
   ): Promise<Buffer> {
     this.readCalls.push({ path, offset, length })
+    const rollout = this.rollout(path)
     if (this.abaReplacementDuringRead) {
       const replacement = this.abaReplacementDuringRead
       this.abaReplacementDuringRead = undefined
@@ -121,10 +145,10 @@ class FakeRuntimeSystem implements ExternalRuntimeSystem {
     if (this.replacementDuringRead) {
       const replacement = this.replacementDuringRead
       this.replacementDuringRead = undefined
-      this.bytes = Buffer.from(replacement.log)
-      this.ino = replacement.ino
+      rollout.bytes = Buffer.from(replacement.log)
+      rollout.ino = replacement.ino
     }
-    return this.bytes.subarray(offset, Math.min(offset + length, this.bytes.length))
+    return rollout.bytes.subarray(offset, Math.min(offset + length, rollout.bytes.length))
   }
 
   async *listFdSnapshots(): AsyncIterable<RuntimeFdSnapshot> {
@@ -134,19 +158,27 @@ class FakeRuntimeSystem implements ExternalRuntimeSystem {
   }
 
   append(value: string | Buffer): void {
-    this.bytes = Buffer.concat([
-      this.bytes,
+    const rollout = this.rollout(this.resolvedRolloutPath)
+    rollout.bytes = Buffer.concat([
+      rollout.bytes,
       Buffer.isBuffer(value) ? value : Buffer.from(value),
     ])
   }
 
   truncate(value: string): void {
-    this.bytes = Buffer.from(value)
+    this.rollout(this.resolvedRolloutPath).bytes = Buffer.from(value)
   }
 
-  replace(value: string, ino = `${Number(this.ino) + 1}`): void {
-    this.bytes = Buffer.from(value)
-    this.ino = ino
+  replace(value: string, ino?: string): void {
+    const rollout = this.rollout(this.resolvedRolloutPath)
+    rollout.bytes = Buffer.from(value)
+    rollout.ino = ino ?? `${Number(rollout.ino) + 1}`
+  }
+
+  private rollout(path: string): MutableFakeRollout {
+    const rollout = this.rollouts.get(path)
+    if (!rollout) throw new Error(`Unknown fake rollout: ${path}`)
+    return rollout
   }
 }
 
@@ -158,6 +190,18 @@ function registeredProbe(system: ExternalRuntimeSystem): ExternalThreadRuntimePr
   const probe = new ExternalThreadRuntimeProbe({ sessionsRoot, system })
   probe.registerThread('thread-1', rolloutPath)
   return probe
+}
+
+function batchProbe(
+  rollouts: FakeRollout[],
+  fds: RuntimeFdSnapshot[],
+): { probe: ExternalThreadRuntimeProbe; system: FakeRuntimeSystem } {
+  const system = fakeRuntimeSystem({ rollouts, fds })
+  const probe = new ExternalThreadRuntimeProbe({ sessionsRoot, system })
+  for (const rollout of rollouts) {
+    probe.registerThread(rollout.path.split('/').at(-1)!, rollout.path)
+  }
+  return { probe, system }
 }
 
 type DefaultRuntimeProcessFixture = {
@@ -309,6 +353,68 @@ function defaultRuntimeProbe(fixture: DefaultRuntimeFixture = {}): ExternalThrea
 describe('ExternalThreadRuntimeProbe', () => {
   beforeEach(() => {
     vi.resetAllMocks()
+  })
+
+  it('inspects multiple runtimes with one descriptor snapshot pass', async () => {
+    const { probe, system } = batchProbe([
+      { path: '/sessions/thread-a', log: lifecycle('task_started', 'turn-a'), dev: '8', ino: '21' },
+      { path: '/sessions/thread-b', log: lifecycle('task_started', 'turn-b'), dev: '8', ino: '22' },
+      {
+        path: '/sessions/thread-c',
+        log: lifecycle('task_started', 'turn-c') + lifecycle('task_complete', 'turn-c'),
+        dev: '8',
+        ino: '23',
+      },
+    ], [
+      writerFd({ dev: '8', ino: '21' }),
+    ])
+
+    await expect(probe.inspectMany(
+      ['thread-a', 'thread-b', 'thread-c', 'missing'],
+      99,
+    )).resolves.toEqual({
+      'thread-a': {
+        state: 'running',
+        turnId: 'turn-a',
+        interruptible: false,
+        source: 'external-session-writer',
+      },
+      'thread-b': { state: 'idle' },
+      'thread-c': { state: 'idle' },
+      missing: { state: 'unknown' },
+    })
+    expect(system.scanCount).toBe(1)
+  })
+
+  it('keeps valid writer evidence when another rollout escapes the sessions root', async () => {
+    const { probe, system } = batchProbe([
+      { path: '/sessions/thread-a', log: lifecycle('task_started', 'turn-a'), dev: '8', ino: '21' },
+      { path: '/tmp/thread-b', log: lifecycle('task_started', 'turn-b'), dev: '8', ino: '22' },
+    ], [
+      writerFd({ dev: '8', ino: '21' }),
+    ])
+
+    await expect(probe.inspectMany(['thread-a', 'thread-b'], 99)).resolves.toEqual({
+      'thread-a': {
+        state: 'running',
+        turnId: 'turn-a',
+        interruptible: false,
+        source: 'external-session-writer',
+      },
+      'thread-b': { state: 'unknown' },
+    })
+    expect(system.scanCount).toBe(1)
+  })
+
+  it('keeps single-thread inspection in parity with batch inspection', async () => {
+    const { probe } = batchProbe([
+      { path: '/sessions/thread-a', log: lifecycle('task_started', 'turn-a'), dev: '8', ino: '21' },
+    ], [
+      writerFd({ dev: '8', ino: '21' }),
+    ])
+
+    const states = await probe.inspectMany(['thread-a'], 99)
+    await expect(probe.inspect('thread-a', 99)).resolves.toEqual(states['thread-a'])
   })
 
   it('requires an unmatched start and a live external writer', async () => {

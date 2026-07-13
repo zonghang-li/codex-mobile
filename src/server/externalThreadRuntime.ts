@@ -49,6 +49,14 @@ type RegisteredThread = {
   cache: RuntimeParseCache | null
 }
 
+type PreparedRuntimeInspection =
+  | { state: 'idle' | 'unknown' }
+  | {
+      state: 'unmatched'
+      turnId: string
+      identity: RuntimeFileIdentity
+    }
+
 type LinuxProcessRecord = {
   pid: number
   parentPid: number
@@ -539,7 +547,59 @@ export class ExternalThreadRuntimeProbe {
     this.threads.set(threadId, { rolloutPath, cache: null })
   }
 
+  async inspectMany(
+    threadIds: readonly string[],
+    excludedPid: number | null,
+  ): Promise<Record<string, ExternalThreadRuntime>> {
+    const uniqueIds = [...new Set(threadIds)]
+    const prepared = await Promise.all(uniqueIds.map(async (threadId) => ({
+      threadId,
+      runtime: await this.prepareInspection(threadId),
+    })))
+    const states: Record<string, ExternalThreadRuntime> = Object.create(null)
+    const unmatched = prepared.filter((entry) => entry.runtime.state === 'unmatched')
+
+    for (const entry of prepared) {
+      if (entry.runtime.state === 'idle') states[entry.threadId] = { state: 'idle' }
+      if (entry.runtime.state === 'unknown') states[entry.threadId] = { state: 'unknown' }
+    }
+    if (unmatched.length === 0) return states
+
+    try {
+      const writers = new Set<string>()
+      for await (const fd of this.system.listFdSnapshots()) {
+        for (const entry of unmatched) {
+          const runtime = entry.runtime
+          if (runtime.state !== 'unmatched') continue
+          if (matchesWriter(fd, runtime.identity, this.system.uid!, excludedPid)) {
+            writers.add(entry.threadId)
+          }
+        }
+      }
+      for (const entry of unmatched) {
+        const runtime = entry.runtime
+        if (runtime.state !== 'unmatched') continue
+        states[entry.threadId] = writers.has(entry.threadId)
+          ? {
+              state: 'running',
+              turnId: runtime.turnId,
+              interruptible: false,
+              source: 'external-session-writer',
+            }
+          : { state: 'idle' }
+      }
+    } catch {
+      for (const entry of unmatched) states[entry.threadId] = { state: 'unknown' }
+    }
+    return states
+  }
+
   async inspect(threadId: string, excludedPid: number | null): Promise<ExternalThreadRuntime> {
+    const states = await this.inspectMany([threadId], excludedPid)
+    return states[threadId] ?? { state: 'unknown' }
+  }
+
+  private async prepareInspection(threadId: string): Promise<PreparedRuntimeInspection> {
     const thread = this.threads.get(threadId)
     if (!thread || this.system.platform !== 'linux' || this.system.uid === null) {
       return { state: 'unknown' }
@@ -612,18 +672,16 @@ export class ExternalThreadRuntimeProbe {
       thread.cache = nextCache
 
       if (!nextCache.unmatchedTurnId) return { state: 'idle' }
-
-      for await (const fd of this.system.listFdSnapshots()) {
-        if (matchesWriter(fd, identity, this.system.uid, excludedPid)) {
-          return {
-            state: 'running',
-            turnId: nextCache.unmatchedTurnId,
-            interruptible: false,
-            source: 'external-session-writer',
-          }
-        }
+      return {
+        state: 'unmatched',
+        turnId: nextCache.unmatchedTurnId,
+        identity: {
+          path: revalidatedIdentity.path,
+          dev: revalidatedIdentity.dev,
+          ino: revalidatedIdentity.ino,
+          size: revalidatedIdentity.size,
+        },
       }
-      return { state: 'idle' }
     } catch {
       return { state: 'unknown' }
     }
