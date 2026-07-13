@@ -16,6 +16,21 @@ describe('ThreadConversation per-block copy integration', () => {
     expect(source).not.toMatch(/CopyableOutputBlock[^>]+(?:message\.text|step\.step|reasoningText|errorText|aggregatedOutput|block\.markdown|block\.url)/u)
     expect(source).not.toMatch(/(?:cmd-output|plan-card|live-overlay|diff-viewer)[\s\S]{0,240}<CopyableOutputBlock/u)
   })
+
+  it('renders fenced code nested in list items through the recursive copyable block renderer', async () => {
+    const conversationSource = await readFile(new URL('./ThreadConversation.vue', import.meta.url), 'utf8')
+    expect(conversationSource).toContain("import MessageBlockRenderer from './MessageBlockRenderer.vue'")
+    expect(conversationSource.match(/<MessageBlockRenderer\b/gu)).toHaveLength(2)
+    expect(conversationSource).not.toContain('v-html="renderListItemContentAsHtml(item)"')
+
+    const rendererSource = await readFile(new URL('./MessageBlockRenderer.vue', import.meta.url), 'utf8')
+    expect(rendererSource).toContain("block.kind === 'codeBlock'")
+    expect(rendererSource).toContain(':copy-text="block.value"')
+    expect(rendererSource).toContain('label="Copy code block"')
+    expect(rendererSource).toContain('<MessageBlockRenderer')
+    expect(rendererSource.match(/<CopyableOutputBlock\b/gu)).toHaveLength(1)
+    expect(rendererSource).not.toMatch(/CopyableOutputBlock[^>]+(?:paragraph|item\.paragraphs|block\.items)/u)
+  })
 })
 
 describe('CopyableOutputBlock interaction and responsive contract', () => {

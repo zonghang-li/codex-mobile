@@ -442,7 +442,14 @@
                     </blockquote>
                     <ul v-else-if="block.kind === 'unorderedList'" class="message-list message-list-unordered">
                       <li v-for="(item, itemIndex) in block.items" :key="`ul-${blockIndex}-${itemIndex}`" class="message-list-item">
-                        <div class="message-list-item-content" v-html="renderListItemContentAsHtml(item)" />
+                        <div class="message-list-item-content">
+                          <MessageBlockRenderer
+                            :item="item"
+                            :render-inline-html="renderInlineSegmentsAsHtml"
+                            :render-block-html="renderMessageBlockAsHtml"
+                            :render-highlighted-code-html="renderCachedHighlightedCodeAsHtml"
+                          />
+                        </div>
                       </li>
                     </ul>
                     <ul v-else-if="block.kind === 'taskList'" class="message-list message-task-list">
@@ -485,7 +492,14 @@
                       :start="block.start"
                     >
                       <li v-for="(item, itemIndex) in block.items" :key="`ol-${blockIndex}-${itemIndex}`" class="message-list-item">
-                        <div class="message-list-item-content" v-html="renderListItemContentAsHtml(item)" />
+                        <div class="message-list-item-content">
+                          <MessageBlockRenderer
+                            :item="item"
+                            :render-inline-html="renderInlineSegmentsAsHtml"
+                            :render-block-html="renderMessageBlockAsHtml"
+                            :render-highlighted-code-html="renderCachedHighlightedCodeAsHtml"
+                          />
+                        </div>
                       </li>
                     </ol>
                     <div v-else-if="block.kind === 'table'" class="message-table-wrap">
@@ -928,6 +942,7 @@ import {
 import type { ListItem, MessageBlock, TableAlignment, TaskListItem } from './messageBlockTypes'
 
 import CopyableOutputBlock from './CopyableOutputBlock.vue'
+import MessageBlockRenderer from './MessageBlockRenderer.vue'
 import IconTablerArrowBackUp from '../icons/IconTablerArrowBackUp.vue'
 import IconTablerArrowUp from '../icons/IconTablerArrowUp.vue'
 import IconTablerCopy from '../icons/IconTablerCopy.vue'
