@@ -63,7 +63,7 @@
   printf 'thread=%s\nrollout=%s\ndev:ino=%s\n' "$THREAD_ID" "$ROLLOUT" "$ROLLOUT_IDENTITY"
   ```
 
-- Define helpers that preserve argv token boundaries, validate PID identity with `/proc/<pid>/stat` field 22, walk PPID links, and accept only a writable positive-position FD whose dev/ino matches the selected rollout:
+- Define helpers that preserve argv token boundaries, validate PID identity with `/proc/<pid>/stat` field 22, walk PPID links, and accept only a writable positive-position FD whose dev/ino and full flags stay stable across two fdinfo snapshots:
 
   ```bash
   proc_starttime() {
@@ -204,8 +204,10 @@
   }
 
   rollout_writer_fds() {
-    local pid="$1" fd info fdinfo_snapshot identity_before identity_after
-    local position flags access target found=1 nullglob_was_set=0
+    local pid="$1" fd info fdinfo_before fdinfo_after
+    local identity_before identity_middle identity_after
+    local position_before position_after flags_before flags_after
+    local access_before access_after target found=1 nullglob_was_set=0
     local -a fd_paths=()
     shopt -q nullglob && nullglob_was_set=1
     shopt -s nullglob
@@ -215,26 +217,34 @@
       [[ -e $fd ]] || return 2
       identity_before="$(stat -Lc '%d:%i' "$fd" 2>/dev/null)" || return 2
       info="$PROC_ROOT/$pid/fdinfo/${fd##*/}"
-      fdinfo_snapshot="$(< "$info")" || return 2
+      fdinfo_before="$(< "$info")" || return 2
+      identity_middle="$(stat -Lc '%d:%i' "$fd" 2>/dev/null)" || return 2
+      fdinfo_after="$(< "$info")" || return 2
       target="$(readlink "$fd")" || return 2
       identity_after="$(stat -Lc '%d:%i' "$fd" 2>/dev/null)" || return 2
-      [[ $identity_before == "$identity_after" ]] || return 2
+      [[ $identity_before == "$identity_middle" && $identity_middle == "$identity_after" ]] || return 2
       [[ $identity_before == "$ROLLOUT_IDENTITY" ]] || continue
-      position="$(awk '$1 == "pos:" { print $2; exit }' <<< "$fdinfo_snapshot")"
-      flags="$(awk '$1 == "flags:" { print $2; exit }' <<< "$fdinfo_snapshot")"
-      [[ $position =~ ^[0-9]+$ && $flags =~ ^[0-7]+$ ]] || return 2
-      access=$(( (8#$flags) & 3 ))
+      position_before="$(awk '$1 == "pos:" { print $2; exit }' <<< "$fdinfo_before")"
+      flags_before="$(awk '$1 == "flags:" { print $2; exit }' <<< "$fdinfo_before")"
+      position_after="$(awk '$1 == "pos:" { print $2; exit }' <<< "$fdinfo_after")"
+      flags_after="$(awk '$1 == "flags:" { print $2; exit }' <<< "$fdinfo_after")"
+      [[ $position_before =~ ^[0-9]+$ && $position_after =~ ^[0-9]+$ ]] || return 2
+      [[ $flags_before =~ ^[0-7]+$ && $flags_after =~ ^[0-7]+$ ]] || return 2
+      access_before=$(( (8#$flags_before) & 3 ))
+      access_after=$(( (8#$flags_after) & 3 ))
+      [[ $flags_before == "$flags_after" && $access_before == "$access_after" ]] || return 2
       printf 'pid=%s fd=%s pos=%s flags=%s target=%s\n' \
-        "$pid" "${fd##*/}" "$position" "$flags" "$target"
-      if ((position > 0 && (access == 1 || access == 2))); then found=0; fi
+        "$pid" "${fd##*/}" "$position_after" "$flags_after" "$target"
+      if ((position_after > 0 && (access_after == 1 || access_after == 2))); then found=0; fi
     done
     return "$found"
   }
 
   classify_rollout_writer() {
-    local pid="$1" uid before_cmdline after_cmdline record_before record_after fd_result
-    uid="$(stable_proc_uid "$pid")" || return 2
-    [[ $uid == "$EUID" ]] || return 1
+    local pid="$1" uid_before uid_after before_cmdline after_cmdline
+    local record_before record_after fd_result
+    uid_before="$(stable_proc_uid "$pid")" || return 2
+    [[ $uid_before == "$EUID" ]] || return 1
     before_cmdline="$(mktemp "$EVIDENCE_DIR/candidate-${pid}.before.XXXXXX.cmdline")" || return 2
     after_cmdline="$(mktemp "$EVIDENCE_DIR/candidate-${pid}.after.XXXXXX.cmdline")" || {
       rm -f -- "$before_cmdline"
@@ -261,6 +271,14 @@
       rm -f -- "$before_cmdline" "$after_cmdline"
       return 2
     fi
+    uid_after="$(stable_proc_uid "$pid")" || {
+      rm -f -- "$before_cmdline" "$after_cmdline"
+      return 2
+    }
+    if [[ $uid_after != "$uid_before" || $uid_after != "$EUID" ]]; then
+      rm -f -- "$before_cmdline" "$after_cmdline"
+      return 2
+    fi
     rm -f -- "$before_cmdline" "$after_cmdline"
     return "$fd_result"
   }
@@ -276,13 +294,15 @@
    [[ $MOBILE_LAUNCHER_PID =~ ^[0-9]+$ ]] && ((MOBILE_LAUNCHER_PID > 1)) || exit 1
    ```
 
-3. First capture the launcher's stable `(starttime, PPid)` record and raw argv, and verify systemd still names the same `MainPID`. Only then enumerate stable app-server command snapshots that hold the exact rollout through a stable descriptor/fdinfo snapshot. Every ancestry classification must use the recorded launcher starttime. Finally capture the selected native and desktop identities and raw argv before changing any process.
+3. First capture the launcher's stable `(starttime, PPid, UID)` evidence and raw argv, and verify systemd still names the same `MainPID`. Only then enumerate stable same-UID app-server command snapshots that hold the exact rollout through stable descriptor and dual-fdinfo snapshots. Every ancestry classification must use the recorded launcher starttime. Finally capture the selected native and desktop identities, UIDs, and raw argv before changing any process.
 
    ```bash
    launcher_record="$(stable_cmdline_snapshot \
      "$MOBILE_LAUNCHER_PID" "$EVIDENCE_DIR/mobile-launcher.cmdline")" || exit 1
    read -r MOBILE_LAUNCHER_STARTTIME MOBILE_LAUNCHER_PPID <<< "$launcher_record"
+   MOBILE_LAUNCHER_UID="$(stable_proc_uid "$MOBILE_LAUNCHER_PID")" || exit 1
    [[ $MOBILE_LAUNCHER_STARTTIME =~ ^[0-9]+$ && $MOBILE_LAUNCHER_PPID =~ ^[0-9]+$ ]] || exit 1
+   [[ $MOBILE_LAUNCHER_UID == "$EUID" ]] || exit 1
    [[ $(systemctl --user show codex-mobile-safe.service -p MainPID --value) == "$MOBILE_LAUNCHER_PID" ]] || exit 1
 
    WRITER_PIDS=()
@@ -340,8 +360,11 @@
      "$DESKTOP_PID" "$EVIDENCE_DIR/desktop.cmdline")" || exit 1
    read -r MOBILE_NATIVE_STARTTIME MOBILE_NATIVE_PPID <<< "$native_record"
    read -r DESKTOP_STARTTIME DESKTOP_PPID <<< "$desktop_record"
+   MOBILE_NATIVE_UID="$(stable_proc_uid "$MOBILE_NATIVE_PID")" || exit 1
+   DESKTOP_UID="$(stable_proc_uid "$DESKTOP_PID")" || exit 1
    [[ $MOBILE_NATIVE_STARTTIME =~ ^[0-9]+$ && $MOBILE_NATIVE_PPID =~ ^[0-9]+$ ]] || exit 1
    [[ $DESKTOP_STARTTIME =~ ^[0-9]+$ && $DESKTOP_PPID =~ ^[0-9]+$ ]] || exit 1
+   [[ $MOBILE_NATIVE_UID == "$EUID" && $DESKTOP_UID == "$EUID" ]] || exit 1
 
    printf 'mobile launcher PID=%s\nmobile native PID=%s\ndesktop PID=%s\n' \
      "$MOBILE_LAUNCHER_PID" "$MOBILE_NATIVE_PID" "$DESKTOP_PID"
@@ -389,7 +412,7 @@
    ```
 
    Expect an exact payload shape of `{"state":"running","turnId":"<turn-id>","interruptible":false,"source":"external-session-writer"}` and the mobile composer to show the disabled “Running in another client” stop control.
-5. Stop only the previously recorded desktop writer. Immediately before signalling, require the same desktop identity and command, revalidate that systemd still names the recorded mobile root and that its stable identity and command are unchanged, then require qualifying desktop command tokens, non-mobile ancestry bound to that root starttime, and a stable matching rollout FD. Repeat both process-identity validations after those checks and immediately before the single `TERM`. If any check fails, abort without signalling. Never use `pkill`, `killall`, a PID rediscovered by name, or `systemctl stop/restart` for this step.
+5. Stop only the previously recorded desktop writer. Immediately before signalling, require the recorded same UIDs, desktop identity and command, and revalidate that systemd still names the recorded mobile root and that its stable identity and command are unchanged. Then require qualifying desktop command tokens, non-mobile ancestry bound to that root starttime, and a stable matching rollout FD. After the FD helper returns, repeat the full ancestry, UID, systemd-root, and both process-identity validations immediately before the single `TERM`. If any check is changed or inconclusive, abort without signalling. Never use `pkill`, `killall`, a PID rediscovered by name, or `systemctl stop/restart` for this step.
 
    ```bash
    [[ $DESKTOP_PID =~ ^[0-9]+$ ]] && ((DESKTOP_PID > 1)) || exit 1
@@ -398,6 +421,8 @@
      "$EVIDENCE_DIR/mobile-launcher.cmdline" || exit 1
    revalidate_saved_process "$DESKTOP_PID" "$DESKTOP_STARTTIME" \
      "$EVIDENCE_DIR/desktop.cmdline" || exit 1
+   [[ $(stable_proc_uid "$MOBILE_LAUNCHER_PID") == "$MOBILE_LAUNCHER_UID" ]] || exit 1
+   [[ $(stable_proc_uid "$DESKTOP_PID") == "$DESKTOP_UID" ]] || exit 1
    is_codex_app_server_file "$EVIDENCE_DIR/desktop.cmdline" || exit 1
    has_argv_token_file "$EVIDENCE_DIR/desktop.cmdline" 'features.code_mode_host=true' || exit 1
    assert_not_descendant_of \
@@ -405,6 +430,8 @@
    rollout_writer_fds "$DESKTOP_PID" || exit 1
    assert_not_descendant_of \
      "$DESKTOP_PID" "$MOBILE_LAUNCHER_PID" "$MOBILE_LAUNCHER_STARTTIME" || exit 1
+   [[ $(stable_proc_uid "$MOBILE_LAUNCHER_PID") == "$MOBILE_LAUNCHER_UID" ]] || exit 1
+   [[ $(stable_proc_uid "$DESKTOP_PID") == "$DESKTOP_UID" ]] || exit 1
    [[ $(systemctl --user show codex-mobile-safe.service -p MainPID --value) == "$MOBILE_LAUNCHER_PID" ]] || exit 1
    revalidate_saved_process "$MOBILE_LAUNCHER_PID" "$MOBILE_LAUNCHER_STARTTIME" \
      "$EVIDENCE_DIR/mobile-launcher.cmdline" || exit 1
@@ -431,11 +458,19 @@
      "$EVIDENCE_DIR/mobile-launcher.cmdline" || exit 1
    revalidate_saved_process "$MOBILE_NATIVE_PID" "$MOBILE_NATIVE_STARTTIME" \
      "$EVIDENCE_DIR/mobile-native.cmdline" || exit 1
+   [[ $(stable_proc_uid "$MOBILE_LAUNCHER_PID") == "$MOBILE_LAUNCHER_UID" ]] || exit 1
+   [[ $(stable_proc_uid "$MOBILE_NATIVE_PID") == "$MOBILE_NATIVE_UID" ]] || exit 1
    assert_descendant_of \
      "$MOBILE_NATIVE_PID" "$MOBILE_LAUNCHER_PID" "$MOBILE_LAUNCHER_STARTTIME" || exit 1
    rollout_writer_fds "$MOBILE_NATIVE_PID" || exit 1
    assert_descendant_of \
      "$MOBILE_NATIVE_PID" "$MOBILE_LAUNCHER_PID" "$MOBILE_LAUNCHER_STARTTIME" || exit 1
+   [[ $(stable_proc_uid "$MOBILE_LAUNCHER_PID") == "$MOBILE_LAUNCHER_UID" ]] || exit 1
+   [[ $(stable_proc_uid "$MOBILE_NATIVE_PID") == "$MOBILE_NATIVE_UID" ]] || exit 1
+   revalidate_saved_process "$MOBILE_LAUNCHER_PID" "$MOBILE_LAUNCHER_STARTTIME" \
+     "$EVIDENCE_DIR/mobile-launcher.cmdline" || exit 1
+   revalidate_saved_process "$MOBILE_NATIVE_PID" "$MOBILE_NATIVE_STARTTIME" \
+     "$EVIDENCE_DIR/mobile-native.cmdline" || exit 1
 
    for proc_dir in "$PROC_ROOT/"[0-9]*; do
      pid="${proc_dir##*/}"
@@ -477,7 +512,7 @@
 ##### Expected Results
 - Command recognition treats `/proc/<pid>/cmdline` as NUL-delimited argv: an argv token whose basename is exactly `codex` must precede a later token that is exactly `app-server`. Options between those tokens are accepted; lookalike basenames, reversed ordering, and lookalike subcommands are rejected.
 - The mobile launcher PID and every native or Node descendant whose validated parent chain reaches that PID are excluded. Only a separate qualifying desktop app-server can supply external writer evidence.
-- Linux process identity is bound to `/proc/<pid>/stat` starttime while the process table and descriptor evidence are collected. Each manual ancestry hop brackets its `status`/`PPid` read with matching starttime reads and binds the mobile root to its recorded starttime. Each rollout FD brackets one fdinfo snapshot with matching descriptor dev/ino reads. PID reuse, ancestry mutation, FD-number reuse, disappearance, or an inconclusive identity read aborts the manual procedure instead of accepting stale writer evidence.
+- Linux process identity is bound to `/proc/<pid>/stat` starttime while the process table and descriptor evidence are collected. Each manual ancestry hop brackets its `status`/`PPid` read with matching starttime reads and binds the mobile root to its recorded starttime. Each rollout FD uses three matching descriptor dev/ino reads around two parsed fdinfo snapshots; full flags and access mode must remain stable, while the second snapshot supplies the current position and flags. Candidate UID is revalidated after FD inspection. PID reuse, UID or ancestry mutation, FD-number reuse, flags/access change, disappearance, or an inconclusive identity read aborts the manual procedure instead of accepting mixed writer evidence.
 - Existing lifecycle, same-UID, exact rollout dev/ino, writable-descriptor, positive-position, canonical-path, and regular-file requirements remain in force.
 
 ##### Automated Acceptance
