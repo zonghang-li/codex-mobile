@@ -42,9 +42,11 @@
 - Run the commands below in one dedicated Bash shell. Export the test thread ID, locate its single canonical rollout, and create temporary evidence files:
 
   ```bash
-  set -u -o pipefail
+  set -euo pipefail
+  umask 077
   export THREAD_ID='<test-thread-id>'
   SERVICE_URL='http://127.0.0.1:5900'
+  PROC_ROOT='/proc'
   SESSIONS_ROOT="$(realpath "${CODEX_HOME:-$HOME/.codex}/sessions")"
   mapfile -t ROLLOUT_MATCHES < <(find "$SESSIONS_ROOT" -type f -name "rollout-*-${THREAD_ID}.jsonl" -print)
   ((${#ROLLOUT_MATCHES[@]} == 1)) || { printf 'expected one rollout, found %s\n' "${#ROLLOUT_MATCHES[@]}" >&2; exit 1; }
@@ -66,7 +68,7 @@
   ```bash
   proc_starttime() {
     local stat_line tail
-    IFS= read -r stat_line < "/proc/$1/stat" || return 1
+    IFS= read -r stat_line < "$PROC_ROOT/$1/stat" || return 1
     tail="${stat_line##*) }"
     set -- $tail
     [[ ${20:-} =~ ^[0-9]+$ ]] || return 1
@@ -74,7 +76,8 @@
   }
 
   proc_ppid() {
-    awk '$1 == "PPid:" { print $2; exit }' "/proc/$1/status" 2>/dev/null
+    awk '$1 == "PPid:" { print $2; found=1; exit } END { if (!found) exit 1 }' \
+      "$PROC_ROOT/$1/status" 2>/dev/null
   }
 
   print_argv() {
@@ -82,7 +85,7 @@
     while IFS= read -r -d '' arg; do
       printf 'pid=%s argv[%s]=%q\n' "$pid" "$index" "$arg"
       ((index += 1))
-    done < "/proc/$pid/cmdline"
+    done < "$PROC_ROOT/$pid/cmdline"
   }
 
   is_codex_app_server() {
@@ -90,7 +93,7 @@
     while IFS= read -r -d '' arg; do
       if ((saw_codex)) && [[ $arg == app-server ]]; then return 0; fi
       [[ ${arg##*/} == codex ]] && saw_codex=1
-    done < "/proc/$pid/cmdline" 2>/dev/null
+    done < "$PROC_ROOT/$pid/cmdline" 2>/dev/null
     return 1
   }
 
@@ -98,30 +101,57 @@
     local pid="$1" expected="$2" arg
     while IFS= read -r -d '' arg; do
       [[ $arg == "$expected" ]] && return 0
-    done < "/proc/$pid/cmdline" 2>/dev/null
+    done < "$PROC_ROOT/$pid/cmdline" 2>/dev/null
     return 1
   }
 
-  is_descendant_of() {
+  classify_ancestry() {
     local current="$1" root="$2" depth parent
+    local -A seen=()
+    [[ $current =~ ^[0-9]+$ && $root =~ ^[0-9]+$ ]] || return 2
     for ((depth = 0; depth < 128; depth += 1)); do
       [[ $current == "$root" ]] && return 0
-      [[ $current =~ ^[0-9]+$ ]] && ((current > 1)) || return 1
-      parent="$(proc_ppid "$current")" || return 1
-      [[ $parent =~ ^[0-9]+$ ]] || return 1
+      ((current == 1)) && return 1
+      [[ -z ${seen[$current]+present} ]] || return 2
+      seen[$current]=1
+      parent="$(proc_ppid "$current")" || return 2
+      [[ $parent =~ ^[0-9]+$ ]] || return 2
+      ((parent == 0)) && return 1
       current="$parent"
     done
-    return 1
+    return 2
+  }
+
+  assert_descendant_of() {
+    local result
+    if classify_ancestry "$1" "$2"; then return 0; else result=$?; fi
+    return "$result"
+  }
+
+  assert_not_descendant_of() {
+    local result
+    if classify_ancestry "$1" "$2"; then
+      return 1
+    else
+      result=$?
+    fi
+    if [[ $result == 1 ]]; then return 0; fi
+    return 2
   }
 
   show_ppid_chain() {
     local current="$1" depth parent starttime
+    local -A seen=()
     for ((depth = 0; depth < 128; depth += 1)); do
+      [[ $current =~ ^[0-9]+$ ]] || return 1
+      [[ -z ${seen[$current]+present} ]] || return 1
+      seen[$current]=1
       starttime="$(proc_starttime "$current")" || return 1
       parent="$(proc_ppid "$current")" || return 1
       printf 'pid=%s ppid=%s starttime=%s\n' "$current" "$parent" "$starttime"
-      print_argv "$current"
+      print_argv "$current" || return 1
       [[ $current == 1 || $parent == 0 ]] && return 0
+      [[ $parent =~ ^[0-9]+$ ]] || return 1
       current="$parent"
     done
     return 1
@@ -129,10 +159,10 @@
 
   rollout_writer_fds() {
     local pid="$1" fd info position flags access found=1
-    for fd in "/proc/$pid/fd/"[0-9]*; do
+    for fd in "$PROC_ROOT/$pid/fd/"[0-9]*; do
       [[ -e $fd ]] || continue
       [[ $(stat -Lc '%d:%i' "$fd" 2>/dev/null) == "$ROLLOUT_IDENTITY" ]] || continue
-      info="/proc/$pid/fdinfo/${fd##*/}"
+      info="$PROC_ROOT/$pid/fdinfo/${fd##*/}"
       position="$(awk '$1 == "pos:" { print $2; exit }' "$info" 2>/dev/null)"
       flags="$(awk '$1 == "flags:" { print $2; exit }' "$info" 2>/dev/null)"
       [[ $position =~ ^[0-9]+$ && $flags =~ ^[0-7]+$ ]] || continue
@@ -155,7 +185,7 @@
    [[ $MOBILE_LAUNCHER_PID =~ ^[0-9]+$ ]] && ((MOBILE_LAUNCHER_PID > 1)) || exit 1
 
    mapfile -t WRITER_PIDS < <(
-     for proc_dir in /proc/[0-9]*; do
+     for proc_dir in "$PROC_ROOT/"[0-9]*; do
        pid="${proc_dir##*/}"
        if is_codex_app_server "$pid" && rollout_writer_fds "$pid" >/dev/null; then printf '%s\n' "$pid"; fi
      done
@@ -164,19 +194,27 @@
    MOBILE_WRITER_PIDS=()
    DESKTOP_CANDIDATES=()
    for pid in "${WRITER_PIDS[@]}"; do
-     if is_descendant_of "$pid" "$MOBILE_LAUNCHER_PID"; then
+     if classify_ancestry "$pid" "$MOBILE_LAUNCHER_PID"; then
        MOBILE_WRITER_PIDS+=("$pid")
-     elif has_argv_token "$pid" 'features.code_mode_host=true' \
-       && has_argv_token "$pid" app-server \
-       && has_argv_token "$pid" --listen \
-       && has_argv_token "$pid" 'unix://'; then
-       DESKTOP_CANDIDATES+=("$pid")
+     else
+       ancestry_result=$?
+       if [[ $ancestry_result == 1 ]]; then
+         if has_argv_token "$pid" 'features.code_mode_host=true' \
+           && has_argv_token "$pid" app-server \
+           && has_argv_token "$pid" --listen \
+           && has_argv_token "$pid" 'unix://'; then
+           DESKTOP_CANDIDATES+=("$pid")
+         fi
+       else
+         printf 'cannot validate ancestry for writer pid=%s\n' "$pid" >&2
+         exit 1
+       fi
      fi
    done
 
    MOBILE_NATIVE_CANDIDATES=()
    for pid in "${MOBILE_WRITER_PIDS[@]}"; do
-     argv0="$(tr '\0' '\n' < "/proc/$pid/cmdline" | head -n 1)"
+     argv0="$(tr '\0' '\n' < "$PROC_ROOT/$pid/cmdline" | head -n 1)"
      [[ ${argv0##*/} == codex ]] && MOBILE_NATIVE_CANDIDATES+=("$pid")
    done
    ((${#MOBILE_NATIVE_CANDIDATES[@]} == 1)) || { printf 'ambiguous mobile native writers\n' >&2; exit 1; }
@@ -191,41 +229,54 @@
    MOBILE_LAUNCHER_STARTTIME="$(proc_starttime "$MOBILE_LAUNCHER_PID")"
    MOBILE_NATIVE_STARTTIME="$(proc_starttime "$MOBILE_NATIVE_PID")"
    DESKTOP_STARTTIME="$(proc_starttime "$DESKTOP_PID")"
-   cp "/proc/$MOBILE_LAUNCHER_PID/cmdline" "$EVIDENCE_DIR/mobile-launcher.cmdline"
-   cp "/proc/$MOBILE_NATIVE_PID/cmdline" "$EVIDENCE_DIR/mobile-native.cmdline"
-   cp "/proc/$DESKTOP_PID/cmdline" "$EVIDENCE_DIR/desktop.cmdline"
+   [[ $MOBILE_LAUNCHER_STARTTIME =~ ^[0-9]+$ ]] || exit 1
+   [[ $MOBILE_NATIVE_STARTTIME =~ ^[0-9]+$ ]] || exit 1
+   [[ $DESKTOP_STARTTIME =~ ^[0-9]+$ ]] || exit 1
+   cp "$PROC_ROOT/$MOBILE_LAUNCHER_PID/cmdline" "$EVIDENCE_DIR/mobile-launcher.cmdline" || exit 1
+   cp "$PROC_ROOT/$MOBILE_NATIVE_PID/cmdline" "$EVIDENCE_DIR/mobile-native.cmdline" || exit 1
+   cp "$PROC_ROOT/$DESKTOP_PID/cmdline" "$EVIDENCE_DIR/desktop.cmdline" || exit 1
 
    printf 'mobile launcher PID=%s\nmobile native PID=%s\ndesktop PID=%s\n' \
      "$MOBILE_LAUNCHER_PID" "$MOBILE_NATIVE_PID" "$DESKTOP_PID"
-   show_ppid_chain "$MOBILE_NATIVE_PID"
-   is_descendant_of "$MOBILE_NATIVE_PID" "$MOBILE_LAUNCHER_PID"
-   ! is_descendant_of "$DESKTOP_PID" "$MOBILE_LAUNCHER_PID"
-   print_argv "$DESKTOP_PID"
-   rollout_writer_fds "$MOBILE_NATIVE_PID"
-   rollout_writer_fds "$DESKTOP_PID"
+   show_ppid_chain "$MOBILE_NATIVE_PID" || exit 1
+   assert_descendant_of "$MOBILE_NATIVE_PID" "$MOBILE_LAUNCHER_PID" || exit 1
+   assert_not_descendant_of "$DESKTOP_PID" "$MOBILE_LAUNCHER_PID" || exit 1
+   print_argv "$DESKTOP_PID" || exit 1
+   rollout_writer_fds "$MOBILE_NATIVE_PID" || exit 1
+   rollout_writer_fds "$DESKTOP_PID" || exit 1
    ```
 
 4. Authenticate without placing the password in argv or the document, then query the runtime endpoint with an encoded thread ID. The synthetic Host header prevents the trusted-localhost shortcut, so this checks the authenticated path.
 
    ```bash
-   read -rsp 'Codex Mobile password: ' CODEX_MOBILE_PASSWORD; printf '\n'
-   export CODEX_MOBILE_PASSWORD
-   node -e 'process.stdout.write(JSON.stringify({password:process.env.CODEX_MOBILE_PASSWORD}))' \
-     | curl -fsS -o /dev/null -c "$COOKIE_JAR" \
-         -H 'Host: codex-mobile.test' -H 'Content-Type: application/json' \
-         --data-binary @- "$SERVICE_URL/auth/login"
+   AUTH_JSON="$EVIDENCE_DIR/auth.json"
+   IFS= read -rsp 'Codex Mobile password: ' CODEX_MOBILE_PASSWORD || exit 1
+   printf '\n'
+   if ! printf '%s' "$CODEX_MOBILE_PASSWORD" | node -e '
+     let password = ""
+     process.stdin.setEncoding("utf8")
+     process.stdin.on("data", (chunk) => { password += chunk })
+     process.stdin.on("end", () => process.stdout.write(JSON.stringify({ password })))
+   ' > "$AUTH_JSON"; then
+     unset CODEX_MOBILE_PASSWORD
+     exit 1
+   fi
    unset CODEX_MOBILE_PASSWORD
+   curl -fsS -o /dev/null -c "$COOKIE_JAR" \
+     -H 'Host: codex-mobile.test' -H 'Content-Type: application/json' \
+     --data-binary @"$AUTH_JSON" "$SERVICE_URL/auth/login" || exit 1
+   rm -f -- "$AUTH_JSON" || exit 1
 
    curl -fsS -b "$COOKIE_JAR" -H 'Host: codex-mobile.test' --get \
      --data-urlencode "threadId=$THREAD_ID" \
-     "$SERVICE_URL/codex-api/thread-runtime-state" > "$EVIDENCE_DIR/running.json"
+     "$SERVICE_URL/codex-api/thread-runtime-state" > "$EVIDENCE_DIR/running.json" || exit 1
    jq -e '
      .state == "running"
      and .interruptible == false
      and .source == "external-session-writer"
      and (.turnId | type == "string" and length > 0)
      and (keys | sort == ["interruptible", "source", "state", "turnId"])
-   ' "$EVIDENCE_DIR/running.json"
+   ' "$EVIDENCE_DIR/running.json" || exit 1
    ```
 
    Expect an exact payload shape of `{"state":"running","turnId":"<turn-id>","interruptible":false,"source":"external-session-writer"}` and the mobile composer to show the disabled “Running in another client” stop control.
@@ -234,12 +285,12 @@
    ```bash
    [[ $DESKTOP_PID =~ ^[0-9]+$ ]] && ((DESKTOP_PID > 1)) || exit 1
    [[ $(proc_starttime "$DESKTOP_PID") == "$DESKTOP_STARTTIME" ]] || exit 1
-   cmp -s "/proc/$DESKTOP_PID/cmdline" "$EVIDENCE_DIR/desktop.cmdline" || exit 1
+   cmp -s "$PROC_ROOT/$DESKTOP_PID/cmdline" "$EVIDENCE_DIR/desktop.cmdline" || exit 1
    is_codex_app_server "$DESKTOP_PID" || exit 1
    has_argv_token "$DESKTOP_PID" 'features.code_mode_host=true' || exit 1
-   ! is_descendant_of "$DESKTOP_PID" "$MOBILE_LAUNCHER_PID" || exit 1
+   assert_not_descendant_of "$DESKTOP_PID" "$MOBILE_LAUNCHER_PID" || exit 1
    rollout_writer_fds "$DESKTOP_PID" || exit 1
-   kill -TERM -- "$DESKTOP_PID"
+   kill -TERM -- "$DESKTOP_PID" || exit 1
 
    for ((attempt = 0; attempt < 50; attempt += 1)); do
      current_starttime="$(proc_starttime "$DESKTOP_PID" 2>/dev/null || true)"
@@ -257,25 +308,33 @@
    ```bash
    [[ $(proc_starttime "$MOBILE_LAUNCHER_PID") == "$MOBILE_LAUNCHER_STARTTIME" ]] || exit 1
    [[ $(proc_starttime "$MOBILE_NATIVE_PID") == "$MOBILE_NATIVE_STARTTIME" ]] || exit 1
-   cmp -s "/proc/$MOBILE_LAUNCHER_PID/cmdline" "$EVIDENCE_DIR/mobile-launcher.cmdline" || exit 1
-   cmp -s "/proc/$MOBILE_NATIVE_PID/cmdline" "$EVIDENCE_DIR/mobile-native.cmdline" || exit 1
-   is_descendant_of "$MOBILE_NATIVE_PID" "$MOBILE_LAUNCHER_PID" || exit 1
+   cmp -s "$PROC_ROOT/$MOBILE_LAUNCHER_PID/cmdline" "$EVIDENCE_DIR/mobile-launcher.cmdline" || exit 1
+   cmp -s "$PROC_ROOT/$MOBILE_NATIVE_PID/cmdline" "$EVIDENCE_DIR/mobile-native.cmdline" || exit 1
+   assert_descendant_of "$MOBILE_NATIVE_PID" "$MOBILE_LAUNCHER_PID" || exit 1
    rollout_writer_fds "$MOBILE_NATIVE_PID" || exit 1
 
-   for proc_dir in /proc/[0-9]*; do
+   for proc_dir in "$PROC_ROOT/"[0-9]*; do
      pid="${proc_dir##*/}"
      if is_codex_app_server "$pid" \
-       && rollout_writer_fds "$pid" >/dev/null \
-       && ! is_descendant_of "$pid" "$MOBILE_LAUNCHER_PID"; then
-       printf 'unexpected non-mobile rollout writer pid=%s\n' "$pid" >&2
-       exit 1
+       && rollout_writer_fds "$pid" >/dev/null; then
+       if classify_ancestry "$pid" "$MOBILE_LAUNCHER_PID"; then
+         :
+       else
+         ancestry_result=$?
+         if [[ $ancestry_result == 1 ]]; then
+           printf 'unexpected non-mobile rollout writer pid=%s\n' "$pid" >&2
+         else
+           printf 'cannot validate ancestry for remaining writer pid=%s\n' "$pid" >&2
+         fi
+         exit 1
+       fi
      fi
    done
 
    curl -fsS -b "$COOKIE_JAR" -H 'Host: codex-mobile.test' --get \
      --data-urlencode "threadId=$THREAD_ID" \
-     "$SERVICE_URL/codex-api/thread-runtime-state" > "$EVIDENCE_DIR/idle.json"
-   jq -e '. == {"state":"idle"}' "$EVIDENCE_DIR/idle.json"
+     "$SERVICE_URL/codex-api/thread-runtime-state" > "$EVIDENCE_DIR/idle.json" || exit 1
+   jq -e '. == {"state":"idle"}' "$EVIDENCE_DIR/idle.json" || exit 1
    ```
 
    Expect exactly `{"state":"idle"}`. After the terminal detail refresh, the normal send control must return. The before/after pair proves that the separate desktop writer supplied the earlier `running` evidence while the still-live mobile descendant writer was excluded.
