@@ -415,6 +415,21 @@ describe('getThreadRuntimeState', () => {
     expect(requests).toEqual(['/codex-api/thread-runtime-state?threadId=thread+1'])
   })
 
+  it('passes an abort signal to the runtime endpoint fetch', async () => {
+    const controller = new AbortController()
+    let receivedSignal: AbortSignal | null | undefined
+    vi.stubGlobal('fetch', vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+      receivedSignal = init?.signal
+      return new Response(JSON.stringify({ state: 'unknown' }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      })
+    }))
+
+    await expect(getThreadRuntimeState('thread-1', controller.signal)).resolves.toEqual({ state: 'unknown' })
+    expect(receivedSignal).toBe(controller.signal)
+  })
+
   it.each([
     null,
     {},

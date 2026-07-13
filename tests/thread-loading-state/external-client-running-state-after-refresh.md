@@ -17,6 +17,8 @@
 6. Resize Client B to `768x1024` while keeping Dark appearance, refresh the same thread, and repeat the visual and disabled-control checks; then switch to Light appearance at `768x1024` and repeat them once more.
 7. Leave both clients open until the turn reaches a terminal state in Client A. Immediately after the external-runtime poll notices completion but before terminal output appears, try to submit once in Client B; then wait for the forced terminal detail refresh to finish.
 8. In Client B, confirm the final output appears, the sidebar and composer leave their running state, and submit a short follow-up message.
+9. While an external-runtime request for one selected thread is deliberately left pending (for example with a development request interceptor), select a second externally running thread and wait one polling interval; then stop polling or trigger a local turn on the selected thread.
+10. Create one pending request scoped to an externally owned thread and one scoped to an idle thread. Change selection before responding to each request, and also exercise one explicitly global request plus an expired/unknown request ID.
 
 #### Expected Results
 - During both refreshes, the thread remains selected and its readable conversation history stays visible.
@@ -28,6 +30,8 @@
 - Client B does not drain the persisted queued follow-up while Client A still owns the external turn, including after Client B startup/recovery; inconclusive Linux ownership checks keep the queue blocked and retry later.
 - Client A retains its enabled local stop control, and an idle composer still retains normal send behavior.
 - Client B retains the external read-only lease until the forced terminal detail refresh has succeeded, so the immediate completion-edge submit cannot start a duplicate turn.
+- Changing selection, stopping/disconnecting, or observing a local takeover aborts the obsolete runtime request; the newly selected external thread starts its own poll after two seconds, and a late completion from the old request cannot clear or reschedule the new poll.
+- Pending responses are authorized by the request ID's recorded scope rather than the selected row: external-thread requests remain blocked after selection changes, idle/local requests remain usable, explicit global requests retain their prior behavior, and unknown/expired IDs send no RPC.
 - After the external turn reaches a terminal state, Client B removes the sidebar spinner, refreshes the completed conversation, replaces the disabled stop control with the normal idle send control, re-enables queue/composer interactions, and sends the follow-up normally.
 - The layout remains usable in Light and Dark appearance at both `375x812` and `768x1024`, with the composer and queue actions remaining visible and correctly disabled.
 

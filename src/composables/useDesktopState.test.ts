@@ -1146,7 +1146,7 @@ describe('external runtime ownership', () => {
     expect(gatewayMocks.getThreadRuntimeState).not.toHaveBeenCalled()
     await vi.advanceTimersByTimeAsync(1)
     expect(gatewayMocks.getThreadRuntimeState).toHaveBeenCalledTimes(1)
-    expect(gatewayMocks.getThreadRuntimeState).toHaveBeenCalledWith('thread-1')
+    expect(gatewayMocks.getThreadRuntimeState).toHaveBeenCalledWith('thread-1', expect.any(AbortSignal))
   })
 
   it('keeps only one selected external runtime request in flight', async () => {
@@ -1175,6 +1175,75 @@ describe('external runtime ownership', () => {
     expect(gatewayMocks.getThreadRuntimeState).toHaveBeenCalledTimes(1)
     await vi.advanceTimersByTimeAsync(1)
     expect(gatewayMocks.getThreadRuntimeState).toHaveBeenCalledTimes(2)
+  })
+
+  it('aborts a stale selected-thread request so a new external thread can poll', async () => {
+    const { state } = await setupExternalRuntimeState()
+    const oldRequest = deferred<{ state: 'idle' }>()
+    const newRequest = deferred<{ state: 'unknown' }>()
+    const signals: AbortSignal[] = []
+    gatewayMocks.resumeThread.mockResolvedValue(externalDetail())
+    gatewayMocks.getThreadRuntimeState.mockImplementation((threadId: string, signal?: AbortSignal) => {
+      if (signal) signals.push(signal)
+      if (threadId === 'thread-1') return oldRequest.promise
+      if (gatewayMocks.getThreadRuntimeState.mock.calls.length === 2) return newRequest.promise
+      return Promise.resolve({ state: 'unknown' as const })
+    })
+    await state.loadMessages('thread-1')
+    await vi.advanceTimersByTimeAsync(2_000)
+    expect(gatewayMocks.getThreadRuntimeState).toHaveBeenCalledTimes(1)
+
+    state.primeSelectedThread('thread-2')
+    await state.loadMessages('thread-2')
+    await vi.advanceTimersByTimeAsync(2_000)
+
+    expect(gatewayMocks.getThreadRuntimeState).toHaveBeenNthCalledWith(2, 'thread-2', expect.any(AbortSignal))
+    expect(signals[0]?.aborted).toBe(true)
+    oldRequest.resolve({ state: 'idle' })
+    await flushMicrotasks()
+    expect(state.selectedThreadRuntimeOwnership.value).toBe('external')
+
+    await vi.advanceTimersByTimeAsync(4_000)
+    expect(gatewayMocks.getThreadRuntimeState).toHaveBeenCalledTimes(2)
+    newRequest.resolve({ state: 'unknown' })
+    await flushMicrotasks()
+    await vi.advanceTimersByTimeAsync(2_000)
+    expect(gatewayMocks.getThreadRuntimeState).toHaveBeenCalledTimes(3)
+  })
+
+  it('aborts an in-flight external runtime request on local takeover', async () => {
+    const { state, emit } = await setupExternalRuntimeState()
+    const pending = deferred<{ state: 'unknown' }>()
+    let signal: AbortSignal | undefined
+    gatewayMocks.resumeThread.mockResolvedValue(externalDetail())
+    gatewayMocks.getThreadRuntimeState.mockImplementation((_threadId: string, nextSignal?: AbortSignal) => {
+      signal = nextSignal
+      return pending.promise
+    })
+    await state.loadMessages('thread-1')
+    await vi.advanceTimersByTimeAsync(2_000)
+
+    emit({ method: 'turn/started', params: { threadId: 'thread-1', turn: { id: 'turn-local' } } })
+
+    expect(signal?.aborted).toBe(true)
+    expect(state.selectedThreadRuntimeOwnership.value).toBe('local')
+  })
+
+  it('aborts an in-flight external runtime request when polling stops', async () => {
+    const { state } = await setupExternalRuntimeState()
+    const pending = deferred<{ state: 'unknown' }>()
+    let signal: AbortSignal | undefined
+    gatewayMocks.resumeThread.mockResolvedValue(externalDetail())
+    gatewayMocks.getThreadRuntimeState.mockImplementation((_threadId: string, nextSignal?: AbortSignal) => {
+      signal = nextSignal
+      return pending.promise
+    })
+    await state.loadMessages('thread-1')
+    await vi.advanceTimersByTimeAsync(2_000)
+
+    state.stopPolling()
+
+    expect(signal?.aborted).toBe(true)
   })
 
   it('retains an established external lease across an inconclusive detail refresh', async () => {
@@ -1479,7 +1548,7 @@ describe('external runtime ownership', () => {
   })
 
   it('keeps rollback and pending-request replies available for an idle selected thread', async () => {
-    const { state } = await setupExternalRuntimeState()
+    const { state, emit } = await setupExternalRuntimeState()
     gatewayMocks.resumeThread.mockResolvedValue({
       ...idleDetail(),
       messages: [{
@@ -1496,12 +1565,93 @@ describe('external runtime ownership', () => {
     await state.loadMessages('thread-1')
 
     await state.rollbackSelectedThread('turn-idle')
+    emit({
+      method: 'server/request',
+      params: {
+        id: 101,
+        method: 'item/tool/requestUserInput',
+        params: { threadId: 'thread-1', questions: [] },
+      },
+    })
     const replied = await state.respondToPendingServerRequest({ id: 101, result: {} })
 
     expect(gatewayMocks.revertThreadFileChanges).toHaveBeenCalledWith('thread-1', 'turn-idle', '/tmp/project')
     expect(gatewayMocks.rollbackThread).toHaveBeenCalledWith('thread-1', 1)
     expect(gatewayMocks.replyToServerRequest).toHaveBeenCalledWith(101, { result: {}, error: undefined })
     expect(replied).toBe(true)
+  })
+
+  it('rejects a pending request owned by an external thread after selection changes', async () => {
+    const { state, emit } = await setupExternalRuntimeState()
+    gatewayMocks.resumeThread.mockResolvedValue(externalDetail())
+    gatewayMocks.replyToServerRequest.mockResolvedValue(undefined)
+    await state.loadMessages('thread-1')
+    emit({
+      method: 'server/request',
+      params: {
+        id: 201,
+        method: 'item/tool/requestUserInput',
+        params: { threadId: 'thread-1', questions: [] },
+      },
+    })
+    state.primeSelectedThread('thread-2')
+
+    const replied = await state.respondToPendingServerRequest({ id: 201, result: {} })
+
+    expect(replied).toBe(false)
+    expect(gatewayMocks.replyToServerRequest).not.toHaveBeenCalled()
+  })
+
+  it('allows a pending request owned by an idle thread even when an external thread is selected', async () => {
+    const { state, emit } = await setupExternalRuntimeState()
+    gatewayMocks.resumeThread.mockResolvedValue(externalDetail())
+    gatewayMocks.replyToServerRequest.mockResolvedValue(undefined)
+    await state.loadMessages('thread-1')
+    state.primeSelectedThread('thread-2')
+    emit({
+      method: 'server/request',
+      params: {
+        id: 202,
+        method: 'item/tool/requestUserInput',
+        params: { threadId: 'thread-2', questions: [] },
+      },
+    })
+    state.primeSelectedThread('thread-1')
+
+    const replied = await state.respondToPendingServerRequest({ id: 202, result: {} })
+
+    expect(replied).toBe(true)
+    expect(gatewayMocks.replyToServerRequest).toHaveBeenCalledWith(202, { result: {}, error: undefined })
+  })
+
+  it('rejects an unknown pending request id without sending an RPC', async () => {
+    const { state } = await setupExternalRuntimeState()
+    gatewayMocks.replyToServerRequest.mockResolvedValue(undefined)
+
+    const replied = await state.respondToPendingServerRequest({ id: 999, result: {} })
+
+    expect(replied).toBe(false)
+    expect(gatewayMocks.replyToServerRequest).not.toHaveBeenCalled()
+  })
+
+  it('allows an explicitly global pending request while an external thread is selected', async () => {
+    const { state, emit } = await setupExternalRuntimeState()
+    gatewayMocks.resumeThread.mockResolvedValue(externalDetail())
+    gatewayMocks.replyToServerRequest.mockResolvedValue(undefined)
+    await state.loadMessages('thread-1')
+    emit({
+      method: 'server/request',
+      params: {
+        id: 203,
+        method: 'global/test',
+        params: {},
+      },
+    })
+
+    const replied = await state.respondToPendingServerRequest({ id: 203, result: {} })
+
+    expect(replied).toBe(true)
+    expect(gatewayMocks.replyToServerRequest).toHaveBeenCalledWith(203, { result: {}, error: undefined })
   })
 
   it('guards user-facing model setters while preserving server detail reconciliation', async () => {

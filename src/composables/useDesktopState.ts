@@ -1520,7 +1520,11 @@ export function useDesktopState() {
   let rateLimitRefreshTimer: number | null = null
   let externalRuntimeTimer: number | null = null
   let externalRuntimeGeneration = 0
-  let externalRuntimeRequest: Promise<void> | null = null
+  let externalRuntimeRequest: {
+    generation: number
+    promise: Promise<void>
+    controller: AbortController
+  } | null = null
   let externalRuntimePollingEnabled = true
   const delayedTurnSyncTimerByThreadId = new Map<string, number>()
   let loadThreadsPromise: Promise<void> | null = null
@@ -2415,6 +2419,9 @@ export function useDesktopState() {
       window.clearTimeout(externalRuntimeTimer)
     }
     externalRuntimeTimer = null
+    const request = externalRuntimeRequest
+    externalRuntimeRequest = null
+    request?.controller.abort()
   }
 
   function scheduleExternalRuntimePolling(threadId: string): void {
@@ -2426,12 +2433,16 @@ export function useDesktopState() {
     externalRuntimeTimer = window.setTimeout(() => {
       externalRuntimeTimer = null
       const generation = externalRuntimeGeneration
-      const request = pollExternalRuntime(threadId, generation)
-      externalRuntimeRequest = request
+      const controller = new AbortController()
+      const request = pollExternalRuntime(threadId, generation, controller.signal)
+      externalRuntimeRequest = { generation, promise: request, controller }
       void request.finally(() => {
-        if (externalRuntimeRequest === request) {
-          externalRuntimeRequest = null
-        }
+        if (
+          externalRuntimeRequest?.promise !== request
+          || externalRuntimeRequest.generation !== generation
+        ) return
+        externalRuntimeRequest = null
+        if (generation !== externalRuntimeGeneration) return
         const selectedId = selectedThreadId.value
         if (selectedId && runtimeOwnershipByThreadId.value[selectedId] === 'external') {
           scheduleExternalRuntimePolling(selectedId)
@@ -2440,9 +2451,13 @@ export function useDesktopState() {
     }, EXTERNAL_RUNTIME_POLL_MS)
   }
 
-  async function pollExternalRuntime(threadId: string, generation: number): Promise<void> {
+  async function pollExternalRuntime(
+    threadId: string,
+    generation: number,
+    signal: AbortSignal,
+  ): Promise<void> {
     try {
-      const runtime = await getThreadRuntimeState(threadId)
+      const runtime = await getThreadRuntimeState(threadId, signal)
       if (generation !== externalRuntimeGeneration) return
       if (selectedThreadId.value !== threadId) return
       if (runtimeOwnershipByThreadId.value[threadId] !== 'external') return
@@ -3284,6 +3299,16 @@ export function useDesktopState() {
     }
     pendingServerRequestsByThreadId.value = next
     applyThreadFlags()
+  }
+
+  function findPendingServerRequestScope(requestId: number): string {
+    let matchedScope = ''
+    for (const [scope, requests] of Object.entries(pendingServerRequestsByThreadId.value)) {
+      if (!requests.some((request) => request.id === requestId)) continue
+      if (matchedScope && matchedScope !== scope) return ''
+      matchedScope = scope
+    }
+    return matchedScope
   }
 
   function replacePendingServerRequests(requests: UiServerRequest[]): void {
@@ -5777,8 +5802,9 @@ export function useDesktopState() {
   }
 
   async function respondToPendingServerRequest(reply: UiServerRequestReply): Promise<boolean> {
-    const threadId = selectedThreadId.value
-    if (threadId && isExternallyOwned(threadId)) return false
+    const requestScope = findPendingServerRequestScope(reply.id)
+    if (!requestScope) return false
+    if (requestScope !== GLOBAL_SERVER_REQUEST_SCOPE && isExternallyOwned(requestScope)) return false
     try {
       await replyToServerRequest(reply.id, {
         result: reply.result,

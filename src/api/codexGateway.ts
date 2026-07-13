@@ -505,10 +505,13 @@ export function readThreadDetailRuntime(payload: ThreadReadResponse): ThreadDeta
   }
 }
 
-export async function getThreadRuntimeState(threadId: string): Promise<ExternalThreadRuntime> {
+export async function getThreadRuntimeState(
+  threadId: string,
+  signal?: AbortSignal,
+): Promise<ExternalThreadRuntime> {
   const params = new URLSearchParams({ threadId })
   try {
-    const response = await fetch(`/codex-api/thread-runtime-state?${params.toString()}`)
+    const response = await fetch(`/codex-api/thread-runtime-state?${params.toString()}`, { signal })
     if (!response.ok) return { state: 'unknown' }
     return parseExternalThreadRuntime(await response.json())
   } catch {
