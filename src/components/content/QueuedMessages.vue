@@ -6,10 +6,10 @@
       :key="msg.id"
       class="queued-row"
       :class="{
-        'is-dragging': draggedMessageId === msg.id,
-        'is-drop-target': dropTargetMessageId === msg.id && draggedMessageId !== msg.id,
+        'is-dragging': !disabled && draggedMessageId === msg.id,
+        'is-drop-target': !disabled && dropTargetMessageId === msg.id && draggedMessageId !== msg.id,
       }"
-      draggable="true"
+      :draggable="!disabled"
       @dragstart="onDragStart($event, msg.id)"
       @dragover.prevent="onDragOver(msg.id)"
       @dragleave="onDragLeave(msg.id)"
@@ -21,6 +21,7 @@
         type="button"
         :aria-label="t('Drag to reorder queued message')"
         :title="t('Drag to reorder queued message')"
+        :disabled="disabled"
       >
         <svg xmlns="http://www.w3.org/2000/svg" width="1em" height="1em" viewBox="0 0 24 24" aria-hidden="true">
           <path fill="currentColor" d="M9 5.5A1.5 1.5 0 1 1 6 5.5a1.5 1.5 0 0 1 3 0m0 6.5a1.5 1.5 0 1 1-3 0a1.5 1.5 0 0 1 3 0m-1.5 8A1.5 1.5 0 1 0 7.5 17a1.5 1.5 0 0 0 0 3m10-13A1.5 1.5 0 1 0 17.5 4a1.5 1.5 0 0 0 0 3m1.5 5a1.5 1.5 0 1 1-3 0a1.5 1.5 0 0 1 3 0m-1.5 8a1.5 1.5 0 1 0 0-3a1.5 1.5 0 0 0 0 3" />
@@ -32,9 +33,9 @@
       </svg>
       <span class="queued-row-text">{{ getMessagePreview(msg) }}</span>
       <div class="queued-row-actions">
-        <button class="queued-row-edit" type="button" :title="t('Edit queued message')" @click="$emit('edit', msg.id)">{{ t('Edit') }}</button>
-        <button class="queued-row-steer" type="button" :title="t('Send now without interrupting work')" @click="$emit('steer', msg.id)">{{ t('Steer') }}</button>
-        <button class="queued-row-delete" type="button" :aria-label="t('Delete queued message')" :title="t('Delete queued message')" @click="$emit('delete', msg.id)">
+        <button class="queued-row-edit" type="button" :title="t('Edit queued message')" :disabled="disabled" @click="$emit('edit', msg.id)">{{ t('Edit') }}</button>
+        <button class="queued-row-steer" type="button" :title="t('Send now without interrupting work')" :disabled="disabled" @click="$emit('steer', msg.id)">{{ t('Steer') }}</button>
+        <button class="queued-row-delete" type="button" :aria-label="t('Delete queued message')" :title="t('Delete queued message')" :disabled="disabled" @click="$emit('delete', msg.id)">
           <svg xmlns="http://www.w3.org/2000/svg" width="1em" height="1em" viewBox="0 0 24 24" aria-hidden="true">
             <path fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
               d="M4 7h16M10 11v6M14 11v6M5 7l1 12a2 2 0 0 0 2 2h8a2 2 0 0 0 2-2l1-12M9 7V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v3" />
@@ -58,8 +59,9 @@ type QueuedMessageRow = {
   fileAttachments?: Array<{ label: string; path: string; fsPath: string }>
 }
 
-defineProps<{
+const props = defineProps<{
   messages: QueuedMessageRow[]
+  disabled?: boolean
 }>()
 
 const emit = defineEmits<{
@@ -74,6 +76,7 @@ const draggedMessageId = ref('')
 const dropTargetMessageId = ref('')
 
 function onDragStart(event: DragEvent, messageId: string): void {
+  if (props.disabled) return
   draggedMessageId.value = messageId
   dropTargetMessageId.value = ''
   event.dataTransfer?.setData('text/plain', messageId)
@@ -83,17 +86,20 @@ function onDragStart(event: DragEvent, messageId: string): void {
 }
 
 function onDragOver(messageId: string): void {
+  if (props.disabled) return
   if (!draggedMessageId.value || draggedMessageId.value === messageId) return
   dropTargetMessageId.value = messageId
 }
 
 function onDragLeave(messageId: string): void {
+  if (props.disabled) return
   if (dropTargetMessageId.value === messageId) {
     dropTargetMessageId.value = ''
   }
 }
 
 function onDrop(targetId: string): void {
+  if (props.disabled) return
   const draggedId = draggedMessageId.value
   resetDragState()
   if (!draggedId || draggedId === targetId) return
@@ -147,6 +153,13 @@ function getMessagePreview(message: QueuedMessageRow): string {
 
 .queued-row-drag {
   @apply inline-flex h-6 w-6 shrink-0 cursor-grab items-center justify-center rounded-md border-0 bg-transparent text-zinc-400 transition hover:bg-zinc-200 hover:text-zinc-700 active:cursor-grabbing;
+}
+
+.queued-row-drag:disabled,
+.queued-row-edit:disabled,
+.queued-row-steer:disabled,
+.queued-row-delete:disabled {
+  @apply cursor-not-allowed opacity-50;
 }
 
 .queued-row-icon {

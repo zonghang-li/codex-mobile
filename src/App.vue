@@ -998,6 +998,7 @@
                   </div>
                   <QueuedMessages
                     :messages="selectedThreadQueuedMessages"
+                    :disabled="selectedThreadRuntimeOwnership === 'external'"
                     @edit="onEditQueuedMessage"
                     @steer="steerQueuedMessage"
                     @delete="removeQueuedMessage"
@@ -1037,6 +1038,7 @@
                     :is-turn-in-progress="isSelectedThreadInProgress"
                     :is-stop-pending="isSelectedThreadInterruptPending"
                     :is-interrupting-turn="isInterruptingTurn"
+                    :runtime-ownership="selectedThreadRuntimeOwnership"
                     :has-queue-above="selectedThreadQueuedMessages.length > 0"
                     :send-with-enter="sendWithEnter" :in-progress-submit-mode="inProgressSendMode"
                     :dictation-click-to-toggle="dictationClickToToggle" :dictation-auto-send="dictationAutoSend"
@@ -1434,6 +1436,7 @@ const {
   isSendingMessage,
   isInterruptingTurn,
   isSelectedThreadInterruptPending,
+  selectedThreadRuntimeOwnership,
   isUpdatingSpeedMode,
   error: desktopError,
   refreshAll,

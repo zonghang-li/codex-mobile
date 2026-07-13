@@ -125,6 +125,7 @@ const zhCN: Record<string, string> = {
   'Search skills and prompts...': '搜索技能和提示词...',
   'Thinking': '思考强度',
   'Saving thread before stop is available': '线程保存后才能停止',
+  'Running in another client': '正在其他客户端中运行',
   'Stop': '停止',
   'Queue message': '加入队列',
   'Send message': '发送消息',

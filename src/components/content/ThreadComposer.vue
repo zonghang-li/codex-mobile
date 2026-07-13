@@ -69,6 +69,7 @@
             type="button"
             :title="skillMarkdownPath(skill.path)"
             :aria-label="`Open ${skill.displayName || skill.name} SKILL.md`"
+            :disabled="isInteractionDisabled"
             @click="openSkillMarkdown(skill)"
           >
             {{ skill.displayName || skill.name }}
@@ -77,6 +78,7 @@
             class="thread-composer-skill-chip-remove"
             type="button"
             :aria-label="`Remove skill ${skill.displayName || skill.name}`"
+            :disabled="isInteractionDisabled"
             @click="removeSkill(skill.path)"
           >×</button>
         </span>
@@ -332,15 +334,15 @@
           </button>
 
           <button
-            v-if="isTurnInProgress && !hasSubmitContent"
+            v-if="isTurnInProgress && (!hasSubmitContent || isExternallyOwned)"
             class="thread-composer-stop"
             type="button"
-            :aria-label="isStopPending ? t('Saving thread before stop is available') : t('Stop')"
-            :title="isStopPending ? t('Saving thread before stop is available') : t('Stop')"
-            :disabled="disabled || !activeThreadId || isInterruptingTurn || isStopPending"
+            :aria-label="isExternallyOwned ? t('Running in another client') : stopControlLabel"
+            :title="isExternallyOwned ? t('Running in another client') : stopControlLabel"
+            :disabled="isExternallyOwned || disabled || !activeThreadId || isInterruptingTurn || isStopPending"
             @click="onInterrupt"
           >
-            <span v-if="isStopPending" class="thread-composer-stop-spinner" aria-hidden="true" />
+            <span v-if="isStopPending && !isExternallyOwned" class="thread-composer-stop-spinner" aria-hidden="true" />
             <IconTablerPlayerStopFilled v-else class="thread-composer-stop-icon" />
           </button>
           <button
@@ -401,6 +403,7 @@ import type {
   UiThreadTokenUsage,
   UiTokenUsageBreakdown,
 } from '../../types/codex'
+import type { ThreadRuntimeOwnership } from '../../types/threadRuntime'
 import { useDictation } from '../../composables/useDictation'
 import { useMobile } from '../../composables/useMobile'
 import { useUiLanguage } from '../../composables/useUiLanguage'
@@ -449,6 +452,7 @@ const props = defineProps<{
   isInterruptingTurn?: boolean
   isUpdatingSpeedMode?: boolean
   disabled?: boolean
+  runtimeOwnership?: ThreadRuntimeOwnership
   hasQueueAbove?: boolean
   sendWithEnter?: boolean
   inProgressSubmitMode?: 'steer' | 'queue'
@@ -634,6 +638,7 @@ const skillDropdownOptions = computed(() =>
 )
 
 const canSubmit = computed(() => {
+  if (isExternallyOwned.value) return false
   if (props.disabled) return false
   if (props.isUpdatingSpeedMode) return false
   if (!props.activeThreadId) return false
@@ -655,8 +660,9 @@ const standaloneFileAttachments = computed(() => {
   }
   return fileAttachments.value.filter((att) => !grouped.has(att.fsPath))
 })
-const isInteractionDisabled = computed(() => props.disabled || !props.activeThreadId)
-const isComposerConfigDisabled = computed(() => props.disabled || !props.activeThreadId)
+const isExternallyOwned = computed(() => props.runtimeOwnership === 'external')
+const isInteractionDisabled = computed(() => isExternallyOwned.value || props.disabled || !props.activeThreadId)
+const isComposerConfigDisabled = computed(() => isExternallyOwned.value || props.disabled || !props.activeThreadId)
 const isFastModeSupported = computed(() => /^gpt-5\.(?:4|5)(?:$|-)/.test(props.selectedModel.trim()))
 const showFastModeModelIcon = computed(() =>
   props.selectedSpeedMode === 'fast' && isFastModeSupported.value,
@@ -681,6 +687,9 @@ const dictationButtonLabel = computed(() => {
   if (dictationState.value === 'recording') return t('Stop dictation')
   return props.dictationClickToToggle ? t('Click to dictate') : t('Hold to dictate')
 })
+const stopControlLabel = computed(() => (
+  props.isStopPending ? t('Saving thread before stop is available') : t('Stop')
+))
 const dictationErrorText = computed(() =>
   dictationState.value === 'idle' ? dictationFeedback.value.trim() : '',
 )
@@ -953,6 +962,7 @@ function buildContextUsageView(
 }
 
 function onSubmit(mode: 'steer' | 'queue' = 'steer'): void {
+  if (isExternallyOwned.value) return
   const text = draft.value.trim()
   if (!canSubmit.value) return
   emit('submit', {
@@ -976,6 +986,7 @@ function onSubmit(mode: 'steer' | 'queue' = 'steer'): void {
 }
 
 function setActiveInProgressMode(mode: 'steer' | 'queue'): void {
+  if (isInteractionDisabled.value) return
   activeInProgressMode.value = mode
 }
 
@@ -1095,6 +1106,7 @@ function getCurrentDraftPayload(): ComposerDraftPayload {
 }
 
 function onInterrupt(): void {
+  if (isExternallyOwned.value) return
   emit('interrupt')
 }
 
@@ -1124,14 +1136,17 @@ function toggleComposerExpanded(): void {
 }
 
 function onModelSelect(value: string): void {
+  if (isComposerConfigDisabled.value) return
   emit('update:selected-model', value)
 }
 
 function toggleCollaborationMode(): void {
+  if (isComposerConfigDisabled.value) return
   emit('update:selected-collaboration-mode', isPlanModeSelected.value ? 'default' : 'plan')
 }
 
 function onReasoningEffortSelect(value: string): void {
+  if (isComposerConfigDisabled.value) return
   emit('update:selected-reasoning-effort', value as ReasoningEffort)
 }
 
@@ -1141,6 +1156,7 @@ function onToggleSpeedMode(): void {
 }
 
 function onDictationToggle(): void {
+  if (isInteractionDisabled.value) return
   if (!props.dictationClickToToggle) return
   if (dictationFeedback.value) {
     dictationFeedback.value = ''
@@ -1149,6 +1165,7 @@ function onDictationToggle(): void {
 }
 
 function onDictationPressStart(event: PointerEvent): void {
+  if (isInteractionDisabled.value) return
   if (props.dictationClickToToggle) return
   event.preventDefault()
   if (isHoldPressActive) return
@@ -1186,14 +1203,17 @@ function toggleAttachMenu(): void {
 }
 
 function triggerPhotoLibrary(): void {
+  if (isInteractionDisabled.value) return
   photoLibraryInputRef.value?.click()
 }
 
 function triggerCameraCapture(): void {
+  if (isInteractionDisabled.value) return
   cameraCaptureInputRef.value?.click()
 }
 
 function triggerFolderPicker(): void {
+  if (isInteractionDisabled.value) return
   folderPickerInputRef.value?.click()
 }
 
@@ -1381,6 +1401,7 @@ async function attachUploadedFile(file: File, sessionToken: number): Promise<voi
 }
 
 function attachIncomingFiles(files: FileList | File[] | null | undefined): void {
+  if (isInteractionDisabled.value) return
   const normalizedFiles = normalizeSelectedFiles(files)
   if (normalizedFiles.length === 0) return
   beginAttachmentBatch(normalizedFiles.length)
@@ -1407,6 +1428,7 @@ function hasFilePayload(dataTransfer: DataTransfer | null): boolean {
 }
 
 async function addFolderFiles(files: FileList | null): Promise<void> {
+  if (isInteractionDisabled.value) return
   if (!files || files.length === 0) return
   const generation = draftGeneration.value
   const rows = Array.from(files)
@@ -1780,6 +1802,7 @@ function skillSourceBadge(skill: SkillItem): SkillSourceBadge {
 }
 
 function onSkillDropdownToggle(path: string, checked: boolean): void {
+  if (isComposerConfigDisabled.value) return
   const promptPath = promptPathFromOptionValue(path)
   if (promptPath) {
     onPromptDropdownToggle(promptPath)
