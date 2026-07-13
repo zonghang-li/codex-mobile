@@ -118,6 +118,17 @@ function idleDetail() {
   }
 }
 
+function localDetail(turnId = '') {
+  return {
+    ...idleDetail(),
+    inProgress: true,
+    activeTurnId: turnId,
+    ownership: 'local' as const,
+    canInterrupt: true,
+    externalRuntimeState: 'unknown' as const,
+  }
+}
+
 function deferred<T>() {
   let resolve!: (value: T | PromiseLike<T>) => void
   let reject!: (reason?: unknown) => void
@@ -773,6 +784,58 @@ describe('turn completion lifecycle', () => {
     expect(state.projectGroups.value[0]?.threads[0]?.inProgress).toBe(true)
     await state.interruptSelectedThreadTurn()
     expect(gatewayMocks.interruptThreadTurn).toHaveBeenCalledWith('thread-1', 'turn-a')
+  })
+
+  it('never caches or interrupts an external turn returned by interrupt fallback detail', async () => {
+    const { state } = await setupTurnLifecycleNotificationState('thread-1')
+    gatewayMocks.resumeThread.mockResolvedValue(localDetail())
+    await state.loadMessages('thread-1')
+    expect(state.selectedThreadRuntimeOwnership.value).toBe('local')
+    expect(state.selectedThread.value?.inProgress).toBe(true)
+
+    gatewayMocks.getThreadDetail.mockResolvedValue(externalDetail('turn-external-fallback'))
+    await state.interruptSelectedThreadTurn()
+
+    expect(gatewayMocks.getThreadDetail).toHaveBeenCalledTimes(1)
+    expect(gatewayMocks.interruptThreadTurn).not.toHaveBeenCalled()
+
+    gatewayMocks.getThreadDetail.mockResolvedValue(localDetail('turn-local-fallback'))
+    await state.interruptSelectedThreadTurn()
+
+    expect(gatewayMocks.getThreadDetail).toHaveBeenCalledTimes(2)
+    expect(gatewayMocks.interruptThreadTurn).toHaveBeenCalledWith('thread-1', 'turn-local-fallback')
+  })
+
+  it('interrupts a validated local turn returned by fallback detail', async () => {
+    const { state } = await setupTurnLifecycleNotificationState('thread-1')
+    gatewayMocks.resumeThread.mockResolvedValue(localDetail())
+    gatewayMocks.getThreadDetail.mockResolvedValue(localDetail('turn-local-fallback'))
+    gatewayMocks.interruptThreadTurn.mockResolvedValue(undefined)
+    await state.loadMessages('thread-1')
+
+    await state.interruptSelectedThreadTurn()
+
+    expect(gatewayMocks.getThreadDetail).toHaveBeenCalledTimes(1)
+    expect(gatewayMocks.interruptThreadTurn).toHaveBeenCalledWith('thread-1', 'turn-local-fallback')
+  })
+
+  it('does not overwrite a local lease established while fallback detail is pending', async () => {
+    const { state, emit } = await setupTurnLifecycleNotificationState('thread-1')
+    const pendingDetail = deferred<ReturnType<typeof localDetail>>()
+    gatewayMocks.resumeThread.mockResolvedValue(localDetail())
+    gatewayMocks.getThreadDetail.mockReturnValue(pendingDetail.promise)
+    gatewayMocks.interruptThreadTurn.mockResolvedValue(undefined)
+    await state.loadMessages('thread-1')
+
+    const staleInterrupt = state.interruptSelectedThreadTurn()
+    await flushMicrotasks()
+    emit({ method: 'turn/started', params: { threadId: 'thread-1', turn: { id: 'turn-new-local' } } })
+    pendingDetail.resolve(localDetail('turn-stale-local'))
+    await staleInterrupt
+
+    expect(gatewayMocks.interruptThreadTurn).not.toHaveBeenCalled()
+    await state.interruptSelectedThreadTurn()
+    expect(gatewayMocks.interruptThreadTurn).toHaveBeenCalledWith('thread-1', 'turn-new-local')
   })
 
   it('ignores an older completion while a newer turn owns the running lease', async () => {

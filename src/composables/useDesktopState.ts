@@ -5393,15 +5393,27 @@ export function useDesktopState() {
     if (interruptBlockedUntilPersistedByThreadId.value[threadId] === true) return
     let turnId = activeTurnIdByThreadId.value[threadId]
     if (!turnId) {
-      const { activeTurnId } = await getThreadDetail(threadId)
-      turnId = activeTurnId
-      if (turnId) {
-        activeTurnIdByThreadId.value = {
-          ...activeTurnIdByThreadId.value,
-          [threadId]: turnId,
-        }
-        setThreadRuntimeOwnership(threadId, 'local')
+      const fallbackGeneration = externalRuntimeGeneration
+      const detail = await getThreadDetail(threadId)
+      const fallbackTurnId = detail.activeTurnId.trim()
+      const canUseFallback =
+        detail.ownership === 'local' &&
+        detail.canInterrupt === true &&
+        detail.inProgress === true &&
+        fallbackTurnId.length > 0 &&
+        externalRuntimeGeneration === fallbackGeneration &&
+        selectedThreadId.value === threadId &&
+        !isExternallyOwned(threadId) &&
+        inProgressById.value[threadId] === true &&
+        !(activeTurnIdByThreadId.value[threadId] ?? '').trim()
+      if (!canUseFallback) return
+
+      turnId = fallbackTurnId
+      activeTurnIdByThreadId.value = {
+        ...activeTurnIdByThreadId.value,
+        [threadId]: turnId,
       }
+      setThreadRuntimeOwnership(threadId, 'local')
     }
     if (!turnId) {
       throw new Error('Could not determine active turn id for interrupt')
