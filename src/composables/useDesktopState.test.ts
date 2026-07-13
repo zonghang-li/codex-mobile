@@ -659,6 +659,25 @@ describe('startup request deduplication', () => {
 })
 
 describe('turn completion lifecycle', () => {
+  it('keeps the active lease after stop acknowledgement until matching completion', async () => {
+    const { state, emit } = await setupTurnLifecycleNotificationState('thread-1')
+    const idleDetail = {
+      messages: [], inProgress: false, activeTurnId: '', hasMoreOlder: false, turnIndexByTurnId: {},
+    }
+    gatewayMocks.resumeThread.mockResolvedValue(idleDetail)
+    gatewayMocks.getThreadDetail.mockResolvedValue(idleDetail)
+    gatewayMocks.interruptThreadTurn.mockResolvedValue(undefined)
+
+    emit({ method: 'turn/started', params: { threadId: 'thread-1', turn: { id: 'turn-a' } } })
+    await state.interruptSelectedThreadTurn()
+
+    expect(gatewayMocks.interruptThreadTurn).toHaveBeenCalledWith('thread-1', 'turn-a')
+    expect(state.projectGroups.value[0]?.threads[0]?.inProgress).toBe(true)
+
+    emit({ method: 'turn/completed', params: { threadId: 'thread-1', turn: { id: 'turn-a', status: 'interrupted' } } })
+    expect(state.projectGroups.value[0]?.threads[0]?.inProgress).toBe(false)
+  })
+
   it('retains an event-established turn across a lagging idle detail', async () => {
     const { state, emit } = await setupTurnLifecycleNotificationState('thread-1')
     gatewayMocks.resumeThread.mockResolvedValue({
@@ -734,6 +753,9 @@ describe('turn completion lifecycle', () => {
 
   it('keeps a thread running and unread false while fallback retry starts', async () => {
     const { state, emit } = await setupTurnLifecycleNotificationState('thread-1')
+    let nowMs = 10_000
+    const nowSpy = vi.spyOn(Date, 'now').mockImplementation(() => nowMs)
+    pollingCleanups.push(() => nowSpy.mockRestore())
     gatewayMocks.resumeThread.mockResolvedValue({
       model: 'gpt-5.5',
       modelProvider: 'openai',
@@ -806,8 +828,11 @@ describe('turn completion lifecycle', () => {
       hasMoreOlder: false,
       turnIndexByTurnId: {},
     })
+    nowMs += 2_001
+    const detailCallsBeforeIdleLoad = gatewayMocks.getThreadDetail.mock.calls.length
     await state.loadMessages('thread-1', { silent: true })
 
+    expect(gatewayMocks.getThreadDetail).toHaveBeenCalledTimes(detailCallsBeforeIdleLoad + 1)
     expect(state.projectGroups.value[0]?.threads[0]).toMatchObject({
       inProgress: true,
       unread: false,

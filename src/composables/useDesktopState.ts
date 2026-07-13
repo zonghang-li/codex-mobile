@@ -4494,7 +4494,12 @@ export function useDesktopState() {
 
       const { messages: nextMessages, inProgress: serverInProgress, activeTurnId, turnIndexByTurnId } = detail
       const localActiveTurnId = activeTurnIdByThreadId.value[threadId] ?? ''
-      const retainLocalInProgress = localActiveTurnId.length > 0
+      const retainLocalInProgress =
+        localActiveTurnId.length > 0 ||
+        (
+          inProgressById.value[threadId] === true &&
+          pendingTurnRequestByThreadId.value[threadId]?.fallbackRetried === true
+        )
       const inProgress = serverInProgress || retainLocalInProgress
       hasMoreOlderMessagesByThreadId.value = {
         ...hasMoreOlderMessagesByThreadId.value,
@@ -5267,12 +5272,6 @@ export function useDesktopState() {
     error.value = ''
     try {
       await interruptThreadTurn(threadId, turnId)
-      setThreadInProgress(threadId, false)
-      setTurnActivityForThread(threadId, null)
-      setTurnErrorForThread(threadId, null)
-      if (activeTurnIdByThreadId.value[threadId]) {
-        activeTurnIdByThreadId.value = omitKey(activeTurnIdByThreadId.value, threadId)
-      }
       pendingThreadMessageRefresh.add(threadId)
       pendingThreadsRefresh = true
       await syncFromNotifications()
