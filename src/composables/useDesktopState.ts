@@ -1550,6 +1550,7 @@ export function useDesktopState() {
   let backgroundRuntimePollingEnabled = false
   let backgroundRuntimeVisibilityListenerInstalled = false
   const backgroundExternalThreadIds = new Set<string>()
+  const localRuntimeAuthorityVersionByThreadId = new Map<string, number>()
   const delayedTurnSyncTimerByThreadId = new Map<string, number>()
   let loadThreadsPromise: Promise<void> | null = null
   const loadMessagePromiseByThreadId = new Map<string, Promise<void>>()
@@ -2294,6 +2295,9 @@ export function useDesktopState() {
     for (const threadId of backgroundExternalThreadIds) {
       if (!activeThreadIds.has(threadId)) backgroundExternalThreadIds.delete(threadId)
     }
+    for (const threadId of localRuntimeAuthorityVersionByThreadId.keys()) {
+      if (!activeThreadIds.has(threadId)) localRuntimeAuthorityVersionByThreadId.delete(threadId)
+    }
     const currentThreadId = selectedThreadId.value.trim()
     if (currentThreadId) {
       activeThreadIds.add(currentThreadId)
@@ -2490,7 +2494,18 @@ export function useDesktopState() {
       }
       const generation = backgroundRuntimeGeneration
       const controller = new AbortController()
-      const promise = pollBackgroundRuntimeStates(threadIds, generation, controller.signal)
+      const localAuthorityVersions = new Map(
+        threadIds.map((threadId) => [
+          threadId,
+          localRuntimeAuthorityVersionByThreadId.get(threadId) ?? 0,
+        ]),
+      )
+      const promise = pollBackgroundRuntimeStates(
+        threadIds,
+        localAuthorityVersions,
+        generation,
+        controller.signal,
+      )
       backgroundRuntimeRequest = { generation, controller, promise }
       void promise.finally(() => {
         if (backgroundRuntimeRequest?.promise !== promise) return
@@ -2508,6 +2523,7 @@ export function useDesktopState() {
 
   async function pollBackgroundRuntimeStates(
     requestedThreadIds: readonly string[],
+    requestedLocalAuthorityVersions: ReadonlyMap<string, number>,
     generation: number,
     signal: AbortSignal,
   ): Promise<void> {
@@ -2523,6 +2539,12 @@ export function useDesktopState() {
 
     for (const threadId of requestedThreadIds) {
       if (!loadedIds.has(threadId) || selectedThreadId.value === threadId) continue
+      const requestedLocalAuthorityVersion = requestedLocalAuthorityVersions.get(threadId) ?? 0
+      const currentLocalAuthorityVersion = localRuntimeAuthorityVersionByThreadId.get(threadId) ?? 0
+      if (currentLocalAuthorityVersion !== requestedLocalAuthorityVersion) {
+        backgroundExternalThreadIds.delete(threadId)
+        continue
+      }
       const ownership = runtimeOwnershipByThreadId.value[threadId] ?? 'idle'
       const locallyRunning = inProgressById.value[threadId] === true && ownership !== 'external'
       if (ownership === 'local' || locallyRunning) {
@@ -2600,6 +2622,13 @@ export function useDesktopState() {
   function setThreadRuntimeOwnership(threadId: string, ownership: ThreadRuntimeOwnership): void {
     if (!threadId) return
     const currentOwnership = runtimeOwnershipByThreadId.value[threadId] ?? 'idle'
+    if (ownership === 'local' && currentOwnership !== 'local') {
+      localRuntimeAuthorityVersionByThreadId.set(
+        threadId,
+        (localRuntimeAuthorityVersionByThreadId.get(threadId) ?? 0) + 1,
+      )
+      backgroundExternalThreadIds.delete(threadId)
+    }
     if (currentOwnership !== ownership) {
       runtimeOwnershipByThreadId.value = ownership === 'idle'
         ? omitKey(runtimeOwnershipByThreadId.value, threadId)
@@ -6009,6 +6038,7 @@ export function useDesktopState() {
     backgroundRuntimePollingEnabled = false
     cancelBackgroundRuntimeRequest()
     backgroundExternalThreadIds.clear()
+    localRuntimeAuthorityVersionByThreadId.clear()
     if (typeof document !== 'undefined' && backgroundRuntimeVisibilityListenerInstalled) {
       document.removeEventListener('visibilitychange', onBackgroundRuntimeVisibilityChange)
       backgroundRuntimeVisibilityListenerInstalled = false

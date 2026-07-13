@@ -1433,6 +1433,71 @@ describe('external runtime ownership', () => {
     })
   })
 
+  it('does not resurrect a completed local turn from a stale running batch result', async () => {
+    let notificationHandler: ((notification: { method: string; params?: unknown }) => void) | undefined
+    gatewayMocks.subscribeCodexNotifications.mockImplementation((handler) => {
+      notificationHandler = handler as typeof notificationHandler
+      return vi.fn()
+    })
+    const state = await setupBackgroundRuntimeState()
+    gatewayMocks.getThreadGroupsPage.mockResolvedValue({
+      groups: [{ projectName: 'Project', threads: [
+        { ...thread('thread-running', '/tmp/project'), updatedAtIso: '2026-07-14T00:00:00.000Z' },
+        thread('thread-unrelated', '/tmp/project'),
+        thread('thread-selected', '/tmp/project'),
+      ] }],
+      nextCursor: null,
+    })
+    await state.refreshAll({ includeSelectedThreadMessages: false, forceThreadRefresh: true })
+    const pending = deferred<Record<string, {
+      state: 'running'
+      turnId: string
+      interruptible: false
+      source: string
+    }>>()
+    gatewayMocks.getThreadRuntimeStates.mockReturnValue(pending.promise)
+
+    state.startPolling()
+    pollingCleanups.push(() => state.stopPolling())
+    await vi.advanceTimersByTimeAsync(0)
+    expect(notificationHandler).toBeDefined()
+    notificationHandler!({
+      method: 'turn/started',
+      params: { threadId: 'thread-running', turn: { id: 'turn-local' } },
+    })
+    notificationHandler!({
+      method: 'turn/completed',
+      params: { threadId: 'thread-running', turn: { id: 'turn-local', status: 'completed' } },
+    })
+    expect(state.projectGroups.value[0]?.threads.find((row) => row.id === 'thread-running')).toMatchObject({
+      inProgress: false,
+    })
+
+    pending.resolve({
+      'thread-running': {
+        state: 'running',
+        turnId: 'turn-stale',
+        interruptible: false,
+        source: 'external-session-writer',
+      },
+      'thread-unrelated': {
+        state: 'running',
+        turnId: 'turn-external',
+        interruptible: false,
+        source: 'external-session-writer',
+      },
+    })
+    await flushMicrotasks()
+
+    expect(state.projectGroups.value[0]?.threads.find((row) => row.id === 'thread-running')).toMatchObject({
+      inProgress: false,
+    })
+    expect(state.projectGroups.value[0]?.threads.find((row) => row.id === 'thread-unrelated')).toMatchObject({
+      id: 'thread-unrelated',
+      inProgress: true,
+    })
+  })
+
   it('ignores a deferred background result for a thread selected during the request', async () => {
     const state = await setupBackgroundRuntimeState()
     const pending = deferred<Record<string, {
