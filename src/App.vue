@@ -1235,6 +1235,7 @@ import type { GitCommitFileChange, GitCommitOption, LocalDirectoryEntry, Telegra
 import { getFreeModeStatus, setFreeMode, setFreeModeCustomKey, setCustomProvider } from './api/codexGateway'
 import { getPathLeafName, getPathParent, isProjectlessChatPath, normalizePathForUi } from './pathUtils.js'
 import { copyTextToClipboard } from './utils/clipboard'
+import { codexDirectiveExportLines } from './utils/codexDirectives'
 
 const ThreadConversation = defineAsyncComponent(() => import('./components/content/ThreadConversation.vue'))
 const ThreadTerminalPanel = defineAsyncComponent(() => import('./components/content/ThreadTerminalPanel.vue'))
@@ -4235,6 +4236,11 @@ function buildThreadMarkdown(): string {
     const normalizedText = message.text.trim()
     if (normalizedText) {
       lines.push(normalizedText)
+      lines.push('')
+    }
+
+    for (const directive of message.directives ?? []) {
+      lines.push(...codexDirectiveExportLines(directive, t))
       lines.push('')
     }
 
