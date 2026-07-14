@@ -88,7 +88,7 @@ Instantiate the service template in a temporary location and run `systemd-analyz
 | Filesystem access | `src/safe/pathPolicy.test.ts` plus the affected HTTP route test |
 | Password/state lifecycle | matching `src/safe/*test.ts`, stale PID and permissions cases |
 | ntfy config/state | `src/safe/ntfyConfig.test.ts`, `src/safe/ntfyState.test.ts`, ownership/mode/symlink/atomic-write cases |
-| ntfy qualification/delivery | `src/server/ntfyCompletionNotifier.test.ts`, including 599,999/600,000 ms, all terminal statuses, real default headers, restart, retry, and redaction |
+| ntfy qualification/delivery | `src/server/ntfyCompletionNotifier.test.ts`, including 599,999/600,000 ms, all terminal statuses, real default headers, restart, retry, redaction, and direct-notification/external-rollout deduplication through one durable key and sequence ID |
 | ntfy CLI/server wiring | safe entry, doctor, packaging, and server security-policy tests; verify disabled mode has no subscription/network |
 | external-turn discovery/parsing | `src/server/externalThreadRuntime.test.ts`, `src/server/rolloutLifecycle.test.ts`; cover same UID, stable identity, canonical sessions-root containment, malformed/partial records, and writer disappearance without inferred completion |
 | external-turn monitoring | `src/server/externalTurnMonitor.test.ts`; cover serialized 15-second scans, incremental reads, 256-cursor bound, exact threshold handoff, restart recovery, historical suppression, and disposal |
