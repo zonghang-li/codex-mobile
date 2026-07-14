@@ -2417,6 +2417,53 @@ describe('external runtime ownership', () => {
   })
 })
 
+describe('external live reasoning overlay', () => {
+  it('shows the latest visible external reasoning summary without duplicating its message', async () => {
+    installTestWindow()
+    gatewayMocks.getPendingServerRequests.mockResolvedValue([])
+    gatewayMocks.resumeThread.mockResolvedValue({
+      ...externalDetail('turn-external'),
+      messages: [
+        {
+          id: 'reasoning-1',
+          role: 'assistant',
+          text: '**Inspecting fixtures**\n\n**Reading development-workflow.md**',
+          messageType: 'reasoning',
+          turnId: 'turn-external',
+        },
+        {
+          id: 'agent-1',
+          role: 'assistant',
+          text: 'Initial desktop output',
+          messageType: 'agentMessage',
+          turnId: 'turn-external',
+        },
+      ],
+    })
+
+    const state = useDesktopState()
+    state.primeSelectedThread('thread-external')
+    await state.loadMessages('thread-external')
+
+    expect(state.selectedLiveOverlay.value?.activityLabel).toBe('Reading development-workflow.md')
+    expect(state.messages.value).toEqual([
+      expect.objectContaining({ id: 'agent-1', text: 'Initial desktop output' }),
+    ])
+  })
+
+  it('falls back to Thinking until the external turn has a visible summary', async () => {
+    installTestWindow()
+    gatewayMocks.getPendingServerRequests.mockResolvedValue([])
+    gatewayMocks.resumeThread.mockResolvedValue(externalDetail('turn-external'))
+
+    const state = useDesktopState()
+    state.primeSelectedThread('thread-external')
+    await state.loadMessages('thread-external')
+
+    expect(state.selectedLiveOverlay.value?.activityLabel).toBe('Thinking')
+  })
+})
+
 describe('live error overlay', () => {
   it('shows the default thinking overlay while a selected thread is in progress without activity events', async () => {
     installTestWindow()

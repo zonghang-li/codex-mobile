@@ -65,7 +65,13 @@ import type {
 import type { ThreadRuntimeOwnership } from '../types/threadRuntime'
 import { getPathParent, isProjectlessChatPath, normalizePathForUi, toProjectName } from '../pathUtils.js'
 import { parseCodexDirectiveText } from '../utils/codexDirectives'
+import {
+  readExternalReasoningSnapshot,
+  type ExternalReasoningSnapshot,
+} from './externalLiveSnapshot'
 import { resolveTurnCompletionDisposition, type TurnTerminalStatus } from './threadLifecycle'
+
+type ThreadDetailSnapshot = Awaited<ReturnType<typeof getThreadDetail>>
 
 function flattenThreads(groups: UiProjectGroup[]): UiThread[] {
   return groups.flatMap((group) => group.threads)
@@ -1473,6 +1479,7 @@ export function useDesktopState() {
   const turnErrorByThreadId = ref<Record<string, TurnErrorState>>({})
   const activeTurnIdByThreadId = ref<Record<string, string>>({})
   const runtimeOwnershipByThreadId = ref<Record<string, ThreadRuntimeOwnership>>({})
+  const externalReasoningSnapshotByThreadId = ref<Record<string, ExternalReasoningSnapshot>>({})
   const interruptBlockedUntilPersistedByThreadId = ref<Record<string, boolean>>({})
   const threadListedByServerById = ref<Record<string, boolean>>({})
   const persistedUserMessageByThreadId = ref<Record<string, boolean>>({})
@@ -1632,10 +1639,13 @@ export function useDesktopState() {
       !isInProgress && liveErrorText && latestPersistedTurnErrorText === liveErrorText
         ? ''
         : liveErrorText
+    const externalReasoning = runtimeOwnershipByThreadId.value[threadId] === 'external'
+      ? externalReasoningSnapshotByThreadId.value[threadId]
+      : undefined
 
     if (!isInProgress && !activity && !reasoningText && !errorText) return null
     return {
-      activityLabel: activity?.label || 'Thinking',
+      activityLabel: externalReasoning?.label || activity?.label || 'Thinking',
       activityDetails: activity?.details ?? [],
       reasoningText,
       errorText,
@@ -1657,10 +1667,17 @@ export function useDesktopState() {
     const liveCommands = liveCommandsByThreadId.value[threadId] ?? []
     const liveFileChanges = liveFileChangeMessagesByThreadId.value[threadId] ?? []
     const combined = [...persisted, ...livePlan, ...liveCommands, ...liveFileChanges, ...liveAgent]
+    const hiddenReasoningIds = runtimeOwnershipByThreadId.value[threadId] === 'external'
+      && inProgressById.value[threadId] === true
+      ? new Set(externalReasoningSnapshotByThreadId.value[threadId]?.hiddenMessageIds ?? [])
+      : new Set<string>()
+    const visibleCombined = hiddenReasoningIds.size > 0
+      ? combined.filter((message) => !hiddenReasoningIds.has(message.id))
+      : combined
 
     const summary = turnSummaryByThreadId.value[threadId]
-    if (!summary) return combined
-    return insertTurnSummaryMessage(combined, summary)
+    if (!summary) return visibleCombined
+    return insertTurnSummaryMessage(visibleCombined, summary)
   })
   const hasMoreOlderMessages = computed(() => {
     const threadId = selectedThreadId.value
@@ -2350,6 +2367,10 @@ export function useDesktopState() {
     turnErrorByThreadId.value = pruneThreadStateMap(turnErrorByThreadId.value, activeThreadIds)
     activeTurnIdByThreadId.value = pruneThreadStateMap(activeTurnIdByThreadId.value, activeThreadIds)
     runtimeOwnershipByThreadId.value = pruneThreadStateMap(runtimeOwnershipByThreadId.value, activeThreadIds)
+    externalReasoningSnapshotByThreadId.value = pruneThreadStateMap(
+      externalReasoningSnapshotByThreadId.value,
+      activeThreadIds,
+    )
     interruptBlockedUntilPersistedByThreadId.value = pruneThreadStateMap(
       interruptBlockedUntilPersistedByThreadId.value,
       activeThreadIds,
@@ -2643,6 +2664,9 @@ export function useDesktopState() {
   function setThreadRuntimeOwnership(threadId: string, ownership: ThreadRuntimeOwnership): void {
     if (!threadId) return
     const currentOwnership = runtimeOwnershipByThreadId.value[threadId] ?? 'idle'
+    if (ownership !== 'external' && externalReasoningSnapshotByThreadId.value[threadId]) {
+      externalReasoningSnapshotByThreadId.value = omitKey(externalReasoningSnapshotByThreadId.value, threadId)
+    }
     if (ownership === 'local' && currentOwnership !== 'local') {
       localRuntimeAuthorityVersionByThreadId.set(
         threadId,
@@ -2679,6 +2703,9 @@ export function useDesktopState() {
       }
     } else {
       inProgressById.value = omitKey(inProgressById.value, threadId)
+      if (externalReasoningSnapshotByThreadId.value[threadId]) {
+        externalReasoningSnapshotByThreadId.value = omitKey(externalReasoningSnapshotByThreadId.value, threadId)
+      }
       clearCompletedTurnLiveState(threadId)
       clearInterruptPersistenceGate(threadId)
     }
@@ -4790,6 +4817,121 @@ export function useDesktopState() {
     await loadThreadsPromise
   }
 
+  function reconcileExternalReasoningSnapshot(
+    threadId: string,
+    detail: ThreadDetailSnapshot,
+    ownership: ThreadRuntimeOwnership,
+    inProgress: boolean,
+  ): void {
+    if (ownership !== 'external' || !inProgress || !detail.activeTurnId) {
+      externalReasoningSnapshotByThreadId.value = omitKey(
+        externalReasoningSnapshotByThreadId.value,
+        threadId,
+      )
+      return
+    }
+    const incoming = readExternalReasoningSnapshot(detail.messages, detail.activeTurnId)
+    const previous = externalReasoningSnapshotByThreadId.value[threadId]
+    const next = !incoming.label && previous?.turnId === incoming.turnId
+      ? { ...incoming, label: previous.label }
+      : incoming
+    externalReasoningSnapshotByThreadId.value = {
+      ...externalReasoningSnapshotByThreadId.value,
+      [threadId]: next,
+    }
+  }
+
+  function reconcileThreadDetailSnapshot(
+    threadId: string,
+    detail: ThreadDetailSnapshot,
+    options: { preserveMissing: boolean; markRead: boolean },
+  ): void {
+    const version = currentThreadVersion(threadId)
+    if (detail.modelProvider) {
+      setThreadModelProviderId(threadId, detail.modelProvider)
+    }
+    if (detail.model) {
+      setThreadModelId(threadId, resolveThreadModelForProvider(threadId, detail.model, detail.modelProvider))
+    }
+
+    const { messages: nextMessages, inProgress: serverInProgress, activeTurnId, turnIndexByTurnId } = detail
+    const localActiveTurnId = activeTurnIdByThreadId.value[threadId] ?? ''
+    const retainLocal =
+      localActiveTurnId.length > 0 ||
+      (
+        inProgressById.value[threadId] === true &&
+        pendingTurnRequestByThreadId.value[threadId]?.fallbackRetried === true
+      )
+    const detailOwnership: ThreadRuntimeOwnership = detail.ownership === 'external'
+      ? 'external'
+      : detail.ownership === 'local' || serverInProgress
+        ? 'local'
+        : 'idle'
+    const retainEstablishedExternal =
+      !retainLocal &&
+      runtimeOwnershipByThreadId.value[threadId] === 'external' &&
+      detailOwnership === 'idle' &&
+      detail.externalRuntimeState === 'unknown'
+    const ownership = retainLocal
+      ? 'local'
+      : retainEstablishedExternal
+        ? 'external'
+        : detailOwnership
+    const inProgress = retainLocal || retainEstablishedExternal || detail.inProgress
+    hasMoreOlderMessagesByThreadId.value = {
+      ...hasMoreOlderMessagesByThreadId.value,
+      [threadId]: detail.hasMoreOlder === true,
+    }
+    markThreadMessagesPersisted(threadId, nextMessages)
+    replaceTurnIndexLookupForThread(threadId, turnIndexByTurnId)
+    rebindLiveFileChangeTurnIndices(threadId)
+    const previousPersisted = persistedMessagesByThreadId.value[threadId] ?? []
+    const mergedMessages = mergeMessages(previousPersisted, detail.messages, {
+      preserveMissing: options.preserveMissing || hasOptimisticUserMessages(previousPersisted),
+    })
+    setPersistedMessagesForThread(threadId, mergedMessages)
+
+    const previousLiveAgent = liveAgentMessagesByThreadId.value[threadId] ?? []
+    if (inProgress) {
+      const nextLiveAgent = removeRedundantLiveAgentMessages(previousLiveAgent, nextMessages)
+      setLiveAgentMessagesForThread(threadId, nextLiveAgent)
+    } else {
+      clearLiveAgentMessagesForThread(threadId)
+    }
+    removeLiveCommandsPersistedIn(threadId, nextMessages)
+    removeLiveFileChangesPersistedIn(threadId, nextMessages)
+
+    loadedMessagesByThreadId.value = {
+      ...loadedMessagesByThreadId.value,
+      [threadId]: true,
+    }
+    lastMessageLoadAtByThreadId.set(threadId, Date.now())
+    lastMessageLoadFailureAtByThreadId.delete(threadId)
+
+    if (version) {
+      loadedVersionByThreadId.value = {
+        ...loadedVersionByThreadId.value,
+        [threadId]: version,
+      }
+    }
+    setThreadRuntimeOwnership(threadId, ownership)
+    setThreadInProgress(threadId, inProgress)
+    reconcileExternalReasoningSnapshot(threadId, detail, ownership, inProgress)
+    if (ownership === 'local' && activeTurnId) {
+      activeTurnIdByThreadId.value = {
+        ...activeTurnIdByThreadId.value,
+        [threadId]: activeTurnId,
+      }
+    }
+    if (!inProgress) {
+      clearTransientTurnErrorForThread(threadId)
+      clearCompletedTurnLiveState(threadId)
+    }
+    if (options.markRead) {
+      markThreadAsRead(threadId)
+    }
+  }
+
   async function loadMessages(threadId: string, options: { silent?: boolean; force?: boolean } = {}) {
     if (!threadId) {
       return
@@ -4852,92 +4994,16 @@ export function useDesktopState() {
       const resumedThread = needsResume ? await resumeThread(threadId) : null
       const detail = resumedThread ?? await getThreadDetail(threadId)
 
-      if (detail.modelProvider) {
-        setThreadModelProviderId(threadId, detail.modelProvider)
-      }
-      if (detail.model) {
-        setThreadModelId(threadId, resolveThreadModelForProvider(threadId, detail.model, detail.modelProvider))
-      }
       if (resumedThread) {
         resumedThreadById.value = {
           ...resumedThreadById.value,
           [threadId]: true,
         }
       }
-
-      const { messages: nextMessages, inProgress: serverInProgress, activeTurnId, turnIndexByTurnId } = detail
-      const localActiveTurnId = activeTurnIdByThreadId.value[threadId] ?? ''
-      const retainLocal =
-        localActiveTurnId.length > 0 ||
-        (
-          inProgressById.value[threadId] === true &&
-          pendingTurnRequestByThreadId.value[threadId]?.fallbackRetried === true
-        )
-      const detailOwnership: ThreadRuntimeOwnership = detail.ownership === 'external'
-        ? 'external'
-        : detail.ownership === 'local' || serverInProgress
-          ? 'local'
-          : 'idle'
-      const retainEstablishedExternal =
-        !retainLocal &&
-        runtimeOwnershipByThreadId.value[threadId] === 'external' &&
-        detailOwnership === 'idle' &&
-        detail.externalRuntimeState === 'unknown'
-      const ownership = retainLocal
-        ? 'local'
-        : retainEstablishedExternal
-          ? 'external'
-          : detailOwnership
-      const inProgress = retainLocal || retainEstablishedExternal || detail.inProgress
-      hasMoreOlderMessagesByThreadId.value = {
-        ...hasMoreOlderMessagesByThreadId.value,
-        [threadId]: detail.hasMoreOlder === true,
-      }
-      markThreadMessagesPersisted(threadId, nextMessages)
-      replaceTurnIndexLookupForThread(threadId, turnIndexByTurnId)
-      rebindLiveFileChangeTurnIndices(threadId)
-      const previousPersisted = persistedMessagesByThreadId.value[threadId] ?? []
-      const mergedMessages = mergeMessages(previousPersisted, nextMessages, {
-        preserveMissing: options.silent === true || hasOptimisticUserMessages(previousPersisted),
+      reconcileThreadDetailSnapshot(threadId, detail, {
+        preserveMissing: options.silent === true,
+        markRead: true,
       })
-      setPersistedMessagesForThread(threadId, mergedMessages)
-
-      const previousLiveAgent = liveAgentMessagesByThreadId.value[threadId] ?? []
-      if (inProgress) {
-        const nextLiveAgent = removeRedundantLiveAgentMessages(previousLiveAgent, nextMessages)
-        setLiveAgentMessagesForThread(threadId, nextLiveAgent)
-      } else {
-        clearLiveAgentMessagesForThread(threadId)
-      }
-      removeLiveCommandsPersistedIn(threadId, nextMessages)
-      removeLiveFileChangesPersistedIn(threadId, nextMessages)
-
-      loadedMessagesByThreadId.value = {
-        ...loadedMessagesByThreadId.value,
-        [threadId]: true,
-      }
-      lastMessageLoadAtByThreadId.set(threadId, Date.now())
-      lastMessageLoadFailureAtByThreadId.delete(threadId)
-
-      if (version) {
-        loadedVersionByThreadId.value = {
-          ...loadedVersionByThreadId.value,
-          [threadId]: version,
-        }
-      }
-      setThreadRuntimeOwnership(threadId, ownership)
-      setThreadInProgress(threadId, inProgress)
-      if (ownership === 'local' && activeTurnId) {
-        activeTurnIdByThreadId.value = {
-          ...activeTurnIdByThreadId.value,
-          [threadId]: activeTurnId,
-        }
-      }
-      if (!inProgress) {
-        clearTransientTurnErrorForThread(threadId)
-        clearCompletedTurnLiveState(threadId)
-      }
-      markThreadAsRead(threadId)
       } catch (unknownError) {
         const message = unknownError instanceof Error ? unknownError.message : 'Unknown application error'
         if (selectedThreadId.value === threadId) {
@@ -6106,6 +6172,7 @@ export function useDesktopState() {
     turnSummaryByThreadId.value = {}
     turnErrorByThreadId.value = {}
     activeTurnIdByThreadId.value = {}
+    externalReasoningSnapshotByThreadId.value = {}
     interruptBlockedUntilPersistedByThreadId.value = {}
     threadListedByServerById.value = {}
     persistedUserMessageByThreadId.value = {}
