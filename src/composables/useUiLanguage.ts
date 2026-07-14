@@ -36,6 +36,8 @@ const zhCN: Record<string, string> = {
   'System': '跟随系统',
   'Dark': '深色',
   'Light': '浅色',
+  'Switch to dark mode': '切换到深色模式',
+  'Switch to light mode': '切换到浅色模式',
   'Chat width': '聊天宽度',
   'Click to toggle dictation': '点击切换语音输入',
   'Auto send dictation': '语音输入后自动发送',

@@ -531,6 +531,16 @@
               @toggle-sidebar="setSidebarCollapsed(!isSidebarCollapsed)"
               @start-new-thread="onStartNewThreadFromToolbar"
             />
+            <button
+              class="mobile-theme-toggle"
+              type="button"
+              :aria-label="themeToggleLabel"
+              :title="themeToggleLabel"
+              @click="toggleQuickTheme"
+            >
+              <IconTablerSun v-if="effectiveTheme === 'dark'" />
+              <IconTablerMoon v-else />
+            </button>
             <span v-if="isSkillsRoute" class="skills-route-header-icon" aria-hidden="true">
               <IconTablerBolt />
             </span>
@@ -1185,8 +1195,10 @@ import HeaderGitBranchDropdown from './components/content/HeaderGitBranchDropdow
 import ComposerRuntimeDropdown from './components/content/ComposerRuntimeDropdown.vue'
 import SidebarThreadControls from './components/sidebar/SidebarThreadControls.vue'
 import IconTablerBolt from './components/icons/IconTablerBolt.vue'
+import IconTablerMoon from './components/icons/IconTablerMoon.vue'
 import IconTablerSearch from './components/icons/IconTablerSearch.vue'
 import IconTablerSettings from './components/icons/IconTablerSettings.vue'
+import IconTablerSun from './components/icons/IconTablerSun.vue'
 import IconTablerTerminal from './components/icons/IconTablerTerminal.vue'
 import IconTablerX from './components/icons/IconTablerX.vue'
 import { useDesktopState } from './composables/useDesktopState'
@@ -1236,7 +1248,7 @@ import { getFreeModeStatus, setFreeMode, setFreeModeCustomKey, setCustomProvider
 import { getPathLeafName, getPathParent, isProjectlessChatPath, normalizePathForUi } from './pathUtils.js'
 import { copyTextToClipboard } from './utils/clipboard'
 import { codexDirectiveExportLines } from './utils/codexDirectives'
-import { readThemeMode, type ThemeMode } from './utils/themeMode'
+import { nextQuickThemeMode, readThemeMode, resolveEffectiveTheme, type ThemeMode } from './utils/themeMode'
 
 const ThreadConversation = defineAsyncComponent(() => import('./components/content/ThreadConversation.vue'))
 const ThreadTerminalPanel = defineAsyncComponent(() => import('./components/content/ThreadTerminalPanel.vue'))
@@ -2074,6 +2086,11 @@ const existingFolderFilteredEntries = computed(() => {
   )
 })
 const darkModeMediaQuery = typeof window !== 'undefined' ? window.matchMedia('(prefers-color-scheme: dark)') : null
+const systemPrefersDark = ref(darkModeMediaQuery?.matches ?? false)
+const effectiveTheme = computed(() => resolveEffectiveTheme(darkMode.value, systemPrefersDark.value))
+const themeToggleLabel = computed(() => t(
+  effectiveTheme.value === 'dark' ? 'Switch to light mode' : 'Switch to dark mode',
+))
 const chatWidthLabel = computed(() => t(CHAT_WIDTH_PRESETS[chatWidth.value].label))
 const terminalShortcutLabel = computed(() => {
   if (typeof navigator !== 'undefined' && /mac|iphone|ipad|ipod/i.test(navigator.platform)) {
@@ -2140,7 +2157,7 @@ onMounted(() => {
   window.visualViewport?.addEventListener('scroll', updateVisualViewportState)
   updateVisualViewportState()
   applyDarkMode()
-  darkModeMediaQuery?.addEventListener('change', applyDarkMode)
+  darkModeMediaQuery?.addEventListener('change', onSystemThemeChange)
   void initialize()
   void loadHomeDirectory()
   void loadFirstLaunchPluginsCardPreference()
@@ -2172,7 +2189,7 @@ onUnmounted(() => {
   window.removeEventListener('resize', updateVisualViewportState)
   window.visualViewport?.removeEventListener('resize', updateVisualViewportState)
   window.visualViewport?.removeEventListener('scroll', updateVisualViewportState)
-  darkModeMediaQuery?.removeEventListener('change', applyDarkMode)
+  darkModeMediaQuery?.removeEventListener('change', onSystemThemeChange)
   if (accountStatePollTimer !== null) {
     window.clearInterval(accountStatePollTimer)
     accountStatePollTimer = null
@@ -4327,6 +4344,17 @@ function cycleDarkMode(): void {
   applyDarkMode()
 }
 
+function onSystemThemeChange(event: MediaQueryListEvent): void {
+  systemPrefersDark.value = event.matches
+  applyDarkMode()
+}
+
+function toggleQuickTheme(): void {
+  darkMode.value = nextQuickThemeMode(darkMode.value, systemPrefersDark.value)
+  window.localStorage.setItem(DARK_MODE_KEY, darkMode.value)
+  applyDarkMode()
+}
+
 function cycleChatWidth(): void {
   const order: ChatWidthMode[] = ['standard', 'wide', 'extra-wide']
   const idx = order.indexOf(chatWidth.value)
@@ -4588,14 +4616,7 @@ function normalizeToWhisperLanguage(raw: string): string {
 
 function applyDarkMode(): void {
   const root = document.documentElement
-  if (darkMode.value === 'dark') {
-    root.classList.add('dark')
-  } else if (darkMode.value === 'light') {
-    root.classList.remove('dark')
-  } else {
-    const prefersDark = window.matchMedia('(prefers-color-scheme: dark)').matches
-    root.classList.toggle('dark', prefersDark)
-  }
+  root.classList.toggle('dark', effectiveTheme.value === 'dark')
 }
 
 function loadSidebarCollapsed(): boolean {

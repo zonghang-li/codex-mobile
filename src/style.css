@@ -1997,7 +1997,25 @@ a.codex-directive-title {
   @apply bg-zinc-900 text-zinc-200;
 }
 
+.mobile-theme-toggle {
+  min-width: 44px;
+  min-height: 44px;
+  @apply hidden shrink-0 items-center justify-center rounded-xl border-0 bg-transparent text-zinc-600 transition hover:bg-zinc-100 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-sky-500;
+}
+
+.mobile-theme-toggle svg {
+  @apply h-5 w-5;
+}
+
+:root.dark .mobile-theme-toggle {
+  @apply text-zinc-300 hover:bg-zinc-800;
+}
+
 @media (max-width: 768px) {
+  .mobile-theme-toggle {
+    display: inline-flex;
+  }
+
   .codex-directive-notice {
     @apply gap-1.5 px-2 py-1.5;
   }
