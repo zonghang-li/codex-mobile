@@ -2547,6 +2547,16 @@ export function useDesktopState() {
   function backgroundRuntimeCandidateIds(): string[] {
     const selectedId = selectedThreadId.value
     const ids: string[] = []
+    const selectedThreadLoaded = flattenThreads(sourceGroups.value)
+      .some((thread) => thread.id === selectedId)
+    if (selectedId && selectedThreadLoaded) {
+      const selectedOwnership = runtimeOwnershipByThreadId.value[selectedId] ?? 'idle'
+      const selectedLocallyRunning = inProgressById.value[selectedId] === true
+        && selectedOwnership !== 'external'
+      if (selectedOwnership === 'idle' && !selectedLocallyRunning) {
+        ids.push(selectedId)
+      }
+    }
     for (const thread of flattenThreads(sourceGroups.value)) {
       if (ids.length >= BACKGROUND_RUNTIME_BATCH_LIMIT) break
       if (!thread.id || thread.id === selectedId) continue
@@ -2594,8 +2604,10 @@ export function useDesktopState() {
           selectionVersionByThreadId.get(threadId) ?? 0,
         ]),
       )
+      const requestedSelectedThreadId = selectedThreadId.value
       const promise = pollBackgroundRuntimeStates(
         threadIds,
+        requestedSelectedThreadId,
         localAuthorityVersions,
         selectionVersions,
         generation,
@@ -2624,6 +2636,7 @@ export function useDesktopState() {
 
   async function pollBackgroundRuntimeStates(
     requestedThreadIds: readonly string[],
+    requestedSelectedThreadId: string,
     requestedLocalAuthorityVersions: ReadonlyMap<string, number>,
     requestedSelectionVersions: ReadonlyMap<string, number>,
     generation: number,
@@ -2640,7 +2653,10 @@ export function useDesktopState() {
     let shouldRefreshThreads = false
 
     for (const threadId of requestedThreadIds) {
-      if (!loadedIds.has(threadId) || selectedThreadId.value === threadId) continue
+      if (!loadedIds.has(threadId)) continue
+      const wasSelectedAtRequest = requestedSelectedThreadId === threadId
+      const isSelectedNow = selectedThreadId.value === threadId
+      if (wasSelectedAtRequest !== isSelectedNow) continue
       const requestedSelectionVersion = requestedSelectionVersions.get(threadId) ?? 0
       const currentSelectionVersion = selectionVersionByThreadId.get(threadId) ?? 0
       if (currentSelectionVersion !== requestedSelectionVersion) continue
@@ -2652,14 +2668,16 @@ export function useDesktopState() {
       }
       const ownership = runtimeOwnershipByThreadId.value[threadId] ?? 'idle'
       const locallyRunning = inProgressById.value[threadId] === true && ownership !== 'external'
-      if (ownership === 'local' || locallyRunning) {
+      if (ownership === 'local' || locallyRunning || (isSelectedNow && ownership === 'external')) {
         backgroundExternalThreadIds.delete(threadId)
         continue
       }
       const runtime = states[threadId] ?? { state: 'unknown' }
       if (runtime.state === 'running') {
-        backgroundExternalThreadIds.add(threadId)
-        setThreadRuntimeOwnership(threadId, 'external')
+        if (!isSelectedNow) backgroundExternalThreadIds.add(threadId)
+        setThreadRuntimeOwnership(threadId, 'external', {
+          externalPollDelayMs: isSelectedNow ? 0 : undefined,
+        })
         setThreadInProgress(threadId, true)
         continue
       }
@@ -2744,7 +2762,11 @@ export function useDesktopState() {
     }
   }
 
-  function setThreadRuntimeOwnership(threadId: string, ownership: ThreadRuntimeOwnership): void {
+  function setThreadRuntimeOwnership(
+    threadId: string,
+    ownership: ThreadRuntimeOwnership,
+    options: { externalPollDelayMs?: number } = {},
+  ): void {
     if (!threadId) return
     const currentOwnership = runtimeOwnershipByThreadId.value[threadId] ?? 'idle'
     if (ownership !== 'external' && externalReasoningSnapshotByThreadId.value[threadId]) {
@@ -2765,7 +2787,7 @@ export function useDesktopState() {
 
     if (selectedThreadId.value !== threadId) return
     if (ownership === 'external') {
-      scheduleExternalRuntimePolling(threadId)
+      scheduleExternalRuntimePolling(threadId, options.externalPollDelayMs)
     } else if (currentOwnership === 'external' || ownership === 'local') {
       cancelExternalRuntimePolling()
     }
