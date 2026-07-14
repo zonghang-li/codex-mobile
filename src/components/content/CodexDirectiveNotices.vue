@@ -4,9 +4,16 @@
       v-for="(directive, index) in directives"
       :key="`${directive.kind}:${index}`"
       class="codex-directive-notice"
+      :class="{
+        'codex-directive-notice-generic': directive.kind === 'generic',
+        'codex-directive-notice-invalid': directive.kind === 'invalid',
+      }"
       :data-kind="directive.kind"
+      :role="directive.kind === 'invalid' ? 'status' : undefined"
     >
-      <span class="codex-directive-icon" aria-hidden="true">✓</span>
+      <span class="codex-directive-icon" aria-hidden="true">
+        {{ directive.kind === 'invalid' ? '!' : directive.kind === 'generic' ? 'i' : '✓' }}
+      </span>
       <div class="codex-directive-content">
         <a
           v-if="codexDirectiveHref(directive)"
@@ -20,6 +27,22 @@
           <span class="codex-directive-meta">{{ codexDirectiveLocation(directive) }}</span>
           <p class="codex-directive-body">{{ directive.body }}</p>
         </template>
+        <dl
+          v-else-if="directive.kind === 'generic'"
+          class="codex-directive-attributes"
+        >
+          <div
+            v-for="attribute in directive.attributes"
+            :key="attribute.key"
+          >
+            <dt>{{ attribute.key }}</dt>
+            <dd>{{ attribute.value }}</dd>
+          </div>
+        </dl>
+        <template v-else-if="directive.kind === 'invalid'">
+          <span v-if="directive.name" class="codex-directive-meta">{{ directive.name }}</span>
+          <p class="codex-directive-body">{{ codexDirectiveInvalidReason(directive, t) }}</p>
+        </template>
       </div>
     </article>
   </div>
@@ -28,7 +51,12 @@
 <script setup lang="ts">
 import type { UiCodexDirective } from '../../types/codex'
 import { useUiLanguage } from '../../composables/useUiLanguage'
-import { codexDirectiveHref, codexDirectiveLabel, codexDirectiveLocation } from '../../utils/codexDirectives'
+import {
+  codexDirectiveHref,
+  codexDirectiveInvalidReason,
+  codexDirectiveLabel,
+  codexDirectiveLocation,
+} from '../../utils/codexDirectives'
 
 defineProps<{ directives: UiCodexDirective[] }>()
 
