@@ -6,10 +6,10 @@ describe('safe doctor', () => {
     const result = inspectSafeSources({
       runtimePolicy: "bindHost: '127.0.0.1'; approvalPolicy: 'on-request'; sandboxMode: 'workspace-write'",
       featureGate: 'isDisabledRoute isAllowedRpcMethod',
-      bridge: "securityPolicy.isRouteDisabled securityPolicy.isRpcMethodAllowed securityPolicy.terminalInputEnabled readThreadForNotifier appServer.rpc('thread/read', { threadId, includeTurns: true })",
+      bridge: "securityPolicy.isRouteDisabled securityPolicy.isRpcMethodAllowed securityPolicy.terminalInputEnabled readThreadForNotifier getAppServerPidForNotifier getSessionsRootForNotifier appServer.rpc('thread/read', { threadId, includeTurns: true })",
       safeCli: "exposeTailscale(state.port); option('--password-file <path>', 'description'); option('--ntfy-url-file <path>', 'description'); loadNtfyPublishUrl({ explicitPath: options.ntfyUrlFile })",
       ntfyConfig: "url.origin !== 'https://ntfy.sh'; url.username; url.password; url.search; url.hash; !/^\\/[A-Za-z0-9_-]+$/u.test(url.pathname)",
-      httpServer: 'options.ntfyNotifications createNtfyNotifierLifecycle bridge.subscribeNotifications NtfyCompletionNotifier',
+      httpServer: 'options.ntfyNotifications createNtfyNotifierLifecycle bridge.subscribeNotifications NtfyCompletionNotifier createExternalTurnMonitor getSessionsRootForNotifier onLifecycle: (event) => notifier.handleObserved(event)',
       securityPolicy: 'backgroundIntegrationsEnabled: false',
     })
     expect(result).toEqual({ ok: true, failures: [] })
@@ -50,11 +50,11 @@ describe('safe doctor', () => {
     const result = inspectSafeSources({
       runtimePolicy: "bindHost: '127.0.0.1'; approvalPolicy: 'on-request'; sandboxMode: 'workspace-write'",
       featureGate: 'isDisabledRoute isAllowedRpcMethod',
-      bridge: "securityPolicy.isRouteDisabled securityPolicy.isRpcMethodAllowed securityPolicy.terminalInputEnabled readThreadForNotifier appServer.rpc('thread/read', { threadId, includeTurns: true })",
+      bridge: "securityPolicy.isRouteDisabled securityPolicy.isRpcMethodAllowed securityPolicy.terminalInputEnabled readThreadForNotifier getAppServerPidForNotifier getSessionsRootForNotifier appServer.rpc('thread/read', { threadId, includeTurns: true })",
       safeCli: "exposeTailscale(state.port); option('--password-file <path>', 'description'); option('--ntfy-url-file <path>', 'description'); loadNtfyPublishUrl({ explicitPath: options.ntfyUrlFile })",
       ntfyConfig: "url.origin !== 'https://ntfy.sh'; url.username; url.password; url.search; url.hash; !/^\\/[A-Za-z0-9_-]+$/u.test(url.pathname)"
         .replace(`${missingInvariant}; `, ''),
-      httpServer: 'options.ntfyNotifications createNtfyNotifierLifecycle bridge.subscribeNotifications NtfyCompletionNotifier',
+      httpServer: 'options.ntfyNotifications createNtfyNotifierLifecycle bridge.subscribeNotifications NtfyCompletionNotifier createExternalTurnMonitor getSessionsRootForNotifier onLifecycle: (event) => notifier.handleObserved(event)',
       securityPolicy: 'backgroundIntegrationsEnabled: false',
     })
 

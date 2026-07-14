@@ -13,6 +13,11 @@ import {
   type ServerSecurityPolicy,
 } from './securityPolicy.js'
 import { NtfyCompletionNotifier, type NtfyCompletionNotifierOptions } from './ntfyCompletionNotifier.js'
+import {
+  createExternalTurnMonitor,
+  type ExternalTurnMonitor,
+  type ExternalTurnMonitorOptions,
+} from './externalTurnMonitor.js'
 import { FileNtfyStateStore } from '../safe/ntfyState.js'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
@@ -36,18 +41,21 @@ export type ServerInstance = {
 
 type NtfyBridge = {
   readThreadForNotifier: (threadId: string) => Promise<unknown>
+  getAppServerPidForNotifier: () => number | null
+  getSessionsRootForNotifier: () => string
   subscribeNotifications: (
     listener: (notification: { method: string; params: unknown; atIso: string }) => void,
   ) => () => void
 }
 
-type NtfyNotifier = Pick<NtfyCompletionNotifier, 'start' | 'handle' | 'dispose'>
+type NtfyNotifier = Pick<NtfyCompletionNotifier, 'start' | 'handle' | 'handleObserved' | 'dispose'>
 
 export function createNtfyNotifierLifecycle(options: {
   bridge: NtfyBridge
   config?: ServerOptions['ntfyNotifications']
   createStateStore?: (statePath: string, warn: (message: string) => void) => FileNtfyStateStore
   createNotifier?: (options: NtfyCompletionNotifierOptions) => NtfyNotifier
+  createExternalMonitor?: (options: ExternalTurnMonitorOptions) => ExternalTurnMonitor
   warn?: (message: string) => void
 }): { dispose: () => void } {
   if (!options.config) return { dispose: () => undefined }
@@ -58,25 +66,45 @@ export function createNtfyNotifierLifecycle(options: {
   const createNotifier = options.createNotifier ?? ((notifierOptions) => (
     new NtfyCompletionNotifier(notifierOptions)
   ))
+  const createExternalMonitor = options.createExternalMonitor ?? createExternalTurnMonitor
   const notifier = createNotifier({
     publishUrl: options.config.publishUrl,
     stateStore: createStateStore(options.config.statePath, warn),
     readThread: options.bridge.readThreadForNotifier,
     warn,
   })
-  void notifier.start().catch(() => {
+  let disposed = false
+  let unsubscribe: (() => void) | null = null
+  let externalMonitor: ExternalTurnMonitor | null = null
+  const initialized = notifier.start().then(() => {
+    if (disposed) return
+    externalMonitor = createExternalMonitor({
+      sessionsRoot: options.bridge.getSessionsRootForNotifier(),
+      getExcludedPid: options.bridge.getAppServerPidForNotifier,
+      onLifecycle: (event) => notifier.handleObserved(event),
+      warn,
+    })
+    void externalMonitor.start().catch(() => {
+      warn('Unable to start external turn monitoring')
+    })
+    unsubscribe = options.bridge.subscribeNotifications((notification) => {
+      notifier.handle(notification)
+    })
+  }).catch(() => {
     warn('Unable to start long-task notifications')
   })
-  const unsubscribe = options.bridge.subscribeNotifications((notification) => {
-    notifier.handle(notification)
-  })
-  let disposed = false
   return {
     dispose: () => {
       if (disposed) return
       disposed = true
-      unsubscribe()
-      void notifier.dispose().catch(() => {
+      unsubscribe?.()
+      unsubscribe = null
+      const monitorDisposal = externalMonitor
+        ? externalMonitor.dispose()
+        : initialized.then(() => externalMonitor?.dispose())
+      void monitorDisposal.catch(() => {
+        warn('Unable to stop external turn monitoring')
+      }).then(() => notifier.dispose()).catch(() => {
         warn('Unable to stop long-task notifications')
       })
     },

@@ -7428,6 +7428,8 @@ class MethodCatalog {
 type CodexBridgeMiddleware = ((req: IncomingMessage, res: ServerResponse, next: () => void) => Promise<void>) & {
   dispose: () => void
   readThreadForNotifier: (threadId: string) => Promise<unknown>
+  getAppServerPidForNotifier: () => number | null
+  getSessionsRootForNotifier: () => string
   subscribeNotifications: (listener: (value: { method: string; params: unknown; atIso: string }) => void) => () => void
 }
 
@@ -9837,6 +9839,8 @@ export function createCodexBridgeMiddleware(options: {
   middleware.readThreadForNotifier = (threadId: string) => (
     appServer.rpc('thread/read', { threadId, includeTurns: true })
   )
+  middleware.getAppServerPidForNotifier = () => appServer.getPid()
+  middleware.getSessionsRootForNotifier = () => join(getCodexHomeDir(), 'sessions')
 
   return middleware
 }
