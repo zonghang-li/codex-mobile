@@ -191,7 +191,7 @@ function toDirective(
 }
 
 function readSafeDirectiveName(value: string): string | undefined {
-  return /^::([a-z][a-z0-9-]*)/u.exec(value)?.[1]
+  return /^::([a-z][a-z0-9-]*)(?=\{|$)/u.exec(value)?.[1]
 }
 
 function readDirective(line: string): UiCodexDirective | null {

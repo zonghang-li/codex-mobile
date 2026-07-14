@@ -198,6 +198,9 @@ describe('parseCodexDirectiveText', () => {
     ['an invalid code-comment range', '::code-comment{title="Title" body="Body" file="a.ts" start="7" end="4"}', 'code-comment', 'invalid-schema'],
     ['an invalid code-comment priority', '::code-comment{title="Title" body="Body" file="a.ts" priority="4"}', 'code-comment', 'invalid-schema'],
     ['an invalid name', '::Future{x="1"}', undefined, 'invalid-name'],
+    ['a name containing an underscore', '::future_name{x="1"}', undefined, 'invalid-name'],
+    ['a name containing a dot', '::future.name{x="1"}', undefined, 'invalid-name'],
+    ['a name containing Unicode', '::未来{x="1"}', undefined, 'invalid-name'],
     ['incomplete final output', '::future{x="1"', 'future', 'incomplete'],
   ])('renders %s as a warning directive', (_label, source, name, reason) => {
     expect(parseCodexDirectiveText(source)).toEqual({
