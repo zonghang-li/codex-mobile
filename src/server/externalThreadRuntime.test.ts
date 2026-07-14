@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import {
+  discoverExternalRolloutWriters,
   ExternalThreadRuntimeProbe,
   type ExternalRuntimeSystem,
   type RuntimeFdSnapshot,
@@ -28,6 +29,7 @@ function lifecycle(type: 'task_started' | 'task_complete' | 'turn_aborted', turn
 
 function writerFd(overrides: Partial<RuntimeFdSnapshot> = {}): RuntimeFdSnapshot {
   return {
+    path: rolloutPath,
     pid: 42,
     ancestorPids: [],
     uid: 1000,
@@ -108,7 +110,8 @@ class FakeRuntimeSystem implements ExternalRuntimeSystem {
 
   async realpath(path: string): Promise<string> {
     if (path === sessionsRoot) return this.resolvedSessionsRoot
-    return this.rollouts.has(path) ? path : this.resolvedRolloutPath
+    if (path === rolloutPath) return this.resolvedRolloutPath
+    return path
   }
 
   async statFile(path: string): Promise<RuntimeFileIdentity & { regular: boolean }> {
@@ -181,6 +184,93 @@ class FakeRuntimeSystem implements ExternalRuntimeSystem {
     return rollout
   }
 }
+
+describe('discoverExternalRolloutWriters', () => {
+  beforeEach(() => {
+    vi.resetAllMocks()
+  })
+
+  it('discovers one canonical same-user external rollout writer', async () => {
+    const system = fakeRuntimeSystem({ fds: [writerFd()] })
+
+    await expect(discoverExternalRolloutWriters(sessionsRoot, 900, system)).resolves.toEqual([
+      { path: rolloutPath, dev: '8', ino: '21', size: 0, pid: 42 },
+    ])
+    expect(system.scanCount).toBe(1)
+  })
+
+  it('deduplicates descriptors for the same device and inode', async () => {
+    const system = fakeRuntimeSystem({
+      fds: [writerFd({ pid: 42 }), writerFd({ pid: 43 })],
+    })
+
+    await expect(discoverExternalRolloutWriters(sessionsRoot, null, system)).resolves.toEqual([
+      { path: rolloutPath, dev: '8', ino: '21', size: 0, pid: 42 },
+    ])
+  })
+
+  it.each([
+    ['safe app-server PID', { pid: 900 }],
+    ['safe app-server descendant', { pid: 901, ancestorPids: [900, 1] }],
+    ['different user', { uid: 1001 }],
+    ['read-only descriptor', { flags: 0o100000 }],
+    ['non-Codex command', { cmdline: '/usr/bin/node\0server.js\0' }],
+  ] satisfies Array<[string, Partial<RuntimeFdSnapshot>]>) (
+    'rejects a %s',
+    async (_label, overrides) => {
+      const system = fakeRuntimeSystem({ fds: [writerFd(overrides)] })
+
+      await expect(discoverExternalRolloutWriters(sessionsRoot, 900, system)).resolves.toEqual([])
+    },
+  )
+
+  it('rejects writers outside the canonical sessions root', async () => {
+    const outsidePath = '/tmp/outside.jsonl'
+    const system = fakeRuntimeSystem({
+      rollouts: [{ path: outsidePath, log: '', dev: '8', ino: '21' }],
+      fds: [writerFd({ path: outsidePath })],
+    })
+
+    await expect(discoverExternalRolloutWriters(sessionsRoot, null, system)).resolves.toEqual([])
+  })
+
+  it('rejects non-JSONL files', async () => {
+    const textPath = '/sessions/2026/07/rollout-thread-1.txt'
+    const system = fakeRuntimeSystem({
+      rollouts: [{ path: textPath, log: '', dev: '8', ino: '21' }],
+      fds: [writerFd({ path: textPath })],
+    })
+
+    await expect(discoverExternalRolloutWriters(sessionsRoot, null, system)).resolves.toEqual([])
+  })
+
+  it('rejects non-regular files', async () => {
+    const system = fakeRuntimeSystem({ regular: false, fds: [writerFd()] })
+
+    await expect(discoverExternalRolloutWriters(sessionsRoot, null, system)).resolves.toEqual([])
+  })
+
+  it('rejects a descriptor whose target identity does not match', async () => {
+    const system = fakeRuntimeSystem({ fds: [writerFd({ ino: '22' })] })
+
+    await expect(discoverExternalRolloutWriters(sessionsRoot, null, system)).resolves.toEqual([])
+  })
+
+  it('discovers the canonical target resolved from a stable proc descriptor', async () => {
+    defaultRuntimeProbe()
+
+    await expect(discoverExternalRolloutWriters(sessionsRoot, 99)).resolves.toEqual([
+      {
+        path: rolloutPath,
+        dev: '8',
+        ino: '21',
+        size: Buffer.byteLength(lifecycle('task_started', 'turn-a')),
+        pid: 42,
+      },
+    ])
+    expect(nodeFs.realpath).toHaveBeenCalledWith('/proc/42/fd/7')
+  })
+})
 
 function fakeRuntimeSystem(options: FakeRuntimeOptions = {}): FakeRuntimeSystem {
   return new FakeRuntimeSystem(options)
@@ -266,7 +356,9 @@ function defaultRuntimeProbe(fixture: DefaultRuntimeFixture = {}): ExternalThrea
     return values[Math.min(index, values.length - 1)]
   }
 
-  nodeFs.realpath.mockImplementation(async (path: string) => path)
+  nodeFs.realpath.mockImplementation(async (path: string) => (
+    path.startsWith('/proc/') ? rolloutPath : path
+  ))
   nodeFs.stat.mockImplementation(async (path: string, options?: { bigint?: boolean }) => {
     const isProcFd = path.startsWith('/proc/')
     const identityReadIndex = isProcFd ? fdIdentityReadCount++ : -1

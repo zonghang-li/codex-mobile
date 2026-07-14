@@ -10,6 +10,7 @@ export type RuntimeFileIdentity = {
 }
 
 export type RuntimeFdSnapshot = {
+  path: string
   pid: number
   ancestorPids: number[]
   uid: number
@@ -18,6 +19,14 @@ export type RuntimeFdSnapshot = {
   ino: string
   position: number
   flags: number
+}
+
+export type ExternalRolloutWriter = {
+  path: string
+  dev: string
+  ino: string
+  size: number
+  pid: number
 }
 
 export interface ExternalRuntimeSystem {
@@ -325,11 +334,23 @@ async function statProcFd(path: string): Promise<{ dev: string; ino: string } | 
   }
 }
 
+async function realpathProcFd(path: string): Promise<string | null> {
+  try {
+    return await realpath(path)
+  } catch (error) {
+    if (isProcessGone(error)) return null
+    return rethrowProcError(error, path)
+  }
+}
+
 async function readStableFdSnapshot(
   processRoot: string,
   pid: number,
   fd: string,
-): Promise<({ dev: string; ino: string } & { position: number; flags: number }) | null> {
+): Promise<(
+  { path: string; dev: string; ino: string }
+  & { position: number; flags: number }
+) | null> {
   const fdPath = `${processRoot}/fd/${fd}`
   const identityBefore = await statProcFd(fdPath)
   if (!identityBefore) return null
@@ -341,6 +362,8 @@ async function readStableFdSnapshot(
   const descriptorBefore = parseFdInfo(fdinfoBefore)
   const identityBetween = await statProcFd(fdPath)
   if (!identityBetween) return null
+  const path = await realpathProcFd(fdPath)
+  if (path === null) return null
   const fdinfoAfter = await readProcText(
     `${processRoot}/fdinfo/${fd}`,
     `process ${pid} descriptor ${fd}`,
@@ -360,7 +383,7 @@ async function readStableFdSnapshot(
   if (descriptorBefore.flags !== descriptorAfter.flags) {
     throw new InconclusiveRuntimeScanError('Descriptor flags changed during inspection')
   }
-  return { ...identityAfter, ...descriptorAfter }
+  return { path, ...identityAfter, ...descriptorAfter }
 }
 
 function isCodexAppServerCommand(cmdline: string): boolean {
@@ -399,6 +422,7 @@ async function* listLinuxFdSnapshots(ownUid: number | null): AsyncIterable<Runti
       const descriptor = await readStableFdSnapshot(processRoot, pid, fd)
       if (!descriptor) continue
       snapshots.push({
+        path: descriptor.path,
         pid,
         ancestorPids,
         uid,
@@ -512,15 +536,18 @@ function matchesWriter(
   uid: number,
   excludedPid: number | null,
 ): boolean {
-  const accessMode = fd.flags & 0b11
-  const isWritable = accessMode === 1 || accessMode === 2
   return fd.uid === uid
     && !belongsToExcludedProcessTree(fd, excludedPid)
     && isCodexAppServerCommand(fd.cmdline)
     && fd.dev === identity.dev
     && fd.ino === identity.ino
-    && isWritable
+    && isWritableDescriptor(fd.flags)
     && fd.position > 0
+}
+
+function isWritableDescriptor(flags: number): boolean {
+  const accessMode = flags & 0b11
+  return accessMode === 1 || accessMode === 2
 }
 
 function belongsToExcludedProcessTree(
@@ -529,6 +556,37 @@ function belongsToExcludedProcessTree(
 ): boolean {
   return excludedPid !== null
     && (fd.pid === excludedPid || fd.ancestorPids.includes(excludedPid))
+}
+
+export async function discoverExternalRolloutWriters(
+  sessionsRoot: string,
+  excludedPid: number | null,
+  system: ExternalRuntimeSystem = createDefaultSystem(),
+): Promise<ExternalRolloutWriter[]> {
+  if (system.platform !== 'linux' || system.uid === null) return []
+  const canonicalRoot = await system.realpath(sessionsRoot)
+  const writers = new Map<string, ExternalRolloutWriter>()
+
+  for await (const fd of system.listFdSnapshots()) {
+    if (fd.uid !== system.uid || belongsToExcludedProcessTree(fd, excludedPid)) continue
+    if (!isCodexAppServerCommand(fd.cmdline) || !isWritableDescriptor(fd.flags)) continue
+    const path = await system.realpath(fd.path).catch(() => '')
+    if (!path.endsWith('.jsonl') || !isContainedPath(canonicalRoot, path)) continue
+    const identity = await system.statFile(path).catch(() => null)
+    if (!identity?.regular || identity.dev !== fd.dev || identity.ino !== fd.ino) continue
+    const key = `${identity.dev}:${identity.ino}`
+    if (!writers.has(key)) {
+      writers.set(key, {
+        path,
+        dev: identity.dev,
+        ino: identity.ino,
+        size: identity.size,
+        pid: fd.pid,
+      })
+    }
+  }
+
+  return [...writers.values()]
 }
 
 export class ExternalThreadRuntimeProbe {
