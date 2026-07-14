@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest'
 import {
   codexDirectiveExportLines,
   codexDirectiveHref,
+  codexDirectiveInvalidReason,
   codexDirectiveLabel,
   codexDirectiveLocation,
   parseCodexDirectiveText,
@@ -91,6 +92,57 @@ describe('parseCodexDirectiveText', () => {
     expect(parseCodexDirectiveText(source)).toEqual({ text: '', directives: [directive] })
   })
 
+  it('parses an unknown valid directive into ordered generic attributes', () => {
+    expect(parseCodexDirectiveText(
+      '::future-directive{phase="done" url="https://example.com"}',
+    )).toEqual({
+      text: '',
+      directives: [{
+        kind: 'generic',
+        name: 'future-directive',
+        attributes: [
+          { key: 'phase', value: 'done', sensitive: false },
+          { key: 'url', value: 'https://example.com', sensitive: false },
+        ],
+      }],
+    })
+  })
+
+  it('redacts sensitive generic values before returning parsed state', () => {
+    const parsed = parseCodexDirectiveText(
+      '::future-auth{accessToken="do-not-retain" password="also-secret" phase="done"}',
+    )
+
+    expect(parsed.directives).toEqual([{
+      kind: 'generic',
+      name: 'future-auth',
+      attributes: [
+        { key: 'accessToken', value: '••••', sensitive: true },
+        { key: 'password', value: '••••', sensitive: true },
+        { key: 'phase', value: 'done', sensitive: false },
+      ],
+    }])
+    expect(JSON.stringify(parsed)).not.toContain('do-not-retain')
+    expect(JSON.stringify(parsed)).not.toContain('also-secret')
+  })
+
+  it('accepts an empty generic attribute set and preserves escaped values', () => {
+    expect(parseCodexDirectiveText([
+      '::future-empty{}',
+      '::future-value{message="Say \\"hi\\"" path="C:\\\\repo"}',
+    ].join('\n')).directives).toEqual([
+      { kind: 'generic', name: 'future-empty', attributes: [] },
+      {
+        kind: 'generic',
+        name: 'future-value',
+        attributes: [
+          { key: 'message', value: 'Say "hi"', sensitive: false },
+          { key: 'path', value: 'C:\\repo', sensitive: false },
+        ],
+      },
+    ])
+  })
+
   it('extracts multiple directives in their original order', () => {
     expect(parseCodexDirectiveText([
       'Done.',
@@ -103,6 +155,22 @@ describe('parseCodexDirectiveText', () => {
         { kind: 'git-commit', cwd: '/tmp/repo' },
       ],
     })
+  })
+
+  it('preserves source order across typed, generic, and invalid directives', () => {
+    expect(parseCodexDirectiveText([
+      '::git-stage{cwd="/tmp/repo"}',
+      '::future-directive{phase="done"}',
+      '::git-push{cwd="/tmp/repo"}',
+    ].join('\n')).directives).toEqual([
+      { kind: 'git-stage', cwd: '/tmp/repo' },
+      {
+        kind: 'generic',
+        name: 'future-directive',
+        attributes: [{ key: 'phase', value: 'done', sensitive: false }],
+      },
+      { kind: 'invalid', name: 'git-push', reason: 'invalid-schema' },
+    ])
   })
 
   it('decodes escaped quotes and backslashes in quoted values', () => {
@@ -120,24 +188,34 @@ describe('parseCodexDirectiveText', () => {
   })
 
   it.each([
-    ['an inline example', 'Use ::git-push{cwd="/tmp/repo" branch="main"} after review.'],
-    ['an unknown name', '::future-directive{cwd="/tmp/repo"}'],
-    ['a missing required attribute', '::git-push{cwd="/tmp/repo"}'],
-    ['a duplicate attribute', '::git-stage{cwd="/tmp/repo" cwd="/tmp/other"}'],
-    ['an unknown attribute', '::git-stage{cwd="/tmp/repo" branch="main"}'],
-    ['trailing garbage', '::git-stage{cwd="/tmp/repo"} nope'],
-    ['a malformed quoted value', '::git-stage{cwd=/tmp/repo}'],
-    ['an HTTP pull request URL', '::git-create-pr{cwd="/tmp/repo" branch="main" url="http://example.com/1" isDraft="false"}'],
-    ['both created-thread ids', '::created-thread{threadId="one" clientThreadId="two"}'],
-    ['an invalid code-comment range', '::code-comment{title="Title" body="Body" file="a.ts" start="7" end="4"}'],
-    ['an invalid code-comment priority', '::code-comment{title="Title" body="Body" file="a.ts" priority="4"}'],
-  ])('leaves %s visible', (_name, source) => {
+    ['missing required fields', '::git-push{cwd="/tmp/repo"}', 'git-push', 'invalid-schema'],
+    ['duplicate attributes', '::future{x="1" x="2"}', 'future', 'invalid-syntax'],
+    ['unknown known-directive fields', '::git-stage{cwd="/tmp/repo" branch="main"}', 'git-stage', 'invalid-schema'],
+    ['trailing garbage', '::future{x="1"} nope', 'future', 'invalid-syntax'],
+    ['malformed quoted values', '::git-stage{cwd=/tmp/repo}', 'git-stage', 'invalid-syntax'],
+    ['an HTTP pull request URL', '::git-create-pr{cwd="/tmp/repo" branch="main" url="http://example.com/1" isDraft="false"}', 'git-create-pr', 'invalid-schema'],
+    ['both created-thread ids', '::created-thread{threadId="one" clientThreadId="two"}', 'created-thread', 'invalid-schema'],
+    ['an invalid code-comment range', '::code-comment{title="Title" body="Body" file="a.ts" start="7" end="4"}', 'code-comment', 'invalid-schema'],
+    ['an invalid code-comment priority', '::code-comment{title="Title" body="Body" file="a.ts" priority="4"}', 'code-comment', 'invalid-schema'],
+    ['an invalid name', '::Future{x="1"}', undefined, 'invalid-name'],
+    ['incomplete final output', '::future{x="1"', 'future', 'incomplete'],
+  ])('renders %s as a warning directive', (_label, source, name, reason) => {
+    expect(parseCodexDirectiveText(source)).toEqual({
+      text: '',
+      directives: [{ kind: 'invalid', name, reason }],
+    })
+  })
+
+  it('leaves an inline example visible', () => {
+    const source = 'Use ::git-push{cwd="/tmp/repo" branch="main"} after review.'
     expect(parseCodexDirectiveText(source)).toEqual({ text: source, directives: [] })
   })
 
   it.each([
     ['backtick', ['```text', '::git-push{cwd="/tmp/repo" branch="main"}', '```']],
     ['tilde', ['~~~', '::git-push{cwd="/tmp/repo" branch="main"}', '~~~']],
+    ['future backtick', ['```text', '::future-directive{phase="done"}', '```']],
+    ['malformed tilde', ['~~~text', '::future-directive{phase="done"', '~~~']],
   ])('leaves directives inside a %s fence visible', (_name, lines) => {
     const source = lines.join('\n')
     expect(parseCodexDirectiveText(source)).toEqual({ text: source, directives: [] })
@@ -184,8 +262,8 @@ describe('parseCodexDirectiveText', () => {
     })).toEqual({ text: 'Done.', directives: [] })
 
     expect(parseCodexDirectiveText('Done.\n\n::git-pu')).toEqual({
-      text: 'Done.\n\n::git-pu',
-      directives: [],
+      text: 'Done.',
+      directives: [{ kind: 'invalid', name: 'git-pu', reason: 'incomplete' }],
     })
   })
 
@@ -209,10 +287,10 @@ describe('parseCodexDirectiveText', () => {
     })
   })
 
-  it('does not withhold an incomplete unsupported directive in live mode', () => {
+  it('withholds an incomplete future directive in live mode', () => {
     expect(parseCodexDirectiveText('Done.\n\n::future-directive', {
       suppressIncompleteTrailingDirective: true,
-    }).text).toContain('::future-directive')
+    })).toEqual({ text: 'Done.', directives: [] })
   })
 
   it('never withholds a trailing directive-like line inside a fence', () => {
@@ -224,6 +302,52 @@ describe('parseCodexDirectiveText', () => {
 })
 
 describe('directive presentation helpers', () => {
+  it('labels generic and invalid directives without granting links', () => {
+    const generic = {
+      kind: 'generic' as const,
+      name: 'future-directive',
+      attributes: [{ key: 'phase', value: 'done', sensitive: false }],
+    }
+    const invalid = {
+      kind: 'invalid' as const,
+      name: 'git-push',
+      reason: 'invalid-schema' as const,
+    }
+
+    expect(codexDirectiveLabel(generic, translate)).toBe('Codex directive: future-directive')
+    expect(codexDirectiveHref(generic)).toBeNull()
+    expect(codexDirectiveLabel(invalid, translate)).toBe('Directive format error')
+    expect(codexDirectiveInvalidReason(invalid, translate)).toBe('Invalid directive fields')
+    expect(codexDirectiveHref(invalid)).toBeNull()
+  })
+
+  it('exports generic and invalid directives as readable Markdown', () => {
+    expect(codexDirectiveExportLines({
+      kind: 'generic',
+      name: 'future-directive',
+      attributes: [
+        { key: 'phase', value: 'done', sensitive: false },
+        { key: 'accessToken', value: '••••', sensitive: true },
+      ],
+    }, translate)).toEqual([
+      '- Codex directive: future\\-directive',
+      '  - phase: done',
+      '  - accessToken: ••••',
+    ])
+
+    const invalidLines = codexDirectiveExportLines({
+      kind: 'invalid',
+      name: 'git-push',
+      reason: 'invalid-schema',
+    }, translate)
+    expect(invalidLines).toEqual([
+      '- Directive format error',
+      '  - Directive name: git\\-push',
+      '  - Invalid directive fields',
+    ])
+    expect(invalidLines.join('\n')).not.toContain('::')
+  })
+
   it.each([
     ['file only', { kind: 'code-comment' as const, title: 'Title', body: 'Body', file: 'src/a.ts' }, 'src/a.ts'],
     ['single line', { kind: 'code-comment' as const, title: 'Title', body: 'Body', file: 'src/a.ts', start: 4 }, 'src/a.ts:4'],
