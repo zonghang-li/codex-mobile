@@ -308,6 +308,54 @@ describe('Codex directive notification state', () => {
     })
   })
 
+  it('withholds and then renders a split future directive without raw fragments', async () => {
+    const { state, emit } = await setupCodexDirectiveNotificationState()
+    emit({
+      method: 'item/agentMessage/delta',
+      params: { threadId: 'thread-1', itemId: 'agent-1', delta: 'Done.\n::future-dire' },
+    })
+    expect(state.messages.value.at(-1)).toMatchObject({ text: 'Done.' })
+    expect(state.messages.value.at(-1)?.directives).toBeUndefined()
+
+    emit({
+      method: 'item/agentMessage/delta',
+      params: {
+        threadId: 'thread-1',
+        itemId: 'agent-1',
+        delta: 'ctive{phase="done"}',
+      },
+    })
+    expect(state.messages.value.at(-1)).toMatchObject({
+      text: 'Done.',
+      directives: [{
+        kind: 'generic',
+        name: 'future-directive',
+        attributes: [{ key: 'phase', value: 'done', sensitive: false }],
+      }],
+    })
+  })
+
+  it('turns a still-incomplete future directive into one warning on completion', async () => {
+    const { state, emit } = await setupCodexDirectiveNotificationState()
+    const text = 'Done.\n::future{x="1"'
+    emit({
+      method: 'item/agentMessage/delta',
+      params: { threadId: 'thread-1', itemId: 'agent-1', delta: text },
+    })
+    expect(state.messages.value.at(-1)).toMatchObject({ text: 'Done.' })
+    expect(state.messages.value.at(-1)?.directives).toBeUndefined()
+
+    emit({
+      method: 'item/completed',
+      params: { threadId: 'thread-1', item: { id: 'agent-1', type: 'agentMessage', text } },
+    })
+    expect(state.messages.value.at(-1)).toMatchObject({
+      text: 'Done.',
+      directives: [{ kind: 'invalid', name: 'future', reason: 'incomplete' }],
+    })
+    expect(state.messages.value.filter((message) => message.id === 'agent-1')).toHaveLength(1)
+  })
+
   it('clears raw delta state when an empty agent message completes', async () => {
     const { state, emit } = await setupCodexDirectiveNotificationState()
 
