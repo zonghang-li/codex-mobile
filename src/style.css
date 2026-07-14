@@ -695,6 +695,41 @@ a.codex-directive-title {
   @apply mb-0 mt-1 whitespace-pre-wrap text-[13px] leading-5 text-slate-700;
 }
 
+.codex-directive-notice-generic {
+  @apply border-sky-200 bg-sky-50/90;
+}
+
+.codex-directive-notice-generic .codex-directive-icon {
+  @apply bg-sky-100 text-sky-700;
+}
+
+.codex-directive-notice-invalid {
+  @apply border-amber-300 bg-amber-50/90;
+}
+
+.codex-directive-notice-invalid .codex-directive-icon {
+  @apply bg-amber-100 text-amber-800;
+}
+
+.codex-directive-attributes {
+  @apply mt-1 grid min-w-0 gap-x-2 gap-y-0.5 text-[12px] leading-4;
+  grid-template-columns: minmax(0, max-content) minmax(0, 1fr);
+}
+
+.codex-directive-attributes div {
+  display: contents;
+}
+
+.codex-directive-attributes dt {
+  @apply min-w-0 font-medium text-slate-500;
+  overflow-wrap: anywhere;
+}
+
+.codex-directive-attributes dd {
+  @apply m-0 min-w-0 text-slate-700;
+  overflow-wrap: anywhere;
+}
+
 :root.dark .codex-directive-notice {
   @apply border-zinc-700 bg-zinc-800/80 text-zinc-300;
 }
@@ -717,6 +752,30 @@ a.codex-directive-title {
 
 :root.dark .codex-directive-body {
   @apply text-zinc-300;
+}
+
+:root.dark .codex-directive-notice-generic {
+  @apply border-sky-800/80 bg-sky-950/40;
+}
+
+:root.dark .codex-directive-notice-generic .codex-directive-icon {
+  @apply bg-sky-400/15 text-sky-300;
+}
+
+:root.dark .codex-directive-notice-invalid {
+  @apply border-amber-700/80 bg-amber-950/30;
+}
+
+:root.dark .codex-directive-notice-invalid .codex-directive-icon {
+  @apply bg-amber-400/15 text-amber-300;
+}
+
+:root.dark .codex-directive-attributes dt {
+  @apply text-zinc-400;
+}
+
+:root.dark .codex-directive-attributes dd {
+  @apply text-zinc-200;
 }
 
 :root.dark .automation-message-label {
@@ -1941,6 +2000,10 @@ a.codex-directive-title {
 @media (max-width: 768px) {
   .codex-directive-notice {
     @apply gap-1.5 px-2 py-1.5;
+  }
+
+  .codex-directive-attributes {
+    @apply gap-x-1.5;
   }
 
   .thread-composer-input,
