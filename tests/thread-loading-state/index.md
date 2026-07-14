@@ -36,3 +36,4 @@ Return to the [manual test index](../../tests.md).
 | [Non-thread startup selection priming](non-thread-startup-selection-priming.md) |
 | [Feature: External client running state after refresh](external-client-running-state-after-refresh.md) |
 | [Feature: External live thread sync](external-live-thread-sync.md) |
+| [Mobile Codex directive notices](mobile-codex-directive-notices.md) |
