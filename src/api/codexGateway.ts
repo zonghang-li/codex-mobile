@@ -652,9 +652,9 @@ export function pickCodexRateLimitSnapshot(payload: unknown): UiRateLimitSnapsho
   return normalizeRateLimitSnapshot(record.rateLimits ?? record.rate_limits)
 }
 
-async function callRpc<T>(method: string, params?: unknown): Promise<T> {
+async function callRpc<T>(method: string, params?: unknown, signal?: AbortSignal): Promise<T> {
   try {
-    return await rpcCall<T>(method, params)
+    return await rpcCall<T>(method, params, signal)
   } catch (error) {
     throw normalizeCodexApiError(error, `RPC ${method} failed`, method)
   }
@@ -866,7 +866,7 @@ async function getThreadSummaryV2(threadId: string): Promise<UiThread> {
   return normalizeThreadSummaryV2(payload)
 }
 
-async function getThreadDetailV2(threadId: string): Promise<{
+async function getThreadDetailV2(threadId: string, signal?: AbortSignal): Promise<{
   model: string
   modelProvider: string
   messages: UiMessage[]
@@ -881,7 +881,7 @@ async function getThreadDetailV2(threadId: string): Promise<{
   const payload = await callRpc<ThreadReadResponse>('thread/read', {
     threadId,
     includeTurns: true,
-  })
+  }, signal)
   const startTurnIndex = readThreadTurnStartIndex(payload)
   const normalized = normalizeThreadMessagesV2(payload, startTurnIndex)
   const runtime = readThreadDetailRuntime(payload)
@@ -964,7 +964,7 @@ export async function getThreadSummary(threadId: string): Promise<UiThread> {
   }
 }
 
-export async function getThreadDetail(threadId: string): Promise<{
+export async function getThreadDetail(threadId: string, signal?: AbortSignal): Promise<{
   model: string
   modelProvider: string
   messages: UiMessage[]
@@ -977,7 +977,7 @@ export async function getThreadDetail(threadId: string): Promise<{
   externalRuntimeState: ThreadDetailRuntime['externalRuntimeState']
 }> {
   try {
-    return await getThreadDetailV2(threadId)
+    return await getThreadDetailV2(threadId, signal)
   } catch (error) {
     throw normalizeCodexApiError(error, `Failed to load thread ${threadId}`, 'thread/read')
   }

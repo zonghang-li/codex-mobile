@@ -194,6 +194,34 @@ describe('getThreadDetail', () => {
     vi.unstubAllGlobals()
   })
 
+  it('forwards the caller abort signal to thread/read', async () => {
+    const controller = new AbortController()
+    let requestSignal: AbortSignal | null | undefined
+    vi.stubGlobal('fetch', vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+      requestSignal = init?.signal
+      return new Response(JSON.stringify({
+        result: {
+          thread: {
+            id: 'external-thread',
+            turns: [],
+            externalRuntime: {
+              state: 'running',
+              turnId: 'turn-external',
+              interruptible: false,
+              source: 'external-session-writer',
+            },
+          },
+        },
+      }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    }))
+
+    await expect(getThreadDetail('external-thread', controller.signal)).resolves.toMatchObject({
+      ownership: 'external',
+      activeTurnId: 'turn-external',
+    })
+    expect(requestSignal).toBe(controller.signal)
+  })
+
   it('reads modelProvider from nested thread payloads returned by thread/read', async () => {
     vi.stubGlobal('fetch', vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
       const body = typeof init?.body === 'string'
