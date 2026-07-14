@@ -438,7 +438,7 @@ async function* listLinuxFdSnapshots(ownUid: number | null): AsyncIterable<Runti
   }
 }
 
-function createDefaultSystem(): ExternalRuntimeSystem {
+export function createExternalRuntimeSystem(): ExternalRuntimeSystem {
   const uid = typeof process.getuid === 'function' ? process.getuid() : null
   return {
     platform: process.platform,
@@ -561,7 +561,7 @@ function belongsToExcludedProcessTree(
 export async function discoverExternalRolloutWriters(
   sessionsRoot: string,
   excludedPid: number | null,
-  system: ExternalRuntimeSystem = createDefaultSystem(),
+  system: ExternalRuntimeSystem = createExternalRuntimeSystem(),
 ): Promise<ExternalRolloutWriter[]> {
   if (system.platform !== 'linux' || system.uid === null) return []
   const canonicalRoot = await system.realpath(sessionsRoot)
@@ -596,7 +596,7 @@ export class ExternalThreadRuntimeProbe {
 
   constructor(options: { sessionsRoot: string; system?: ExternalRuntimeSystem }) {
     this.sessionsRoot = options.sessionsRoot
-    this.system = options.system ?? createDefaultSystem()
+    this.system = options.system ?? createExternalRuntimeSystem()
   }
 
   registerThread(threadId: string, rolloutPath: string): void {
