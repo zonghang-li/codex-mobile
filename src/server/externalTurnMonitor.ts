@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto'
 import {
   createExternalRuntimeSystem,
-  discoverExternalRolloutWriters,
+  discoverExternalRolloutWriterSnapshot,
   type ExternalRolloutWriter,
   type ExternalRuntimeSystem,
   type RuntimeFileIdentity,
@@ -471,11 +471,12 @@ export function createExternalTurnMonitor(
       }
     }
 
-    const writers = await discoverExternalRolloutWriters(
+    const discovery = await discoverExternalRolloutWriterSnapshot(
       options.sessionsRoot,
       excludedPid(),
       system,
     )
+    const { writers } = discovery
     const writerKeys = new Set(writers.map((writer) => `${writer.dev}:${writer.ino}`))
     const observedAt = now()
     for (const cursor of [...cursors.values()]) {
@@ -484,7 +485,10 @@ export function createExternalTurnMonitor(
         continue
       }
       const inactiveSince = Math.max(cursor.lastFileActivityAt, cursor.lastWriterSeenAt)
-      if (observedAt - inactiveSince >= inactiveExpiryMs) cursors.delete(cursor.key)
+      if (
+        discovery.complete
+        && observedAt - inactiveSince >= inactiveExpiryMs
+      ) cursors.delete(cursor.key)
     }
 
     for (const writer of writers) {

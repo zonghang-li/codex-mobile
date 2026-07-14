@@ -40,7 +40,7 @@ export interface ExternalRuntimeSystem {
     length: number,
     expectedIdentity: RuntimeFileIdentity,
   ): Promise<Buffer>
-  listFdSnapshots(): AsyncIterable<RuntimeFdSnapshot>
+  listFdSnapshots(): AsyncGenerator<RuntimeFdSnapshot, boolean | void, void>
 }
 
 type RuntimeParseCache = {
@@ -400,13 +400,13 @@ function isCodexAppServerCommand(cmdline: string): boolean {
 async function* listLinuxFdSnapshots(
   ownUid: number | null,
   now: () => number,
-): AsyncIterable<RuntimeFdSnapshot> {
+): AsyncGenerator<RuntimeFdSnapshot, boolean, void> {
   const scanStartedAt = now()
   const hasTimeRemaining = (): boolean => {
     const elapsed = now() - scanStartedAt
     return elapsed >= 0 && elapsed < EXTERNAL_RUNTIME_SCAN_WALL_BUDGET_MS
   }
-  if (!hasTimeRemaining()) return
+  if (!hasTimeRemaining()) return false
   const processEntries = await readProcDirectory('/proc', '/proc')
   if (!processEntries) {
     throw new InconclusiveRuntimeScanError('Cannot inspect /proc')
@@ -414,39 +414,46 @@ async function* listLinuxFdSnapshots(
 
   const processes = new Map<number, LinuxProcessRecord>()
   let numericProcessCount = 0
+  let complete = true
   for (const entry of processEntries) {
     if (!/^\d+$/u.test(entry)) continue
-    if (numericProcessCount >= EXTERNAL_RUNTIME_MAX_NUMERIC_PROCESSES) break
+    if (numericProcessCount >= EXTERNAL_RUNTIME_MAX_NUMERIC_PROCESSES) {
+      complete = false
+      break
+    }
     numericProcessCount += 1
-    if (!hasTimeRemaining()) return
+    if (!hasTimeRemaining()) return false
     const pid = Number.parseInt(entry, 10)
     if (!Number.isSafeInteger(pid)) continue
 
     const process = await readStableProcessRecord(`/proc/${entry}`, pid, ownUid)
-    if (!hasTimeRemaining()) return
+    if (!hasTimeRemaining()) return false
     if (process) processes.set(pid, process)
   }
 
   let yieldedSnapshots = 0
   for (const process of processes.values()) {
-    if (yieldedSnapshots >= EXTERNAL_RUNTIME_MAX_FD_SNAPSHOTS || !hasTimeRemaining()) return
+    if (yieldedSnapshots >= EXTERNAL_RUNTIME_MAX_FD_SNAPSHOTS || !hasTimeRemaining()) return false
     const { pid, uid, cmdline } = process
     if (uid !== ownUid || !isCodexAppServerCommand(cmdline)) continue
     const processRoot = `/proc/${pid}`
     const ancestorPids = collectAncestorPids(pid, processes)
     if (!(await validateProcessChain(process, ancestorPids, processes))) continue
-    if (!hasTimeRemaining()) return
+    if (!hasTimeRemaining()) return false
     const fdEntries = await readProcDirectory(`${processRoot}/fd`, `process ${pid} descriptors`)
     if (fdEntries === null) continue
     const snapshots: RuntimeFdSnapshot[] = []
     let numericDescriptorCount = 0
     for (const fd of fdEntries) {
       if (!/^\d+$/u.test(fd)) continue
-      if (numericDescriptorCount >= EXTERNAL_RUNTIME_MAX_DESCRIPTORS_PER_APP_SERVER) break
+      if (numericDescriptorCount >= EXTERNAL_RUNTIME_MAX_DESCRIPTORS_PER_APP_SERVER) {
+        complete = false
+        break
+      }
       numericDescriptorCount += 1
-      if (!hasTimeRemaining()) return
+      if (!hasTimeRemaining()) return false
       const descriptor = await readStableFdSnapshot(processRoot, pid, fd)
-      if (!hasTimeRemaining()) return
+      if (!hasTimeRemaining()) return false
       if (!descriptor) continue
       snapshots.push({
         path: descriptor.path,
@@ -461,13 +468,14 @@ async function* listLinuxFdSnapshots(
       })
     }
     if (!(await validateProcessChain(process, ancestorPids, processes))) continue
-    if (!hasTimeRemaining()) return
+    if (!hasTimeRemaining()) return false
     for (const snapshot of snapshots) {
-      if (yieldedSnapshots >= EXTERNAL_RUNTIME_MAX_FD_SNAPSHOTS || !hasTimeRemaining()) return
+      if (yieldedSnapshots >= EXTERNAL_RUNTIME_MAX_FD_SNAPSHOTS || !hasTimeRemaining()) return false
       yieldedSnapshots += 1
       yield snapshot
     }
   }
+  return complete
 }
 
 export function createExternalRuntimeSystem(
@@ -593,16 +601,31 @@ function belongsToExcludedProcessTree(
     && (fd.pid === excludedPid || fd.ancestorPids.includes(excludedPid))
 }
 
-export async function discoverExternalRolloutWriters(
+export type ExternalRolloutWriterSnapshot = {
+  writers: ExternalRolloutWriter[]
+  complete: boolean
+}
+
+export async function discoverExternalRolloutWriterSnapshot(
   sessionsRoot: string,
   excludedPid: number | null,
   system: ExternalRuntimeSystem = createExternalRuntimeSystem(),
-): Promise<ExternalRolloutWriter[]> {
-  if (system.platform !== 'linux' || system.uid === null) return []
+): Promise<ExternalRolloutWriterSnapshot> {
+  if (system.platform !== 'linux' || system.uid === null) {
+    return { writers: [], complete: true }
+  }
   const canonicalRoot = await system.realpath(sessionsRoot)
   const writers = new Map<string, ExternalRolloutWriter>()
+  const iterator = system.listFdSnapshots()[Symbol.asyncIterator]()
+  let complete = true
 
-  for await (const fd of system.listFdSnapshots()) {
+  while (true) {
+    const next = await iterator.next()
+    if (next.done) {
+      complete = next.value !== false
+      break
+    }
+    const fd = next.value
     if (fd.uid !== system.uid || belongsToExcludedProcessTree(fd, excludedPid)) continue
     if (!isCodexAppServerCommand(fd.cmdline) || !isWritableDescriptor(fd.flags)) continue
     const path = await system.realpath(fd.path).catch(() => '')
@@ -618,11 +641,27 @@ export async function discoverExternalRolloutWriters(
         size: identity.size,
         pid: fd.pid,
       })
-      if (writers.size >= EXTERNAL_RUNTIME_MAX_ROLLOUT_WRITERS) break
+      if (writers.size >= EXTERNAL_RUNTIME_MAX_ROLLOUT_WRITERS) {
+        complete = false
+        await iterator.return?.()
+        break
+      }
     }
   }
 
-  return [...writers.values()]
+  return { writers: [...writers.values()], complete }
+}
+
+export async function discoverExternalRolloutWriters(
+  sessionsRoot: string,
+  excludedPid: number | null,
+  system: ExternalRuntimeSystem = createExternalRuntimeSystem(),
+): Promise<ExternalRolloutWriter[]> {
+  return (await discoverExternalRolloutWriterSnapshot(
+    sessionsRoot,
+    excludedPid,
+    system,
+  )).writers
 }
 
 export class ExternalThreadRuntimeProbe {
