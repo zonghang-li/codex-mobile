@@ -713,7 +713,7 @@ a.codex-directive-title {
 
 .codex-directive-attributes {
   @apply mt-1 grid min-w-0 gap-x-2 gap-y-0.5 text-[12px] leading-4;
-  grid-template-columns: minmax(0, max-content) minmax(0, 1fr);
+  grid-template-columns: fit-content(40%) minmax(0, 1fr);
 }
 
 .codex-directive-attributes div {
