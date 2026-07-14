@@ -74,23 +74,27 @@ export function createNtfyNotifierLifecycle(options: {
     warn,
   })
   let disposed = false
-  let unsubscribe: (() => void) | null = null
   let externalMonitor: ExternalTurnMonitor | null = null
-  const initialized = notifier.start().then(() => {
+  const notifierStart = notifier.start()
+  let unsubscribe: (() => void) | null = options.bridge.subscribeNotifications((notification) => {
+    notifier.handle(notification)
+  })
+  const initialized = notifierStart.then(() => {
     if (disposed) return
-    externalMonitor = createExternalMonitor({
-      sessionsRoot: options.bridge.getSessionsRootForNotifier(),
-      getExcludedPid: options.bridge.getAppServerPidForNotifier,
-      onLifecycle: (event) => notifier.handleObserved(event),
-      warn,
-    })
-    void externalMonitor.start().catch(() => {
+    try {
+      externalMonitor = createExternalMonitor({
+        sessionsRoot: options.bridge.getSessionsRootForNotifier(),
+        getExcludedPid: options.bridge.getAppServerPidForNotifier,
+        onLifecycle: (event) => notifier.handleObserved(event),
+        warn,
+      })
+      void externalMonitor.start().catch(() => {
+        warn('Unable to start external turn monitoring')
+      })
+    } catch {
       warn('Unable to start external turn monitoring')
-    })
-    unsubscribe = options.bridge.subscribeNotifications((notification) => {
-      notifier.handle(notification)
-    })
-  }).catch(() => {
+    }
+  }, () => {
     warn('Unable to start long-task notifications')
   })
   return {
