@@ -204,7 +204,19 @@ export type UiPlanData = {
   isStreaming?: boolean
 }
 
+export type UiGenericCodexDirectiveAttribute = {
+  key: string
+  value: string
+  sensitive: boolean
+}
+
 export type UiCodexDirective =
+  | { kind: 'generic'; name: string; attributes: UiGenericCodexDirectiveAttribute[] }
+  | {
+      kind: 'invalid'
+      name?: string
+      reason: 'invalid-name' | 'invalid-syntax' | 'invalid-schema' | 'incomplete'
+    }
   | { kind: 'git-stage'; cwd: string }
   | { kind: 'git-commit'; cwd: string }
   | { kind: 'git-create-branch'; cwd: string; branch: string }

@@ -20,6 +20,21 @@ const SUPPORTED_DIRECTIVE_NAMES = [
   'code-comment',
 ] as const
 
+type ParsedDirectiveAttributes = {
+  values: Record<string, string>
+  ordered: Array<{ key: string; value: string }>
+}
+
+const SENSITIVE_ATTRIBUTE_PARTS = [
+  'password',
+  'passwd',
+  'token',
+  'secret',
+  'credential',
+  'authorization',
+  'apikey',
+] as const
+
 function hasOnlyKeys(attributes: Record<string, string>, allowed: readonly string[]): boolean {
   const allowedSet = new Set(allowed)
   return Object.keys(attributes).every((key) => allowedSet.has(key))
@@ -41,21 +56,22 @@ function readPositiveInteger(value: string | undefined): number | undefined | nu
   return Number.isSafeInteger(parsed) ? parsed : null
 }
 
-function readAttributes(source: string): Record<string, string> | null {
-  const attributes: Record<string, string> = {}
+function readAttributes(source: string): ParsedDirectiveAttributes | null {
+  const values: Record<string, string> = {}
+  const ordered: ParsedDirectiveAttributes['ordered'] = []
   let index = 0
   let hasAttribute = false
 
   while (index < source.length) {
     const whitespaceStart = index
     while (/\s/u.test(source[index] ?? '')) index += 1
-    if (index >= source.length) return attributes
+    if (index >= source.length) return { values, ordered }
     if (hasAttribute && index === whitespaceStart) return null
 
     const keyMatch = /^[A-Za-z][A-Za-z0-9]*/u.exec(source.slice(index))
     if (!keyMatch) return null
     const key = keyMatch[0]
-    if (Object.prototype.hasOwnProperty.call(attributes, key)) return null
+    if (Object.prototype.hasOwnProperty.call(values, key)) return null
     index += key.length
     if (source[index] !== '=') return null
     index += 1
@@ -82,11 +98,35 @@ function readAttributes(source: string): Record<string, string> | null {
       index += 1
     }
     if (!closed) return null
-    attributes[key] = value
+    values[key] = value
+    ordered.push({ key, value })
     hasAttribute = true
   }
 
-  return attributes
+  return { values, ordered }
+}
+
+function isSensitiveAttribute(key: string): boolean {
+  const normalized = key.toLowerCase()
+  return SENSITIVE_ATTRIBUTE_PARTS.some((part) => normalized.includes(part))
+}
+
+function toGenericDirective(
+  name: string,
+  ordered: ParsedDirectiveAttributes['ordered'],
+): UiCodexDirective {
+  return {
+    kind: 'generic',
+    name,
+    attributes: ordered.map(({ key, value }) => {
+      const sensitive = isSensitiveAttribute(key)
+      return {
+        key,
+        value: sensitive ? '••••' : value,
+        sensitive,
+      }
+    }),
+  }
 }
 
 function toDirective(
@@ -150,11 +190,30 @@ function toDirective(
   }
 }
 
+function readSafeDirectiveName(value: string): string | undefined {
+  return /^::([a-z][a-z0-9-]*)/u.exec(value)?.[1]
+}
+
 function readDirective(line: string): UiCodexDirective | null {
-  const match = /^::([a-z][a-z0-9-]*)\{(.*)\}$/u.exec(line.trim())
-  if (!match) return null
+  const trimmed = line.trim()
+  if (!trimmed.startsWith('::')) return null
+
+  const name = readSafeDirectiveName(trimmed)
+  if (!name) return { kind: 'invalid', reason: 'invalid-name' }
+  if (!hasStructuralClosingBrace(trimmed.slice(2))) {
+    return { kind: 'invalid', name, reason: 'incomplete' }
+  }
+
+  const match = /^::([a-z][a-z0-9-]*)\{(.*)\}$/u.exec(trimmed)
+  if (!match) return { kind: 'invalid', name, reason: 'invalid-syntax' }
   const attributes = readAttributes(match[2])
-  return attributes ? toDirective(match[1], attributes) : null
+  if (!attributes) return { kind: 'invalid', name, reason: 'invalid-syntax' }
+
+  if (!SUPPORTED_DIRECTIVE_NAMES.includes(name as typeof SUPPORTED_DIRECTIVE_NAMES[number])) {
+    return toGenericDirective(name, attributes.ordered)
+  }
+  return toDirective(name, attributes.values)
+    ?? { kind: 'invalid', name, reason: 'invalid-schema' }
 }
 
 type FenceState = { marker: '`' | '~'; length: number }
@@ -195,16 +254,9 @@ function hasStructuralClosingBrace(value: string): boolean {
   return false
 }
 
-function isIncompleteSupportedDirective(line: string): boolean {
+function isIncompleteTrailingDirective(line: string): boolean {
   const trimmed = line.trim()
-  if (!trimmed.startsWith('::')) return false
-  return SUPPORTED_DIRECTIVE_NAMES.some((name) => {
-    const opening = `::${name}{`
-    return opening.startsWith(trimmed) || (
-      trimmed.startsWith(opening) &&
-      !hasStructuralClosingBrace(trimmed.slice(opening.length))
-    )
-  })
+  return trimmed.startsWith('::') && !hasStructuralClosingBrace(trimmed.slice(2))
 }
 
 export function parseCodexDirectiveText(
@@ -241,7 +293,7 @@ export function parseCodexDirectiveText(
     if (
       isFinalLine &&
       options.suppressIncompleteTrailingDirective === true &&
-      isIncompleteSupportedDirective(line)
+      isIncompleteTrailingDirective(line)
     ) {
       removedLineIndexes.add(index)
       continue
@@ -303,6 +355,10 @@ export function codexDirectiveLabel(
   translate: DirectiveTranslate,
 ): string {
   switch (directive.kind) {
+    case 'generic':
+      return translate('Codex directive: {name}', { name: directive.name })
+    case 'invalid':
+      return translate('Directive format error')
     case 'git-stage':
       return translate('Changes staged')
     case 'git-commit':
@@ -317,6 +373,22 @@ export function codexDirectiveLabel(
       return translate(directive.threadId ? 'New task created' : 'New task queued')
     case 'code-comment':
       return translate('Code comment: {title}', { title: directive.title })
+  }
+}
+
+export function codexDirectiveInvalidReason(
+  directive: Extract<UiCodexDirective, { kind: 'invalid' }>,
+  translate: DirectiveTranslate,
+): string {
+  switch (directive.reason) {
+    case 'invalid-name':
+      return translate('Invalid directive name')
+    case 'invalid-syntax':
+      return translate('Invalid directive syntax')
+    case 'invalid-schema':
+      return translate('Invalid directive fields')
+    case 'incomplete':
+      return translate('Incomplete directive output')
   }
 }
 
@@ -355,6 +427,23 @@ export function codexDirectiveExportLines(
   translate: DirectiveTranslate,
 ): string[] {
   switch (directive.kind) {
+    case 'generic':
+      return [
+        `- ${codexDirectiveLabel(
+          { ...directive, name: escapeMarkdown(directive.name) },
+          translate,
+        )}`,
+        ...directive.attributes.map(({ key, value }) =>
+          `  - ${escapeMarkdown(key)}: ${escapeMarkdown(value)}`),
+      ]
+    case 'invalid':
+      return [
+        `- ${codexDirectiveLabel(directive, translate)}`,
+        ...(directive.name
+          ? [`  - ${translate('Directive name')}: ${escapeMarkdown(directive.name)}`]
+          : []),
+        `  - ${codexDirectiveInvalidReason(directive, translate)}`,
+      ]
     case 'git-stage':
     case 'git-commit':
       return [
