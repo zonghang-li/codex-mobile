@@ -148,7 +148,11 @@ function observedCompleted(
   }
 }
 
-function monitorFixture(options: { now?: number; cursorLimit?: number } = {}) {
+function monitorFixture(options: {
+  now?: number
+  cursorLimit?: number
+  onLifecycle?: (event: ObservedTurnLifecycle) => void | Promise<void>
+} = {}) {
   const system = new FakeMonitorSystem()
   const events: ObservedTurnLifecycle[] = []
   const warnings: string[] = []
@@ -161,7 +165,7 @@ function monitorFixture(options: { now?: number; cursorLimit?: number } = {}) {
     system,
     now: () => now,
     cursorLimit: options.cursorLimit,
-    onLifecycle: (event) => { events.push(event) },
+    onLifecycle: options.onLifecycle ?? ((event) => { events.push(event) }),
     warn: (message) => { warnings.push(message) },
     setTimer: (callback) => {
       scheduled.push(callback)
@@ -270,7 +274,37 @@ describe('ExternalTurnMonitor', () => {
     ])
   })
 
-  it('tracks two rollouts and reads no payload bytes from unchanged files', async () => {
+  it('does not replay an older completed turn after a newer turn completes', async () => {
+    const fixture = monitorFixture()
+    const rollout = fixture.system.add(
+      '/sessions/rollout-1.jsonl',
+      sessionMeta('thread-1') + started('turn-1', 1_000),
+      '1',
+    )
+    await fixture.monitor.start()
+    fixture.system.append(
+      rollout,
+      completed('turn-1', 2_000, 1_000)
+        + started('turn-2', 3_000)
+        + completed('turn-2', 4_000, 1_000),
+    )
+    await fixture.runScheduledScan()
+
+    fixture.system.append(
+      rollout,
+      started('turn-1', 1_000) + completed('turn-1', 2_000, 1_000),
+    )
+    await fixture.runScheduledScan()
+
+    expect(fixture.events.map((event) => `${event.turnId}:${event.status}`)).toEqual([
+      'turn-1:inProgress',
+      'turn-1:completed',
+      'turn-2:inProgress',
+      'turn-2:completed',
+    ])
+  })
+
+  it('tracks two rollouts and limits unchanged-file reads to bounded checkpoints', async () => {
     const fixture = monitorFixture()
     fixture.system.add('/sessions/a.jsonl', sessionMeta('a') + started('ta', 1_000), '1')
     fixture.system.add('/sessions/b.jsonl', sessionMeta('b') + started('tb', 2_000), '2')
@@ -283,7 +317,11 @@ describe('ExternalTurnMonitor', () => {
       observedStarted('a', 'ta', 1_000),
       observedStarted('b', 'tb', 2_000),
     ])
-    expect(fixture.system.readCalls).toEqual([])
+    expect(new Set(fixture.system.readCalls.map(({ path }) => path))).toEqual(new Set([
+      '/sessions/a.jsonl',
+      '/sessions/b.jsonl',
+    ]))
+    expect(fixture.system.readCalls.every(({ length }) => length <= 256)).toBe(true)
   })
 
   it('drops a cursor on file replacement or truncation without replaying history', async () => {
@@ -305,6 +343,25 @@ describe('ExternalTurnMonitor', () => {
     expect(fixture.events).toEqual([observedStarted('thread-1', 'turn-1', 1_000)])
   })
 
+  it('detects truncate-and-regrow on the same inode using a bounded checkpoint', async () => {
+    const fixture = monitorFixture()
+    const rollout = fixture.system.add(
+      '/sessions/rollout-1.jsonl',
+      sessionMeta('thread-1') + started('turn-1', 1_000),
+      '1',
+    )
+    await fixture.monitor.start()
+
+    rollout.bytes = Buffer.from(sessionMeta('thread-1') + started('turn-2', 2_000))
+    fixture.system.writers = [fixture.system.writer(rollout)]
+    await fixture.runScheduledScan()
+
+    expect(fixture.events).toEqual([
+      observedStarted('thread-1', 'turn-1', 1_000),
+      observedStarted('thread-1', 'turn-2', 2_000),
+    ])
+  })
+
   it('rejects an unsafe identity and never infers terminal from writer disappearance', async () => {
     const fixture = monitorFixture()
     const rollout = fixture.system.add(
@@ -323,27 +380,52 @@ describe('ExternalTurnMonitor', () => {
     expect(fixture.events).toEqual([observedStarted('thread-1', 'turn-1', 1_000)])
   })
 
-  it('bounds cursor state at 256 and prefers evicting inactive cursors', async () => {
+  it('never registers or emits more active cursors than the cursor limit', async () => {
     const fixture = monitorFixture({ cursorLimit: 256 })
     for (let index = 0; index < 257; index += 1) {
       fixture.system.add(
         `/sessions/${index}.jsonl`,
-        sessionMeta(`thread-${index}`)
-          + started(`turn-${index}`, index)
-          + (index === 0 ? completed('turn-0', 10, 10) : ''),
+        sessionMeta(`thread-${index}`) + started(`turn-${index}`, index),
         `${index}`,
       )
     }
     await fixture.monitor.start()
-    fixture.system.writers = []
-    fixture.system.readCalls.length = 0
+    expect(fixture.events).toHaveLength(256)
+    expect(new Set(fixture.system.readCalls.map(({ path }) => path)).size).toBe(256)
 
-    const oldestActive = fixture.system.files.get('/sessions/1.jsonl')!
-    fixture.system.append(oldestActive, completed('turn-1', 601_000, 600_999))
     await fixture.runScheduledScan()
+    expect(fixture.events).toHaveLength(256)
+    expect(new Set(fixture.system.readCalls.map(({ path }) => path)).size).toBe(256)
+  })
 
-    expect(fixture.events.some((event) => event.turnId === 'turn-1' && event.status === 'completed'))
-      .toBe(true)
+  it('retries a terminal callback rejection without losing the completion offset', async () => {
+    const events: ObservedTurnLifecycle[] = []
+    let rejectTerminal = true
+    const fixture = monitorFixture({
+      onLifecycle: async (event) => {
+        if (event.method === 'turn/completed' && rejectTerminal) {
+          throw new Error('temporary callback failure')
+        }
+        events.push(event)
+      },
+    })
+    const rollout = fixture.system.add(
+      '/sessions/rollout-1.jsonl',
+      sessionMeta('thread-1') + started('turn-1', 1_000),
+      '1',
+    )
+    await fixture.monitor.start()
+    fixture.system.append(rollout, completed('turn-1', 601_000, 600_000))
+
+    await fixture.runScheduledScan()
+    expect(events).toEqual([observedStarted('thread-1', 'turn-1', 1_000)])
+
+    rejectTerminal = false
+    await fixture.runScheduledScan()
+    expect(events).toEqual([
+      observedStarted('thread-1', 'turn-1', 1_000),
+      observedCompleted('thread-1', 'turn-1', 601_000, 600_000),
+    ])
   })
 
   it('serializes scheduled scans and clears the timer on dispose', async () => {
