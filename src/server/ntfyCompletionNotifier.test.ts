@@ -9,6 +9,7 @@ import {
   summarizeAssistantResponse,
   type NtfySendRequest,
 } from './ntfyCompletionNotifier'
+import type { ObservedTurnLifecycle } from './externalTurnMonitor'
 
 afterEach(() => {
   vi.unstubAllGlobals()
@@ -41,6 +42,24 @@ function started(threadId = 'thread-1', turnId = 'turn-1'): TestNotification {
 
 function completed(status = 'completed', threadId = 'thread-1', turnId = 'turn-1'): TestNotification {
   return { method: 'turn/completed', params: { threadId, turn: { id: turnId, status } } }
+}
+
+function observedStarted(
+  threadId = 'thread-1',
+  turnId = 'turn-1',
+  occurredAt = 1_000,
+): ObservedTurnLifecycle {
+  return { method: 'turn/started', threadId, turnId, status: 'inProgress', occurredAt }
+}
+
+function observedCompleted(
+  threadId = 'thread-1',
+  turnId = 'turn-1',
+  occurredAt = 601_000,
+  durationMs = 600_000,
+  status: 'completed' | 'interrupted' = 'completed',
+): ObservedTurnLifecycle {
+  return { method: 'turn/completed', threadId, turnId, status, occurredAt, durationMs }
 }
 
 function harness(options: {
@@ -129,6 +148,80 @@ describe('long-turn notification decisions', () => {
     expect(fixture.store.saves).toHaveLength(0)
     expect(fixture.readThread).not.toHaveBeenCalled()
     expect(fixture.send).not.toHaveBeenCalled()
+  })
+
+  it('qualifies an observed turn using authoritative timestamps', async () => {
+    const fixture = harness({ now: () => 9_999_999 })
+    await fixture.notifier.start()
+    fixture.notifier.handleObserved(observedStarted())
+    fixture.notifier.handleObserved(observedCompleted())
+    await fixture.notifier.dispose()
+    expect(fixture.send).toHaveBeenCalledTimes(1)
+  })
+
+  it.each([
+    [599_999, 600_999, 0],
+    [600_000, 601_000, 1],
+  ] as const)(
+    'uses authoritative observed timestamps at the %i millisecond boundary',
+    async (durationMs, occurredAt, expectedSends) => {
+      const fixture = harness({ now: () => 9_999_999 })
+      await fixture.notifier.start()
+      fixture.notifier.handleObserved(observedStarted())
+      fixture.notifier.handleObserved(observedCompleted(
+        'thread-1',
+        'turn-1',
+        occurredAt,
+        durationMs,
+      ))
+      await fixture.notifier.dispose()
+      expect(fixture.send).toHaveBeenCalledTimes(expectedSends)
+    },
+  )
+
+  it('deduplicates direct and external observations for one turn', async () => {
+    let now = 1_000
+    const fixture = harness({ now: () => now })
+    await fixture.notifier.start()
+    fixture.notifier.handle(started())
+    fixture.notifier.handleObserved(observedStarted())
+    now = 601_000
+    fixture.notifier.handleObserved(observedCompleted())
+    fixture.notifier.handle(completed())
+    await fixture.notifier.dispose()
+    expect(fixture.send).toHaveBeenCalledTimes(1)
+  })
+
+  it('keeps an earlier authoritative start observed after a direct start', async () => {
+    const fixture = harness({ now: () => 5_000 })
+    await fixture.notifier.start()
+    fixture.notifier.handle(started())
+    fixture.notifier.handleObserved(observedStarted())
+    fixture.notifier.handleObserved(observedCompleted())
+    await fixture.notifier.dispose()
+    expect(fixture.send).toHaveBeenCalledTimes(1)
+    expect(fixture.store.saves.some((state) => state.active[0]?.startedAt === 1_000)).toBe(true)
+  })
+
+  it('uses the interrupted title and fallback for an observed turn', async () => {
+    const fixture = harness({
+      now: () => 9_999_999,
+      readThread: async () => ({ thread: { turns: [] } }),
+    })
+    await fixture.notifier.start()
+    fixture.notifier.handleObserved(observedStarted())
+    fixture.notifier.handleObserved(observedCompleted(
+      'thread-1',
+      'turn-1',
+      601_000,
+      600_000,
+      'interrupted',
+    ))
+    await fixture.notifier.dispose()
+    expect(fixture.send.mock.calls[0]?.[0].record).toMatchObject({
+      title: 'Codex 任务已中断',
+      message: '任务已中断。',
+    })
   })
 
   it('does not read or send at 599,999 milliseconds', async () => {

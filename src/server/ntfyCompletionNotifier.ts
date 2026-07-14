@@ -6,6 +6,7 @@ import {
   type NtfyNotifierState,
   type PendingNtfyRecord,
 } from '../safe/ntfyState'
+import type { ObservedTurnLifecycle } from './externalTurnMonitor'
 
 export const NTFY_MIN_DURATION_MS = 600_000
 export const NTFY_SUMMARY_MAX_LENGTH = 180
@@ -183,9 +184,17 @@ export class NtfyCompletionNotifier {
     if (!this.started) return
     const event = readEvent(notification)
     if (!event) return
-    const receivedAt = this.now()
+    this.enqueueLifecycle(event, this.now())
+  }
+
+  handleObserved(event: ObservedTurnLifecycle): void {
+    if (!this.started) return
+    this.enqueueLifecycle(event, event.occurredAt)
+  }
+
+  private enqueueLifecycle(event: TurnEvent, occurredAt: number): void {
     this.enqueue(async () => {
-      await this.processNotification(event, receivedAt)
+      await this.processNotification(event, occurredAt)
       this.requestDrain()
     })
   }
@@ -222,7 +231,16 @@ export class NtfyCompletionNotifier {
 
     if (event.method === 'turn/started') {
       const active = this.state.active.find((record) => record.key === key)
-      if (active) return
+      if (active) {
+        if (receivedAt >= active.startedAt) return
+        await this.persistState(boundNtfyState({
+          ...this.state,
+          active: this.state.active.map((record) => record.key === key
+            ? { ...record, startedAt: receivedAt }
+            : record),
+        }))
+        return
+      }
       if (this.state.sent.some((record) => record.key === key)) return
       await this.persistState(boundNtfyState({
         ...this.state,
