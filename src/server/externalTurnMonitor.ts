@@ -11,6 +11,8 @@ export const EXTERNAL_TURN_SCAN_INTERVAL_MS = 15_000
 const READ_CHUNK_BYTES = 64 * 1024
 const MAX_TRAILING_BYTES = 256 * 1024
 const DEFAULT_CURSOR_LIMIT = 256
+const CHECKPOINT_BYTES = 256
+const RECENT_TURN_LIMIT = 256
 
 export type ObservedTurnLifecycle = {
   method: 'turn/started' | 'turn/completed'
@@ -47,9 +49,12 @@ type RolloutCursor = {
   ino: string
   offset: number
   trailing: Buffer
+  checkpoint: Buffer
   threadId: string
   activeTurn: { turnId: string; startedAt: number } | null
-  lastTerminalTurnId: string
+  recentTerminalTurnIds: Set<string>
+  recentTerminalTurnOrder: string[]
+  pendingInitialLifecycle: Exclude<ParsedRolloutRecord, { kind: 'session' }> | null
   lastObservedAt: number
 }
 
@@ -111,8 +116,17 @@ export function createExternalTurnMonitor(
     await options.onLifecycle(event)
   }
 
+  function rememberTerminal(cursor: RolloutCursor, turnId: string): void {
+    if (cursor.recentTerminalTurnIds.has(turnId)) return
+    cursor.recentTerminalTurnIds.add(turnId)
+    cursor.recentTerminalTurnOrder.push(turnId)
+    while (cursor.recentTerminalTurnOrder.length > RECENT_TURN_LIMIT) {
+      const oldest = cursor.recentTerminalTurnOrder.shift()
+      if (oldest) cursor.recentTerminalTurnIds.delete(oldest)
+    }
+  }
+
   async function applyRecord(cursor: RolloutCursor, record: ParsedRolloutRecord): Promise<void> {
-    cursor.lastObservedAt = now()
     if (record.kind === 'session') {
       if (!cursor.threadId) cursor.threadId = record.threadId
       return
@@ -122,9 +136,8 @@ export function createExternalTurnMonitor(
     if (record.kind === 'started') {
       if (
         cursor.activeTurn?.turnId === record.turnId
-        || cursor.lastTerminalTurnId === record.turnId
+        || cursor.recentTerminalTurnIds.has(record.turnId)
       ) return
-      cursor.activeTurn = { turnId: record.turnId, startedAt: record.occurredAt }
       await emit({
         method: 'turn/started',
         threadId: cursor.threadId,
@@ -132,8 +145,12 @@ export function createExternalTurnMonitor(
         status: 'inProgress',
         occurredAt: record.occurredAt,
       })
+      cursor.activeTurn = { turnId: record.turnId, startedAt: record.occurredAt }
+      cursor.lastObservedAt = now()
       return
     }
+
+    if (cursor.recentTerminalTurnIds.has(record.turnId)) return
 
     if (cursor.activeTurn?.turnId === record.turnId) {
       await emit({
@@ -145,7 +162,8 @@ export function createExternalTurnMonitor(
         ...(record.durationMs === null ? {} : { durationMs: record.durationMs }),
       })
       cursor.activeTurn = null
-      cursor.lastTerminalTurnId = record.turnId
+      rememberTerminal(cursor, record.turnId)
+      cursor.lastObservedAt = now()
       return
     }
 
@@ -154,8 +172,7 @@ export function createExternalTurnMonitor(
       ? null
       : record.occurredAt - durationMs
     if (
-      cursor.lastTerminalTurnId !== record.turnId
-      && durationMs !== null
+      durationMs !== null
       && reconstructedStart !== null
       && record.occurredAt >= monitorStartedAt
       && reconstructedStart <= monitorStartedAt
@@ -167,6 +184,8 @@ export function createExternalTurnMonitor(
         status: 'inProgress',
         occurredAt: reconstructedStart,
       })
+      cursor.activeTurn = { turnId: record.turnId, startedAt: reconstructedStart }
+      cursor.lastObservedAt = now()
       await emit({
         method: 'turn/completed',
         threadId: cursor.threadId,
@@ -175,7 +194,9 @@ export function createExternalTurnMonitor(
         occurredAt: record.occurredAt,
         durationMs,
       })
-      cursor.lastTerminalTurnId = record.turnId
+      cursor.activeTurn = null
+      rememberTerminal(cursor, record.turnId)
+      cursor.lastObservedAt = now()
     }
   }
 
@@ -308,6 +329,7 @@ export function createExternalTurnMonitor(
     }
     const revalidated = await system.statFile(writer.path)
     if (!hasStableIdentity(revalidated, stableIdentity) || revalidated.size < stableIdentity.size) return
+    const checkpoint = await readCheckpoint(stableIdentity, stableIdentity.size)
 
     const cursor: RolloutCursor = {
       key: `${writer.dev}:${writer.ino}`,
@@ -316,16 +338,63 @@ export function createExternalTurnMonitor(
       ino: writer.ino,
       offset: stableIdentity.size,
       trailing: tail.trailing,
+      checkpoint,
       threadId,
       activeTurn: null,
-      lastTerminalTurnId: '',
+      recentTerminalTurnIds: new Set(),
+      recentTerminalTurnOrder: [],
+      pendingInitialLifecycle: tail.latestLifecycle,
       lastObservedAt: now(),
     }
     cursors.set(cursor.key, cursor)
-    if (tail.latestLifecycle) await applyRecord(cursor, tail.latestLifecycle)
+    await applyPendingInitialLifecycle(cursor)
     if (revalidated.size > cursor.offset && !await readForward(cursor, revalidated.size)) {
       cursors.delete(cursor.key)
     }
+  }
+
+  async function applyPendingInitialLifecycle(cursor: RolloutCursor): Promise<void> {
+    const pending = cursor.pendingInitialLifecycle
+    if (!pending) return
+    await applyRecord(cursor, pending)
+    cursor.pendingInitialLifecycle = null
+  }
+
+  async function readCheckpoint(
+    identity: RuntimeFileIdentity,
+    offset: number,
+  ): Promise<Buffer> {
+    const length = Math.min(CHECKPOINT_BYTES, offset)
+    if (length === 0) return Buffer.alloc(0)
+    const checkpoint = await system.readRange(
+      identity.path,
+      offset - length,
+      length,
+      identity,
+    )
+    if (checkpoint.length !== length) throw new Error('Unable to read external rollout')
+    return Buffer.from(checkpoint)
+  }
+
+  async function hasMatchingCheckpoint(
+    cursor: RolloutCursor,
+    identity: RuntimeFileIdentity,
+  ): Promise<boolean> {
+    if (cursor.checkpoint.length === 0) return true
+    const checkpoint = await system.readRange(
+      cursor.path,
+      cursor.offset - cursor.checkpoint.length,
+      cursor.checkpoint.length,
+      identity,
+    )
+    return checkpoint.equals(cursor.checkpoint)
+  }
+
+  function appendCheckpoint(cursor: RolloutCursor, chunk: Buffer): void {
+    const bytes = cursor.checkpoint.length > 0
+      ? Buffer.concat([cursor.checkpoint, chunk])
+      : chunk
+    cursor.checkpoint = Buffer.from(bytes.subarray(Math.max(0, bytes.length - CHECKPOINT_BYTES)))
   }
 
   async function readForward(cursor: RolloutCursor, size: number): Promise<boolean> {
@@ -334,24 +403,22 @@ export function createExternalTurnMonitor(
       const length = Math.min(READ_CHUNK_BYTES, size - cursor.offset)
       const chunk = await system.readRange(cursor.path, cursor.offset, length, identity)
       if (chunk.length === 0) return false
-      cursor.offset += chunk.length
       if (!await applyChunk(cursor, chunk)) return false
+      appendCheckpoint(cursor, chunk)
+      cursor.offset += chunk.length
     }
     const revalidated = await system.statFile(cursor.path)
     return hasStableIdentity(revalidated, cursor) && revalidated.size >= cursor.offset
   }
 
-  function evictToLimit(): void {
-    if (cursors.size <= cursorLimit) return
-    const candidates = [...cursors.values()].sort((left, right) => {
-      const leftActive = left.activeTurn ? 1 : 0
-      const rightActive = right.activeTurn ? 1 : 0
-      return leftActive - rightActive || left.lastObservedAt - right.lastObservedAt
-    })
-    for (const cursor of candidates) {
-      if (cursors.size <= cursorLimit) break
-      cursors.delete(cursor.key)
-    }
+  function makeRoomForCursor(): boolean {
+    if (cursors.size < cursorLimit) return true
+    const inactive = [...cursors.values()]
+      .filter((cursor) => !cursor.activeTurn && !cursor.pendingInitialLifecycle)
+      .sort((left, right) => left.lastObservedAt - right.lastObservedAt)[0]
+    if (!inactive) return false
+    cursors.delete(inactive.key)
+    return true
   }
 
   async function scan(): Promise<void> {
@@ -367,17 +434,25 @@ export function createExternalTurnMonitor(
         !identity
         || !hasStableIdentity(identity, cursor)
         || identity.size < cursor.offset
-        || (identity.size > cursor.offset && !await readForward(cursor, identity.size))
       ) {
+        cursors.delete(cursor.key)
+        continue
+      }
+      const stableIdentity = identityFor(cursor, identity.size)
+      if (!await hasMatchingCheckpoint(cursor, stableIdentity)) {
+        cursors.delete(cursor.key)
+        continue
+      }
+      await applyPendingInitialLifecycle(cursor)
+      if (identity.size > cursor.offset && !await readForward(cursor, identity.size)) {
         cursors.delete(cursor.key)
       }
     }
 
     for (const writer of writers) {
       const key = `${writer.dev}:${writer.ino}`
-      if (!cursors.has(key)) await register(writer)
+      if (!cursors.has(key) && makeRoomForCursor()) await register(writer)
     }
-    evictToLimit()
   }
 
   async function runAndSchedule(): Promise<void> {
