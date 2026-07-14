@@ -31,6 +31,9 @@ class FakeMonitorSystem implements ExternalRuntimeSystem {
   blockReads: Promise<void> | null = null
   beforeDiscovery: (() => void) | null = null
   discoveryComplete: boolean | void = undefined
+  readonly resolvedPaths = new Map<string, string>()
+  readonly realpathFailures = new Map<string, number>()
+  readonly statFailures = new Map<string, number>()
 
   add(path: string, value = '', ino = path): FakeFile {
     const file = { path, bytes: Buffer.from(value), dev: '8', ino, regular: true }
@@ -54,10 +57,20 @@ class FakeMonitorSystem implements ExternalRuntimeSystem {
   }
 
   async realpath(path: string): Promise<string> {
-    return path
+    const failures = this.realpathFailures.get(path) ?? 0
+    if (failures > 0) {
+      this.realpathFailures.set(path, failures - 1)
+      throw Object.assign(new Error('candidate canonicalization failed'), { code: 'EACCES' })
+    }
+    return this.resolvedPaths.get(path) ?? path
   }
 
   async statFile(path: string): Promise<RuntimeFileIdentity & { regular: boolean }> {
+    const failures = this.statFailures.get(path) ?? 0
+    if (failures > 0) {
+      this.statFailures.set(path, failures - 1)
+      throw Object.assign(new Error('candidate stat failed'), { code: 'ENOENT' })
+    }
     const file = this.files.get(path)
     if (!file) throw Object.assign(new Error('missing'), { code: 'ENOENT' })
     return {
@@ -557,6 +570,45 @@ describe('ExternalTurnMonitor', () => {
       observedCompleted('tracked-thread', 'tracked-turn', 601_000, 600_000),
     ])
   })
+
+  it.each(['realpath', 'stat'] as const)(
+    'retains an aged tracked cursor when candidate %s validation rejects',
+    async (failure) => {
+      let time = 1_000
+      const fixture = monitorFixture({ now: () => time, inactiveExpiryMs: 100 })
+      const rollout = fixture.system.add(
+        '/sessions/tracked.jsonl',
+        sessionMeta('tracked-thread') + started('tracked-turn', 1_000),
+        'tracked',
+      )
+      await fixture.monitor.start()
+
+      if (failure === 'realpath') {
+        const alias = '/proc/42/fd/7'
+        fixture.system.resolvedPaths.set(alias, rollout.path)
+        fixture.system.realpathFailures.set(alias, 1)
+        fixture.system.writers = [{ ...fixture.system.writer(rollout), path: alias }]
+      } else {
+        fixture.system.beforeDiscovery = () => {
+          fixture.system.beforeDiscovery = null
+          fixture.system.statFailures.set(rollout.path, 1)
+        }
+      }
+      time += 100
+      await fixture.runScheduledScan()
+      expect(fixture.events).toEqual([
+        observedStarted('tracked-thread', 'tracked-turn', 1_000),
+      ])
+
+      fixture.system.append(rollout, completed('tracked-turn', 601_000, 600_000))
+      await fixture.runScheduledScan()
+
+      expect(fixture.events).toEqual([
+        observedStarted('tracked-thread', 'tracked-turn', 1_000),
+        observedCompleted('tracked-thread', 'tracked-turn', 601_000, 600_000),
+      ])
+    },
+  )
 
   it('exports a 24-hour production inactive-expiry default', () => {
     expect(EXTERNAL_TURN_INACTIVE_EXPIRY_MS).toBe(24 * 60 * 60 * 1_000)

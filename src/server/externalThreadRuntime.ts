@@ -622,16 +622,28 @@ export async function discoverExternalRolloutWriterSnapshot(
   while (true) {
     const next = await iterator.next()
     if (next.done) {
-      complete = next.value !== false
+      complete = complete && next.value !== false
       break
     }
     const fd = next.value
     if (fd.uid !== system.uid || belongsToExcludedProcessTree(fd, excludedPid)) continue
     if (!isCodexAppServerCommand(fd.cmdline) || !isWritableDescriptor(fd.flags)) continue
-    const path = await system.realpath(fd.path).catch(() => '')
+    let path: string
+    try {
+      path = await system.realpath(fd.path)
+    } catch {
+      complete = false
+      continue
+    }
     if (!path.endsWith('.jsonl') || !isContainedPath(canonicalRoot, path)) continue
-    const identity = await system.statFile(path).catch(() => null)
-    if (!identity?.regular || identity.dev !== fd.dev || identity.ino !== fd.ino) continue
+    let identity: RuntimeFileIdentity & { regular: boolean }
+    try {
+      identity = await system.statFile(path)
+    } catch {
+      complete = false
+      continue
+    }
+    if (!identity.regular || identity.dev !== fd.dev || identity.ino !== fd.ino) continue
     const key = `${identity.dev}:${identity.ino}`
     if (!writers.has(key)) {
       writers.set(key, {

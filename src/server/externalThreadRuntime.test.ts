@@ -255,7 +255,10 @@ describe('discoverExternalRolloutWriters', () => {
       fds: [writerFd({ path: outsidePath })],
     })
 
-    await expect(discoverExternalRolloutWriters(sessionsRoot, null, system)).resolves.toEqual([])
+    await expect(discoverExternalRolloutWriterSnapshot(sessionsRoot, null, system)).resolves.toEqual({
+      writers: [],
+      complete: true,
+    })
   })
 
   it('rejects non-JSONL files', async () => {
@@ -265,19 +268,28 @@ describe('discoverExternalRolloutWriters', () => {
       fds: [writerFd({ path: textPath })],
     })
 
-    await expect(discoverExternalRolloutWriters(sessionsRoot, null, system)).resolves.toEqual([])
+    await expect(discoverExternalRolloutWriterSnapshot(sessionsRoot, null, system)).resolves.toEqual({
+      writers: [],
+      complete: true,
+    })
   })
 
   it('rejects non-regular files', async () => {
     const system = fakeRuntimeSystem({ regular: false, fds: [writerFd()] })
 
-    await expect(discoverExternalRolloutWriters(sessionsRoot, null, system)).resolves.toEqual([])
+    await expect(discoverExternalRolloutWriterSnapshot(sessionsRoot, null, system)).resolves.toEqual({
+      writers: [],
+      complete: true,
+    })
   })
 
   it('rejects a descriptor whose target identity does not match', async () => {
     const system = fakeRuntimeSystem({ fds: [writerFd({ ino: '22' })] })
 
-    await expect(discoverExternalRolloutWriters(sessionsRoot, null, system)).resolves.toEqual([])
+    await expect(discoverExternalRolloutWriterSnapshot(sessionsRoot, null, system)).resolves.toEqual({
+      writers: [],
+      complete: true,
+    })
   })
 
   it('discovers the canonical target resolved from a stable proc descriptor', async () => {
@@ -347,6 +359,31 @@ describe('discoverExternalRolloutWriters', () => {
     await expect(discoverExternalRolloutWriterSnapshot(sessionsRoot, null, system)).resolves.toMatchObject({
       writers: [{ path: rolloutPath, dev: '8', ino: '21', size: 0, pid: 42 }],
       complete: true,
+    })
+  })
+
+  it('marks discovery incomplete when candidate canonicalization rejects', async () => {
+    const system = fakeRuntimeSystem({ fds: [writerFd()] })
+    vi.spyOn(system, 'realpath').mockImplementation(async (path) => {
+      if (path === rolloutPath) throw Object.assign(new Error('permission denied'), { code: 'EACCES' })
+      return path
+    })
+
+    await expect(discoverExternalRolloutWriterSnapshot(sessionsRoot, null, system)).resolves.toEqual({
+      writers: [],
+      complete: false,
+    })
+  })
+
+  it('marks discovery incomplete when candidate stat rejects', async () => {
+    const system = fakeRuntimeSystem({ fds: [writerFd()] })
+    vi.spyOn(system, 'statFile').mockRejectedValue(
+      Object.assign(new Error('descriptor disappeared'), { code: 'ENOENT' }),
+    )
+
+    await expect(discoverExternalRolloutWriterSnapshot(sessionsRoot, null, system)).resolves.toEqual({
+      writers: [],
+      complete: false,
     })
   })
 })
