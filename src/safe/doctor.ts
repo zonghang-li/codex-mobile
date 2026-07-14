@@ -41,10 +41,15 @@ export function inspectSafeSources(sources: SafeSourceSet): DoctorResult {
   requireText(failures, sources.ntfyConfig, 'url.hash', 'ntfy configuration must reject URL fragments')
   requireText(failures, sources.ntfyConfig, '!/^\\/[A-Za-z0-9_-]+$/u.test(url.pathname)', 'ntfy configuration must require one strict topic segment')
   requireText(failures, sources.bridge, 'readThreadForNotifier', 'Bridge must keep notifier thread reads internal')
+  requireText(failures, sources.bridge, 'getAppServerPidForNotifier', 'Bridge must keep the notifier app-server PID internal')
+  requireText(failures, sources.bridge, 'getSessionsRootForNotifier', 'Bridge must keep the notifier sessions root internal')
   requireText(failures, sources.httpServer, 'options.ntfyNotifications', 'HTTP server must keep ntfy wiring optional')
   requireText(failures, sources.httpServer, 'createNtfyNotifierLifecycle', 'HTTP server must own the optional ntfy lifecycle')
   requireText(failures, sources.httpServer, 'bridge.subscribeNotifications', 'HTTP server must explicitly subscribe the enabled notifier')
   requireText(failures, sources.httpServer, 'NtfyCompletionNotifier', 'HTTP server must use the bounded completion notifier')
+  requireText(failures, sources.httpServer, 'createExternalTurnMonitor', 'HTTP server must own external turn monitoring')
+  requireText(failures, sources.httpServer, 'getSessionsRootForNotifier', 'External turn monitoring must use the canonical sessions root')
+  requireText(failures, sources.httpServer, 'onLifecycle: (event) => notifier.handleObserved(event)', 'External turn lifecycle must route into the notifier')
   requireText(failures, sources.securityPolicy, 'backgroundIntegrationsEnabled: false', 'Safe policy must keep background integrations disabled')
   return { ok: failures.length === 0, failures }
 }
