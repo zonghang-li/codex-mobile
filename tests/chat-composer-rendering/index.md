@@ -30,6 +30,7 @@ Return to the [manual test index](../../tests.md).
 | [Feature: Backticked bare filenames render as file links](backticked-bare-filenames-render-as-file-links.md) |
 | [Feature: Lazy message rendering (windowed conversation)](lazy-message-rendering-windowed-conversation.md) |
 | [Feature: Mobile thread single tap and terminal status](mobile-thread-single-tap-and-terminal-status.md) |
+| [Selected idle desktop turn live sync](selected-idle-desktop-turn-live-sync.md) |
 | [Feature: Mobile output block copy controls](mobile-output-block-copy-controls.md) |
 | [Assistant generated image rendering](assistant-generated-image-rendering.md) |
 | [Stop button activates promptly for new threads](stop-button-activates-promptly-for-new-threads.md) |
