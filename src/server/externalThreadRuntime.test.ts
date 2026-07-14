@@ -1,6 +1,12 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import {
+  createExternalRuntimeSystem,
   discoverExternalRolloutWriters,
+  EXTERNAL_RUNTIME_MAX_DESCRIPTORS_PER_APP_SERVER,
+  EXTERNAL_RUNTIME_MAX_FD_SNAPSHOTS,
+  EXTERNAL_RUNTIME_MAX_NUMERIC_PROCESSES,
+  EXTERNAL_RUNTIME_SCAN_WALL_BUDGET_MS,
+  EXTERNAL_RUNTIME_MAX_ROLLOUT_WRITERS,
   ExternalThreadRuntimeProbe,
   type ExternalRuntimeSystem,
   type RuntimeFdSnapshot,
@@ -70,6 +76,7 @@ class FakeRuntimeSystem implements ExternalRuntimeSystem {
   readonly uid: number | null
   readonly readCalls: Array<{ path: string; offset: number; length: number }> = []
   scanCount = 0
+  snapshotYieldCount = 0
 
   private readonly rollouts: Map<string, MutableFakeRollout>
   private readonly fds: RuntimeFdSnapshot[]
@@ -157,7 +164,10 @@ class FakeRuntimeSystem implements ExternalRuntimeSystem {
   async *listFdSnapshots(): AsyncIterable<RuntimeFdSnapshot> {
     this.scanCount += 1
     if (this.scanError) throw this.scanError
-    yield* this.fds
+    for (const fd of this.fds) {
+      this.snapshotYieldCount += 1
+      yield fd
+    }
   }
 
   append(value: string | Buffer): void {
@@ -269,6 +279,126 @@ describe('discoverExternalRolloutWriters', () => {
       },
     ])
     expect(nodeFs.realpath).toHaveBeenCalledWith('/proc/42/fd/7')
+  })
+
+  it('returns at most 256 unique rollout writers and stops consuming snapshots', async () => {
+    const rollouts = Array.from({ length: 276 }, (_, index) => ({
+      path: `/sessions/${index}.jsonl`,
+      log: '',
+      dev: '8',
+      ino: `${index + 1}`,
+    }))
+    const system = fakeRuntimeSystem({
+      rollouts,
+      fds: rollouts.map((rollout, index) => writerFd({
+        path: rollout.path,
+        ino: rollout.ino,
+        pid: index + 10,
+      })),
+    })
+
+    const writers = await discoverExternalRolloutWriters(sessionsRoot, null, system)
+
+    expect(EXTERNAL_RUNTIME_MAX_ROLLOUT_WRITERS).toBe(256)
+    expect(writers).toHaveLength(256)
+    expect(system.snapshotYieldCount).toBe(256)
+  })
+})
+
+describe('default Linux descriptor discovery work caps', () => {
+  beforeEach(() => {
+    vi.resetAllMocks()
+  })
+
+  it('inspects no more than the numeric process cap', async () => {
+    const pids = Array.from({ length: 16_385 }, (_, index) => index + 2)
+    const uid = typeof process.getuid === 'function' ? process.getuid() : 1000
+    nodeFs.readdir.mockImplementation(async (path: string) => {
+      if (path === '/proc') return pids.map(String)
+      throw new Error(`Unexpected readdir: ${path}`)
+    })
+    nodeFs.readFile.mockImplementation(async (path: string) => {
+      const match = /^\/proc\/(\d+)\/(stat|status|cmdline)$/u.exec(path)
+      if (!match) throw new Error(`Unexpected readFile: ${path}`)
+      const pid = Number.parseInt(match[1], 10)
+      if (match[2] === 'stat') {
+        return procStat({ pid, parentPid: 0, cmdline: '', fds: [] }, BigInt(pid) * 1_000n)
+      }
+      if (match[2] === 'status') return `Name:\tother\nPPid:\t0\nUid:\t${uid}\t${uid}\t${uid}\t${uid}\n`
+      return '/usr/bin/other\0'
+    })
+    const system = createExternalRuntimeSystem({ now: () => 0 })
+
+    for await (const _snapshot of system.listFdSnapshots()) { /* no candidates */ }
+
+    expect(EXTERNAL_RUNTIME_MAX_NUMERIC_PROCESSES).toBe(16_384)
+    const excludedPid = pids.at(-1)
+    expect(nodeFs.readFile).not.toHaveBeenCalledWith(`/proc/${excludedPid}/stat`, 'utf8')
+  })
+
+  it('inspects no more than the descriptor cap for one app-server', async () => {
+    const fds = Array.from(
+      { length: 4_097 },
+      (_, index) => `${index + 3}`,
+    )
+    defaultRuntimeProbe({ processes: [{
+      pid: 42,
+      parentPid: 0,
+      cmdline: '/usr/local/bin/codex\0app-server\0',
+      fds,
+    }] })
+    const system = createExternalRuntimeSystem({ now: () => 0 })
+    let snapshots = 0
+
+    for await (const _snapshot of system.listFdSnapshots()) snapshots += 1
+
+    expect(EXTERNAL_RUNTIME_MAX_DESCRIPTORS_PER_APP_SERVER).toBe(4_096)
+    expect(snapshots).toBe(4_096)
+    expect(nodeFs.stat).not.toHaveBeenCalledWith(`/proc/42/fd/${fds.at(-1)}`, { bigint: true })
+  })
+
+  it('yields no more than the global snapshot cap', async () => {
+    const processes = Array.from({ length: 3 }, (_, processIndex): DefaultRuntimeProcessFixture => ({
+      pid: 42 + processIndex,
+      parentPid: 0,
+      cmdline: '/usr/local/bin/codex\0app-server\0',
+      fds: Array.from(
+        { length: 4_096 },
+        (_, fdIndex) => `${processIndex * 4_096 + fdIndex + 3}`,
+      ),
+    }))
+    defaultRuntimeProbe({ processes })
+    const system = createExternalRuntimeSystem({ now: () => 0 })
+    let snapshots = 0
+
+    for await (const _snapshot of system.listFdSnapshots()) snapshots += 1
+
+    expect(EXTERNAL_RUNTIME_MAX_FD_SNAPSHOTS).toBe(8_192)
+    expect(snapshots).toBe(8_192)
+  })
+
+  it('returns partial results when the scan wall budget is exhausted', async () => {
+    defaultRuntimeProbe({ processes: [{
+      pid: 42,
+      parentPid: 0,
+      cmdline: '/usr/local/bin/codex\0app-server\0',
+      fds: ['3', '4'],
+    }] })
+    let current = 0
+    const system = createExternalRuntimeSystem({
+      now: () => {
+        const value = current
+        current += 5_000
+        return value
+      },
+    })
+    const snapshots: RuntimeFdSnapshot[] = []
+
+    for await (const snapshot of system.listFdSnapshots()) snapshots.push(snapshot)
+
+    expect(EXTERNAL_RUNTIME_SCAN_WALL_BUDGET_MS).toBe(5_000)
+    expect(snapshots).toEqual([])
+    expect(nodeFs.stat).not.toHaveBeenCalled()
   })
 })
 

@@ -6,6 +6,7 @@ import type {
 } from './externalThreadRuntime'
 import {
   createExternalTurnMonitor,
+  EXTERNAL_TURN_INACTIVE_EXPIRY_MS,
   type ObservedTurnLifecycle,
 } from './externalTurnMonitor'
 
@@ -28,6 +29,7 @@ class FakeMonitorSystem implements ExternalRuntimeSystem {
   activeReads = 0
   maxActiveReads = 0
   blockReads: Promise<void> | null = null
+  beforeDiscovery: (() => void) | null = null
 
   add(path: string, value = '', ino = path): FakeFile {
     const file = { path, bytes: Buffer.from(value), dev: '8', ino, regular: true }
@@ -88,6 +90,7 @@ class FakeMonitorSystem implements ExternalRuntimeSystem {
   }
 
   async *listFdSnapshots(): AsyncIterable<RuntimeFdSnapshot> {
+    this.beforeDiscovery?.()
     yield* this.writers
   }
 
@@ -149,8 +152,9 @@ function observedCompleted(
 }
 
 function monitorFixture(options: {
-  now?: number
+  now?: number | (() => number)
   cursorLimit?: number
+  inactiveExpiryMs?: number
   onLifecycle?: (event: ObservedTurnLifecycle) => void | Promise<void>
 } = {}) {
   const system = new FakeMonitorSystem()
@@ -158,13 +162,17 @@ function monitorFixture(options: {
   const warnings: string[] = []
   const scheduled: Array<() => Promise<void>> = []
   const cleared: unknown[] = []
-  const now = options.now ?? 1_000
+  const configuredNow = options.now
+  const now: () => number = typeof configuredNow === 'function'
+    ? configuredNow
+    : () => configuredNow ?? 1_000
   const monitor = createExternalTurnMonitor({
     sessionsRoot,
     excludedPid: 900,
     system,
-    now: () => now,
+    now,
     cursorLimit: options.cursorLimit,
+    inactiveExpiryMs: options.inactiveExpiryMs,
     onLifecycle: options.onLifecycle ?? ((event) => { events.push(event) }),
     warn: (message) => { warnings.push(message) },
     setTimer: (callback) => {
@@ -394,6 +402,103 @@ describe('ExternalTurnMonitor', () => {
     fixture.system.writers = []
     await fixture.runScheduledScan()
     expect(fixture.events).toEqual([observedStarted('thread-1', 'turn-1', 1_000)])
+  })
+
+  it('checks tracked rollouts before starting process discovery', async () => {
+    const fixture = monitorFixture()
+    const rollout = fixture.system.add(
+      '/sessions/rollout-1.jsonl',
+      sessionMeta('thread-1') + started('turn-1', 1_000),
+      '1',
+    )
+    await fixture.monitor.start()
+    fixture.system.append(rollout, completed('turn-1', 601_000, 600_000))
+    fixture.system.readCalls.length = 0
+    fixture.system.beforeDiscovery = () => {
+      expect(fixture.system.readCalls.length).toBeGreaterThan(0)
+    }
+
+    await fixture.runScheduledScan()
+    expect(fixture.events.at(-1)).toEqual(
+      observedCompleted('thread-1', 'turn-1', 601_000, 600_000),
+    )
+  })
+
+  it('retains a missing-writer active cursor before the inactive-expiry boundary', async () => {
+    let time = 1_000
+    const fixture = monitorFixture({ now: () => time, inactiveExpiryMs: 100 })
+    const rollout = fixture.system.add(
+      '/sessions/rollout-1.jsonl',
+      sessionMeta('thread-1') + started('turn-1', 1_000),
+      '1',
+    )
+    await fixture.monitor.start()
+    fixture.system.writers = []
+    time += 99
+    await fixture.runScheduledScan()
+
+    fixture.system.append(rollout, completed('turn-1', 601_000, 600_000))
+    fixture.system.writers = []
+    await fixture.runScheduledScan()
+    expect(fixture.events).toEqual([
+      observedStarted('thread-1', 'turn-1', 1_000),
+      observedCompleted('thread-1', 'turn-1', 601_000, 600_000),
+    ])
+  })
+
+  it('evicts a missing-writer active cursor at expiry without emitting a terminal event', async () => {
+    let time = 1_000
+    const fixture = monitorFixture({ now: () => time, cursorLimit: 1, inactiveExpiryMs: 100 })
+    fixture.system.add(
+      '/sessions/old.jsonl',
+      sessionMeta('old-thread') + started('old-turn', 1_000),
+      '1',
+    )
+    await fixture.monitor.start()
+    fixture.system.writers = []
+    time += 100
+    await fixture.runScheduledScan()
+    expect(fixture.events).toEqual([observedStarted('old-thread', 'old-turn', 1_000)])
+
+    fixture.system.add(
+      '/sessions/new.jsonl',
+      sessionMeta('new-thread') + started('new-turn', time),
+      '2',
+    )
+    await fixture.runScheduledScan()
+    expect(fixture.events).toEqual([
+      observedStarted('old-thread', 'old-turn', 1_000),
+      observedStarted('new-thread', 'new-turn', time),
+    ])
+  })
+
+  it('retains long turns while the writer is live or the rollout keeps growing', async () => {
+    let time = 1_000
+    const fixture = monitorFixture({ now: () => time, inactiveExpiryMs: 100 })
+    const rollout = fixture.system.add(
+      '/sessions/rollout-1.jsonl',
+      sessionMeta('thread-1') + started('turn-1', 1_000),
+      '1',
+    )
+    await fixture.monitor.start()
+
+    time += 100
+    await fixture.runScheduledScan()
+    fixture.system.writers = []
+    time += 100
+    fixture.system.append(rollout, `${JSON.stringify({ type: 'event_msg', payload: { type: 'progress' } })}\n`)
+    await fixture.runScheduledScan()
+    time += 99
+    fixture.system.append(rollout, completed('turn-1', 601_000, 600_000))
+    await fixture.runScheduledScan()
+
+    expect(fixture.events.at(-1)).toEqual(
+      observedCompleted('thread-1', 'turn-1', 601_000, 600_000),
+    )
+  })
+
+  it('exports a 24-hour production inactive-expiry default', () => {
+    expect(EXTERNAL_TURN_INACTIVE_EXPIRY_MS).toBe(24 * 60 * 60 * 1_000)
   })
 
   it('never registers or emits more active cursors than the cursor limit', async () => {

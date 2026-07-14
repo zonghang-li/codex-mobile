@@ -85,7 +85,9 @@ export function createNtfyNotifierLifecycle(options: {
       externalMonitor = createExternalMonitor({
         sessionsRoot: options.bridge.getSessionsRootForNotifier(),
         getExcludedPid: options.bridge.getAppServerPidForNotifier,
-        onLifecycle: (event) => notifier.handleObserved(event),
+        onLifecycle: (event) => {
+          return notifier.handleObserved(event)
+        },
         warn,
       })
       void externalMonitor.start().catch(() => {

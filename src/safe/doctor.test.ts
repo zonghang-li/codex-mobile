@@ -9,7 +9,7 @@ describe('safe doctor', () => {
       bridge: "securityPolicy.isRouteDisabled securityPolicy.isRpcMethodAllowed securityPolicy.terminalInputEnabled readThreadForNotifier getAppServerPidForNotifier getSessionsRootForNotifier appServer.rpc('thread/read', { threadId, includeTurns: true })",
       safeCli: "exposeTailscale(state.port); option('--password-file <path>', 'description'); option('--ntfy-url-file <path>', 'description'); loadNtfyPublishUrl({ explicitPath: options.ntfyUrlFile })",
       ntfyConfig: "url.origin !== 'https://ntfy.sh'; url.username; url.password; url.search; url.hash; !/^\\/[A-Za-z0-9_-]+$/u.test(url.pathname)",
-      httpServer: 'options.ntfyNotifications createNtfyNotifierLifecycle bridge.subscribeNotifications NtfyCompletionNotifier createExternalTurnMonitor getSessionsRootForNotifier onLifecycle: (event) => notifier.handleObserved(event)',
+      httpServer: 'options.ntfyNotifications createNtfyNotifierLifecycle bridge.subscribeNotifications NtfyCompletionNotifier createExternalTurnMonitor getSessionsRootForNotifier return notifier.handleObserved(event)',
       securityPolicy: 'backgroundIntegrationsEnabled: false',
     })
     expect(result).toEqual({ ok: true, failures: [] })
@@ -43,6 +43,20 @@ describe('safe doctor', () => {
     expect(result.failures.join('\n')).toContain('ntfy')
   })
 
+  it('rejects external lifecycle wiring that discards the durable acknowledgement', () => {
+    const result = inspectSafeSources({
+      runtimePolicy: "bindHost: '127.0.0.1'; approvalPolicy: 'on-request'; sandboxMode: 'workspace-write'",
+      featureGate: 'isDisabledRoute isAllowedRpcMethod',
+      bridge: "securityPolicy.isRouteDisabled securityPolicy.isRpcMethodAllowed securityPolicy.terminalInputEnabled readThreadForNotifier getAppServerPidForNotifier getSessionsRootForNotifier appServer.rpc('thread/read', { threadId, includeTurns: true })",
+      safeCli: "exposeTailscale(state.port); option('--password-file <path>', 'description'); option('--ntfy-url-file <path>', 'description'); loadNtfyPublishUrl({ explicitPath: options.ntfyUrlFile })",
+      ntfyConfig: "url.origin !== 'https://ntfy.sh'; url.username; url.password; url.search; url.hash; !/^\\/[A-Za-z0-9_-]+$/u.test(url.pathname)",
+      httpServer: 'options.ntfyNotifications createNtfyNotifierLifecycle bridge.subscribeNotifications NtfyCompletionNotifier createExternalTurnMonitor getSessionsRootForNotifier void notifier.handleObserved(event)',
+      securityPolicy: 'backgroundIntegrationsEnabled: false',
+    })
+
+    expect(result.failures).toContain('External turn lifecycle must return the durable notifier acknowledgement')
+  })
+
   it.each([
     ['url.password', 'password'],
     ['url.hash', 'fragment'],
@@ -54,7 +68,7 @@ describe('safe doctor', () => {
       safeCli: "exposeTailscale(state.port); option('--password-file <path>', 'description'); option('--ntfy-url-file <path>', 'description'); loadNtfyPublishUrl({ explicitPath: options.ntfyUrlFile })",
       ntfyConfig: "url.origin !== 'https://ntfy.sh'; url.username; url.password; url.search; url.hash; !/^\\/[A-Za-z0-9_-]+$/u.test(url.pathname)"
         .replace(`${missingInvariant}; `, ''),
-      httpServer: 'options.ntfyNotifications createNtfyNotifierLifecycle bridge.subscribeNotifications NtfyCompletionNotifier createExternalTurnMonitor getSessionsRootForNotifier onLifecycle: (event) => notifier.handleObserved(event)',
+      httpServer: 'options.ntfyNotifications createNtfyNotifierLifecycle bridge.subscribeNotifications NtfyCompletionNotifier createExternalTurnMonitor getSessionsRootForNotifier return notifier.handleObserved(event)',
       securityPolicy: 'backgroundIntegrationsEnabled: false',
     })
 

@@ -184,16 +184,16 @@ export class NtfyCompletionNotifier {
     if (!this.started) return
     const event = readEvent(notification)
     if (!event) return
-    this.enqueueLifecycle(event, this.now())
+    void this.enqueueLifecycle(event, this.now()).catch(() => undefined)
   }
 
-  handleObserved(event: ObservedTurnLifecycle): void {
-    if (!this.started) return
-    this.enqueueLifecycle(event, event.occurredAt)
+  handleObserved(event: ObservedTurnLifecycle): Promise<void> {
+    if (!this.started) return Promise.resolve()
+    return this.enqueueLifecycle(event, event.occurredAt)
   }
 
-  private enqueueLifecycle(event: TurnEvent, occurredAt: number): void {
-    this.enqueue(async () => {
+  private enqueueLifecycle(event: TurnEvent, occurredAt: number): Promise<void> {
+    return this.enqueue(async () => {
       await this.processNotification(event, occurredAt)
       this.requestDrain()
     })
@@ -203,10 +203,12 @@ export class NtfyCompletionNotifier {
     await this.flushWork()
   }
 
-  private enqueue(task: () => Promise<void>): void {
-    this.work = this.work.then(task).catch(() => {
+  private enqueue(task: () => Promise<void>): Promise<void> {
+    const acknowledged = this.work.then(task)
+    this.work = acknowledged.catch(() => {
       this.warn('Unable to process long-task notification state')
     })
+    return acknowledged
   }
 
   private async flushWork(): Promise<void> {

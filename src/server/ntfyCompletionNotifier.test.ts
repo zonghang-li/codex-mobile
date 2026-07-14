@@ -159,6 +159,57 @@ describe('long-turn notification decisions', () => {
     expect(fixture.send).toHaveBeenCalledTimes(1)
   })
 
+  it('acknowledges an observed lifecycle only after its durable state mutation', async () => {
+    let releaseSave: (() => void) | undefined
+    const store = new MemoryStateStore()
+    store.save = vi.fn(async (state: NtfyNotifierState) => {
+      await new Promise<void>((resolve) => { releaseSave = resolve })
+      store.state = cloneState(state)
+      store.saves.push(cloneState(state))
+    })
+    const fixture = harness({ store })
+    await fixture.notifier.start()
+
+    let acknowledged = false
+    const acknowledgement = fixture.notifier.handleObserved(observedStarted())
+      .then(() => { acknowledged = true })
+    await vi.waitFor(() => expect(releaseSave).toBeTypeOf('function'))
+    expect(acknowledged).toBe(false)
+    expect(store.state.active).toHaveLength(0)
+
+    releaseSave?.()
+    await acknowledgement
+    expect(store.state.active.map(({ key }) => key)).toEqual(['thread-1:turn-1'])
+  })
+
+  it('rejects a failed observed completion acknowledgement and retries it exactly once', async () => {
+    const store = new MemoryStateStore()
+    let failPendingSave = true
+    const originalSave = store.save.bind(store)
+    store.save = vi.fn(async (state: NtfyNotifierState) => {
+      if (state.pending.length > 0 && failPendingSave) {
+        failPendingSave = false
+        throw new Error('temporary pending save failure')
+      }
+      await originalSave(state)
+    })
+    const fixture = harness({ store })
+    await fixture.notifier.start()
+    await fixture.notifier.handleObserved(observedStarted())
+
+    await expect(fixture.notifier.handleObserved(observedCompleted())).rejects.toThrow(
+      'temporary pending save failure',
+    )
+    expect(store.state.active.map(({ key }) => key)).toEqual(['thread-1:turn-1'])
+    expect(fixture.send).not.toHaveBeenCalled()
+
+    await fixture.notifier.handleObserved(observedCompleted())
+    await fixture.notifier.dispose()
+    expect(fixture.send).toHaveBeenCalledTimes(1)
+    expect(store.state.sent.map(({ key }) => key)).toEqual(['thread-1:turn-1'])
+    expect(fixture.warn).toHaveBeenCalledWith('Unable to process long-task notification state')
+  })
+
   it.each([
     [599_999, 600_999, 0],
     [600_000, 601_000, 1],
