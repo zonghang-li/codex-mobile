@@ -38,7 +38,7 @@ pnpm run service:restart
 9. In the deterministic integration harness, deliver the same logical turn once through a direct app-server notification and once through external rollout discovery. Confirm exactly one ntfy send is captured, both observations resolve to the same durable turn key and sequence ID, and no duplicate pending or sent record is created.
 10. Confirm an external completion acknowledgement is withheld until its state save succeeds. Make that save fail once, then verify the monitor retries the same record with one durable start and exactly one send.
 11. Confirm tracked cursors are read before process discovery. A missing-writer cursor remains eligible before 24 hours, is evicted at the 24-hour inactive boundary without a synthetic terminal event, and a live writer or growing file refreshes the appropriate activity clock.
-12. Confirm default Linux discovery stops at 16,384 numeric processes, 4,096 descriptors per app-server, 8,192 yielded snapshots, 256 unique rollout writers, or 5,000 ms wall time. Each capped/deadline result must report incomplete, and omission from it must not expire an aged tracked cursor; only a complete missing-writer scan can release capacity.
+12. Confirm default Linux discovery stops at 16,384 numeric processes, 4,096 descriptors per app-server, 8,192 yielded snapshots, 256 unique rollout writers, or 5,000 ms wall time. Each capped/deadline result and each candidate canonicalization/stat rejection must report incomplete, and omission from it must not expire an aged tracked cursor; only a complete missing-writer scan can release capacity. A successfully validated unsafe candidate remains a conclusive rejection.
 
 ## Cross-client and restart acceptance
 
