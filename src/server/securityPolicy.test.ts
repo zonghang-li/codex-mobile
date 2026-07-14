@@ -141,6 +141,206 @@ describe('server security policy', () => {
     await vi.waitFor(() => expect(notifier.dispose).toHaveBeenCalledTimes(1))
   })
 
+  it('retains direct notifications while notifier startup is pending and delays only the monitor', async () => {
+    const { createNtfyNotifierLifecycle } = await import('./httpServer')
+    let finishStart: (() => void) | undefined
+    let listener: ((notification: { method: string; params: unknown; atIso: string }) => void) | undefined
+    const notifier = {
+      start: vi.fn(() => new Promise<void>((resolve) => { finishStart = resolve })),
+      handle: vi.fn(),
+      handleObserved: vi.fn(),
+      dispose: vi.fn(async () => {}),
+    }
+    const monitor = { start: vi.fn(async () => {}), dispose: vi.fn(async () => {}) }
+    const createExternalMonitor = vi.fn(() => monitor)
+    const unsubscribe = vi.fn()
+
+    const lifecycle = createNtfyNotifierLifecycle({
+      bridge: {
+        readThreadForNotifier: vi.fn(),
+        getAppServerPidForNotifier: vi.fn(() => 1234),
+        getSessionsRootForNotifier: vi.fn(() => '/home/test/.codex/sessions'),
+        subscribeNotifications: vi.fn((next) => {
+          listener = next
+          return unsubscribe
+        }),
+      },
+      config: { publishUrl: 'https://ntfy.sh/test-topic', statePath: '/tmp/ntfy-state.json' },
+      createStateStore: vi.fn(() => ({ load: vi.fn(), save: vi.fn() }) as never),
+      createNotifier: vi.fn(() => notifier),
+      createExternalMonitor,
+      warn: vi.fn(),
+    })
+
+    expect(createExternalMonitor).not.toHaveBeenCalled()
+    const notification = { method: 'turn/started', params: {}, atIso: '2026-07-15T00:00:00.000Z' }
+    listener?.(notification)
+    expect(notifier.handle).toHaveBeenCalledWith(notification)
+
+    finishStart?.()
+    await vi.waitFor(() => expect(monitor.start).toHaveBeenCalledTimes(1))
+    lifecycle.dispose()
+    await vi.waitFor(() => expect(notifier.dispose).toHaveBeenCalledTimes(1))
+  })
+
+  it('keeps direct subscription cleanup safe when notifier startup rejects', async () => {
+    const { createNtfyNotifierLifecycle } = await import('./httpServer')
+    const warn = vi.fn()
+    const unsubscribe = vi.fn()
+    const notifier = {
+      start: vi.fn(async () => { throw new Error('secret startup detail') }),
+      handle: vi.fn(),
+      handleObserved: vi.fn(),
+      dispose: vi.fn(async () => {}),
+    }
+    const createExternalMonitor = vi.fn()
+    const subscribeNotifications = vi.fn(() => unsubscribe)
+
+    const lifecycle = createNtfyNotifierLifecycle({
+      bridge: {
+        readThreadForNotifier: vi.fn(),
+        getAppServerPidForNotifier: vi.fn(),
+        getSessionsRootForNotifier: vi.fn(),
+        subscribeNotifications,
+      },
+      config: { publishUrl: 'https://ntfy.sh/test-topic', statePath: '/tmp/ntfy-state.json' },
+      createStateStore: vi.fn(() => ({ load: vi.fn(), save: vi.fn() }) as never),
+      createNotifier: vi.fn(() => notifier),
+      createExternalMonitor,
+      warn,
+    })
+
+    expect(subscribeNotifications).toHaveBeenCalledTimes(1)
+    await vi.waitFor(() => expect(warn).toHaveBeenCalledWith('Unable to start long-task notifications'))
+    expect(warn).not.toHaveBeenCalledWith(expect.stringContaining('secret'))
+    expect(createExternalMonitor).not.toHaveBeenCalled()
+
+    lifecycle.dispose()
+    expect(unsubscribe).toHaveBeenCalledTimes(1)
+    await vi.waitFor(() => expect(notifier.dispose).toHaveBeenCalledTimes(1))
+  })
+
+  it('unsubscribes immediately and leaves no monitor when disposed during notifier startup', async () => {
+    const { createNtfyNotifierLifecycle } = await import('./httpServer')
+    let finishStart: (() => void) | undefined
+    const unsubscribe = vi.fn()
+    const notifier = {
+      start: vi.fn(() => new Promise<void>((resolve) => { finishStart = resolve })),
+      handle: vi.fn(),
+      handleObserved: vi.fn(),
+      dispose: vi.fn(async () => {}),
+    }
+    const createExternalMonitor = vi.fn()
+
+    const lifecycle = createNtfyNotifierLifecycle({
+      bridge: {
+        readThreadForNotifier: vi.fn(),
+        getAppServerPidForNotifier: vi.fn(),
+        getSessionsRootForNotifier: vi.fn(),
+        subscribeNotifications: vi.fn(() => unsubscribe),
+      },
+      config: { publishUrl: 'https://ntfy.sh/test-topic', statePath: '/tmp/ntfy-state.json' },
+      createStateStore: vi.fn(() => ({ load: vi.fn(), save: vi.fn() }) as never),
+      createNotifier: vi.fn(() => notifier),
+      createExternalMonitor,
+      warn: vi.fn(),
+    })
+
+    lifecycle.dispose()
+    expect(unsubscribe).toHaveBeenCalledTimes(1)
+    expect(notifier.dispose).not.toHaveBeenCalled()
+    finishStart?.()
+    await vi.waitFor(() => expect(notifier.dispose).toHaveBeenCalledTimes(1))
+    expect(createExternalMonitor).not.toHaveBeenCalled()
+  })
+
+  it('redacts monitor startup rejection and still disposes monitor before notifier', async () => {
+    const { createNtfyNotifierLifecycle } = await import('./httpServer')
+    let finishMonitorDispose: (() => void) | undefined
+    const warn = vi.fn()
+    const notifier = {
+      start: vi.fn(async () => {}),
+      handle: vi.fn(),
+      handleObserved: vi.fn(),
+      dispose: vi.fn(async () => {}),
+    }
+    const monitor = {
+      start: vi.fn(async () => { throw new Error('secret monitor detail') }),
+      dispose: vi.fn(() => new Promise<void>((resolve) => { finishMonitorDispose = resolve })),
+    }
+
+    const lifecycle = createNtfyNotifierLifecycle({
+      bridge: {
+        readThreadForNotifier: vi.fn(),
+        getAppServerPidForNotifier: vi.fn(() => 1234),
+        getSessionsRootForNotifier: vi.fn(() => '/home/test/.codex/sessions'),
+        subscribeNotifications: vi.fn(() => vi.fn()),
+      },
+      config: { publishUrl: 'https://ntfy.sh/test-topic', statePath: '/tmp/ntfy-state.json' },
+      createStateStore: vi.fn(() => ({ load: vi.fn(), save: vi.fn() }) as never),
+      createNotifier: vi.fn(() => notifier),
+      createExternalMonitor: vi.fn(() => monitor),
+      warn,
+    })
+
+    await vi.waitFor(() => expect(warn).toHaveBeenCalledWith('Unable to start external turn monitoring'))
+    expect(warn).not.toHaveBeenCalledWith(expect.stringContaining('secret'))
+    lifecycle.dispose()
+    expect(monitor.dispose).toHaveBeenCalledTimes(1)
+    expect(notifier.dispose).not.toHaveBeenCalled()
+    finishMonitorDispose?.()
+    await vi.waitFor(() => expect(notifier.dispose).toHaveBeenCalledTimes(1))
+  })
+
+  it.each(['sessions getter', 'monitor factory'] as const)(
+    'keeps direct notifications active when the external %s throws synchronously',
+    async (failurePoint) => {
+      const { createNtfyNotifierLifecycle } = await import('./httpServer')
+      let listener: ((notification: { method: string; params: unknown; atIso: string }) => void) | undefined
+      const warn = vi.fn()
+      const unsubscribe = vi.fn()
+      const notifier = {
+        start: vi.fn(async () => {}),
+        handle: vi.fn(),
+        handleObserved: vi.fn(),
+        dispose: vi.fn(async () => {}),
+      }
+      const createExternalMonitor = vi.fn(() => {
+        if (failurePoint === 'monitor factory') throw new Error('secret factory detail')
+        return { start: vi.fn(async () => {}), dispose: vi.fn(async () => {}) }
+      })
+
+      const lifecycle = createNtfyNotifierLifecycle({
+        bridge: {
+          readThreadForNotifier: vi.fn(),
+          getAppServerPidForNotifier: vi.fn(),
+          getSessionsRootForNotifier: vi.fn(() => {
+            if (failurePoint === 'sessions getter') throw new Error('secret getter detail')
+            return '/home/test/.codex/sessions'
+          }),
+          subscribeNotifications: vi.fn((next) => {
+            listener = next
+            return unsubscribe
+          }),
+        },
+        config: { publishUrl: 'https://ntfy.sh/test-topic', statePath: '/tmp/ntfy-state.json' },
+        createStateStore: vi.fn(() => ({ load: vi.fn(), save: vi.fn() }) as never),
+        createNotifier: vi.fn(() => notifier),
+        createExternalMonitor,
+        warn,
+      })
+
+      await vi.waitFor(() => expect(warn).toHaveBeenCalledWith('Unable to start external turn monitoring'))
+      expect(warn).not.toHaveBeenCalledWith(expect.stringContaining('secret'))
+      const notification = { method: 'turn/started', params: {}, atIso: '2026-07-15T00:00:00.000Z' }
+      listener?.(notification)
+      expect(notifier.handle).toHaveBeenCalledWith(notification)
+      lifecycle.dispose()
+      expect(unsubscribe).toHaveBeenCalledTimes(1)
+      await vi.waitFor(() => expect(notifier.dispose).toHaveBeenCalledTimes(1))
+    },
+  )
+
   it('keeps notifier thread reads internal to the bridge with no HTTP route', async () => {
     const [bridgeSource, httpServerSource] = await Promise.all([
       readFile(new URL('./codexAppServerBridge.ts', import.meta.url), 'utf8'),
