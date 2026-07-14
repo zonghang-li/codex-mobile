@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto'
 import {
   createExternalRuntimeSystem,
   discoverExternalRolloutWriters,
@@ -13,6 +14,7 @@ const MAX_TRAILING_BYTES = 256 * 1024
 const DEFAULT_CURSOR_LIMIT = 256
 const CHECKPOINT_BYTES = 256
 const RECENT_TURN_LIMIT = 256
+const MAX_TERMINAL_TOMBSTONES = DEFAULT_CURSOR_LIMIT * RECENT_TURN_LIMIT
 
 export type ObservedTurnLifecycle = {
   method: 'turn/started' | 'turn/completed'
@@ -52,8 +54,6 @@ type RolloutCursor = {
   checkpoint: Buffer
   threadId: string
   activeTurn: { turnId: string; startedAt: number } | null
-  recentTerminalTurnIds: Set<string>
-  recentTerminalTurnOrder: string[]
   pendingInitialLifecycle: Exclude<ParsedRolloutRecord, { kind: 'session' }> | null
   lastObservedAt: number
 }
@@ -86,7 +86,10 @@ export function createExternalTurnMonitor(
 ): ExternalTurnMonitor {
   const system = options.system ?? createExternalRuntimeSystem()
   const scanIntervalMs = options.scanIntervalMs ?? EXTERNAL_TURN_SCAN_INTERVAL_MS
-  const cursorLimit = Math.max(1, Math.floor(options.cursorLimit ?? DEFAULT_CURSOR_LIMIT))
+  const requestedCursorLimit = options.cursorLimit ?? DEFAULT_CURSOR_LIMIT
+  const cursorLimit = Number.isFinite(requestedCursorLimit)
+    ? Math.min(DEFAULT_CURSOR_LIMIT, Math.max(1, Math.floor(requestedCursorLimit)))
+    : DEFAULT_CURSOR_LIMIT
   const now = options.now ?? Date.now
   const warn = options.warn ?? console.warn
   const setTimer = options.setTimer ?? ((callback, delayMs) => setTimeout(() => {
@@ -94,6 +97,7 @@ export function createExternalTurnMonitor(
   }, delayMs))
   const clearTimer = options.clearTimer ?? ((handle) => clearTimeout(handle as NodeJS.Timeout))
   const cursors = new Map<string, RolloutCursor>()
+  const terminalTombstones = new Set<string>()
   const warned = new Set<string>()
 
   let monitorStartedAt = 0
@@ -116,13 +120,25 @@ export function createExternalTurnMonitor(
     await options.onLifecycle(event)
   }
 
+  function terminalTombstone(cursor: RolloutCursor, turnId: string): string {
+    return createHash('sha256')
+      .update(cursor.key)
+      .update('\0')
+      .update(turnId)
+      .digest('hex')
+  }
+
+  function hasTerminalTombstone(cursor: RolloutCursor, turnId: string): boolean {
+    return terminalTombstones.has(terminalTombstone(cursor, turnId))
+  }
+
   function rememberTerminal(cursor: RolloutCursor, turnId: string): void {
-    if (cursor.recentTerminalTurnIds.has(turnId)) return
-    cursor.recentTerminalTurnIds.add(turnId)
-    cursor.recentTerminalTurnOrder.push(turnId)
-    while (cursor.recentTerminalTurnOrder.length > RECENT_TURN_LIMIT) {
-      const oldest = cursor.recentTerminalTurnOrder.shift()
-      if (oldest) cursor.recentTerminalTurnIds.delete(oldest)
+    const tombstone = terminalTombstone(cursor, turnId)
+    if (terminalTombstones.has(tombstone)) return
+    terminalTombstones.add(tombstone)
+    while (terminalTombstones.size > MAX_TERMINAL_TOMBSTONES) {
+      const oldest = terminalTombstones.values().next().value
+      if (oldest) terminalTombstones.delete(oldest)
     }
   }
 
@@ -136,7 +152,7 @@ export function createExternalTurnMonitor(
     if (record.kind === 'started') {
       if (
         cursor.activeTurn?.turnId === record.turnId
-        || cursor.recentTerminalTurnIds.has(record.turnId)
+        || hasTerminalTombstone(cursor, record.turnId)
       ) return
       await emit({
         method: 'turn/started',
@@ -150,7 +166,7 @@ export function createExternalTurnMonitor(
       return
     }
 
-    if (cursor.recentTerminalTurnIds.has(record.turnId)) return
+    if (hasTerminalTombstone(cursor, record.turnId)) return
 
     if (cursor.activeTurn?.turnId === record.turnId) {
       await emit({
@@ -197,7 +213,9 @@ export function createExternalTurnMonitor(
       cursor.activeTurn = null
       rememberTerminal(cursor, record.turnId)
       cursor.lastObservedAt = now()
+      return
     }
+    rememberTerminal(cursor, record.turnId)
   }
 
   async function applyCompleteLine(cursor: RolloutCursor, bytes: Buffer): Promise<void> {
@@ -341,8 +359,6 @@ export function createExternalTurnMonitor(
       checkpoint,
       threadId,
       activeTurn: null,
-      recentTerminalTurnIds: new Set(),
-      recentTerminalTurnOrder: [],
       pendingInitialLifecycle: tail.latestLifecycle,
       lastObservedAt: now(),
     }
@@ -490,6 +506,7 @@ export function createExternalTurnMonitor(
       }
       await activeWork
       cursors.clear()
+      terminalTombstones.clear()
     },
   }
 }

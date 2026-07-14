@@ -235,6 +235,22 @@ describe('ExternalTurnMonitor', () => {
     expect(fixture.events).toEqual([])
   })
 
+  it('deduplicates a suppressed historical terminal when the pair appears again', async () => {
+    const fixture = monitorFixture({ now: 700_000 })
+    const historicalPair = started('turn-1', 0) + completed('turn-1', 600_000, 600_000)
+    const rollout = fixture.system.add(
+      '/sessions/rollout-1.jsonl',
+      sessionMeta('thread-1') + historicalPair,
+      '1',
+    )
+    await fixture.monitor.start()
+
+    fixture.system.append(rollout, historicalPair)
+    await fixture.runScheduledScan()
+
+    expect(fixture.events).toEqual([])
+  })
+
   it('reconstructs a start when a terminal races the initial scan', async () => {
     const fixture = monitorFixture({ now: 500_000 })
     fixture.system.add(
@@ -396,6 +412,25 @@ describe('ExternalTurnMonitor', () => {
     await fixture.runScheduledScan()
     expect(fixture.events).toHaveLength(256)
     expect(new Set(fixture.system.readCalls.map(({ path }) => path)).size).toBe(256)
+  })
+
+  it('does not replay completed turns while inactive cursors churn beyond the limit', async () => {
+    const fixture = monitorFixture({ now: 1_000, cursorLimit: 2 })
+    for (let index = 0; index < 3; index += 1) {
+      fixture.system.add(
+        `/sessions/${index}.jsonl`,
+        sessionMeta(`thread-${index}`) + completed(`turn-${index}`, 2_000, 2_000),
+        `${index}`,
+      )
+    }
+    await fixture.monitor.start()
+    expect(fixture.events).toHaveLength(6)
+
+    await fixture.runScheduledScan()
+    await fixture.runScheduledScan()
+    await fixture.runScheduledScan()
+
+    expect(fixture.events).toHaveLength(6)
   })
 
   it('retries a terminal callback rejection without losing the completion offset', async () => {
