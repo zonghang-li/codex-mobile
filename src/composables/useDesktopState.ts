@@ -11,7 +11,6 @@ import {
   getPendingServerRequests,
   getSkillsList,
   getThreadDetail,
-  getThreadRuntimeState,
   getThreadRuntimeStates,
   getOlderThreadMessages,
   getBackgroundThreadListLimit,
@@ -1556,7 +1555,7 @@ export function useDesktopState() {
     promise: Promise<void>
   } | null = null
   let backgroundRuntimePollingEnabled = false
-  let backgroundRuntimeVisibilityListenerInstalled = false
+  let runtimeVisibilityListenerInstalled = false
   const backgroundExternalThreadIds = new Set<string>()
   const localRuntimeAuthorityVersionByThreadId = new Map<string, number>()
   const selectionVersionByThreadId = new Map<string, number>()
@@ -2554,10 +2553,16 @@ export function useDesktopState() {
     }, delayMs)
   }
 
-  function onBackgroundRuntimeVisibilityChange(): void {
+  function onRuntimeVisibilityChange(): void {
     if (typeof document === 'undefined') return
     cancelBackgroundRuntimeRequest()
-    if (document.visibilityState === 'visible') scheduleBackgroundRuntimePolling(0)
+    cancelExternalRuntimePolling()
+    if (document.visibilityState !== 'visible') return
+    scheduleBackgroundRuntimePolling(0)
+    const selectedId = selectedThreadId.value
+    if (selectedId && runtimeOwnershipByThreadId.value[selectedId] === 'external') {
+      scheduleExternalRuntimePolling(selectedId, 0)
+    }
   }
 
   async function pollBackgroundRuntimeStates(
@@ -2616,8 +2621,12 @@ export function useDesktopState() {
     }
   }
 
-  function scheduleExternalRuntimePolling(threadId: string): void {
+  function scheduleExternalRuntimePolling(
+    threadId: string,
+    delayMs = EXTERNAL_RUNTIME_POLL_MS,
+  ): void {
     if (!externalRuntimePollingEnabled || typeof window === 'undefined') return
+    if (typeof document !== 'undefined' && document.visibilityState === 'hidden') return
     if (!threadId || selectedThreadId.value !== threadId) return
     if (runtimeOwnershipByThreadId.value[threadId] !== 'external') return
     if (externalRuntimeTimer !== null || externalRuntimeRequest !== null) return
@@ -2640,7 +2649,7 @@ export function useDesktopState() {
           scheduleExternalRuntimePolling(selectedId)
         }
       })
-    }, EXTERNAL_RUNTIME_POLL_MS)
+    }, delayMs)
   }
 
   async function pollExternalRuntime(
@@ -2649,16 +2658,18 @@ export function useDesktopState() {
     signal: AbortSignal,
   ): Promise<void> {
     try {
-      const runtime = await getThreadRuntimeState(threadId, signal)
+      const detail = await getThreadDetail(threadId, signal)
       if (generation !== externalRuntimeGeneration) return
       if (selectedThreadId.value !== threadId) return
       if (runtimeOwnershipByThreadId.value[threadId] !== 'external') return
 
-      if (runtime.state !== 'idle') return
-
-      await loadMessages(threadId, { silent: true, force: true })
+      reconcileThreadDetailSnapshot(threadId, detail, {
+        preserveMissing: true,
+        markRead: true,
+        requestedVersion: '',
+      })
     } catch {
-      // Unknown runtime state retains an already-established external lease.
+      // Abort and read failures retain the confirmed external lease, output, and summary.
     }
   }
 
@@ -6081,9 +6092,9 @@ export function useDesktopState() {
 
     externalRuntimePollingEnabled = true
     backgroundRuntimePollingEnabled = true
-    if (typeof document !== 'undefined' && !backgroundRuntimeVisibilityListenerInstalled) {
-      document.addEventListener('visibilitychange', onBackgroundRuntimeVisibilityChange)
-      backgroundRuntimeVisibilityListenerInstalled = true
+    if (typeof document !== 'undefined' && !runtimeVisibilityListenerInstalled) {
+      document.addEventListener('visibilitychange', onRuntimeVisibilityChange)
+      runtimeVisibilityListenerInstalled = true
     }
     scheduleBackgroundRuntimePolling(0)
     const selectedId = selectedThreadId.value
@@ -6140,9 +6151,9 @@ export function useDesktopState() {
     backgroundExternalThreadIds.clear()
     localRuntimeAuthorityVersionByThreadId.clear()
     selectionVersionByThreadId.clear()
-    if (typeof document !== 'undefined' && backgroundRuntimeVisibilityListenerInstalled) {
-      document.removeEventListener('visibilitychange', onBackgroundRuntimeVisibilityChange)
-      backgroundRuntimeVisibilityListenerInstalled = false
+    if (typeof document !== 'undefined' && runtimeVisibilityListenerInstalled) {
+      document.removeEventListener('visibilitychange', onRuntimeVisibilityChange)
+      runtimeVisibilityListenerInstalled = false
     }
     if (stopNotificationStream) {
       stopNotificationStream()

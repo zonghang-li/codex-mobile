@@ -1745,6 +1745,59 @@ describe('external runtime ownership', () => {
     expect(gatewayMocks.getThreadRuntimeStates).toHaveBeenCalledTimes(2)
   })
 
+  it('aborts selected and background requests while hidden and refreshes immediately when visible', async () => {
+    vi.stubGlobal('document', {
+      visibilityState: 'visible',
+      addEventListener: vi.fn(),
+      removeEventListener: vi.fn(),
+    })
+    const { state } = await setupExternalRuntimeState()
+    const selectedPending = deferred<ReturnType<typeof externalDetail>>()
+    const backgroundPending = deferred<Record<string, { state: 'unknown' }>>()
+    let selectedSignal: AbortSignal | undefined
+    let backgroundSignal: AbortSignal | undefined
+    gatewayMocks.resumeThread.mockResolvedValue(externalDetail())
+    gatewayMocks.getThreadDetail
+      .mockImplementationOnce((_threadId: string, signal?: AbortSignal) => {
+        selectedSignal = signal
+        return selectedPending.promise
+      })
+      .mockResolvedValue(externalDetail())
+    gatewayMocks.getThreadRuntimeStates
+      .mockImplementationOnce((_threadIds: string[], signal?: AbortSignal) => {
+        backgroundSignal = signal
+        return backgroundPending.promise
+      })
+      .mockResolvedValue({})
+    await state.loadMessages('thread-1')
+
+    await vi.advanceTimersByTimeAsync(0)
+    await vi.advanceTimersByTimeAsync(2_000)
+    expect(gatewayMocks.getThreadDetail).toHaveBeenCalledTimes(1)
+    expect(gatewayMocks.getThreadRuntimeStates).toHaveBeenCalledTimes(1)
+
+    const visibilityHandler = vi.mocked(document.addEventListener).mock.calls.find(
+      ([eventName]) => eventName === 'visibilitychange',
+    )?.[1] as EventListener
+    expect(visibilityHandler).toBeDefined()
+    Object.assign(document, { visibilityState: 'hidden' })
+    visibilityHandler(new Event('visibilitychange'))
+
+    expect(selectedSignal?.aborted).toBe(true)
+    expect(backgroundSignal?.aborted).toBe(true)
+    await vi.advanceTimersByTimeAsync(10_000)
+    expect(gatewayMocks.getThreadDetail).toHaveBeenCalledTimes(1)
+    expect(gatewayMocks.getThreadRuntimeStates).toHaveBeenCalledTimes(1)
+
+    Object.assign(document, { visibilityState: 'visible' })
+    visibilityHandler(new Event('visibilitychange'))
+    await vi.advanceTimersByTimeAsync(0)
+    await flushMicrotasks()
+
+    expect(gatewayMocks.getThreadDetail).toHaveBeenCalledTimes(2)
+    expect(gatewayMocks.getThreadRuntimeStates).toHaveBeenCalledTimes(2)
+  })
+
   it('aborts and invalidates a background batch when polling stops', async () => {
     const state = await setupBackgroundRuntimeState()
     const pending = deferred<Record<string, {
@@ -1785,94 +1838,148 @@ describe('external runtime ownership', () => {
   it('restores and polls an externally owned selected thread after 2 seconds', async () => {
     const { state } = await setupExternalRuntimeState()
     gatewayMocks.resumeThread.mockResolvedValue(externalDetail())
-    gatewayMocks.getThreadRuntimeState.mockResolvedValue({
-      state: 'running',
-      turnId: 'turn-external',
-      interruptible: false,
-      source: 'external-session-writer',
-    })
+    gatewayMocks.getThreadDetail.mockResolvedValue(externalDetail())
 
     await state.loadMessages('thread-1')
 
     expect(state.selectedThreadRuntimeOwnership.value).toBe('external')
     expect(state.selectedThread.value?.inProgress).toBe(true)
-    expect(gatewayMocks.getThreadRuntimeState).not.toHaveBeenCalled()
+    expect(gatewayMocks.getThreadDetail).not.toHaveBeenCalled()
 
     await vi.advanceTimersByTimeAsync(1_999)
-    expect(gatewayMocks.getThreadRuntimeState).not.toHaveBeenCalled()
+    expect(gatewayMocks.getThreadDetail).not.toHaveBeenCalled()
     await vi.advanceTimersByTimeAsync(1)
-    expect(gatewayMocks.getThreadRuntimeState).toHaveBeenCalledTimes(1)
-    expect(gatewayMocks.getThreadRuntimeState).toHaveBeenCalledWith('thread-1', expect.any(AbortSignal))
+    expect(gatewayMocks.getThreadDetail).toHaveBeenCalledTimes(1)
+    expect(gatewayMocks.getThreadDetail).toHaveBeenCalledWith('thread-1', expect.any(AbortSignal))
+    expect(gatewayMocks.getThreadRuntimeState).not.toHaveBeenCalled()
   })
 
-  it('keeps only one selected external runtime request in flight', async () => {
+  it('refreshes external reasoning and agent output without a page reload', async () => {
     const { state } = await setupExternalRuntimeState()
-    const pending = deferred<{
-      state: 'running'
-      turnId: string
-      interruptible: false
-      source: 'external-session-writer'
-    }>()
+    gatewayMocks.resumeThread.mockResolvedValue(externalDetail('turn-external'))
+    gatewayMocks.getThreadDetail
+      .mockResolvedValueOnce({
+        ...externalDetail('turn-external'),
+        messages: [
+          {
+            id: 'reasoning-live',
+            role: 'assistant',
+            text: '**Reading development-workflow.md**',
+            messageType: 'reasoning',
+            turnId: 'turn-external',
+          },
+          {
+            id: 'agent-live',
+            role: 'assistant',
+            text: 'New desktop output',
+            messageType: 'agentMessage',
+            turnId: 'turn-external',
+          },
+        ],
+      })
+      .mockResolvedValueOnce({
+        ...externalDetail('turn-external'),
+        messages: [
+          {
+            id: 'reasoning-live',
+            role: 'assistant',
+            text: '**Reading development-workflow.md**',
+            messageType: 'reasoning',
+            turnId: 'turn-external',
+          },
+          {
+            id: 'agent-live',
+            role: 'assistant',
+            text: 'New desktop output updated',
+            messageType: 'agentMessage',
+            turnId: 'turn-external',
+          },
+        ],
+      })
+    await state.loadMessages('thread-1')
+
+    await vi.advanceTimersByTimeAsync(2_000)
+    await flushMicrotasks()
+
+    expect(gatewayMocks.getThreadDetail).toHaveBeenCalledWith(
+      'thread-1',
+      expect.any(AbortSignal),
+    )
+    expect(gatewayMocks.getThreadRuntimeState).not.toHaveBeenCalled()
+    expect(state.selectedLiveOverlay.value?.activityLabel).toBe('Reading development-workflow.md')
+    expect(state.messages.value).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: 'agent-live', text: 'New desktop output' }),
+    ]))
+
+    await vi.advanceTimersByTimeAsync(2_000)
+    await flushMicrotasks()
+
+    expect(state.messages.value.filter((message) => message.id === 'agent-live')).toEqual([
+      expect.objectContaining({ text: 'New desktop output updated' }),
+    ])
+  })
+
+  it('starts the next external snapshot two seconds after settlement', async () => {
+    const { state } = await setupExternalRuntimeState()
+    const pending = deferred<ReturnType<typeof externalDetail>>()
     gatewayMocks.resumeThread.mockResolvedValue(externalDetail())
-    gatewayMocks.getThreadRuntimeState.mockReturnValue(pending.promise)
+    gatewayMocks.getThreadDetail
+      .mockReturnValueOnce(pending.promise)
+      .mockResolvedValue(externalDetail())
     await state.loadMessages('thread-1')
 
     await vi.advanceTimersByTimeAsync(6_000)
-    expect(gatewayMocks.getThreadRuntimeState).toHaveBeenCalledTimes(1)
+    expect(gatewayMocks.getThreadDetail).toHaveBeenCalledTimes(1)
 
-    pending.resolve({
-      state: 'running',
-      turnId: 'turn-external',
-      interruptible: false,
-      source: 'external-session-writer',
-    })
+    pending.resolve(externalDetail())
     await flushMicrotasks()
     await vi.advanceTimersByTimeAsync(1_999)
-    expect(gatewayMocks.getThreadRuntimeState).toHaveBeenCalledTimes(1)
+    expect(gatewayMocks.getThreadDetail).toHaveBeenCalledTimes(1)
     await vi.advanceTimersByTimeAsync(1)
-    expect(gatewayMocks.getThreadRuntimeState).toHaveBeenCalledTimes(2)
+    expect(gatewayMocks.getThreadDetail).toHaveBeenCalledTimes(2)
   })
 
   it('aborts a stale selected-thread request so a new external thread can poll', async () => {
     const { state } = await setupExternalRuntimeState()
-    const oldRequest = deferred<{ state: 'idle' }>()
-    const newRequest = deferred<{ state: 'unknown' }>()
+    const oldRequest = deferred<ReturnType<typeof idleDetail>>()
+    const newRequest = deferred<ReturnType<typeof externalDetail>>()
     const signals: AbortSignal[] = []
     gatewayMocks.resumeThread.mockResolvedValue(externalDetail())
-    gatewayMocks.getThreadRuntimeState.mockImplementation((threadId: string, signal?: AbortSignal) => {
+    gatewayMocks.getThreadDetail.mockImplementation((threadId: string, signal?: AbortSignal) => {
       if (signal) signals.push(signal)
       if (threadId === 'thread-1') return oldRequest.promise
-      if (gatewayMocks.getThreadRuntimeState.mock.calls.length === 2) return newRequest.promise
-      return Promise.resolve({ state: 'unknown' as const })
+      if (gatewayMocks.getThreadDetail.mock.calls.length === 2) return newRequest.promise
+      return Promise.resolve(externalDetail())
     })
     await state.loadMessages('thread-1')
     await vi.advanceTimersByTimeAsync(2_000)
-    expect(gatewayMocks.getThreadRuntimeState).toHaveBeenCalledTimes(1)
+    expect(gatewayMocks.getThreadDetail).toHaveBeenCalledTimes(1)
 
     state.primeSelectedThread('thread-2')
     await state.loadMessages('thread-2')
     await vi.advanceTimersByTimeAsync(2_000)
 
-    expect(gatewayMocks.getThreadRuntimeState).toHaveBeenNthCalledWith(2, 'thread-2', expect.any(AbortSignal))
+    expect(gatewayMocks.getThreadDetail).toHaveBeenNthCalledWith(2, 'thread-2', expect.any(AbortSignal))
     expect(signals[0]?.aborted).toBe(true)
-    oldRequest.resolve({ state: 'idle' })
+    oldRequest.resolve(idleDetail())
     await flushMicrotasks()
     expect(state.selectedThreadRuntimeOwnership.value).toBe('external')
 
     await vi.advanceTimersByTimeAsync(4_000)
-    expect(gatewayMocks.getThreadRuntimeState).toHaveBeenCalledTimes(2)
-    newRequest.resolve({ state: 'unknown' })
+    expect(gatewayMocks.getThreadDetail).toHaveBeenCalledTimes(2)
+    newRequest.resolve(externalDetail())
     await flushMicrotasks()
     await vi.advanceTimersByTimeAsync(2_000)
-    expect(gatewayMocks.getThreadRuntimeState).toHaveBeenCalledTimes(3)
+    expect(gatewayMocks.getThreadDetail).toHaveBeenCalledTimes(3)
+    expect(gatewayMocks.getThreadRuntimeState).not.toHaveBeenCalled()
   })
 
   it('aborts an in-flight external runtime request on local takeover', async () => {
     const { state, emit } = await setupExternalRuntimeState()
-    const pending = deferred<{ state: 'unknown' }>()
+    const pending = deferred<ReturnType<typeof externalDetail>>()
     let signal: AbortSignal | undefined
     gatewayMocks.resumeThread.mockResolvedValue(externalDetail())
-    gatewayMocks.getThreadRuntimeState.mockImplementation((_threadId: string, nextSignal?: AbortSignal) => {
+    gatewayMocks.getThreadDetail.mockImplementation((_threadId: string, nextSignal?: AbortSignal) => {
       signal = nextSignal
       return pending.promise
     })
@@ -1887,10 +1994,10 @@ describe('external runtime ownership', () => {
 
   it('aborts an in-flight external runtime request when polling stops', async () => {
     const { state } = await setupExternalRuntimeState()
-    const pending = deferred<{ state: 'unknown' }>()
+    const pending = deferred<ReturnType<typeof externalDetail>>()
     let signal: AbortSignal | undefined
     gatewayMocks.resumeThread.mockResolvedValue(externalDetail())
-    gatewayMocks.getThreadRuntimeState.mockImplementation((_threadId: string, nextSignal?: AbortSignal) => {
+    gatewayMocks.getThreadDetail.mockImplementation((_threadId: string, nextSignal?: AbortSignal) => {
       signal = nextSignal
       return pending.promise
     })
@@ -1932,13 +2039,27 @@ describe('external runtime ownership', () => {
     expect(gatewayMocks.getThreadRuntimeState).not.toHaveBeenCalled()
   })
 
-  it('forces a detail refresh when external runtime becomes idle', async () => {
+  it('applies final external output before clearing the live overlay', async () => {
     const { state } = await setupExternalRuntimeState()
     gatewayMocks.resumeThread.mockResolvedValue(externalDetail())
-    gatewayMocks.getThreadRuntimeState.mockResolvedValue({ state: 'idle' })
     gatewayMocks.getThreadDetail.mockResolvedValue({
       ...idleDetail(),
-      messages: [{ id: 'persisted-after-idle', role: 'assistant', text: 'finished' }],
+      messages: [
+        {
+          id: 'reasoning-final',
+          role: 'assistant',
+          text: '**Finishing external work**',
+          messageType: 'reasoning',
+          turnId: 'turn-external',
+        },
+        {
+          id: 'agent-final',
+          role: 'assistant',
+          text: 'Final desktop output',
+          messageType: 'agentMessage',
+          turnId: 'turn-external',
+        },
+      ],
     })
     await state.loadMessages('thread-1')
 
@@ -1946,26 +2067,26 @@ describe('external runtime ownership', () => {
     await flushMicrotasks()
 
     expect(gatewayMocks.getThreadDetail).toHaveBeenCalledTimes(1)
-    expect(gatewayMocks.getThreadDetail).toHaveBeenCalledWith('thread-1')
+    expect(gatewayMocks.getThreadDetail).toHaveBeenCalledWith('thread-1', expect.any(AbortSignal))
+    expect(state.messages.value).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: 'agent-final', text: 'Final desktop output' }),
+    ]))
     expect(state.selectedThreadRuntimeOwnership.value).toBe('idle')
     expect(state.selectedThread.value?.inProgress).toBe(false)
-    expect(state.messages.value).toEqual(expect.arrayContaining([
-      expect.objectContaining({ id: 'persisted-after-idle' }),
-    ]))
+    expect(state.selectedLiveOverlay.value).toBe(null)
   })
 
   it('keeps the external lease until a delayed terminal detail refresh completes', async () => {
     const { state } = await setupExternalRuntimeState()
     const terminalDetail = deferred<ReturnType<typeof idleDetail>>()
     gatewayMocks.resumeThread.mockResolvedValue(externalDetail())
-    gatewayMocks.getThreadRuntimeState.mockResolvedValue({ state: 'idle' })
     gatewayMocks.getThreadDetail.mockReturnValue(terminalDetail.promise)
     gatewayMocks.startThreadTurn.mockResolvedValue('turn-follow-up')
     await state.loadMessages('thread-1')
 
     await vi.advanceTimersByTimeAsync(2_000)
     await flushMicrotasks()
-    expect(gatewayMocks.getThreadDetail).toHaveBeenCalledWith('thread-1')
+    expect(gatewayMocks.getThreadDetail).toHaveBeenCalledWith('thread-1', expect.any(AbortSignal))
 
     const blockedSend = state.sendMessageToSelectedThread('must wait for terminal detail')
     await flushMicrotasks()
@@ -1985,9 +2106,12 @@ describe('external runtime ownership', () => {
   it('does not let a delayed terminal detail clear a newer local lease', async () => {
     const { state, emit } = await setupExternalRuntimeState()
     const terminalDetail = deferred<ReturnType<typeof idleDetail>>()
+    let signal: AbortSignal | undefined
     gatewayMocks.resumeThread.mockResolvedValue(externalDetail())
-    gatewayMocks.getThreadRuntimeState.mockResolvedValue({ state: 'idle' })
-    gatewayMocks.getThreadDetail.mockReturnValue(terminalDetail.promise)
+    gatewayMocks.getThreadDetail.mockImplementation((_threadId: string, nextSignal?: AbortSignal) => {
+      signal = nextSignal
+      return terminalDetail.promise
+    })
     await state.loadMessages('thread-1')
 
     await vi.advanceTimersByTimeAsync(2_000)
@@ -1996,6 +2120,7 @@ describe('external runtime ownership', () => {
     terminalDetail.resolve(idleDetail())
     await flushMicrotasks()
 
+    expect(signal?.aborted).toBe(true)
     expect(state.selectedThreadRuntimeOwnership.value).toBe('local')
     expect(state.selectedThread.value?.inProgress).toBe(true)
   })
@@ -2005,7 +2130,6 @@ describe('external runtime ownership', () => {
     const staleLoad = deferred<ReturnType<typeof externalDetail>>()
     let detailCallCount = 0
     gatewayMocks.resumeThread.mockResolvedValue(externalDetail())
-    gatewayMocks.getThreadRuntimeState.mockResolvedValue({ state: 'idle' })
     gatewayMocks.getThreadDetail.mockImplementation(() => {
       detailCallCount += 1
       return detailCallCount === 1
@@ -2022,14 +2146,15 @@ describe('external runtime ownership', () => {
     expect(gatewayMocks.getThreadDetail).toHaveBeenCalledTimes(1)
 
     await vi.advanceTimersByTimeAsync(2_000)
-    expect(gatewayMocks.getThreadRuntimeState).toHaveBeenCalledTimes(1)
+    expect(gatewayMocks.getThreadDetail).toHaveBeenCalledTimes(2)
+    expect(gatewayMocks.getThreadRuntimeState).not.toHaveBeenCalled()
     const concurrentForce = state.loadMessages('thread-1', { silent: true, force: true })
     staleLoad.resolve(externalDetail('turn-stale'))
     await loadA
     await concurrentForce
     await flushMicrotasks()
 
-    expect(gatewayMocks.getThreadDetail).toHaveBeenCalledTimes(2)
+    expect(gatewayMocks.getThreadDetail).toHaveBeenCalledTimes(3)
     expect(state.selectedThreadRuntimeOwnership.value).toBe('idle')
     expect(state.selectedThread.value?.inProgress).toBe(false)
     expect(state.messages.value).toEqual(expect.arrayContaining([
@@ -2037,39 +2162,74 @@ describe('external runtime ownership', () => {
     ]))
   })
 
-  it.each([
-    ['unknown result', () => Promise.resolve({ state: 'unknown' as const })],
-    ['failed request', () => Promise.reject(new Error('runtime unavailable'))],
-  ])('retains established external ownership after an %s', async (_label, runtimeResult) => {
+  it('retains the last detailed summary and output when a snapshot read fails', async () => {
     const { state } = await setupExternalRuntimeState()
     gatewayMocks.resumeThread.mockResolvedValue(externalDetail())
-    gatewayMocks.getThreadRuntimeState.mockImplementation(runtimeResult)
+    gatewayMocks.getThreadDetail
+      .mockResolvedValueOnce({
+        ...externalDetail(),
+        messages: [
+          {
+            id: 'reasoning-retained',
+            role: 'assistant',
+            text: '**Retaining detailed work**',
+            messageType: 'reasoning',
+            turnId: 'turn-external',
+          },
+          {
+            id: 'agent-retained',
+            role: 'assistant',
+            text: 'Detailed desktop output',
+            messageType: 'agentMessage',
+            turnId: 'turn-external',
+          },
+        ],
+      })
+      .mockRejectedValueOnce(new Error('snapshot unavailable'))
     await state.loadMessages('thread-1')
 
     await vi.advanceTimersByTimeAsync(2_000)
     await flushMicrotasks()
+    expect(state.selectedLiveOverlay.value?.activityLabel).toBe('Retaining detailed work')
 
+    await vi.advanceTimersByTimeAsync(2_000)
+    await flushMicrotasks()
+
+    expect(gatewayMocks.getThreadDetail).toHaveBeenCalledTimes(2)
+    expect(state.selectedLiveOverlay.value?.activityLabel).toBe('Retaining detailed work')
+    expect(state.messages.value).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: 'agent-retained', text: 'Detailed desktop output' }),
+    ]))
     expect(state.selectedThreadRuntimeOwnership.value).toBe('external')
     expect(state.selectedThread.value?.inProgress).toBe(true)
-    await vi.advanceTimersByTimeAsync(2_000)
-    expect(gatewayMocks.getThreadRuntimeState).toHaveBeenCalledTimes(2)
   })
 
   it('never lets stale external idle clear a local lease', async () => {
     const { state, emit } = await setupExternalRuntimeState()
-    const pending = deferred<{ state: 'idle' }>()
+    const staleIdleDetail = {
+      ...idleDetail(),
+      messages: [{ id: 'stale-idle', role: 'assistant', text: 'stale external output' }],
+    }
+    const pending = deferred<typeof staleIdleDetail>()
+    let signal: AbortSignal | undefined
     gatewayMocks.resumeThread.mockResolvedValue(externalDetail())
-    gatewayMocks.getThreadRuntimeState.mockReturnValue(pending.promise)
+    gatewayMocks.getThreadDetail.mockImplementation((_threadId: string, nextSignal?: AbortSignal) => {
+      signal = nextSignal
+      return pending.promise
+    })
     await state.loadMessages('thread-1')
     await vi.advanceTimersByTimeAsync(2_000)
 
     emit({ method: 'turn/started', params: { threadId: 'thread-1', turn: { id: 'turn-local' } } })
-    pending.resolve({ state: 'idle' })
+    pending.resolve(staleIdleDetail)
     await flushMicrotasks()
 
+    expect(signal?.aborted).toBe(true)
     expect(state.selectedThreadRuntimeOwnership.value).toBe('local')
     expect(state.selectedThread.value?.inProgress).toBe(true)
-    expect(gatewayMocks.getThreadDetail).not.toHaveBeenCalled()
+    expect(state.messages.value).not.toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: 'stale-idle' }),
+    ]))
   })
 
   it('does not let a completion without a matching local lease clear external ownership', async () => {
@@ -2099,43 +2259,58 @@ describe('external runtime ownership', () => {
 
   it('rejects poll results after selection changes or polling stops', async () => {
     const { state } = await setupExternalRuntimeState()
-    const selectionPending = deferred<{ state: 'idle' }>()
+    const staleSelectionDetail = {
+      ...idleDetail(),
+      messages: [{ id: 'stale-selection', role: 'assistant', text: 'stale selection output' }],
+    }
+    const selectionPending = deferred<typeof staleSelectionDetail>()
     gatewayMocks.resumeThread.mockResolvedValue(externalDetail())
-    gatewayMocks.getThreadRuntimeState.mockReturnValueOnce(selectionPending.promise)
+    gatewayMocks.getThreadDetail.mockReturnValueOnce(selectionPending.promise)
     await state.loadMessages('thread-1')
     await vi.advanceTimersByTimeAsync(2_000)
 
     state.primeSelectedThread('thread-2')
-    selectionPending.resolve({ state: 'idle' })
+    selectionPending.resolve(staleSelectionDetail)
     await flushMicrotasks()
 
-    expect(gatewayMocks.getThreadDetail).not.toHaveBeenCalled()
+    expect(gatewayMocks.getThreadDetail).toHaveBeenCalledTimes(1)
     state.primeSelectedThread('thread-1')
     expect(state.selectedThreadRuntimeOwnership.value).toBe('external')
+    expect(state.messages.value).not.toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: 'stale-selection' }),
+    ]))
 
-    const stopPending = deferred<{ state: 'idle' }>()
-    gatewayMocks.getThreadRuntimeState.mockReturnValueOnce(stopPending.promise)
+    const staleStopDetail = {
+      ...idleDetail(),
+      messages: [{ id: 'stale-stop', role: 'assistant', text: 'stale stop output' }],
+    }
+    const stopPending = deferred<typeof staleStopDetail>()
+    gatewayMocks.getThreadDetail.mockReturnValueOnce(stopPending.promise)
     await vi.advanceTimersByTimeAsync(2_000)
     state.stopPolling()
-    stopPending.resolve({ state: 'idle' })
+    stopPending.resolve(staleStopDetail)
     await flushMicrotasks()
 
-    expect(gatewayMocks.getThreadDetail).not.toHaveBeenCalled()
+    expect(gatewayMocks.getThreadDetail).toHaveBeenCalledTimes(2)
+    expect(state.messages.value).not.toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: 'stale-stop' }),
+    ]))
   })
 
   it('cancels scheduled polling on stop and resumes it after reconnect', async () => {
     const { state } = await setupExternalRuntimeState()
     gatewayMocks.resumeThread.mockResolvedValue(externalDetail())
-    gatewayMocks.getThreadRuntimeState.mockResolvedValue({ state: 'unknown' })
+    gatewayMocks.getThreadDetail.mockResolvedValue(externalDetail())
     await state.loadMessages('thread-1')
 
     state.stopPolling()
     await vi.advanceTimersByTimeAsync(4_000)
-    expect(gatewayMocks.getThreadRuntimeState).not.toHaveBeenCalled()
+    expect(gatewayMocks.getThreadDetail).not.toHaveBeenCalled()
 
     state.startPolling()
     await vi.advanceTimersByTimeAsync(2_000)
-    expect(gatewayMocks.getThreadRuntimeState).toHaveBeenCalledTimes(1)
+    expect(gatewayMocks.getThreadDetail).toHaveBeenCalledTimes(1)
+    expect(gatewayMocks.getThreadRuntimeState).not.toHaveBeenCalled()
   })
 
   it('guards all selected-thread mutations while externally owned', async () => {
