@@ -9,7 +9,7 @@ import {
   isThreadUnreadByLastRead,
   useDesktopState,
 } from './useDesktopState'
-import type { UiProjectGroup } from '../types/codex'
+import type { UiMessage, UiProjectGroup } from '../types/codex'
 import type { WorkspaceRootsState } from '../api/codexGateway'
 
 const gatewayMocks = vi.hoisted(() => ({
@@ -21,6 +21,7 @@ const gatewayMocks = vi.hoisted(() => ({
   getCurrentModelConfig: vi.fn(),
   getPendingServerRequests: vi.fn(),
   getSkillsList: vi.fn(),
+  getExternalThreadLiveSnapshot: vi.fn(),
   getThreadDetail: vi.fn(),
   getThreadGroupsPage: vi.fn(),
   getThreadRuntimeState: vi.fn(),
@@ -261,6 +262,9 @@ async function setupCodexDirectiveNotificationState(groups: UiProjectGroup[] = [
 
 beforeEach(() => {
   vi.clearAllMocks()
+  gatewayMocks.getExternalThreadLiveSnapshot.mockImplementation(
+    (threadId: string, signal?: AbortSignal) => gatewayMocks.getThreadDetail(threadId, signal),
+  )
   gatewayMocks.getThreadQueueState.mockResolvedValue({})
   gatewayMocks.getThreadRuntimeStates.mockResolvedValue({})
   gatewayMocks.setThreadQueueState.mockResolvedValue(undefined)
@@ -1798,6 +1802,32 @@ describe('external runtime ownership', () => {
     expect(gatewayMocks.getThreadRuntimeStates).toHaveBeenCalledTimes(2)
   })
 
+  it('shares one selected detail request between foreground resume refresh and external polling', async () => {
+    vi.stubGlobal('document', {
+      visibilityState: 'visible',
+      addEventListener: vi.fn(),
+      removeEventListener: vi.fn(),
+    })
+    const { state } = await setupExternalRuntimeState()
+    gatewayMocks.resumeThread.mockResolvedValue(externalDetail())
+    gatewayMocks.getExternalThreadLiveSnapshot.mockResolvedValue(externalDetail())
+    await state.loadMessages('thread-1')
+
+    const visibilityHandler = vi.mocked(document.addEventListener).mock.calls.find(
+      ([eventName]) => eventName === 'visibilitychange',
+    )?.[1] as EventListener
+    expect(visibilityHandler).toBeDefined()
+
+    visibilityHandler(new Event('visibilitychange'))
+    const resumeRefresh = state.refreshAll({ includeSelectedThreadMessages: true })
+    await vi.advanceTimersByTimeAsync(0)
+    await resumeRefresh
+    await flushMicrotasks()
+
+    expect(gatewayMocks.getExternalThreadLiveSnapshot).toHaveBeenCalledTimes(1)
+    expect(gatewayMocks.getThreadDetail).not.toHaveBeenCalled()
+  })
+
   it('aborts and invalidates a background batch when polling stops', async () => {
     const state = await setupBackgroundRuntimeState()
     const pending = deferred<Record<string, {
@@ -2024,6 +2054,53 @@ describe('external runtime ownership', () => {
     expect(state.selectedThread.value?.inProgress).toBe(true)
   })
 
+  it('does not let an older running detail overwrite a newer idle detail', async () => {
+    vi.stubGlobal('document', {
+      visibilityState: 'visible',
+      addEventListener: vi.fn(),
+      removeEventListener: vi.fn(),
+    })
+    const { state } = await setupExternalRuntimeState()
+    const olderRunning = deferred<Omit<ReturnType<typeof externalDetail>, 'messages'> & { messages: UiMessage[] }>()
+    gatewayMocks.resumeThread.mockResolvedValue(externalDetail())
+    gatewayMocks.getExternalThreadLiveSnapshot
+      .mockReturnValueOnce(olderRunning.promise)
+      .mockResolvedValueOnce({
+        ...idleDetail(),
+        messages: [{ id: 'newer-idle', role: 'assistant', text: 'newer terminal output' }],
+      })
+    await state.loadMessages('thread-1')
+
+    await vi.advanceTimersByTimeAsync(2_000)
+    const firstSignal = gatewayMocks.getExternalThreadLiveSnapshot.mock.calls[0]?.[1] as AbortSignal
+    Object.assign(document, { visibilityState: 'hidden' })
+    const visibilityHandler = vi.mocked(document.addEventListener).mock.calls.find(
+      ([eventName]) => eventName === 'visibilitychange',
+    )?.[1] as EventListener
+    visibilityHandler(new Event('visibilitychange'))
+    expect(firstSignal.aborted).toBe(true)
+
+    Object.assign(document, { visibilityState: 'visible' })
+    visibilityHandler(new Event('visibilitychange'))
+    await vi.advanceTimersByTimeAsync(0)
+    await flushMicrotasks()
+    expect(state.selectedThreadRuntimeOwnership.value).toBe('idle')
+
+    olderRunning.resolve({
+      ...externalDetail('turn-stale'),
+      messages: [{ id: 'older-running', role: 'assistant', text: 'stale running output' }],
+    })
+    await flushMicrotasks()
+
+    expect(state.selectedThreadRuntimeOwnership.value).toBe('idle')
+    expect(state.messages.value).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: 'newer-idle' }),
+    ]))
+    expect(state.messages.value).not.toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: 'older-running' }),
+    ]))
+  })
+
   it('does not establish external ownership from inconclusive detail while idle', async () => {
     const { state } = await setupExternalRuntimeState()
     gatewayMocks.resumeThread.mockResolvedValue({
@@ -2125,7 +2202,7 @@ describe('external runtime ownership', () => {
     expect(state.selectedThread.value?.inProgress).toBe(true)
   })
 
-  it('runs a fresh forced detail request after an existing stale load settles', async () => {
+  it('serializes a forced load behind an existing detail request and then refreshes', async () => {
     const { state } = await setupExternalRuntimeState()
     const staleLoad = deferred<ReturnType<typeof externalDetail>>()
     let detailCallCount = 0
@@ -2146,7 +2223,7 @@ describe('external runtime ownership', () => {
     expect(gatewayMocks.getThreadDetail).toHaveBeenCalledTimes(1)
 
     await vi.advanceTimersByTimeAsync(2_000)
-    expect(gatewayMocks.getThreadDetail).toHaveBeenCalledTimes(2)
+    expect(gatewayMocks.getThreadDetail).toHaveBeenCalledTimes(1)
     expect(gatewayMocks.getThreadRuntimeState).not.toHaveBeenCalled()
     const concurrentForce = state.loadMessages('thread-1', { silent: true, force: true })
     staleLoad.resolve(externalDetail('turn-stale'))
@@ -2154,7 +2231,7 @@ describe('external runtime ownership', () => {
     await concurrentForce
     await flushMicrotasks()
 
-    expect(gatewayMocks.getThreadDetail).toHaveBeenCalledTimes(3)
+    expect(gatewayMocks.getThreadDetail).toHaveBeenCalledTimes(2)
     expect(state.selectedThreadRuntimeOwnership.value).toBe('idle')
     expect(state.selectedThread.value?.inProgress).toBe(false)
     expect(state.messages.value).toEqual(expect.arrayContaining([
@@ -2740,6 +2817,41 @@ describe('external live reasoning overlay', () => {
 
     expect(state.selectedLiveOverlay.value?.activityLabel).toBe('Reading runtime state')
     expect(state.messages.value.map((message) => message.id)).toEqual(['agent-1'])
+  })
+
+  it('merges and hides same-turn reasoning from an inconclusive detail without an active turn id', async () => {
+    installTestWindow()
+    gatewayMocks.getPendingServerRequests.mockResolvedValue([])
+    gatewayMocks.resumeThread.mockResolvedValue({
+      ...externalDetail('turn-external'),
+      messages: [{
+        id: 'reasoning-1',
+        role: 'assistant',
+        text: '**Reading runtime state**',
+        messageType: 'reasoning',
+        turnId: 'turn-external',
+      }],
+    })
+    gatewayMocks.getThreadDetail.mockResolvedValue({
+      ...idleDetail(),
+      inProgress: false,
+      externalRuntimeState: 'unknown',
+      messages: [{
+        id: 'reasoning-2',
+        role: 'assistant',
+        text: '**Inspecting the next snapshot**',
+        messageType: 'reasoning',
+        turnId: 'turn-external',
+      }],
+    })
+
+    const state = useDesktopState()
+    state.primeSelectedThread('thread-external')
+    await state.loadMessages('thread-external')
+    await state.loadMessages('thread-external', { silent: true, force: true })
+
+    expect(state.selectedLiveOverlay.value?.activityLabel).toBe('Inspecting the next snapshot')
+    expect(state.messages.value.map((message) => message.id)).not.toContain('reasoning-2')
   })
 
   it('lands the final idle output before clearing the external overlay', async () => {

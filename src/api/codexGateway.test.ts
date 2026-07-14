@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { ThreadReadResponse } from './appServerDtos'
 import {
   getAvailableModelIds,
+  getExternalThreadLiveSnapshot,
   getThreadDetail,
   getThreadRuntimeState,
   getThreadRuntimeStates,
@@ -220,6 +221,66 @@ describe('getThreadDetail', () => {
       activeTurnId: 'turn-external',
     })
     expect(requestSignal).toBe(controller.signal)
+  })
+
+  it('normalizes an aborted thread/read through the existing API error model', async () => {
+    const controller = new AbortController()
+    vi.stubGlobal('fetch', vi.fn((_input: RequestInfo | URL, init?: RequestInit) => new Promise<Response>((_resolve, reject) => {
+      init?.signal?.addEventListener('abort', () => reject(new DOMException('aborted', 'AbortError')))
+    })))
+
+    const detailPromise = getThreadDetail('external-thread', controller.signal)
+    controller.abort()
+
+    await expect(detailPromise).rejects.toMatchObject({
+      name: 'CodexApiError',
+      code: 'network_error',
+      method: 'thread/read',
+    })
+  })
+
+  it('marks external live snapshots as lightweight and preserves messages plus runtime', async () => {
+    let requestBody: { method: string; params: Record<string, unknown> } | null = null
+    vi.stubGlobal('fetch', vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+      requestBody = JSON.parse(String(init?.body)) as typeof requestBody
+      return new Response(JSON.stringify({
+        result: {
+          threadTurnStartIndex: 8,
+          thread: {
+            id: 'external-thread',
+            turns: [{
+              id: 'turn-external',
+              status: 'completed',
+              items: [{
+                id: 'agent-live',
+                type: 'agentMessage',
+                text: 'live output',
+              }],
+            }],
+            externalRuntime: {
+              state: 'running',
+              turnId: 'turn-external',
+              interruptible: false,
+              source: 'external-session-writer',
+            },
+          },
+        },
+      }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    }))
+
+    await expect(getExternalThreadLiveSnapshot('external-thread')).resolves.toMatchObject({
+      ownership: 'external',
+      activeTurnId: 'turn-external',
+      messages: [expect.objectContaining({ id: 'agent-live', text: 'live output' })],
+    })
+    expect(requestBody).toEqual({
+      method: 'thread/read',
+      params: {
+        threadId: 'external-thread',
+        includeTurns: true,
+        __codexMobileLiveSnapshot: true,
+      },
+    })
   })
 
   it('reads modelProvider from nested thread payloads returned by thread/read', async () => {

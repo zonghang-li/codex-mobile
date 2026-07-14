@@ -1,6 +1,12 @@
-### External live thread sync
+### Feature: External live thread sync
 
-#### Acceptance Steps
+#### Prerequisites
+
+- Run the current `main` build through `codex-mobile-safe` with the browser connected over the existing Tailscale-only route.
+- Keep desktop Codex and mobile browser access to the same test thread, and open mobile DevTools network recording.
+- Prepare `390×844` and `768×1024` responsive viewports with both light and dark appearances available.
+
+#### Steps
 
 1. Start a desktop Codex turn that emits at least two visible reasoning summaries and two commentary/agent messages.
 2. Record the desktop thread ID and open the same thread in mobile Chrome without reloading again.
@@ -12,6 +18,14 @@
 8. Return visible; confirm one immediate detail refresh catches up both summary and output.
 9. Complete the desktop task; confirm the final output appears before the live overlay disappears and persisted reasoning becomes visible in history.
 10. Repeat layout checks at `768×1024` and in light/dark appearances.
+
+#### Expected Results
+
+- The newest visible desktop reasoning summary replaces `Thinking` within one settled polling cycle, while `Thinking` remains the fallback before a summary exists.
+- New commentary/output appears without reload, stable IDs do not duplicate, and active reasoning rows stay out of the transcript until the turn completes.
+- Exactly one selected live `thread/read` is in flight; the next starts at least 2,000 ms after settlement, and no selected runtime-only request is sent.
+- Hiding the page aborts live-detail and background-runtime requests and pauses new requests; returning visible performs one immediate catch-up.
+- The final output is reconciled before external ownership and the live overlay clear, and externally owned controls remain non-interruptible.
 
 #### Evidence Template
 
@@ -27,6 +41,6 @@ foreground catch-up: passed
 final output before overlay clear: passed
 ```
 
-#### Rollback
+#### Rollback/Cleanup
 
 Revert the feature commits, run `pnpm run install:local`, and restart only `codex-mobile-safe.service`; do not change or restart Tailscale Serve.

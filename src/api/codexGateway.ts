@@ -866,7 +866,11 @@ async function getThreadSummaryV2(threadId: string): Promise<UiThread> {
   return normalizeThreadSummaryV2(payload)
 }
 
-async function getThreadDetailV2(threadId: string, signal?: AbortSignal): Promise<{
+async function getThreadDetailV2(
+  threadId: string,
+  signal?: AbortSignal,
+  options: { liveSnapshot?: boolean } = {},
+): Promise<{
   model: string
   modelProvider: string
   messages: UiMessage[]
@@ -881,6 +885,7 @@ async function getThreadDetailV2(threadId: string, signal?: AbortSignal): Promis
   const payload = await callRpc<ThreadReadResponse>('thread/read', {
     threadId,
     includeTurns: true,
+    ...(options.liveSnapshot ? { __codexMobileLiveSnapshot: true } : {}),
   }, signal)
   const startTurnIndex = readThreadTurnStartIndex(payload)
   const normalized = normalizeThreadMessagesV2(payload, startTurnIndex)
@@ -980,6 +985,25 @@ export async function getThreadDetail(threadId: string, signal?: AbortSignal): P
     return await getThreadDetailV2(threadId, signal)
   } catch (error) {
     throw normalizeCodexApiError(error, `Failed to load thread ${threadId}`, 'thread/read')
+  }
+}
+
+export async function getExternalThreadLiveSnapshot(threadId: string, signal?: AbortSignal): Promise<{
+  model: string
+  modelProvider: string
+  messages: UiMessage[]
+  inProgress: boolean
+  activeTurnId: string
+  hasMoreOlder: boolean
+  turnIndexByTurnId: ThreadTurnIndexById
+  ownership: ThreadDetailRuntime['ownership']
+  canInterrupt: boolean
+  externalRuntimeState: ThreadDetailRuntime['externalRuntimeState']
+}> {
+  try {
+    return await getThreadDetailV2(threadId, signal, { liveSnapshot: true })
+  } catch (error) {
+    throw normalizeCodexApiError(error, `Failed to live-sync thread ${threadId}`, 'thread/read')
   }
 }
 

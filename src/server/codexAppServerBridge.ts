@@ -77,6 +77,8 @@ type RpcProxyRequest = {
   params?: unknown
 }
 
+const CODEX_MOBILE_LIVE_SNAPSHOT_PARAM = '__codexMobileLiveSnapshot'
+
 type RpcExecutor = {
   rpc: (method: string, params: unknown) => Promise<unknown>
 }
@@ -448,6 +450,23 @@ async function mergeSessionSkillInputsIntoThreadResult(result: unknown): Promise
   }
 }
 
+export async function applySessionSkillEnrichmentForRpc(
+  method: string,
+  skipSessionSkillEnrichment: boolean,
+  result: unknown,
+  enrich: (value: unknown) => Promise<unknown> = mergeSessionSkillInputsIntoThreadResult,
+): Promise<unknown> {
+  if (!THREAD_METHODS_WITH_TURNS.has(method) || skipSessionSkillEnrichment) return result
+  return enrich(result)
+}
+
+export function shouldStoreThreadReadSnapshotForRpc(
+  method: string,
+  skipSessionSkillEnrichment: boolean,
+): boolean {
+  return THREAD_METHODS_WITH_THREAD_SNAPSHOT.has(method) && !skipSessionSkillEnrichment
+}
+
 function readEnvValueFromFile(filePath: string, key: string): string | null {
   try {
     const content = readFileSync(filePath, 'utf8')
@@ -531,6 +550,25 @@ function asRecord(value: unknown): Record<string, unknown> | null {
   return value !== null && typeof value === 'object' && !Array.isArray(value)
     ? (value as Record<string, unknown>)
     : null
+}
+
+export function prepareRpcProxyRequest(
+  method: string,
+  params: unknown,
+): { params: unknown; skipSessionSkillEnrichment: boolean } {
+  const record = asRecord(params)
+  const isLiveSnapshot = method === 'thread/read'
+    && record?.[CODEX_MOBILE_LIVE_SNAPSHOT_PARAM] === true
+  if (!isLiveSnapshot || !record) {
+    return { params: params ?? null, skipSessionSkillEnrichment: false }
+  }
+
+  const forwardedParams = { ...record }
+  delete forwardedParams[CODEX_MOBILE_LIVE_SNAPSHOT_PARAM]
+  return {
+    params: forwardedParams,
+    skipSessionSkillEnrichment: true,
+  }
 }
 
 function isInlineDataUrl(value: string): boolean {
@@ -8062,6 +8100,8 @@ export function createCodexBridgeMiddleware(options: {
           return
         }
 
+        const preparedRpcRequest = prepareRpcProxyRequest(body.method, body.params ?? null)
+
 	        if (body.method === 'generate-thread-title') {
 	          setJson(res, 200, { result: { title: '' } })
 	          return
@@ -8074,14 +8114,14 @@ export function createCodexBridgeMiddleware(options: {
 
         let rpcResult: unknown
         try {
-          rpcResult = await callRpcWithArchiveRecovery(appServer, body.method, body.params ?? null)
+          rpcResult = await callRpcWithArchiveRecovery(appServer, body.method, preparedRpcRequest.params)
         } catch (error) {
 	          if (body.method === 'account/rateLimits/read' && isUnauthenticatedRateLimitError(error)) {
 	            setJson(res, 200, { result: null })
 	            return
 	          }
 		          if (body.method === 'thread/read' && isEmptyThreadReadError(error)) {
-		            const params = asRecord(body.params)
+		            const params = asRecord(preparedRpcRequest.params)
 		            const threadId = typeof params?.threadId === 'string' ? params.threadId.trim() : ''
 		            const snapshot = threadId ? appServer.getLastThreadReadSnapshot(threadId) : null
 		            if (snapshot) {
@@ -8090,7 +8130,7 @@ export function createCodexBridgeMiddleware(options: {
 		            }
 		          }
           if (body.method === 'thread/read' && isThreadMaterializationPendingError(error)) {
-            const params = asRecord(body.params)
+            const params = asRecord(preparedRpcRequest.params)
             const threadId = typeof params?.threadId === 'string' ? params.threadId.trim() : ''
             if (threadId) {
               setJson(res, 200, {
@@ -8115,11 +8155,16 @@ export function createCodexBridgeMiddleware(options: {
           ? mergeImportedThreadsIntoThreadListResult(errorMergedResult)
           : errorMergedResult
         const sanitizedResult = await sanitizeThreadTurnsInlinePayloads(body.method, listMergedResult)
-        const result = THREAD_METHODS_WITH_TURNS.has(body.method)
-          ? await mergeSessionSkillInputsIntoThreadResult(sanitizedResult)
-          : sanitizedResult
+        const result = await applySessionSkillEnrichmentForRpc(
+          body.method,
+          preparedRpcRequest.skipSessionSkillEnrichment,
+          sanitizedResult,
+        )
 
-        if (THREAD_METHODS_WITH_THREAD_SNAPSHOT.has(body.method)) {
+        if (shouldStoreThreadReadSnapshotForRpc(
+          body.method,
+          preparedRpcRequest.skipSessionSkillEnrichment,
+        )) {
           const rpcRecord = asRecord(result)
           const rpcThread = asRecord(rpcRecord?.thread)
           const rpcThreadId = typeof rpcThread?.id === 'string' ? rpcThread.id : ''

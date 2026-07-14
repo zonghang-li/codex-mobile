@@ -8,6 +8,7 @@ import {
   renameThread,
   getAvailableModelIds,
   getCurrentModelConfig,
+  getExternalThreadLiveSnapshot,
   getPendingServerRequests,
   getSkillsList,
   getThreadDetail,
@@ -72,6 +73,12 @@ import {
 import { resolveTurnCompletionDisposition, type TurnTerminalStatus } from './threadLifecycle'
 
 type ThreadDetailSnapshot = Awaited<ReturnType<typeof getThreadDetail>>
+
+type ThreadDetailRequestLease = {
+  epoch: number
+  ownsRequest: boolean
+  promise: Promise<ThreadDetailSnapshot>
+}
 
 function flattenThreads(groups: UiProjectGroup[]): UiThread[] {
   return groups.flatMap((group) => group.threads)
@@ -1545,6 +1552,8 @@ export function useDesktopState() {
     generation: number
     promise: Promise<void>
     controller: AbortController
+    threadId: string
+    detailEpoch: number | null
   } | null = null
   let externalRuntimePollingEnabled = true
   let backgroundRuntimeTimer: number | null = null
@@ -1562,6 +1571,13 @@ export function useDesktopState() {
   const delayedTurnSyncTimerByThreadId = new Map<string, number>()
   let loadThreadsPromise: Promise<void> | null = null
   const loadMessagePromiseByThreadId = new Map<string, Promise<void>>()
+  const detailRequestEpochByThreadId = new Map<string, number>()
+  const detailRequestByThreadId = new Map<string, {
+    epoch: number
+    promise: Promise<ThreadDetailSnapshot>
+    controller?: AbortController
+    consumers: number
+  }>()
   let refreshSkillsPromise: Promise<void> | null = null
   let lastThreadListLoadAt = 0
   let hasLoadedSkills = false
@@ -2476,6 +2492,44 @@ export function useDesktopState() {
     }
   }
 
+  function isCurrentThreadDetailEpoch(threadId: string, epoch: number): boolean {
+    return (detailRequestEpochByThreadId.get(threadId) ?? 0) === epoch
+  }
+
+  function acquireThreadDetailRequest(
+    threadId: string,
+    request: () => Promise<ThreadDetailSnapshot>,
+    controller?: AbortController,
+  ): ThreadDetailRequestLease {
+    const existing = detailRequestByThreadId.get(threadId)
+    if (existing) {
+      existing.consumers += 1
+      return { epoch: existing.epoch, ownsRequest: false, promise: existing.promise }
+    }
+
+    const epoch = (detailRequestEpochByThreadId.get(threadId) ?? 0) + 1
+    detailRequestEpochByThreadId.set(threadId, epoch)
+    const promise = request()
+    detailRequestByThreadId.set(threadId, { epoch, promise, controller, consumers: 1 })
+    return { epoch, ownsRequest: true, promise }
+  }
+
+  function releaseThreadDetailRequest(threadId: string, lease: ThreadDetailRequestLease): void {
+    const current = detailRequestByThreadId.get(threadId)
+    if (!current || current.epoch !== lease.epoch || current.promise !== lease.promise) return
+    current.consumers -= 1
+    if (current.consumers <= 0) detailRequestByThreadId.delete(threadId)
+  }
+
+  function invalidateOwnedThreadDetailRequest(threadId: string, epoch: number | null): void {
+    if (epoch === null) return
+    const current = detailRequestByThreadId.get(threadId)
+    if (!current || current.epoch !== epoch) return
+    detailRequestByThreadId.delete(threadId)
+    detailRequestEpochByThreadId.set(threadId, epoch + 1)
+    current.controller?.abort()
+  }
+
   function cancelExternalRuntimePolling(): void {
     externalRuntimeGeneration += 1
     if (externalRuntimeTimer !== null && typeof window !== 'undefined') {
@@ -2484,6 +2538,9 @@ export function useDesktopState() {
     externalRuntimeTimer = null
     const request = externalRuntimeRequest
     externalRuntimeRequest = null
+    if (request) {
+      invalidateOwnedThreadDetailRequest(request.threadId, request.detailEpoch)
+    }
     request?.controller.abort()
   }
 
@@ -2635,8 +2692,19 @@ export function useDesktopState() {
       externalRuntimeTimer = null
       const generation = externalRuntimeGeneration
       const controller = new AbortController()
-      const request = pollExternalRuntime(threadId, generation, controller.signal)
-      externalRuntimeRequest = { generation, promise: request, controller }
+      const detailRequest = acquireThreadDetailRequest(
+        threadId,
+        () => getExternalThreadLiveSnapshot(threadId, controller.signal),
+        controller,
+      )
+      const request = pollExternalRuntime(threadId, generation, detailRequest)
+      externalRuntimeRequest = {
+        generation,
+        promise: request,
+        controller,
+        threadId,
+        detailEpoch: detailRequest.ownsRequest ? detailRequest.epoch : null,
+      }
       void request.finally(() => {
         if (
           externalRuntimeRequest?.promise !== request
@@ -2655,10 +2723,10 @@ export function useDesktopState() {
   async function pollExternalRuntime(
     threadId: string,
     generation: number,
-    signal: AbortSignal,
+    detailRequest: ThreadDetailRequestLease,
   ): Promise<void> {
     try {
-      const detail = await getThreadDetail(threadId, signal)
+      const detail = await detailRequest.promise
       if (generation !== externalRuntimeGeneration) return
       if (selectedThreadId.value !== threadId) return
       if (runtimeOwnershipByThreadId.value[threadId] !== 'external') return
@@ -2667,9 +2735,12 @@ export function useDesktopState() {
         preserveMissing: true,
         markRead: true,
         requestedVersion: '',
+        detailEpoch: detailRequest.epoch,
       })
     } catch {
       // Abort and read failures retain the confirmed external lease, output, and summary.
+    } finally {
+      releaseThreadDetailRequest(threadId, detailRequest)
     }
   }
 
@@ -4836,23 +4907,16 @@ export function useDesktopState() {
     inProgress: boolean,
   ): void {
     const previous = externalReasoningSnapshotByThreadId.value[threadId]
-    if (
-      ownership === 'external'
-      && inProgress
-      && detail.externalRuntimeState === 'unknown'
-      && !detail.activeTurnId
-      && previous
-    ) {
-      return
-    }
-    if (ownership !== 'external' || !inProgress || !detail.activeTurnId) {
+    const reasoningTurnId = detail.activeTurnId
+      || (detail.externalRuntimeState === 'unknown' ? previous?.turnId ?? '' : '')
+    if (ownership !== 'external' || !inProgress || !reasoningTurnId) {
       externalReasoningSnapshotByThreadId.value = omitKey(
         externalReasoningSnapshotByThreadId.value,
         threadId,
       )
       return
     }
-    const incoming = readExternalReasoningSnapshot(detail.messages, detail.activeTurnId)
+    const incoming = readExternalReasoningSnapshot(detail.messages, reasoningTurnId)
     const next = mergeExternalReasoningSnapshots(previous, incoming)
     externalReasoningSnapshotByThreadId.value = {
       ...externalReasoningSnapshotByThreadId.value,
@@ -4863,8 +4927,14 @@ export function useDesktopState() {
   function reconcileThreadDetailSnapshot(
     threadId: string,
     detail: ThreadDetailSnapshot,
-    options: { preserveMissing: boolean; markRead: boolean; requestedVersion: string },
+    options: {
+      preserveMissing: boolean
+      markRead: boolean
+      requestedVersion: string
+      detailEpoch: number
+    },
   ): void {
+    if (!isCurrentThreadDetailEpoch(threadId, options.detailEpoch)) return
     if (detail.modelProvider) {
       setThreadModelProviderId(threadId, detail.modelProvider)
     }
@@ -5014,20 +5084,31 @@ export function useDesktopState() {
       }
 
       const needsResume = resumedThreadById.value[threadId] !== true
-      const resumedThread = needsResume ? await resumeThread(threadId) : null
-      const detail = resumedThread ?? await getThreadDetail(threadId)
+      const detailRequest = acquireThreadDetailRequest(
+        threadId,
+        async () => {
+          if (!needsResume) return getThreadDetail(threadId)
+          return (await resumeThread(threadId)) ?? getThreadDetail(threadId)
+        },
+      )
+      try {
+        const detail = await detailRequest.promise
 
-      if (resumedThread) {
-        resumedThreadById.value = {
-          ...resumedThreadById.value,
-          [threadId]: true,
+        if (needsResume && detailRequest.ownsRequest) {
+          resumedThreadById.value = {
+            ...resumedThreadById.value,
+            [threadId]: true,
+          }
         }
+        reconcileThreadDetailSnapshot(threadId, detail, {
+          preserveMissing: options.silent === true,
+          markRead: true,
+          requestedVersion: version,
+          detailEpoch: detailRequest.epoch,
+        })
+      } finally {
+        releaseThreadDetailRequest(threadId, detailRequest)
       }
-      reconcileThreadDetailSnapshot(threadId, detail, {
-        preserveMissing: options.silent === true,
-        markRead: true,
-        requestedVersion: version,
-      })
       } catch (unknownError) {
         const message = unknownError instanceof Error ? unknownError.message : 'Unknown application error'
         if (selectedThreadId.value === threadId) {
@@ -5171,7 +5252,10 @@ export function useDesktopState() {
     try {
       await loadPersistedQueueStateIfNeeded()
       await loadThreads({ force: options.forceThreadRefresh === true })
-      if (includeSelectedThreadMessages) {
+      if (
+        includeSelectedThreadMessages
+        && runtimeOwnershipByThreadId.value[selectedThreadId.value] !== 'external'
+      ) {
         try {
           await loadMessages(selectedThreadId.value)
         } catch (unknownError) {
