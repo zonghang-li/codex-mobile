@@ -2014,7 +2014,12 @@ describe('external runtime ownership', () => {
 
   it('aborts background polling while hidden and resumes immediately when visible', async () => {
     const state = await setupBackgroundRuntimeState()
-    const first = deferred<Record<string, { state: 'unknown' }>>()
+    const first = deferred<Record<string, {
+      state: 'running'
+      turnId: string
+      interruptible: false
+      source: string
+    }>>()
     let signal: AbortSignal | undefined
     gatewayMocks.getThreadRuntimeStates.mockImplementationOnce((_threadIds, nextSignal?: AbortSignal) => {
       signal = nextSignal
@@ -2031,8 +2036,20 @@ describe('external runtime ownership', () => {
     Object.assign(document, { visibilityState: 'hidden' })
     visibilityHandler(new Event('visibilitychange'))
     expect(signal?.aborted).toBe(true)
+    first.resolve({
+      'thread-selected': {
+        state: 'running',
+        turnId: 'turn-selected-stale',
+        interruptible: false,
+        source: 'external-session-writer',
+      },
+    })
+    await flushMicrotasks()
     await vi.advanceTimersByTimeAsync(6_000)
     expect(gatewayMocks.getThreadRuntimeStates).toHaveBeenCalledTimes(1)
+    expect(state.selectedThreadRuntimeOwnership.value).toBe('idle')
+    expect(state.selectedThread.value).toMatchObject({ inProgress: false })
+    expect(gatewayMocks.getExternalThreadLiveSnapshot).not.toHaveBeenCalled()
 
     Object.assign(document, { visibilityState: 'visible' })
     visibilityHandler(new Event('visibilitychange'))
@@ -2137,6 +2154,12 @@ describe('external runtime ownership', () => {
 
     state.stopPolling()
     pending.resolve({
+      'thread-selected': {
+        state: 'running',
+        turnId: 'turn-selected-stale',
+        interruptible: false,
+        source: 'external-session-writer',
+      },
       'thread-running': {
         state: 'running',
         turnId: 'turn-external',
@@ -2151,6 +2174,8 @@ describe('external runtime ownership', () => {
     expect(gatewayMocks.getThreadRuntimeStates).toHaveBeenCalledTimes(1)
     expect(state.projectGroups.value[0]?.threads[0]).toMatchObject({ inProgress: false })
     expect(state.selectedThreadRuntimeOwnership.value).toBe('idle')
+    expect(state.selectedThread.value).toMatchObject({ inProgress: false })
+    expect(gatewayMocks.getExternalThreadLiveSnapshot).not.toHaveBeenCalled()
     expect(document.removeEventListener).toHaveBeenCalledWith(
       'visibilitychange',
       expect.any(Function),
