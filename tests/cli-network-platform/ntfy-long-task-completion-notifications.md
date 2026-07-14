@@ -25,7 +25,7 @@ pnpm run service:restart
 1. Run the focused notification suite:
 
    ```bash
-   pnpm exec vitest run src/safe/ntfyConfig.test.ts src/safe/ntfyState.test.ts src/server/ntfyCompletionNotifier.test.ts src/server/securityPolicy.test.ts src/cli/safe.entry.test.ts src/safe/doctor.test.ts src/safe/packaging.test.ts
+   pnpm exec vitest run src/safe/ntfyConfig.test.ts src/safe/ntfyState.test.ts src/server/externalThreadRuntime.test.ts src/server/rolloutLifecycle.test.ts src/server/externalTurnMonitor.test.ts src/server/ntfyCompletionNotifier.test.ts src/server/securityPolicy.test.ts src/cli/safe.entry.test.ts src/safe/doctor.test.ts src/safe/packaging.test.ts
    ```
 
 2. Confirm the tests cover `599_999` ms with no thread read/send and exactly `600_000` ms with a send.
@@ -34,7 +34,20 @@ pnpm run service:restart
 5. Confirm active timing survives notifier reconstruction, pending delivery is durable before sending, a startup retries pending work, each attempt has a five-second timeout, and each drain makes at most three immediate attempts per pending record.
 6. Confirm ordinary duplicate completion events create one local pending/sent key and reuse the same bounded ASCII ntfy sequence ID; distinct turn keys use distinct sequence IDs.
 7. Confirm the real default Fetch request uses an RFC 2047 ASCII title and `X-Sequence-ID`, while warnings contain no URL, topic, body, or sender exception text.
-8. Confirm absent notification configuration creates no notifier, event subscription, state store, or network work.
+8. Confirm absent notification configuration creates no notifier, external monitor, event subscription, process/filesystem scan, timer, state store, or network work.
+
+## Cross-client and restart acceptance
+
+Use only synthetic topic placeholders in deterministic harness output. Do not print, paste, or record the production topic or publish URL.
+
+1. Close all mobile browser tabs so the acceptance result cannot depend on a foreground or background browser connection.
+2. Start a controlled external turn from Codex Desktop or Codex CLI under the same operating-system user as `codex-mobile-safe`.
+3. While it runs, repeat `ss -ltnp` and `tailscale serve status`. Verify no new inbound or public listener appears: the backend remains on `127.0.0.1:5900`, Tailscale Serve remains non-Funnel, and notification delivery is outbound-only.
+4. In the deterministic external-monitor/notifier harness, complete a turn at `599_999` ms and observe no captured ntfy send.
+5. In the same harness, complete a turn at exactly `600_000` ms and observe exactly one captured ntfy send.
+6. Start another controlled external turn, restart the safe service between its authoritative rollout start and terminal records, then complete it. Observe exactly one send using the original rollout timestamp rather than the restart time.
+7. Complete a historical rollout fixture before monitor startup, start the monitor, and observe no send. Also remove its writer/process evidence without a terminal lifecycle record and confirm no completion is inferred.
+8. Lock the subscribed phone, leave all browser tabs closed, and complete a qualifying production Desktop/CLI turn. Verify the real ntfy app receives one notification according to the device's ntfy notification, Focus, sound, and vibration settings.
 
 ## Service and Tailnet boundary checks
 
@@ -71,12 +84,14 @@ pnpm run service:restart
 
    Confirm both pass; they reconstruct the notifier around durable state rather than relying on an unsafe production threshold override.
 6. Repeat an ordinary completion event in the deterministic harness and confirm no second local pending/sent record is created and the same sequence ID is retained. Do not interpret this as transport-level exactly-once delivery: an ambiguous timeout or a process crash after ntfy accepts the POST but before the local sent-state commit can append another event and may re-alert depending on client timing/platform behavior.
+7. Confirm the cross-client cases above work with every mobile browser tab closed. The 15-second monitor cadence may add detection latency, but it must not change qualification duration, infer completion from writer disappearance, or require a browser reconnect.
 
 ## Expected results
 
 - Notifications are disabled when the default file is absent and enabled only after a valid current-user mode-`0600` regular file is present and the service restarts.
 - Only `https://ntfy.sh/<single-topic>` is accepted. The topic segment contains only letters, numbers, `_`, or `-`; credentials, queries, fragments, other origins, extra segments, and symlinks are rejected.
 - Tasks shorter than 10 minutes never notify. Successful, failed, and interrupted qualifying turns use the exact titles and one-sentence summary behavior above.
+- With ntfy enabled, same-user turns started from the mobile UI, Codex Desktop, Codex CLI, and other Codex clients that write authoritative rollouts are eligible. External detection is server-side, polls on a serialized 15-second cadence, survives a safe-service restart using authoritative rollout timestamps, and never replays already-terminal history.
 - Notification sending is outbound-only and does not block or fail the Codex turn. Active/pending/sent state is private, durable, and bounded to 256 records per collection.
 - Ordinary duplicates are locally suppressed and reuse a stable sequence ID for one logical client notification. Ambiguous delivery remains a documented possible re-alert boundary.
 - Browser access remains password-protected, loopback-backed, and Tailscale Serve-only. No LAN listener, Funnel, Telegram bridge, or Cloudflare/public tunnel is enabled.

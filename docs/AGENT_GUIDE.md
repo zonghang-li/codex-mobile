@@ -19,6 +19,9 @@ This repository maintains the upstream-compatible `codex-mobile` command and a h
 - `src/safe/exposure.ts`: Tailscale Serve lifecycle; Funnel is rejected.
 - `src/safe/doctor.ts`: static security-invariant diagnostics.
 - `src/server/securityPolicy.ts`: policy interface injected into HTTP and app-server bridges.
+- `src/server/externalThreadRuntime.ts`: hardened same-user app-server and canonical rollout-writer discovery.
+- `src/server/rolloutLifecycle.ts`: strict parser for authoritative rollout session and turn lifecycle records.
+- `src/server/externalTurnMonitor.ts`: bounded serialized 15-second external rollout monitor with incremental cursors and restart recovery.
 - `src/server/ntfyCompletionNotifier.ts`: asynchronous ten-minute turn qualification, deterministic summaries, logical deduplication, and bounded ntfy delivery.
 - `packaging/systemd/`: template for the safe Linux user service.
 - `scripts/install-local.sh` and `scripts/*user-service.sh`: repeatable local installation and service lifecycle.
@@ -34,9 +37,11 @@ This repository maintains the upstream-compatible `codex-mobile` command and a h
 7. Canonicalize filesystem paths and keep them under the configured project root. Reject symlink escapes and missing paths.
 8. Do not commit secrets, password files, runtime state, generated units, `.tgz` packages, or Tailnet credentials.
 9. Treat the ntfy topic as a credential. Read it only from the default `~/.codex/codex-mobile-safe-ntfy-url` file or an explicit `--ntfy-url-file` path. Require a current-user-owned regular file with mode `0600` or stricter and exactly one `https://ntfy.sh/<single-topic>` URL. Never place the URL/topic in Git, process arguments, systemd `Environment=`, managed notifier state, response bodies, or logs.
-10. Keep notifications outbound-only and optional. Missing default configuration must create no notification subscription or network work. Do not enable Telegram, background integrations, incoming commands, Cloudflare/public tunnels, Tailscale Funnel, LAN binding, or a Tailscale authentication bypass while adding or operating ntfy notifications.
+10. Keep notifications outbound-only and optional. Missing default configuration must create no notification subscription, external-turn monitor, process/filesystem scan, timer, or network work. Do not enable Telegram, background integrations, incoming commands, Cloudflare/public tunnels, Tailscale Funnel, LAN binding, or a Tailscale authentication bypass while adding or operating ntfy notifications.
 11. Preserve notification behavior: threshold exactly `600_000` ms; exact success/failure/interruption titles; deterministic first non-empty assistant sentence capped at 180 characters; no extra AI call; five-second request timeout; three immediate attempts per pending record per drain; active/pending/sent collections capped at 256.
 12. Preserve one logical notification per turn through local pending/sent suppression and a stable bounded ASCII ntfy sequence ID. Do not claim transport-level exactly-once delivery: an ambiguous timeout or a crash after remote acceptance but before the local sent-state commit may re-alert.
+13. Accept external rollout writers only from current-UID Codex app-server processes with stable process/descriptor evidence. Canonicalize each regular `.jsonl` rollout and require it to remain under the canonical current-user Codex sessions root; exclude the safe service's own app-server process tree.
+14. Keep external monitoring serialized and bounded: scan at the 15-second production cadence, parse only complete newly appended JSONL records through bounded incremental cursors, and cap retained cursors. A process or writable descriptor disappearing is not a terminal lifecycle record and must never be interpreted as completion.
 
 The original command may retain upstream behavior. Do not weaken safe mode to make both commands identical; move genuinely shared mechanics into `src/cli/shared` or the server layer and inject the policy difference.
 
@@ -85,6 +90,9 @@ Instantiate the service template in a temporary location and run `systemd-analyz
 | ntfy config/state | `src/safe/ntfyConfig.test.ts`, `src/safe/ntfyState.test.ts`, ownership/mode/symlink/atomic-write cases |
 | ntfy qualification/delivery | `src/server/ntfyCompletionNotifier.test.ts`, including 599,999/600,000 ms, all terminal statuses, real default headers, restart, retry, and redaction |
 | ntfy CLI/server wiring | safe entry, doctor, packaging, and server security-policy tests; verify disabled mode has no subscription/network |
+| external-turn discovery/parsing | `src/server/externalThreadRuntime.test.ts`, `src/server/rolloutLifecycle.test.ts`; cover same UID, stable identity, canonical sessions-root containment, malformed/partial records, and writer disappearance without inferred completion |
+| external-turn monitoring | `src/server/externalTurnMonitor.test.ts`; cover serialized 15-second scans, incremental reads, 256-cursor bound, exact threshold handoff, restart recovery, historical suppression, and disposal |
+| external notification wiring | safe lifecycle and doctor tests; verify absent ntfy configuration creates no monitor, timer, process/filesystem scan, or network work |
 | Tailscale exposure | `src/safe/exposure.test.ts`; confirm Serve only and no Funnel |
 | CLI/build/package | launcher and safe entry tests, production build, both help commands, temporary-prefix install |
 | systemd scripts/template | packaging test, `sh -n`, `systemd-analyze --user verify`, restart recovery |
@@ -141,6 +149,10 @@ journalctl --user -u codex-mobile-safe -n 100 --no-pager
 ```
 
 `doctor` is a static packaged-invariant check, not proof that an optional topic is configured or that a phone received an alert. A qualifying notification requires a turn duration of at least 10 minutes (`600_000` ms). Completed, failed, and interrupted turns use `Codex 任务完成`, `Codex 任务失败`, and `Codex 任务已中断`; the body is the deterministic first non-empty final-assistant sentence or a fixed fallback. The notifier retains only bounded timing/outbox/deduplication state under the safe home and never conversation history or the publish URL.
+
+With ntfy enabled, `codex-mobile-safe` observes qualifying turns from the mobile UI, Codex Desktop, Codex CLI, and other same-user Codex clients that write authoritative rollouts. Detection is server-side and continues with no browser connection. The external monitor uses a serialized 15-second scan cadence and authoritative rollout timestamps, so a turn already running when the service restarts remains eligible; turns already terminal before restart are baseline history and are not replayed. A missing terminal lifecycle is never inferred from an app-server process or rollout-writer descriptor disappearing.
+
+External-monitor diagnostics must remain redacted. Use `doctor`, service status, and the journal to confirm whether optional wiring is active and whether scans or delivery fail; never log or print the ntfy URL/topic, notification body, password, conversation content, rollout contents, or request object. Enabling the monitor does not add an inbound listener or change loopback binding, password authentication, Tailscale Serve-only exposure, or the Funnel/LAN/public-tunnel prohibitions.
 
 When notification delivery fails, check the redacted journal for `Unable to ... long-task notification` messages, confirm ordinary HTTPS egress to `ntfy.sh`, confirm the URL file mode/owner without printing its contents, and run the focused tests. Do not print the file, add debug logging of request objects, or relax the URL validator. Pending records are retried on startup and later notification events. Stable sequence IDs provide logical replacement on supported clients, but ambiguous remote acceptance may still re-alert.
 
