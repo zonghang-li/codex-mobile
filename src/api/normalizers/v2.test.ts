@@ -55,6 +55,42 @@ describe('normalizeThreadMessagesV2', () => {
     expect(messages[1].directives).toBeUndefined()
   })
 
+  it('normalizes future and invalid standalone directives only from assistant messages', () => {
+    const response = threadReadResponseWithContent([
+      {
+        type: 'agentMessage',
+        id: 'assistant-future',
+        text: 'Done.\n::future-directive{phase="done"}\n::git-push{cwd="/tmp/repo"}',
+      },
+      {
+        type: 'userMessage',
+        id: 'user-future',
+        content: [{
+          type: 'text',
+          text: '::future-directive{phase="user"}',
+          text_elements: [],
+        }],
+      },
+    ])
+
+    const messages = normalizeThreadMessagesV2(response)
+    expect(messages[0]).toMatchObject({
+      text: 'Done.',
+      directives: [
+        {
+          kind: 'generic',
+          name: 'future-directive',
+          attributes: [{ key: 'phase', value: 'done', sensitive: false }],
+        },
+        { kind: 'invalid', name: 'git-push', reason: 'invalid-schema' },
+      ],
+    })
+    expect(messages[1]).toMatchObject({
+      text: '::future-directive{phase="user"}',
+    })
+    expect(messages[1].directives).toBeUndefined()
+  })
+
   it('preserves directive-only assistant messages as structured messages', () => {
     const messages = normalizeThreadMessagesV2(threadReadResponseWithContent([{
       type: 'agentMessage',
