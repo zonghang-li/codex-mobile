@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import {
   createExternalRuntimeSystem,
+  discoverExternalRolloutWriterSnapshot,
   discoverExternalRolloutWriters,
   EXTERNAL_RUNTIME_MAX_DESCRIPTORS_PER_APP_SERVER,
   EXTERNAL_RUNTIME_MAX_FD_SNAPSHOTS,
@@ -161,7 +162,7 @@ class FakeRuntimeSystem implements ExternalRuntimeSystem {
     return rollout.bytes.subarray(offset, Math.min(offset + length, rollout.bytes.length))
   }
 
-  async *listFdSnapshots(): AsyncIterable<RuntimeFdSnapshot> {
+  async *listFdSnapshots(): AsyncGenerator<RuntimeFdSnapshot, void, void> {
     this.scanCount += 1
     if (this.scanError) throw this.scanError
     for (const fd of this.fds) {
@@ -192,6 +193,19 @@ class FakeRuntimeSystem implements ExternalRuntimeSystem {
     const rollout = this.rollouts.get(path)
     if (!rollout) throw new Error(`Unknown fake rollout: ${path}`)
     return rollout
+  }
+}
+
+async function collectDefaultSnapshots(system: ExternalRuntimeSystem): Promise<{
+  snapshots: RuntimeFdSnapshot[]
+  complete: boolean | void
+}> {
+  const iterator = system.listFdSnapshots()[Symbol.asyncIterator]()
+  const snapshots: RuntimeFdSnapshot[] = []
+  while (true) {
+    const result = await iterator.next()
+    if (result.done) return { snapshots, complete: result.value }
+    snapshots.push(result.value)
   }
 }
 
@@ -303,6 +317,38 @@ describe('discoverExternalRolloutWriters', () => {
     expect(writers).toHaveLength(256)
     expect(system.snapshotYieldCount).toBe(256)
   })
+
+  it('marks writer discovery incomplete when the unique-writer cap closes the iterator', async () => {
+    const rollouts = Array.from({ length: 276 }, (_, index) => ({
+      path: `/sessions/${index}.jsonl`,
+      log: '',
+      dev: '8',
+      ino: `${index + 1}`,
+    }))
+    const system = fakeRuntimeSystem({
+      rollouts,
+      fds: rollouts.map((rollout, index) => writerFd({
+        path: rollout.path,
+        ino: rollout.ino,
+        pid: index + 10,
+      })),
+    })
+
+    await expect(discoverExternalRolloutWriterSnapshot(sessionsRoot, null, system)).resolves.toMatchObject({
+      writers: { length: 256 },
+      complete: false,
+    })
+    expect(system.snapshotYieldCount).toBe(256)
+  })
+
+  it('treats a legacy injected void generator completion as complete', async () => {
+    const system = fakeRuntimeSystem({ fds: [writerFd()] })
+
+    await expect(discoverExternalRolloutWriterSnapshot(sessionsRoot, null, system)).resolves.toMatchObject({
+      writers: [{ path: rolloutPath, dev: '8', ino: '21', size: 0, pid: 42 }],
+      complete: true,
+    })
+  })
 })
 
 describe('default Linux descriptor discovery work caps', () => {
@@ -329,9 +375,10 @@ describe('default Linux descriptor discovery work caps', () => {
     })
     const system = createExternalRuntimeSystem({ now: () => 0 })
 
-    for await (const _snapshot of system.listFdSnapshots()) { /* no candidates */ }
+    const result = await collectDefaultSnapshots(system)
 
     expect(EXTERNAL_RUNTIME_MAX_NUMERIC_PROCESSES).toBe(16_384)
+    expect(result.complete).toBe(false)
     const excludedPid = pids.at(-1)
     expect(nodeFs.readFile).not.toHaveBeenCalledWith(`/proc/${excludedPid}/stat`, 'utf8')
   })
@@ -348,12 +395,11 @@ describe('default Linux descriptor discovery work caps', () => {
       fds,
     }] })
     const system = createExternalRuntimeSystem({ now: () => 0 })
-    let snapshots = 0
-
-    for await (const _snapshot of system.listFdSnapshots()) snapshots += 1
+    const result = await collectDefaultSnapshots(system)
 
     expect(EXTERNAL_RUNTIME_MAX_DESCRIPTORS_PER_APP_SERVER).toBe(4_096)
-    expect(snapshots).toBe(4_096)
+    expect(result.snapshots).toHaveLength(4_096)
+    expect(result.complete).toBe(false)
     expect(nodeFs.stat).not.toHaveBeenCalledWith(`/proc/42/fd/${fds.at(-1)}`, { bigint: true })
   })
 
@@ -369,12 +415,11 @@ describe('default Linux descriptor discovery work caps', () => {
     }))
     defaultRuntimeProbe({ processes })
     const system = createExternalRuntimeSystem({ now: () => 0 })
-    let snapshots = 0
-
-    for await (const _snapshot of system.listFdSnapshots()) snapshots += 1
+    const result = await collectDefaultSnapshots(system)
 
     expect(EXTERNAL_RUNTIME_MAX_FD_SNAPSHOTS).toBe(8_192)
-    expect(snapshots).toBe(8_192)
+    expect(result.snapshots).toHaveLength(8_192)
+    expect(result.complete).toBe(false)
   })
 
   it('returns partial results when the scan wall budget is exhausted', async () => {
@@ -392,13 +437,22 @@ describe('default Linux descriptor discovery work caps', () => {
         return value
       },
     })
-    const snapshots: RuntimeFdSnapshot[] = []
-
-    for await (const snapshot of system.listFdSnapshots()) snapshots.push(snapshot)
+    const result = await collectDefaultSnapshots(system)
 
     expect(EXTERNAL_RUNTIME_SCAN_WALL_BUDGET_MS).toBe(5_000)
-    expect(snapshots).toEqual([])
+    expect(result.snapshots).toEqual([])
+    expect(result.complete).toBe(false)
     expect(nodeFs.stat).not.toHaveBeenCalled()
+  })
+
+  it('marks an uncapped stable default scan complete', async () => {
+    defaultRuntimeProbe()
+    const system = createExternalRuntimeSystem({ now: () => 0 })
+
+    const result = await collectDefaultSnapshots(system)
+
+    expect(result.snapshots).toHaveLength(1)
+    expect(result.complete).toBe(true)
   })
 })
 

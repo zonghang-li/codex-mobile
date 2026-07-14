@@ -30,6 +30,7 @@ class FakeMonitorSystem implements ExternalRuntimeSystem {
   maxActiveReads = 0
   blockReads: Promise<void> | null = null
   beforeDiscovery: (() => void) | null = null
+  discoveryComplete: boolean | void = undefined
 
   add(path: string, value = '', ino = path): FakeFile {
     const file = { path, bytes: Buffer.from(value), dev: '8', ino, regular: true }
@@ -89,9 +90,10 @@ class FakeMonitorSystem implements ExternalRuntimeSystem {
     }
   }
 
-  async *listFdSnapshots(): AsyncIterable<RuntimeFdSnapshot> {
+  async *listFdSnapshots(): AsyncGenerator<RuntimeFdSnapshot, boolean | void, void> {
     this.beforeDiscovery?.()
     yield* this.writers
+    return this.discoveryComplete
   }
 
   append(file: FakeFile, value: string): void {
@@ -495,6 +497,65 @@ describe('ExternalTurnMonitor', () => {
     expect(fixture.events.at(-1)).toEqual(
       observedCompleted('thread-1', 'turn-1', 601_000, 600_000),
     )
+  })
+
+  it('retains an aged missing writer when descriptor discovery is incomplete', async () => {
+    let time = 1_000
+    const fixture = monitorFixture({ now: () => time, inactiveExpiryMs: 100 })
+    const rollout = fixture.system.add(
+      '/sessions/rollout-1.jsonl',
+      sessionMeta('thread-1') + started('turn-1', 1_000),
+      '1',
+    )
+    await fixture.monitor.start()
+    fixture.system.writers = []
+    fixture.system.discoveryComplete = false
+    time += 100
+    await fixture.runScheduledScan()
+
+    fixture.system.append(rollout, completed('turn-1', 601_000, 600_000))
+    await fixture.runScheduledScan()
+
+    expect(fixture.events).toEqual([
+      observedStarted('thread-1', 'turn-1', 1_000),
+      observedCompleted('thread-1', 'turn-1', 601_000, 600_000),
+    ])
+  })
+
+  it('retains an aged live tracked writer omitted by the 256-writer discovery cap', async () => {
+    let time = 1_000
+    const fixture = monitorFixture({
+      now: () => time,
+      cursorLimit: 1,
+      inactiveExpiryMs: 100,
+    })
+    const rollout = fixture.system.add(
+      '/sessions/tracked.jsonl',
+      sessionMeta('tracked-thread') + started('tracked-turn', 1_000),
+      'tracked',
+    )
+    const trackedWriter = fixture.system.writers[0]!
+    await fixture.monitor.start()
+
+    for (let index = 0; index < 256; index += 1) {
+      fixture.system.add(
+        `/sessions/other-${index}.jsonl`,
+        sessionMeta(`other-thread-${index}`),
+        `other-${index}`,
+      )
+    }
+    fixture.system.writers = [...fixture.system.writers.slice(1), trackedWriter]
+    time += 100
+    await fixture.runScheduledScan()
+
+    fixture.system.append(rollout, completed('tracked-turn', 601_000, 600_000))
+    fixture.system.writers = [...fixture.system.writers.slice(0, 256), fixture.system.writer(rollout)]
+    await fixture.runScheduledScan()
+
+    expect(fixture.events).toEqual([
+      observedStarted('tracked-thread', 'tracked-turn', 1_000),
+      observedCompleted('tracked-thread', 'tracked-turn', 601_000, 600_000),
+    ])
   })
 
   it('exports a 24-hour production inactive-expiry default', () => {

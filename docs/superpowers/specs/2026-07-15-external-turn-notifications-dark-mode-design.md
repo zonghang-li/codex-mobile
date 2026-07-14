@@ -217,6 +217,7 @@ The button must not reduce the title, terminal control, or branch selector below
 - Process/FD discovery reuses one `/proc` snapshot per cycle rather than one scan per thread.
 - Missing-writer inactive expiry: 24 hours without file growth or renewed writer evidence.
 - Per-cycle Linux discovery caps: 16,384 numeric processes, 4,096 descriptors per app-server, 8,192 yielded descriptor snapshots, 256 unique rollout writers, and a 5,000 ms wall-clock budget.
+- A scan that reaches any discovery cap reports itself as incomplete. It may refresh evidence for writers it found, but absence from that partial result never advances inactive expiry.
 - Historical session files are not repeatedly parsed.
 - ntfy-disabled mode starts no monitor, timer, scan, or notification network work.
 
