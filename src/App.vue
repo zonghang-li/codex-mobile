@@ -1236,6 +1236,7 @@ import { getFreeModeStatus, setFreeMode, setFreeModeCustomKey, setCustomProvider
 import { getPathLeafName, getPathParent, isProjectlessChatPath, normalizePathForUi } from './pathUtils.js'
 import { copyTextToClipboard } from './utils/clipboard'
 import { codexDirectiveExportLines } from './utils/codexDirectives'
+import { readThemeMode, type ThemeMode } from './utils/themeMode'
 
 const ThreadConversation = defineAsyncComponent(() => import('./components/content/ThreadConversation.vue'))
 const ThreadTerminalPanel = defineAsyncComponent(() => import('./components/content/ThreadTerminalPanel.vue'))
@@ -4290,11 +4291,9 @@ function loadBoolPref(key: string, fallback: boolean): boolean {
   return v === '1'
 }
 
-function loadDarkModePref(): 'system' | 'light' | 'dark' {
+function loadDarkModePref(): ThemeMode {
   if (typeof window === 'undefined') return 'system'
-  const v = window.localStorage.getItem(DARK_MODE_KEY)
-  if (v === 'light' || v === 'dark') return v
-  return 'system'
+  return readThemeMode(window.localStorage.getItem(DARK_MODE_KEY))
 }
 
 function loadInProgressSendModePref(): 'steer' | 'queue' {
