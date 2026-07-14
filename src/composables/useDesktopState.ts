@@ -66,6 +66,7 @@ import type { ThreadRuntimeOwnership } from '../types/threadRuntime'
 import { getPathParent, isProjectlessChatPath, normalizePathForUi, toProjectName } from '../pathUtils.js'
 import { parseCodexDirectiveText } from '../utils/codexDirectives'
 import {
+  mergeExternalReasoningSnapshots,
   readExternalReasoningSnapshot,
   type ExternalReasoningSnapshot,
 } from './externalLiveSnapshot'
@@ -4823,6 +4824,16 @@ export function useDesktopState() {
     ownership: ThreadRuntimeOwnership,
     inProgress: boolean,
   ): void {
+    const previous = externalReasoningSnapshotByThreadId.value[threadId]
+    if (
+      ownership === 'external'
+      && inProgress
+      && detail.externalRuntimeState === 'unknown'
+      && !detail.activeTurnId
+      && previous
+    ) {
+      return
+    }
     if (ownership !== 'external' || !inProgress || !detail.activeTurnId) {
       externalReasoningSnapshotByThreadId.value = omitKey(
         externalReasoningSnapshotByThreadId.value,
@@ -4831,10 +4842,7 @@ export function useDesktopState() {
       return
     }
     const incoming = readExternalReasoningSnapshot(detail.messages, detail.activeTurnId)
-    const previous = externalReasoningSnapshotByThreadId.value[threadId]
-    const next = !incoming.label && previous?.turnId === incoming.turnId
-      ? { ...incoming, label: previous.label }
-      : incoming
+    const next = mergeExternalReasoningSnapshots(previous, incoming)
     externalReasoningSnapshotByThreadId.value = {
       ...externalReasoningSnapshotByThreadId.value,
       [threadId]: next,
@@ -4844,9 +4852,8 @@ export function useDesktopState() {
   function reconcileThreadDetailSnapshot(
     threadId: string,
     detail: ThreadDetailSnapshot,
-    options: { preserveMissing: boolean; markRead: boolean },
+    options: { preserveMissing: boolean; markRead: boolean; requestedVersion: string },
   ): void {
-    const version = currentThreadVersion(threadId)
     if (detail.modelProvider) {
       setThreadModelProviderId(threadId, detail.modelProvider)
     }
@@ -4908,14 +4915,19 @@ export function useDesktopState() {
     lastMessageLoadAtByThreadId.set(threadId, Date.now())
     lastMessageLoadFailureAtByThreadId.delete(threadId)
 
-    if (version) {
+    if (options.requestedVersion) {
       loadedVersionByThreadId.value = {
         ...loadedVersionByThreadId.value,
-        [threadId]: version,
+        [threadId]: options.requestedVersion,
       }
     }
-    setThreadRuntimeOwnership(threadId, ownership)
-    setThreadInProgress(threadId, inProgress)
+    if (inProgress) {
+      setThreadRuntimeOwnership(threadId, ownership)
+      setThreadInProgress(threadId, true)
+    } else {
+      setThreadInProgress(threadId, false)
+      setThreadRuntimeOwnership(threadId, ownership)
+    }
     reconcileExternalReasoningSnapshot(threadId, detail, ownership, inProgress)
     if (ownership === 'local' && activeTurnId) {
       activeTurnIdByThreadId.value = {
@@ -5003,6 +5015,7 @@ export function useDesktopState() {
       reconcileThreadDetailSnapshot(threadId, detail, {
         preserveMissing: options.silent === true,
         markRead: true,
+        requestedVersion: version,
       })
       } catch (unknownError) {
         const message = unknownError instanceof Error ? unknownError.message : 'Unknown application error'

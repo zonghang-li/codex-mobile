@@ -1,6 +1,9 @@
 import { describe, expect, it } from 'vitest'
 import type { UiMessage } from '../types/codex'
-import { readExternalReasoningSnapshot } from './externalLiveSnapshot'
+import {
+  mergeExternalReasoningSnapshots,
+  readExternalReasoningSnapshot,
+} from './externalLiveSnapshot'
 
 function reasoning(id: string, turnId: string, text: string): UiMessage {
   return { id, turnId, role: 'assistant', text, messageType: 'reasoning' }
@@ -38,6 +41,25 @@ describe('external live reasoning snapshot', () => {
       turnId: 'turn-active',
       label: '',
       hiddenMessageIds: [],
+    })
+  })
+
+  it('carries the same-turn label and hidden ids across bounded snapshots', () => {
+    expect(mergeExternalReasoningSnapshots(
+      {
+        turnId: 'turn-active',
+        label: 'Inspecting fixtures',
+        hiddenMessageIds: ['reasoning-1'],
+      },
+      {
+        turnId: 'turn-active',
+        label: '',
+        hiddenMessageIds: ['reasoning-2'],
+      },
+    )).toEqual({
+      turnId: 'turn-active',
+      label: 'Inspecting fixtures',
+      hiddenMessageIds: ['reasoning-1', 'reasoning-2'],
     })
   })
 })

@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { watch } from 'vue'
 import {
   buildWorkspaceRootsProjectOrderState,
   collectWorkspaceRootPathsForProjectRemoval,
@@ -2461,6 +2462,212 @@ describe('external live reasoning overlay', () => {
     await state.loadMessages('thread-external')
 
     expect(state.selectedLiveOverlay.value?.activityLabel).toBe('Thinking')
+  })
+
+  it('keeps prior active-turn reasoning hidden across consecutive bounded snapshots', async () => {
+    installTestWindow()
+    gatewayMocks.getPendingServerRequests.mockResolvedValue([])
+    gatewayMocks.resumeThread.mockResolvedValue({
+      ...externalDetail('turn-external'),
+      messages: [
+        {
+          id: 'reasoning-1',
+          role: 'assistant',
+          text: '**Inspecting fixtures**',
+          messageType: 'reasoning',
+          turnId: 'turn-external',
+        },
+        {
+          id: 'agent-1',
+          role: 'assistant',
+          text: 'First output',
+          messageType: 'agentMessage',
+          turnId: 'turn-external',
+        },
+      ],
+    })
+    gatewayMocks.getThreadDetail
+      .mockResolvedValueOnce({
+        ...externalDetail('turn-external'),
+        messages: [{
+          id: 'agent-2',
+          role: 'assistant',
+          text: 'Second output',
+          messageType: 'agentMessage',
+          turnId: 'turn-external',
+        }],
+      })
+      .mockResolvedValueOnce({
+        ...externalDetail('turn-external'),
+        messages: [
+          {
+            id: 'reasoning-2',
+            role: 'assistant',
+            text: '**Continuing analysis**',
+            messageType: 'reasoning',
+            turnId: 'turn-external',
+          },
+          {
+            id: 'agent-3',
+            role: 'assistant',
+            text: 'Third output',
+            messageType: 'agentMessage',
+            turnId: 'turn-external',
+          },
+        ],
+      })
+
+    const state = useDesktopState()
+    state.primeSelectedThread('thread-external')
+    await state.loadMessages('thread-external')
+    await state.loadMessages('thread-external', { silent: true, force: true })
+    await state.loadMessages('thread-external', { silent: true, force: true })
+
+    expect(state.selectedLiveOverlay.value?.activityLabel).toBe('Continuing analysis')
+    expect(state.messages.value.map((message) => message.id)).toEqual([
+      'agent-1',
+      'agent-2',
+      'agent-3',
+    ])
+  })
+
+  it('preserves the last external reasoning snapshot for an inconclusive detail', async () => {
+    installTestWindow()
+    gatewayMocks.getPendingServerRequests.mockResolvedValue([])
+    gatewayMocks.resumeThread.mockResolvedValue({
+      ...externalDetail('turn-external'),
+      messages: [
+        {
+          id: 'reasoning-1',
+          role: 'assistant',
+          text: '**Reading runtime state**',
+          messageType: 'reasoning',
+          turnId: 'turn-external',
+        },
+        {
+          id: 'agent-1',
+          role: 'assistant',
+          text: 'Existing output',
+          messageType: 'agentMessage',
+          turnId: 'turn-external',
+        },
+      ],
+    })
+    gatewayMocks.getThreadDetail.mockResolvedValue({
+      ...idleDetail(),
+      externalRuntimeState: 'unknown',
+    })
+
+    const state = useDesktopState()
+    state.primeSelectedThread('thread-external')
+    await state.loadMessages('thread-external')
+    await state.loadMessages('thread-external', { silent: true, force: true })
+
+    expect(state.selectedLiveOverlay.value?.activityLabel).toBe('Reading runtime state')
+    expect(state.messages.value.map((message) => message.id)).toEqual(['agent-1'])
+  })
+
+  it('lands the final idle output before clearing the external overlay', async () => {
+    installTestWindow()
+    gatewayMocks.getPendingServerRequests.mockResolvedValue([])
+    gatewayMocks.resumeThread.mockResolvedValue({
+      ...externalDetail('turn-external'),
+      messages: [{
+        id: 'reasoning-1',
+        role: 'assistant',
+        text: '**Finishing work**',
+        messageType: 'reasoning',
+        turnId: 'turn-external',
+      }],
+    })
+    gatewayMocks.getThreadDetail.mockResolvedValue({
+      ...idleDetail(),
+      messages: [{
+        id: 'agent-final',
+        role: 'assistant',
+        text: 'Final desktop output',
+        messageType: 'agentMessage',
+        turnId: 'turn-external',
+      }],
+    })
+
+    const state = useDesktopState()
+    state.primeSelectedThread('thread-external')
+    await state.loadMessages('thread-external')
+    const overlayChanges: Array<{ label: string | null; messageIds: string[] }> = []
+    const stopWatching = watch(
+      () => state.selectedLiveOverlay.value?.activityLabel ?? null,
+      (label) => {
+        overlayChanges.push({
+          label,
+          messageIds: state.messages.value.map((message) => message.id),
+        })
+      },
+      { flush: 'sync' },
+    )
+
+    await state.loadMessages('thread-external', { silent: true, force: true })
+    stopWatching()
+
+    expect(overlayChanges.map((change) => change.label)).toEqual([null])
+    expect(overlayChanges[0]?.messageIds).toContain('agent-final')
+  })
+})
+
+describe('thread detail version reconciliation', () => {
+  it('does not mark a notification version loaded with an older in-flight detail', async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date('2026-07-14T00:00:00.000Z'))
+    installTestWindow()
+    let notificationHandler: ((notification: { method: string; params?: unknown }) => void) | undefined
+    gatewayMocks.subscribeCodexNotifications.mockImplementation((handler) => {
+      notificationHandler = handler as typeof notificationHandler
+      return vi.fn()
+    })
+    gatewayMocks.getPendingServerRequests.mockResolvedValue([])
+    gatewayMocks.getThreadGroupsPage.mockResolvedValue({
+      groups: [{ projectName: 'Project', threads: [
+        { ...thread('thread-race', '/tmp/project'), updatedAtIso: '2026-07-14T00:00:00.000Z' },
+      ] }],
+      nextCursor: null,
+    })
+
+    const state = useDesktopState()
+    state.primeSelectedThread('thread-race')
+    await state.refreshAll({ includeSelectedThreadMessages: false })
+    state.startPolling()
+    pollingCleanups.push(() => state.stopPolling())
+    const pendingDetail = deferred<ReturnType<typeof idleDetail>>()
+    gatewayMocks.resumeThread.mockReturnValue(pendingDetail.promise)
+    const firstLoad = state.loadMessages('thread-race')
+
+    gatewayMocks.getThreadGroupsPage.mockResolvedValue({
+      groups: [{ projectName: 'Project', threads: [
+        { ...thread('thread-race', '/tmp/project'), updatedAtIso: '2026-07-14T00:00:01.000Z' },
+      ] }],
+      nextCursor: null,
+    })
+    notificationHandler?.({
+      method: 'thread/name/updated',
+      params: { threadId: 'thread-race', name: 'Updated while reading detail' },
+    })
+    const eventSyncCallback = vi.mocked(window.setTimeout).mock.calls
+      .filter(([, delay]) => delay === 220)
+      .pop()?.[0]
+    expect(eventSyncCallback).toBeTypeOf('function')
+    eventSyncCallback?.()
+    await flushMicrotasks()
+    expect(state.projectGroups.value[0]?.threads[0]?.updatedAtIso).toBe('2026-07-14T00:00:01.000Z')
+
+    pendingDetail.resolve(idleDetail())
+    await firstLoad
+    await flushMicrotasks()
+    vi.setSystemTime(new Date('2026-07-14T00:00:03.000Z'))
+    gatewayMocks.getThreadDetail.mockResolvedValue(idleDetail())
+
+    await state.loadMessages('thread-race')
+
+    expect(gatewayMocks.getThreadDetail).toHaveBeenCalledTimes(1)
   })
 })
 

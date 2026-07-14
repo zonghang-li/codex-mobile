@@ -6,6 +6,21 @@ export type ExternalReasoningSnapshot = {
   hiddenMessageIds: string[]
 }
 
+export function mergeExternalReasoningSnapshots(
+  previous: ExternalReasoningSnapshot | undefined,
+  incoming: ExternalReasoningSnapshot,
+): ExternalReasoningSnapshot {
+  if (!previous || previous.turnId !== incoming.turnId) return incoming
+  return {
+    ...incoming,
+    label: incoming.label || previous.label,
+    hiddenMessageIds: [...new Set([
+      ...previous.hiddenMessageIds,
+      ...incoming.hiddenMessageIds,
+    ])],
+  }
+}
+
 function normalizeSummaryParagraph(value: string): string {
   const normalized = value.replace(/\s+/gu, ' ').trim()
   if (normalized.length > 4 && normalized.startsWith('**') && normalized.endsWith('**')) {
