@@ -2,6 +2,8 @@ import { readFile } from 'node:fs/promises'
 import { describe, expect, it, vi } from 'vitest'
 import { buildSafeSecurityPolicy, PERMISSIVE_SECURITY_POLICY } from './securityPolicy'
 import { loadSafeRuntimeConfig } from '../safe/runtimePolicy'
+import { createEmptyNtfyState, type NtfyNotifierState } from '../safe/ntfyState'
+import { NtfyCompletionNotifier } from './ntfyCompletionNotifier'
 
 describe('server security policy', () => {
   it('preserves upstream behavior with the permissive default', async () => {
@@ -85,14 +87,15 @@ describe('server security policy', () => {
     }
     const stateStore = { load: vi.fn(), save: vi.fn() }
     const createStateStore = vi.fn(() => stateStore)
+    const acknowledgement = Promise.resolve()
     const notifier = {
       start: vi.fn(async () => {}),
       handle: vi.fn(),
-      handleObserved: vi.fn(),
+      handleObserved: vi.fn(() => acknowledgement),
       dispose: vi.fn(async () => {}),
     }
     const createNotifier = vi.fn(() => notifier)
-    let onLifecycle: ((event: unknown) => void) | undefined
+    let onLifecycle: ((event: unknown) => void | Promise<void>) | undefined
     let finishMonitorDispose: (() => void) | undefined
     const monitor = {
       start: vi.fn(async () => {}),
@@ -100,7 +103,9 @@ describe('server security policy', () => {
         finishMonitorDispose = resolve
       })),
     }
-    const createExternalMonitor = vi.fn((monitorOptions: { onLifecycle: (event: unknown) => void }) => {
+    const createExternalMonitor = vi.fn((monitorOptions: {
+      onLifecycle: (event: unknown) => void | Promise<void>
+    }) => {
       onLifecycle = monitorOptions.onLifecycle
       return monitor
     })
@@ -129,7 +134,7 @@ describe('server security policy', () => {
       occurredAt: 600_000,
       durationMs: 600_000,
     }
-    onLifecycle?.(observed)
+    expect(onLifecycle?.(observed)).toBe(acknowledgement)
     expect(notifier.handleObserved).toHaveBeenCalledWith(observed)
 
     lifecycle.dispose()
@@ -181,6 +186,77 @@ describe('server security policy', () => {
     await vi.waitFor(() => expect(monitor.start).toHaveBeenCalledTimes(1))
     lifecycle.dispose()
     await vi.waitFor(() => expect(notifier.dispose).toHaveBeenCalledTimes(1))
+  })
+
+  it('retries one failed durable external completion through the real notifier wiring', async () => {
+    const { createNtfyNotifierLifecycle } = await import('./httpServer')
+    let state = createEmptyNtfyState()
+    let failPendingSave = true
+    const save = vi.fn(async (nextState: NtfyNotifierState) => {
+      if (nextState.pending.length > 0 && failPendingSave) {
+        failPendingSave = false
+        throw new Error('temporary state failure')
+      }
+      state = structuredClone(nextState)
+    })
+    const send = vi.fn(async () => {})
+    let completionAttempts = 0
+
+    const lifecycle = createNtfyNotifierLifecycle({
+      bridge: {
+        readThreadForNotifier: vi.fn(async () => ({
+          thread: {
+            turns: [{ id: 'turn-1', items: [{ type: 'agentMessage', text: '完成。' }] }],
+          },
+        })),
+        getAppServerPidForNotifier: vi.fn(() => 1234),
+        getSessionsRootForNotifier: vi.fn(() => '/home/test/.codex/sessions'),
+        subscribeNotifications: vi.fn(() => vi.fn()),
+      },
+      config: { publishUrl: 'https://ntfy.sh/test-topic', statePath: '/tmp/ntfy-state.json' },
+      createStateStore: vi.fn(() => ({
+        load: async () => structuredClone(state),
+        save,
+      }) as never),
+      createNotifier: vi.fn((options) => new NtfyCompletionNotifier({ ...options, send })),
+      createExternalMonitor: vi.fn((options) => ({
+        async start() {
+          await options.onLifecycle({
+            method: 'turn/started',
+            threadId: 'thread-1',
+            turnId: 'turn-1',
+            status: 'inProgress',
+            occurredAt: 1_000,
+          })
+          for (let attempt = 0; attempt < 2; attempt += 1) {
+            completionAttempts += 1
+            try {
+              await options.onLifecycle({
+                method: 'turn/completed',
+                threadId: 'thread-1',
+                turnId: 'turn-1',
+                status: 'completed',
+                occurredAt: 601_000,
+                durationMs: 600_000,
+              })
+              break
+            } catch {
+              // The monitor retains its cursor and retries this exact lifecycle record.
+            }
+          }
+        },
+        async dispose() {},
+      })),
+      warn: vi.fn(),
+    })
+
+    await vi.waitFor(() => expect(send).toHaveBeenCalledTimes(1))
+    expect(completionAttempts).toBe(2)
+    expect(state.active).toEqual([])
+    expect(state.sent.map(({ key }) => key)).toEqual(['thread-1:turn-1'])
+    expect(save.mock.calls.filter(([saved]) => saved.active.length === 1)).toHaveLength(1)
+
+    lifecycle.dispose()
   })
 
   it('keeps direct subscription cleanup safe when notifier startup rejects', async () => {

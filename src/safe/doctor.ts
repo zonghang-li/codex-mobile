@@ -49,7 +49,7 @@ export function inspectSafeSources(sources: SafeSourceSet): DoctorResult {
   requireText(failures, sources.httpServer, 'NtfyCompletionNotifier', 'HTTP server must use the bounded completion notifier')
   requireText(failures, sources.httpServer, 'createExternalTurnMonitor', 'HTTP server must own external turn monitoring')
   requireText(failures, sources.httpServer, 'getSessionsRootForNotifier', 'External turn monitoring must use the canonical sessions root')
-  requireText(failures, sources.httpServer, 'onLifecycle: (event) => notifier.handleObserved(event)', 'External turn lifecycle must route into the notifier')
+  requireText(failures, sources.httpServer, 'return notifier.handleObserved(event)', 'External turn lifecycle must return the durable notifier acknowledgement')
   requireText(failures, sources.securityPolicy, 'backgroundIntegrationsEnabled: false', 'Safe policy must keep background integrations disabled')
   return { ok: failures.length === 0, failures }
 }

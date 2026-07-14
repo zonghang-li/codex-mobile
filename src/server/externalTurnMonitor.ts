@@ -9,6 +9,7 @@ import {
 import { parseRolloutRecord, type ParsedRolloutRecord } from './rolloutLifecycle'
 
 export const EXTERNAL_TURN_SCAN_INTERVAL_MS = 15_000
+export const EXTERNAL_TURN_INACTIVE_EXPIRY_MS = 24 * 60 * 60 * 1_000
 const READ_CHUNK_BYTES = 64 * 1024
 const MAX_TRAILING_BYTES = 256 * 1024
 const DEFAULT_CURSOR_LIMIT = 256
@@ -37,6 +38,7 @@ export type ExternalTurnMonitorOptions = {
   system?: ExternalRuntimeSystem
   scanIntervalMs?: number
   cursorLimit?: number
+  inactiveExpiryMs?: number
   now?: () => number
   onLifecycle: (event: ObservedTurnLifecycle) => void | Promise<void>
   warn?: (message: string) => void
@@ -56,6 +58,8 @@ type RolloutCursor = {
   activeTurn: { turnId: string; startedAt: number } | null
   pendingInitialLifecycle: Exclude<ParsedRolloutRecord, { kind: 'session' }> | null
   lastObservedAt: number
+  lastFileActivityAt: number
+  lastWriterSeenAt: number
 }
 
 type InitialTail = {
@@ -91,6 +95,7 @@ export function createExternalTurnMonitor(
     ? Math.min(DEFAULT_CURSOR_LIMIT, Math.max(1, Math.floor(requestedCursorLimit)))
     : DEFAULT_CURSOR_LIMIT
   const now = options.now ?? Date.now
+  const inactiveExpiryMs = options.inactiveExpiryMs ?? EXTERNAL_TURN_INACTIVE_EXPIRY_MS
   const warn = options.warn ?? console.warn
   const setTimer = options.setTimer ?? ((callback, delayMs) => setTimeout(() => {
     void callback()
@@ -349,6 +354,7 @@ export function createExternalTurnMonitor(
     if (!hasStableIdentity(revalidated, stableIdentity) || revalidated.size < stableIdentity.size) return
     const checkpoint = await readCheckpoint(stableIdentity, stableIdentity.size)
 
+    const registeredAt = now()
     const cursor: RolloutCursor = {
       key: `${writer.dev}:${writer.ino}`,
       path: writer.path,
@@ -360,7 +366,9 @@ export function createExternalTurnMonitor(
       threadId,
       activeTurn: null,
       pendingInitialLifecycle: tail.latestLifecycle,
-      lastObservedAt: now(),
+      lastObservedAt: registeredAt,
+      lastFileActivityAt: registeredAt,
+      lastWriterSeenAt: registeredAt,
     }
     cursors.set(cursor.key, cursor)
     await applyPendingInitialLifecycle(cursor)
@@ -438,12 +446,6 @@ export function createExternalTurnMonitor(
   }
 
   async function scan(): Promise<void> {
-    const writers = await discoverExternalRolloutWriters(
-      options.sessionsRoot,
-      excludedPid(),
-      system,
-    )
-
     for (const cursor of [...cursors.values()]) {
       const identity = await system.statFile(cursor.path).catch(() => null)
       if (
@@ -460,9 +462,29 @@ export function createExternalTurnMonitor(
         continue
       }
       await applyPendingInitialLifecycle(cursor)
-      if (identity.size > cursor.offset && !await readForward(cursor, identity.size)) {
-        cursors.delete(cursor.key)
+      if (identity.size > cursor.offset) {
+        if (!await readForward(cursor, identity.size)) {
+          cursors.delete(cursor.key)
+        } else {
+          cursor.lastFileActivityAt = now()
+        }
       }
+    }
+
+    const writers = await discoverExternalRolloutWriters(
+      options.sessionsRoot,
+      excludedPid(),
+      system,
+    )
+    const writerKeys = new Set(writers.map((writer) => `${writer.dev}:${writer.ino}`))
+    const observedAt = now()
+    for (const cursor of [...cursors.values()]) {
+      if (writerKeys.has(cursor.key)) {
+        cursor.lastWriterSeenAt = observedAt
+        continue
+      }
+      const inactiveSince = Math.max(cursor.lastFileActivityAt, cursor.lastWriterSeenAt)
+      if (observedAt - inactiveSince >= inactiveExpiryMs) cursors.delete(cursor.key)
     }
 
     for (const writer of writers) {

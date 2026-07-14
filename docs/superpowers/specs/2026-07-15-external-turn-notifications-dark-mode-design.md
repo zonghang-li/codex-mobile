@@ -1,7 +1,7 @@
 # External Turn Notifications and Mobile Dark Mode Design
 
 Date: 2026-07-15
-Status: Awaiting written-spec review
+Status: Approved and implemented
 Branch: `codex/external-turn-notifications-dark-mode`
 
 ## Summary
@@ -112,7 +112,7 @@ Each scan immediately registers newly discovered rollout identities. The scan in
 
 The monitor retains only active/recently terminal rollout cursors, capped at 256. It does not recursively reread all historical sessions on every interval.
 
-Once a rollout is registered, continue checking its append offset even after the writer descriptor disappears, until a terminal lifecycle record is consumed or a bounded inactive-expiry policy evicts the cursor. Writer disappearance by itself never creates a terminal event.
+Once a rollout is registered, continue checking its append offset even after the writer descriptor disappears, until a terminal lifecycle record is consumed or 24 hours pass with neither file growth nor live-writer evidence. This inactive expiry only evicts the cursor; writer disappearance by itself never creates a terminal event.
 
 ### Incremental JSONL Parsing
 
@@ -215,6 +215,8 @@ The button must not reduce the title, terminal control, or branch selector below
 - Incremental 64 KiB reads; unchanged files read zero payload bytes.
 - Cursor and active-turn collections capped at 256.
 - Process/FD discovery reuses one `/proc` snapshot per cycle rather than one scan per thread.
+- Missing-writer inactive expiry: 24 hours without file growth or renewed writer evidence.
+- Per-cycle Linux discovery caps: 16,384 numeric processes, 4,096 descriptors per app-server, 8,192 yielded descriptor snapshots, 256 unique rollout writers, and a 5,000 ms wall-clock budget.
 - Historical session files are not repeatedly parsed.
 - ntfy-disabled mode starts no monitor, timer, scan, or notification network work.
 

@@ -36,6 +36,9 @@ pnpm run service:restart
 7. Confirm the real default Fetch request uses an RFC 2047 ASCII title and `X-Sequence-ID`, while warnings contain no URL, topic, body, or sender exception text.
 8. Confirm absent notification configuration creates no notifier, external monitor, event subscription, process/filesystem scan, timer, state store, or network work.
 9. In the deterministic integration harness, deliver the same logical turn once through a direct app-server notification and once through external rollout discovery. Confirm exactly one ntfy send is captured, both observations resolve to the same durable turn key and sequence ID, and no duplicate pending or sent record is created.
+10. Confirm an external completion acknowledgement is withheld until its state save succeeds. Make that save fail once, then verify the monitor retries the same record with one durable start and exactly one send.
+11. Confirm tracked cursors are read before process discovery. A missing-writer cursor remains eligible before 24 hours, is evicted at the 24-hour inactive boundary without a synthetic terminal event, and a live writer or growing file refreshes the appropriate activity clock.
+12. Confirm default Linux discovery stops at 16,384 numeric processes, 4,096 descriptors per app-server, 8,192 yielded snapshots, 256 unique rollout writers, or 5,000 ms wall time.
 
 ## Cross-client and restart acceptance
 
@@ -51,6 +54,7 @@ Use only synthetic topic placeholders in deterministic harness output. Do not pr
 8. In the deterministic integration harness, feed one logical turn through both direct app-server notification handling and external rollout discovery. Observe exactly one captured send, one durable turn key, one stable sequence ID, and no duplicate pending or sent record.
 9. Start another controlled external turn, restart the safe service between its authoritative rollout start and terminal records, then complete it. Observe exactly one send using the original rollout timestamp rather than the restart time.
 10. Complete a historical rollout fixture before monitor startup, start the monitor, and observe no send. Also remove its writer/process evidence without a terminal lifecycle record and confirm no completion is inferred.
+11. In the deterministic fake-clock harness, keep a missing-writer active cursor below and then at the 24-hour inactive boundary. Confirm append checks continue before the boundary, eviction at the boundary emits nothing, and released cursor capacity can admit a newly discovered writer.
 
 ## Service and Tailnet boundary checks
 
@@ -94,7 +98,7 @@ Use only synthetic topic placeholders in deterministic harness output. Do not pr
 - Notifications are disabled when the default file is absent and enabled only after a valid current-user mode-`0600` regular file is present and the service restarts.
 - Only `https://ntfy.sh/<single-topic>` is accepted. The topic segment contains only letters, numbers, `_`, or `-`; credentials, queries, fragments, other origins, extra segments, and symlinks are rejected.
 - Tasks shorter than 10 minutes never notify. Successful, failed, and interrupted qualifying turns use the exact titles and one-sentence summary behavior above.
-- With ntfy enabled, same-user turns started from the mobile UI, Codex Desktop, Codex CLI, and other Codex clients that write authoritative rollouts are eligible. External detection is server-side, polls on a serialized 15-second cadence, survives a safe-service restart using authoritative rollout timestamps, and never replays already-terminal history.
+- With ntfy enabled, same-user turns started from the mobile UI, Codex Desktop, Codex CLI, and other Codex clients that write authoritative rollouts are eligible. External detection is server-side, polls on a serialized 15-second cadence, reads tracked rollouts before bounded discovery, survives a safe-service restart using authoritative rollout timestamps, and never replays already-terminal history. A missing writer is not completion; its cursor expires only after 24 inactive hours.
 - Notification sending is outbound-only and does not block or fail the Codex turn. Active/pending/sent state is private, durable, and bounded to 256 records per collection.
 - Ordinary duplicates and cross-source observations of the same logical turn are locally suppressed through one durable key and reuse one stable sequence ID, without duplicate pending/sent records. Ambiguous delivery remains a documented possible re-alert boundary.
 - Browser access remains password-protected, loopback-backed, and Tailscale Serve-only. No LAN listener, Funnel, Telegram bridge, or Cloudflare/public tunnel is enabled.

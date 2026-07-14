@@ -78,6 +78,11 @@ const READ_CHUNK_BYTES = 64 * 1024
 const CACHE_CHECKPOINT_BYTES = 256
 const MAX_PROCESS_ANCESTRY_DEPTH = 128
 const PROCESS_GONE_CODES = new Set(['ENOENT', 'ESRCH'])
+export const EXTERNAL_RUNTIME_MAX_NUMERIC_PROCESSES = 16_384
+export const EXTERNAL_RUNTIME_MAX_DESCRIPTORS_PER_APP_SERVER = 4_096
+export const EXTERNAL_RUNTIME_MAX_FD_SNAPSHOTS = 8_192
+export const EXTERNAL_RUNTIME_SCAN_WALL_BUDGET_MS = 5_000
+export const EXTERNAL_RUNTIME_MAX_ROLLOUT_WRITERS = 256
 
 class InconclusiveRuntimeScanError extends Error {
   constructor(message: string) {
@@ -392,34 +397,56 @@ function isCodexAppServerCommand(cmdline: string): boolean {
   return codexIndex >= 0 && argv.slice(codexIndex + 1).includes('app-server')
 }
 
-async function* listLinuxFdSnapshots(ownUid: number | null): AsyncIterable<RuntimeFdSnapshot> {
+async function* listLinuxFdSnapshots(
+  ownUid: number | null,
+  now: () => number,
+): AsyncIterable<RuntimeFdSnapshot> {
+  const scanStartedAt = now()
+  const hasTimeRemaining = (): boolean => {
+    const elapsed = now() - scanStartedAt
+    return elapsed >= 0 && elapsed < EXTERNAL_RUNTIME_SCAN_WALL_BUDGET_MS
+  }
+  if (!hasTimeRemaining()) return
   const processEntries = await readProcDirectory('/proc', '/proc')
   if (!processEntries) {
     throw new InconclusiveRuntimeScanError('Cannot inspect /proc')
   }
 
   const processes = new Map<number, LinuxProcessRecord>()
+  let numericProcessCount = 0
   for (const entry of processEntries) {
     if (!/^\d+$/u.test(entry)) continue
+    if (numericProcessCount >= EXTERNAL_RUNTIME_MAX_NUMERIC_PROCESSES) break
+    numericProcessCount += 1
+    if (!hasTimeRemaining()) return
     const pid = Number.parseInt(entry, 10)
     if (!Number.isSafeInteger(pid)) continue
 
     const process = await readStableProcessRecord(`/proc/${entry}`, pid, ownUid)
+    if (!hasTimeRemaining()) return
     if (process) processes.set(pid, process)
   }
 
+  let yieldedSnapshots = 0
   for (const process of processes.values()) {
+    if (yieldedSnapshots >= EXTERNAL_RUNTIME_MAX_FD_SNAPSHOTS || !hasTimeRemaining()) return
     const { pid, uid, cmdline } = process
     if (uid !== ownUid || !isCodexAppServerCommand(cmdline)) continue
     const processRoot = `/proc/${pid}`
     const ancestorPids = collectAncestorPids(pid, processes)
     if (!(await validateProcessChain(process, ancestorPids, processes))) continue
+    if (!hasTimeRemaining()) return
     const fdEntries = await readProcDirectory(`${processRoot}/fd`, `process ${pid} descriptors`)
     if (fdEntries === null) continue
     const snapshots: RuntimeFdSnapshot[] = []
+    let numericDescriptorCount = 0
     for (const fd of fdEntries) {
       if (!/^\d+$/u.test(fd)) continue
+      if (numericDescriptorCount >= EXTERNAL_RUNTIME_MAX_DESCRIPTORS_PER_APP_SERVER) break
+      numericDescriptorCount += 1
+      if (!hasTimeRemaining()) return
       const descriptor = await readStableFdSnapshot(processRoot, pid, fd)
+      if (!hasTimeRemaining()) return
       if (!descriptor) continue
       snapshots.push({
         path: descriptor.path,
@@ -434,12 +461,20 @@ async function* listLinuxFdSnapshots(ownUid: number | null): AsyncIterable<Runti
       })
     }
     if (!(await validateProcessChain(process, ancestorPids, processes))) continue
-    yield* snapshots
+    if (!hasTimeRemaining()) return
+    for (const snapshot of snapshots) {
+      if (yieldedSnapshots >= EXTERNAL_RUNTIME_MAX_FD_SNAPSHOTS || !hasTimeRemaining()) return
+      yieldedSnapshots += 1
+      yield snapshot
+    }
   }
 }
 
-export function createExternalRuntimeSystem(): ExternalRuntimeSystem {
+export function createExternalRuntimeSystem(
+  options: { now?: () => number } = {},
+): ExternalRuntimeSystem {
   const uid = typeof process.getuid === 'function' ? process.getuid() : null
+  const now = options.now ?? Date.now
   return {
     platform: process.platform,
     uid,
@@ -472,7 +507,7 @@ export function createExternalRuntimeSystem(): ExternalRuntimeSystem {
         await handle.close()
       }
     },
-    listFdSnapshots: () => listLinuxFdSnapshots(uid),
+    listFdSnapshots: () => listLinuxFdSnapshots(uid, now),
   }
 }
 
@@ -583,6 +618,7 @@ export async function discoverExternalRolloutWriters(
         size: identity.size,
         pid: fd.pid,
       })
+      if (writers.size >= EXTERNAL_RUNTIME_MAX_ROLLOUT_WRITERS) break
     }
   }
 
