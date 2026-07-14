@@ -1272,6 +1272,66 @@ describe('turn completion lifecycle', () => {
 })
 
 describe('external runtime ownership', () => {
+  it('discovers a new desktop turn for the selected idle task and immediately loads its output', async () => {
+    const state = await setupBackgroundRuntimeState()
+    gatewayMocks.getThreadRuntimeStates.mockResolvedValue({
+      'thread-selected': {
+        state: 'running',
+        turnId: 'turn-external',
+        interruptible: false,
+        source: 'external-session-writer',
+      },
+    })
+    gatewayMocks.getExternalThreadLiveSnapshot.mockResolvedValue({
+      ...externalDetail('turn-external'),
+      messages: [
+        {
+          id: 'user-external',
+          role: 'user',
+          text: 'desktop input',
+          messageType: 'userMessage',
+          turnId: 'turn-external',
+        },
+        {
+          id: 'reasoning-external',
+          role: 'assistant',
+          text: '**Inspecting state**',
+          messageType: 'reasoning',
+          turnId: 'turn-external',
+        },
+        {
+          id: 'agent-external',
+          role: 'assistant',
+          text: 'desktop output',
+          messageType: 'agentMessage',
+          turnId: 'turn-external',
+        },
+      ],
+    })
+
+    state.startPolling()
+    pollingCleanups.push(() => state.stopPolling())
+    await vi.advanceTimersByTimeAsync(0)
+    await flushMicrotasks()
+
+    expect(gatewayMocks.getThreadRuntimeStates).toHaveBeenCalledWith(
+      ['thread-selected', 'thread-running'],
+      expect.any(AbortSignal),
+    )
+    expect(state.selectedThreadRuntimeOwnership.value).toBe('external')
+    expect(state.selectedThread.value).toMatchObject({ inProgress: true })
+
+    await vi.advanceTimersByTimeAsync(1)
+    await flushMicrotasks()
+
+    expect(gatewayMocks.getExternalThreadLiveSnapshot).toHaveBeenCalledTimes(1)
+    expect(state.messages.value).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: 'user-external', text: 'desktop input' }),
+      expect.objectContaining({ id: 'agent-external', text: 'desktop output' }),
+    ]))
+    expect(state.selectedLiveOverlay.value?.activityLabel).toBe('Inspecting state')
+  })
+
   it('shows a non-selected unread desktop task as working after a running batch result', async () => {
     const state = await setupBackgroundRuntimeState()
     gatewayMocks.getThreadRuntimeStates.mockResolvedValue({
@@ -1297,7 +1357,7 @@ describe('external runtime ownership', () => {
       unread: false,
     })
     expect(gatewayMocks.getThreadRuntimeStates).toHaveBeenCalledWith(
-      ['thread-running'],
+      ['thread-selected', 'thread-running'],
       expect.any(AbortSignal),
     )
   })
@@ -1695,7 +1755,10 @@ describe('external runtime ownership', () => {
     await flushMicrotasks()
 
     expect(gatewayMocks.getThreadRuntimeStates).toHaveBeenCalledWith(
-      Array.from({ length: 50 }, (_, index) => `thread-${index}`),
+      [
+        'thread-selected',
+        ...Array.from({ length: 49 }, (_, index) => `thread-${index}`),
+      ],
       expect.any(AbortSignal),
     )
   })
