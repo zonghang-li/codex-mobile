@@ -62,6 +62,16 @@ function observedCompleted(
   return { method: 'turn/completed', threadId, turnId, status, occurredAt, durationMs }
 }
 
+function topLevelThread(turns: unknown[] = []): unknown {
+  return {
+    thread: {
+      parentThreadId: null,
+      source: 'appServer',
+      turns,
+    },
+  }
+}
+
 function harness(options: {
   now?: () => number
   store?: MemoryStateStore
@@ -71,9 +81,9 @@ function harness(options: {
   createTimeoutSignal?: (milliseconds: number) => AbortSignal
 } = {}) {
   const store = options.store ?? new MemoryStateStore()
-  const readThread = vi.fn(options.readThread ?? (async () => ({
-    thread: { turns: [{ id: 'turn-1', items: [{ type: 'agentMessage', text: '工作完成。更多内容' }] }] },
-  })))
+  const readThread = vi.fn(options.readThread ?? (async () => topLevelThread([
+    { id: 'turn-1', items: [{ type: 'agentMessage', text: '工作完成。更多内容' }] },
+  ])))
   const requests: NtfySendRequest[] = []
   const send = vi.fn(options.send ?? (async (request: NtfySendRequest) => {
     requests.push(request)
@@ -285,7 +295,7 @@ describe('long-turn notification decisions', () => {
   it('uses the interrupted title and fallback for an observed turn', async () => {
     const fixture = harness({
       now: () => 9_999_999,
-      readThread: async () => ({ thread: { turns: [] } }),
+      readThread: async () => topLevelThread(),
     })
     await fixture.notifier.start()
     fixture.notifier.handleObserved(observedStarted())
@@ -316,6 +326,72 @@ describe('long-turn notification decisions', () => {
   })
 
   it.each([
+    ['parent field', {
+      thread: { parentThreadId: 'parent-1', source: 'appServer', turns: [] },
+    }],
+    ['subagent source', {
+      thread: { parentThreadId: null, source: { subAgent: 'review' }, turns: [] },
+    }],
+  ] as const)('silently removes a completed child active record identified by %s', async (
+    _label,
+    child,
+  ) => {
+    const fixture = await runTurn(NTFY_MIN_DURATION_MS, {
+      readThread: async () => child,
+    })
+
+    expect(fixture.readThread).toHaveBeenCalledTimes(1)
+    expect(fixture.send).not.toHaveBeenCalled()
+    expect(fixture.store.state).toEqual(createEmptyNtfyState())
+  })
+
+  it.each([
+    ['unknown source', async () => ({ thread: { parentThreadId: null, source: 'unknown', turns: [] } })],
+    ['malformed parent', async () => ({ thread: { parentThreadId: 42, source: 'appServer', turns: [] } })],
+    ['read failure', async () => { throw new Error('thread unavailable') }],
+  ] as const)('fails closed for %s at send time', async (_label, readThread) => {
+    const fixture = await runTurn(NTFY_MIN_DURATION_MS, { readThread })
+
+    expect(fixture.send).not.toHaveBeenCalled()
+    expect(fixture.store.state).toEqual(createEmptyNtfyState())
+  })
+
+  it('warns generically when top-level verification cannot read the thread', async () => {
+    const fixture = await runTurn(NTFY_MIN_DURATION_MS, {
+      readThread: async () => { throw new Error('secret thread unavailable') },
+    })
+
+    expect(fixture.warn).toHaveBeenCalledWith('Unable to verify top-level long-task notification')
+    expect(fixture.warn.mock.calls.flat().join('\n')).not.toContain('secret')
+  })
+
+  it('silently clears a child active record persisted by an older process', async () => {
+    const store = new MemoryStateStore({
+      active: [{
+        key: 'thread-1:turn-1',
+        threadId: 'thread-1',
+        turnId: 'turn-1',
+        startedAt: 0,
+      }],
+      pending: [],
+      sent: [],
+    })
+    const fixture = harness({
+      store,
+      now: () => NTFY_MIN_DURATION_MS,
+      readThread: async () => ({
+        thread: { parentThreadId: 'parent-1', source: { subAgent: 'review' }, turns: [] },
+      }),
+    })
+    await fixture.notifier.start()
+    fixture.notifier.handle(completed())
+    await fixture.notifier.dispose()
+
+    expect(fixture.send).not.toHaveBeenCalled()
+    expect(store.state).toEqual(createEmptyNtfyState())
+  })
+
+  it.each([
     ['completed', 'Codex 任务完成'],
     ['failed', 'Codex 任务失败'],
     ['cancelled', 'Codex 任务已中断'],
@@ -331,7 +407,7 @@ describe('long-turn notification decisions', () => {
   ] as const)('uses the %s fallback when no assistant message exists', async (status, message) => {
     const fixture = await runTurn(
       NTFY_MIN_DURATION_MS,
-      { readThread: async () => ({ thread: { turns: [] } }) },
+      { readThread: async () => topLevelThread() },
       status,
     )
     expect(fixture.send.mock.calls[0]?.[0].record.message).toBe(message)
@@ -339,15 +415,11 @@ describe('long-turn notification decisions', () => {
 
   it('uses the fallback when only historical and future turns have assistant messages', async () => {
     const fixture = await runTurn(NTFY_MIN_DURATION_MS, {
-      readThread: async () => ({
-        thread: {
-          turns: [
-            { id: 'turn-before', items: [{ type: 'agentMessage', text: '历史回复。' }] },
-            { id: 'turn-1', items: [{ type: 'commandExecution' }] },
-            { id: 'turn-after', items: [{ type: 'agentMessage', text: '未来回复。' }] },
-          ],
-        },
-      }),
+      readThread: async () => topLevelThread([
+        { id: 'turn-before', items: [{ type: 'agentMessage', text: '历史回复。' }] },
+        { id: 'turn-1', items: [{ type: 'commandExecution' }] },
+        { id: 'turn-after', items: [{ type: 'agentMessage', text: '未来回复。' }] },
+      ]),
     })
 
     expect(fixture.send.mock.calls[0]?.[0].record.message).toBe('任务已完成。')
