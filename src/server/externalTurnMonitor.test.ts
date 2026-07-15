@@ -486,6 +486,31 @@ describe('ExternalTurnMonitor', () => {
     expect(fixture.warnings.join(' ')).not.toMatch(/first|inode|\/sessions\//u)
   })
 
+  it('does not expire an aged missing-writer cursor after an inconclusive tracked read', async () => {
+    let time = 1_000
+    const fixture = monitorFixture({ now: () => time, inactiveExpiryMs: 100 })
+    const rollout = fixture.system.add(
+      '/sessions/aged-missing.jsonl',
+      sessionMeta('thread-1') + started('turn-1', 1_000),
+      'aged-inode',
+    )
+    await fixture.monitor.start()
+    fixture.system.append(rollout, completed('turn-1', 601_000, 600_000))
+    fixture.system.writers = []
+    fixture.system.statFailures.set(rollout.path, 1)
+    time = 1_100
+
+    await fixture.runScheduledScan()
+    expect(fixture.events).toEqual([observedStarted('thread-1', 'turn-1', 1_000)])
+
+    await fixture.runScheduledScan()
+    expect(fixture.events).toEqual([
+      observedStarted('thread-1', 'turn-1', 1_000),
+      observedCompleted('thread-1', 'turn-1', 601_000, 600_000),
+    ])
+    expect(fixture.warnings).toEqual(['Unable to inspect tracked external turn lifecycle'])
+  })
+
   it('does not let a checkpoint read failure block a later completion', async () => {
     const fixture = monitorFixture()
     const first = fixture.system.add(
