@@ -692,11 +692,35 @@ describe('ExternalThreadRuntimeProbe', () => {
         interruptible: false,
         source: 'external-session-writer',
       },
-      'thread-b': { state: 'idle' },
+      'thread-b': { state: 'unknown' },
       'thread-c': { state: 'idle' },
       missing: { state: 'unknown' },
     })
     expect(system.scanCount).toBe(1)
+  })
+
+  it('keeps missing writer evidence unknown beside running and terminal rows', async () => {
+    const { probe } = batchProbe([
+      { path: '/sessions/running', log: lifecycle('task_started', 'turn-running'), dev: '8', ino: '21' },
+      { path: '/sessions/missing', log: lifecycle('task_started', 'turn-missing'), dev: '8', ino: '22' },
+      {
+        path: '/sessions/terminal',
+        log: lifecycle('task_started', 'turn-terminal') + lifecycle('task_complete', 'turn-terminal'),
+        dev: '8',
+        ino: '23',
+      },
+    ], [writerFd({ dev: '8', ino: '21' })])
+
+    await expect(probe.inspectMany(['running', 'missing', 'terminal'], 99)).resolves.toEqual({
+      running: {
+        state: 'running',
+        turnId: 'turn-running',
+        interruptible: false,
+        source: 'external-session-writer',
+      },
+      missing: { state: 'unknown' },
+      terminal: { state: 'idle' },
+    })
   })
 
   it('keeps valid writer evidence when another rollout escapes the sessions root', async () => {
@@ -784,11 +808,11 @@ describe('ExternalThreadRuntimeProbe', () => {
     })
   })
 
-  it('returns idle when an unmatched start has no live writer', async () => {
+  it('returns unknown when an unmatched start has no live writer', async () => {
     const system = fakeRuntimeSystem({ log: lifecycle('task_started', 'turn-a') })
 
     await expect(registeredProbe(system).inspect('thread-1', 99)).resolves.toEqual({
-      state: 'idle',
+      state: 'unknown',
     })
   })
 
@@ -799,7 +823,7 @@ describe('ExternalThreadRuntimeProbe', () => {
     })
 
     await expect(registeredProbe(system).inspect('thread-1', 42)).resolves.toEqual({
-      state: 'idle',
+      state: 'unknown',
     })
   })
 
@@ -812,7 +836,7 @@ describe('ExternalThreadRuntimeProbe', () => {
       fds: [writerFd({ pid: 200, ancestorPids })],
     })
 
-    await expect(registeredProbe(system).inspect('thread-1', 99)).resolves.toEqual({ state: 'idle' })
+    await expect(registeredProbe(system).inspect('thread-1', 99)).resolves.toEqual({ state: 'unknown' })
   })
 
   it('accepts a separate desktop app-server whose ancestors do not include the mobile launcher', async () => {
@@ -834,7 +858,7 @@ describe('ExternalThreadRuntimeProbe', () => {
     })
 
     await expect(registeredProbe(system).inspect('thread-1', 99)).resolves.toEqual({
-      state: 'idle',
+      state: 'unknown',
     })
   })
 
@@ -853,7 +877,7 @@ describe('ExternalThreadRuntimeProbe', () => {
       })
 
       await expect(registeredProbe(system).inspect('thread-1', 99)).resolves.toEqual({
-        state: 'idle',
+        state: 'unknown',
       })
     },
   )
@@ -893,7 +917,7 @@ describe('ExternalThreadRuntimeProbe', () => {
       fds: [writerFd({ cmdline })],
     })
 
-    await expect(registeredProbe(system).inspect('thread-1', 99)).resolves.toEqual({ state: 'idle' })
+    await expect(registeredProbe(system).inspect('thread-1', 99)).resolves.toEqual({ state: 'unknown' })
   })
 
   it('accepts a writable read-write descriptor', async () => {
@@ -1135,7 +1159,7 @@ describe('ExternalThreadRuntimeProbe', () => {
       fdIno: nextLargeInode,
     })
 
-    await expect(probe.inspect('thread-1', 99)).resolves.toEqual({ state: 'idle' })
+    await expect(probe.inspect('thread-1', 99)).resolves.toEqual({ state: 'unknown' })
   })
 
   it('excludes a native Codex process descended from the mobile Node launcher', async () => {
@@ -1156,7 +1180,7 @@ describe('ExternalThreadRuntimeProbe', () => {
       ],
     })
 
-    await expect(probe.inspect('thread-1', 99)).resolves.toEqual({ state: 'idle' })
+    await expect(probe.inspect('thread-1', 99)).resolves.toEqual({ state: 'unknown' })
   })
 
   it('returns unknown when a candidate app-server ancestry contains a cycle', async () => {
@@ -1371,7 +1395,7 @@ describe('ExternalThreadRuntimeProbe', () => {
       ],
     })
 
-    await expect(probe.inspect('thread-1', 99)).resolves.toEqual({ state: 'idle' })
+    await expect(probe.inspect('thread-1', 99)).resolves.toEqual({ state: 'unknown' })
   })
 
   it('accepts a stable writable FD whose position advances during inspection', async () => {
@@ -1399,7 +1423,7 @@ describe('ExternalThreadRuntimeProbe', () => {
   ])('skips a descriptor that disappears %s', async (_label, goneAt) => {
     const probe = defaultRuntimeProbe({ fdStatGoneAt: [goneAt] })
 
-    await expect(probe.inspect('thread-1', 99)).resolves.toEqual({ state: 'idle' })
+    await expect(probe.inspect('thread-1', 99)).resolves.toEqual({ state: 'unknown' })
   })
 
   it('returns unknown when a proc status has a malformed parent PID', async () => {
