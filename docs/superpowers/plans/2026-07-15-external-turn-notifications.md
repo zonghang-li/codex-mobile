@@ -772,4 +772,3 @@ journalctl --user -u codex-mobile-safe -n 50 --no-pager
 ```
 
 Expected: service active; listener only on `127.0.0.1:5900`; HTTPS URL remains Tailnet-only; journal contains no ntfy URL/topic, password, prompt, assistant text, or repeated monitor errors.
-
