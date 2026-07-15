@@ -6,6 +6,7 @@ import {
   type ExternalRuntimeSystem,
   type RuntimeFileIdentity,
 } from './externalThreadRuntime'
+import type { NtfyThreadScope } from './ntfyThreadScope'
 import { parseRolloutRecord, type ParsedRolloutRecord } from './rolloutLifecycle'
 
 export const EXTERNAL_TURN_SCAN_INTERVAL_MS = 15_000
@@ -55,12 +56,15 @@ type RolloutCursor = {
   trailing: Buffer
   checkpoint: Buffer
   threadId: string
+  notificationScope: NtfyThreadScope
   activeTurn: { turnId: string; startedAt: number } | null
   pendingInitialLifecycle: Exclude<ParsedRolloutRecord, { kind: 'session' }> | null
   lastObservedAt: number
   lastFileActivityAt: number
   lastWriterSeenAt: number
 }
+
+type RolloutSession = { threadId: string; notificationScope: NtfyThreadScope }
 
 type InitialTail = {
   latestLifecycle: Exclude<ParsedRolloutRecord, { kind: 'session' }> | null
@@ -152,6 +156,7 @@ export function createExternalTurnMonitor(
       if (!cursor.threadId) cursor.threadId = record.threadId
       return
     }
+    if (cursor.notificationScope !== 'topLevel') return
     if (!cursor.threadId) return
 
     if (record.kind === 'started') {
@@ -245,32 +250,42 @@ export function createExternalTurnMonitor(
     return false
   }
 
-  async function readSessionThreadId(identity: RuntimeFileIdentity): Promise<string> {
+  async function readSessionMetadata(identity: RuntimeFileIdentity): Promise<RolloutSession | null> {
     let offset = 0
     let trailing = Buffer.alloc(0)
     const limit = Math.min(identity.size, MAX_TRAILING_BYTES)
     while (offset < limit) {
       const length = Math.min(READ_CHUNK_BYTES, limit - offset)
       const chunk = await system.readRange(identity.path, offset, length, identity)
-      if (chunk.length === 0) return ''
+      if (chunk.length === 0) return null
       offset += chunk.length
       const bytes = trailing.length > 0 ? Buffer.concat([trailing, chunk]) : chunk
       let lineStart = 0
       let newline = bytes.indexOf(0x0a)
       while (newline !== -1) {
         const record = parseRolloutRecord(bytes.subarray(lineStart, newline).toString('utf8'))
-        if (record?.kind === 'session') return record.threadId
+        if (record?.kind === 'session') {
+          return {
+            threadId: record.threadId,
+            notificationScope: record.notificationScope,
+          }
+        }
         lineStart = newline + 1
         newline = bytes.indexOf(0x0a, lineStart)
       }
       trailing = Buffer.from(bytes.subarray(lineStart))
-      if (trailing.length > MAX_TRAILING_BYTES) return ''
+      if (trailing.length > MAX_TRAILING_BYTES) return null
     }
     if (offset === identity.size && trailing.length > 0) {
       const record = parseRolloutRecord(trailing.toString('utf8'))
-      if (record?.kind === 'session') return record.threadId
+      if (record?.kind === 'session') {
+        return {
+          threadId: record.threadId,
+          notificationScope: record.notificationScope,
+        }
+      }
     }
-    return ''
+    return null
   }
 
   async function readInitialTail(identity: RuntimeFileIdentity): Promise<InitialTail> {
@@ -337,8 +352,8 @@ export function createExternalTurnMonitor(
       ino: identity.ino,
       size: identity.size,
     }
-    const threadId = await readSessionThreadId(stableIdentity)
-    if (!threadId) return
+    const session = await readSessionMetadata(stableIdentity)
+    if (!session) return
 
     let tail: InitialTail
     try {
@@ -363,7 +378,8 @@ export function createExternalTurnMonitor(
       offset: stableIdentity.size,
       trailing: tail.trailing,
       checkpoint,
-      threadId,
+      threadId: session.threadId,
+      notificationScope: session.notificationScope,
       activeTurn: null,
       pendingInitialLifecycle: tail.latestLifecycle,
       lastObservedAt: registeredAt,
