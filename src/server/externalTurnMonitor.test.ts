@@ -511,6 +511,12 @@ describe('ExternalTurnMonitor', () => {
     expect(fixture.events).toContainEqual(
       observedCompleted('second-thread', 'second-turn', 601_000, 600_000),
     )
+
+    await fixture.runScheduledScan()
+    expect(fixture.events.filter(({ threadId }) => threadId === 'first-thread')).toEqual([
+      observedStarted('first-thread', 'first-turn', 1_000),
+      observedCompleted('first-thread', 'first-turn', 601_000, 600_000),
+    ])
     expect(fixture.warnings).toEqual(['Unable to inspect tracked external turn lifecycle'])
     expect(fixture.warnings.join(' ')).not.toMatch(/checkpoint|first|inode|\/sessions\//u)
   })
