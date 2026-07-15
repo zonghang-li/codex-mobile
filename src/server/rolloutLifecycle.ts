@@ -1,5 +1,10 @@
+import {
+  classifyNtfyThreadScope,
+  type NtfyThreadScope,
+} from './ntfyThreadScope'
+
 export type ParsedRolloutRecord =
-  | { kind: 'session'; threadId: string }
+  | { kind: 'session'; threadId: string; notificationScope: NtfyThreadScope }
   | { kind: 'started'; turnId: string; occurredAt: number }
   | {
       kind: 'terminal'
@@ -48,7 +53,13 @@ export function parseRolloutRecord(line: string): ParsedRolloutRecord | null {
 
   if (root.type === 'session_meta') {
     const threadId = readString(payload.id)
-    return threadId ? { kind: 'session', threadId } : null
+    return threadId
+      ? {
+          kind: 'session',
+          threadId,
+          notificationScope: classifyNtfyThreadScope(payload),
+        }
+      : null
   }
   if (root.type !== 'event_msg') return null
 

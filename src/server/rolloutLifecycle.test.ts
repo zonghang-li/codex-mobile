@@ -6,8 +6,12 @@ describe('parseRolloutRecord', () => {
     expect(parseRolloutRecord(JSON.stringify({
       timestamp: '2026-07-14T22:47:19.971Z',
       type: 'session_meta',
-      payload: { id: 'thread-1' },
-    }))).toEqual({ kind: 'session', threadId: 'thread-1' })
+      payload: { id: 'thread-1', source: 'vscode' },
+    }))).toEqual({
+      kind: 'session',
+      threadId: 'thread-1',
+      notificationScope: 'topLevel',
+    })
 
     expect(parseRolloutRecord(JSON.stringify({
       timestamp: '2026-07-14T22:47:19.971Z',
@@ -17,6 +21,18 @@ describe('parseRolloutRecord', () => {
       kind: 'started',
       turnId: 'turn-1',
       occurredAt: Date.parse('2026-07-14T22:47:19.971Z'),
+    })
+  })
+
+  it.each([
+    [{ id: 'child-1', parent_thread_id: 'parent-1', source: 'vscode' }, 'child'],
+    [{ id: 'child-2', source: { subagent: 'review' } }, 'child'],
+    [{ id: 'unknown-1', source: 'unknown' }, 'unknown'],
+  ] as const)('retains notification scope from session metadata %#', (payload, notificationScope) => {
+    expect(parseRolloutRecord(JSON.stringify({ type: 'session_meta', payload }))).toEqual({
+      kind: 'session',
+      threadId: payload.id,
+      notificationScope,
     })
   })
 
