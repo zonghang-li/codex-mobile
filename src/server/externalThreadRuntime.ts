@@ -731,7 +731,7 @@ export class ExternalThreadRuntimeProbe {
               interruptible: false,
               source: 'external-session-writer',
             }
-          : { state: 'idle' }
+          : { state: 'unknown' }
       }
     } catch {
       for (const entry of unmatched) states[entry.threadId] = { state: 'unknown' }
