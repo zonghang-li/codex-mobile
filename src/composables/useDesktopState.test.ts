@@ -335,6 +335,28 @@ describe('Codex directive notification state', () => {
     })
   })
 
+  it('withholds and then renders a split typed pull-request directive', async () => {
+    const { state, emit } = await setupCodexDirectiveNotificationState()
+    emit({
+      method: 'item/agentMessage/delta',
+      params: {
+        threadId: 'thread-1', itemId: 'agent-typed-pr',
+        delta: 'Done.\n::git-create-pr{cwd="/tmp/repo" branch="feature/one" url="https://example.com/pull/1" isDr',
+      },
+    })
+    expect(state.messages.value.at(-1)).toMatchObject({ text: 'Done.' })
+    expect(state.messages.value.at(-1)?.directives).toBeUndefined()
+
+    emit({
+      method: 'item/agentMessage/delta',
+      params: { threadId: 'thread-1', itemId: 'agent-typed-pr', delta: 'aft=false}' },
+    })
+    expect(state.messages.value.at(-1)).toMatchObject({
+      text: 'Done.',
+      directives: [{ kind: 'git-create-pr', url: 'https://example.com/pull/1', isDraft: false }],
+    })
+  })
+
   it('turns a still-incomplete future directive into one warning on completion', async () => {
     const { state, emit } = await setupCodexDirectiveNotificationState()
     const text = 'Done.\n::future{x="1"'
