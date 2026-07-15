@@ -55,6 +55,26 @@ describe('normalizeThreadMessagesV2', () => {
     expect(messages[1].directives).toBeUndefined()
   })
 
+  it('normalizes official typed pull-request and code-comment literals', () => {
+    const messages = normalizeThreadMessagesV2(threadReadResponseWithContent([{
+      type: 'agentMessage',
+      id: 'assistant-typed-directives',
+      text: [
+        'Done.',
+        '::git-create-pr{cwd="/tmp/repo" branch="feature/one" url="https://example.com/pull/1" isDraft=false}',
+        '::code-comment{title="Fix" body="Body" file="src/a.ts" start=4 end=7 priority=2}',
+      ].join('\n'),
+    }]))
+
+    expect(messages[0]).toMatchObject({
+      text: 'Done.',
+      directives: [
+        { kind: 'git-create-pr', url: 'https://example.com/pull/1', isDraft: false },
+        { kind: 'code-comment', file: 'src/a.ts', start: 4, end: 7, priority: 2 },
+      ],
+    })
+  })
+
   it('normalizes future and invalid standalone directives only from assistant messages', () => {
     const response = threadReadResponseWithContent([
       {
