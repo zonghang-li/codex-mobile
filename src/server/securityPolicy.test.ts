@@ -206,6 +206,8 @@ describe('server security policy', () => {
       bridge: {
         readThreadForNotifier: vi.fn(async () => ({
           thread: {
+            parentThreadId: null,
+            source: 'appServer',
             turns: [{ id: 'turn-1', items: [{ type: 'agentMessage', text: '完成。' }] }],
           },
         })),
