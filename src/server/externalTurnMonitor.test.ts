@@ -34,6 +34,7 @@ class FakeMonitorSystem implements ExternalRuntimeSystem {
   readonly resolvedPaths = new Map<string, string>()
   readonly realpathFailures = new Map<string, number>()
   readonly statFailures = new Map<string, number>()
+  readonly readFailures: Array<{ path: string; offset: number; remaining: number }> = []
 
   add(path: string, value = '', ino = path): FakeFile {
     const file = { path, bytes: Buffer.from(value), dev: '8', ino, regular: true }
@@ -89,6 +90,15 @@ class FakeMonitorSystem implements ExternalRuntimeSystem {
     expected: RuntimeFileIdentity,
   ): Promise<Buffer> {
     this.readCalls.push({ path, offset, length })
+    const failure = this.readFailures.find((candidate) => (
+      candidate.path === path
+      && candidate.offset === offset
+      && candidate.remaining > 0
+    ))
+    if (failure) {
+      failure.remaining -= 1
+      throw Object.assign(new Error(`read failed for ${path}`), { code: 'EIO' })
+    }
     this.activeReads += 1
     this.maxActiveReads = Math.max(this.maxActiveReads, this.activeReads)
     try {
@@ -114,6 +124,10 @@ class FakeMonitorSystem implements ExternalRuntimeSystem {
     this.writers = this.writers.map((writer) => writer.path === file.path
       ? this.writer(file)
       : writer)
+  }
+
+  failRead(path: string, offset: number, count = 1): void {
+    this.readFailures.push({ path, offset, remaining: count })
   }
 }
 
@@ -437,6 +451,130 @@ describe('ExternalTurnMonitor', () => {
     expect(fixture.events.at(-1)).toEqual(
       observedCompleted('thread-1', 'turn-1', 601_000, 600_000),
     )
+  })
+
+  it('retains a cursor after tracked stat rejection and still consumes later cursors', async () => {
+    const fixture = monitorFixture()
+    const first = fixture.system.add(
+      '/sessions/first.jsonl',
+      sessionMeta('first-thread') + started('first-turn', 1_000),
+      'first-inode',
+    )
+    const second = fixture.system.add(
+      '/sessions/second.jsonl',
+      sessionMeta('second-thread') + started('second-turn', 1_000),
+      'second-inode',
+    )
+    await fixture.monitor.start()
+    fixture.system.append(first, completed('first-turn', 601_000, 600_000))
+    fixture.system.append(second, completed('second-turn', 601_000, 600_000))
+    fixture.system.statFailures.set(first.path, 1)
+
+    await fixture.runScheduledScan()
+    expect(fixture.events).toContainEqual(
+      observedCompleted('second-thread', 'second-turn', 601_000, 600_000),
+    )
+    expect(fixture.events).not.toContainEqual(
+      observedCompleted('first-thread', 'first-turn', 601_000, 600_000),
+    )
+
+    await fixture.runScheduledScan()
+    expect(fixture.events).toContainEqual(
+      observedCompleted('first-thread', 'first-turn', 601_000, 600_000),
+    )
+    expect(fixture.warnings).toEqual(['Unable to inspect tracked external turn lifecycle'])
+    expect(fixture.warnings.join(' ')).not.toMatch(/first|inode|\/sessions\//u)
+  })
+
+  it('does not let a checkpoint read failure block a later completion', async () => {
+    const fixture = monitorFixture()
+    const first = fixture.system.add(
+      '/sessions/checkpoint-first.jsonl',
+      sessionMeta('first-thread') + started('first-turn', 1_000),
+      'first-inode',
+    )
+    const second = fixture.system.add(
+      '/sessions/checkpoint-second.jsonl',
+      sessionMeta('second-thread') + started('second-turn', 1_000),
+      'second-inode',
+    )
+    await fixture.monitor.start()
+    fixture.system.append(first, completed('first-turn', 601_000, 600_000))
+    fixture.system.append(second, completed('second-turn', 601_000, 600_000))
+    fixture.system.failRead(first.path, 0)
+
+    await fixture.runScheduledScan()
+
+    expect(fixture.events).not.toContainEqual(
+      observedCompleted('first-thread', 'first-turn', 601_000, 600_000),
+    )
+    expect(fixture.events).toContainEqual(
+      observedCompleted('second-thread', 'second-turn', 601_000, 600_000),
+    )
+    expect(fixture.warnings).toEqual(['Unable to inspect tracked external turn lifecycle'])
+    expect(fixture.warnings.join(' ')).not.toMatch(/checkpoint|first|inode|\/sessions\//u)
+  })
+
+  it('does not let a forward read failure block a later completion and retries it', async () => {
+    const fixture = monitorFixture()
+    const first = fixture.system.add(
+      '/sessions/forward-first.jsonl',
+      sessionMeta('first-thread') + started('first-turn', 1_000),
+      'first-inode',
+    )
+    const second = fixture.system.add(
+      '/sessions/forward-second.jsonl',
+      sessionMeta('second-thread') + started('second-turn', 1_000),
+      'second-inode',
+    )
+    await fixture.monitor.start()
+    const firstOffset = first.bytes.length
+    fixture.system.append(first, completed('first-turn', 601_000, 600_000))
+    fixture.system.append(second, completed('second-turn', 601_000, 600_000))
+    fixture.system.failRead(first.path, firstOffset)
+
+    await fixture.runScheduledScan()
+    expect(fixture.events).not.toContainEqual(
+      observedCompleted('first-thread', 'first-turn', 601_000, 600_000),
+    )
+    expect(fixture.events).toContainEqual(
+      observedCompleted('second-thread', 'second-turn', 601_000, 600_000),
+    )
+
+    await fixture.runScheduledScan()
+    expect(fixture.events).toContainEqual(
+      observedCompleted('first-thread', 'first-turn', 601_000, 600_000),
+    )
+    expect(fixture.warnings).toEqual(['Unable to inspect tracked external turn lifecycle'])
+    expect(fixture.warnings.join(' ')).not.toMatch(/forward|first|inode|\/sessions\//u)
+  })
+
+  it('continues registering later writers after one registration exception', async () => {
+    const fixture = monitorFixture()
+    const first = fixture.system.add(
+      '/sessions/register-first.jsonl',
+      sessionMeta('first-thread') + started('first-turn', 1_000),
+      'first-inode',
+    )
+    const second = fixture.system.add(
+      '/sessions/register-second.jsonl',
+      sessionMeta('second-thread') + started('second-turn', 1_000),
+      'second-inode',
+    )
+    fixture.system.failRead(first.path, 0)
+
+    await fixture.monitor.start()
+    expect(fixture.events).toEqual([
+      observedStarted('second-thread', 'second-turn', 1_000),
+    ])
+
+    fixture.system.append(second, completed('second-turn', 601_000, 600_000))
+    await fixture.runScheduledScan()
+    expect(fixture.events).toContainEqual(
+      observedCompleted('second-thread', 'second-turn', 601_000, 600_000),
+    )
+    expect(fixture.warnings).toEqual(['Unable to register external turn lifecycle'])
+    expect(fixture.warnings.join(' ')).not.toMatch(/register-first|first-inode|\/sessions\//u)
   })
 
   it('retains a missing-writer active cursor before the inactive-expiry boundary', async () => {

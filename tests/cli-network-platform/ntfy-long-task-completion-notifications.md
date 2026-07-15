@@ -28,7 +28,7 @@ pnpm run service:restart
    pnpm exec vitest run src/safe/ntfyConfig.test.ts src/safe/ntfyState.test.ts src/server/externalThreadRuntime.test.ts src/server/rolloutLifecycle.test.ts src/server/externalTurnMonitor.test.ts src/server/ntfyCompletionNotifier.test.ts src/server/securityPolicy.test.ts src/cli/safe.entry.test.ts src/safe/doctor.test.ts src/safe/packaging.test.ts
    ```
 
-2. Confirm the tests cover `599_999` ms with no thread read/send and exactly `600_000` ms with a send.
+2. Confirm the tests cover `599_999` ms with no thread read/send and exactly `600_000` ms with a send. Also confirm an authoritative `duration_ms` of `600_000` qualifies when the timestamp delta is `599_999`, while an authoritative `duration_ms` of `599_999` does not qualify when the timestamp delta is `600_000`; direct events without a duration continue using the timestamp delta.
 3. Confirm completed, failed, and interrupted/cancelled terminal statuses produce the exact titles `Codex 任务完成`, `Codex 任务失败`, and `Codex 任务已中断`.
 4. Confirm the body uses the first non-empty final-assistant sentence, collapses whitespace, truncates to 180 characters, uses a fixed status fallback when needed, and makes no additional AI request.
 5. Confirm active timing survives notifier reconstruction, pending delivery is durable before sending, a startup retries pending work, each attempt has a five-second timeout, and each drain makes at most three immediate attempts per pending record.
@@ -39,6 +39,8 @@ pnpm run service:restart
 10. Confirm an external completion acknowledgement is withheld until its state save succeeds. Make that save fail once, then verify the monitor retries the same record with one durable start and exactly one send.
 11. Confirm tracked cursors are read before process discovery. A missing-writer cursor remains eligible before 24 hours, is evicted at the 24-hour inactive boundary without a synthetic terminal event, and a live writer or growing file refreshes the appropriate activity clock.
 12. Confirm default Linux discovery stops at 16,384 numeric processes, 4,096 descriptors per app-server, 8,192 yielded snapshots, 256 unique rollout writers, or 5,000 ms wall time. Each capped/deadline result and each candidate canonicalization/stat rejection must report incomplete, and omission from it must not expire an aged tracked cursor; only a complete missing-writer scan can release capacity. A successfully validated unsafe candidate remains a conclusive rejection.
+13. Inject a tracked-file stat rejection, checkpoint-read exception, and forward-read exception into the first of two cursors. Confirm each failure retains the first cursor for retry, the second cursor still consumes its terminal record in the same scan, no terminal is inferred, and only the fixed redacted warning is emitted. Then clear the fault and confirm the first cursor consumes its terminal exactly once.
+14. Inject a registration exception for the first of two discovered writers. Confirm the second writer still registers within the cursor cap, later consumes its terminal record, and the warning contains no path, inode, thread ID, turn ID, rollout content, or underlying exception text.
 
 ## Cross-client and restart acceptance
 

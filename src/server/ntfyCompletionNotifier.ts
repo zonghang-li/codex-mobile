@@ -21,6 +21,7 @@ type TurnEvent = {
   threadId: string
   turnId: string
   status: string
+  durationMs?: number
 }
 
 export type NtfySendRequest = {
@@ -271,7 +272,12 @@ export class NtfyCompletionNotifier {
       active: this.state.active.filter((_, index) => index !== activeIndex),
     }
 
-    if (receivedAt - active.startedAt < NTFY_MIN_DURATION_MS) {
+    const durationMs = typeof event.durationMs === 'number'
+      && Number.isFinite(event.durationMs)
+      && event.durationMs >= 0
+      ? event.durationMs
+      : receivedAt - active.startedAt
+    if (durationMs < NTFY_MIN_DURATION_MS) {
       await this.persistState(stateWithoutActive)
       return
     }
