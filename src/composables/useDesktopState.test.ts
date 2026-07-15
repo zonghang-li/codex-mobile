@@ -1730,6 +1730,58 @@ describe('external runtime ownership', () => {
     })
   })
 
+  it('keeps the working indicator through missing writer evidence until confirmed idle', async () => {
+    const state = await setupBackgroundRuntimeState()
+    gatewayMocks.getThreadRuntimeStates
+      .mockResolvedValueOnce({
+        'thread-running': {
+          state: 'running',
+          turnId: 'turn-external',
+          interruptible: false,
+          source: 'external-session-writer',
+        },
+      })
+      .mockResolvedValueOnce({ 'thread-running': { state: 'unknown' } })
+      .mockResolvedValueOnce({
+        'thread-running': {
+          state: 'running',
+          turnId: 'turn-external',
+          interruptible: false,
+          source: 'external-session-writer',
+        },
+      })
+      .mockResolvedValueOnce({ 'thread-running': { state: 'idle' } })
+
+    state.startPolling()
+    pollingCleanups.push(() => state.stopPolling())
+
+    await vi.advanceTimersByTimeAsync(0)
+    await flushMicrotasks()
+    expect(state.projectGroups.value[0]?.threads[0]).toMatchObject({ inProgress: true, unread: false })
+
+    await vi.advanceTimersByTimeAsync(2_000)
+    await flushMicrotasks()
+    expect(state.projectGroups.value[0]?.threads[0]).toMatchObject({ inProgress: true, unread: false })
+
+    await vi.advanceTimersByTimeAsync(2_000)
+    await flushMicrotasks()
+    expect(state.projectGroups.value[0]?.threads[0]).toMatchObject({ inProgress: true, unread: false })
+
+    gatewayMocks.getThreadGroupsPage.mockResolvedValue({
+      groups: [{ projectName: 'Project', threads: [
+        { ...thread('thread-running', '/tmp/project'), updatedAtIso: '2026-07-14T00:00:01.000Z' },
+        thread('thread-selected', '/tmp/project'),
+      ] }],
+      nextCursor: null,
+    })
+    const refreshCallsBeforeTerminal = gatewayMocks.getThreadGroupsPage.mock.calls.length
+    await vi.advanceTimersByTimeAsync(2_000)
+    await flushMicrotasks()
+
+    expect(state.projectGroups.value[0]?.threads[0]).toMatchObject({ inProgress: false, unread: true })
+    expect(gatewayMocks.getThreadGroupsPage).toHaveBeenCalledTimes(refreshCallsBeforeTerminal + 1)
+  })
+
   it('ignores a deferred idle result after a background task is taken over locally', async () => {
     let notificationHandler: ((notification: { method: string; params?: unknown }) => void) | undefined
     gatewayMocks.subscribeCodexNotifications.mockImplementation((handler) => {
