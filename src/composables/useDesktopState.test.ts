@@ -1742,6 +1742,7 @@ describe('external runtime ownership', () => {
         },
       })
       .mockResolvedValueOnce({ 'thread-running': { state: 'unknown' } })
+      .mockResolvedValueOnce({ 'thread-running': { state: 'unknown' } })
       .mockResolvedValueOnce({
         'thread-running': {
           state: 'running',
@@ -1756,6 +1757,10 @@ describe('external runtime ownership', () => {
     pollingCleanups.push(() => state.stopPolling())
 
     await vi.advanceTimersByTimeAsync(0)
+    await flushMicrotasks()
+    expect(state.projectGroups.value[0]?.threads[0]).toMatchObject({ inProgress: true, unread: false })
+
+    await vi.advanceTimersByTimeAsync(2_000)
     await flushMicrotasks()
     expect(state.projectGroups.value[0]?.threads[0]).toMatchObject({ inProgress: true, unread: false })
 
