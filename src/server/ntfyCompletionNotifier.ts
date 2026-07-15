@@ -96,7 +96,11 @@ export function readLatestAssistantText(threadReadResult: unknown, turnId: strin
 
 function readThreadObject(threadReadResult: unknown): Record<string, unknown> | null {
   const response = asRecord(threadReadResult)
-  return asRecord(response?.thread) ?? response
+  if (!response) return null
+  if (Object.prototype.hasOwnProperty.call(response, 'thread')) {
+    return asRecord(response.thread)
+  }
+  return response
 }
 
 function readEvent(notification: unknown): TurnEvent | null {
