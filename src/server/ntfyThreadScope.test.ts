@@ -12,6 +12,7 @@ describe('classifyNtfyThreadScope', () => {
   it.each([
     { parent_thread_id: 'parent-1', source: 'vscode' },
     { parentThreadId: 'parent-1', source: 'appServer' },
+    { parentThreadId: 42, parent_thread_id: 'parent-1', source: 'vscode' },
     { source: { subagent: { thread_spawn: {} } } },
     { source: { subAgent: 'review' } },
     { parentThreadId: 42, source: { subagent: 'review' } },
