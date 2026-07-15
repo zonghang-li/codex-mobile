@@ -92,6 +92,35 @@ describe('parseCodexDirectiveText', () => {
     expect(parseCodexDirectiveText(source)).toEqual({ text: '', directives: [directive] })
   })
 
+  it.each([
+    [
+      'ready pull request boolean',
+      '::git-create-pr{cwd="/tmp/repo" branch="feature/one" url="https://example.com/pull/1" isDraft=false}',
+      {
+        kind: 'git-create-pr', cwd: '/tmp/repo', branch: 'feature/one',
+        url: 'https://example.com/pull/1', isDraft: false,
+      },
+    ],
+    [
+      'draft pull request boolean',
+      '::git-create-pr{cwd="/tmp/repo" branch="feature/two" url="https://example.com/pull/2" isDraft=true}',
+      {
+        kind: 'git-create-pr', cwd: '/tmp/repo', branch: 'feature/two',
+        url: 'https://example.com/pull/2', isDraft: true,
+      },
+    ],
+    [
+      'code comment integers',
+      '::code-comment{title="Fix" body="Body" file="src/a.ts" start=4 end=7 priority=2}',
+      {
+        kind: 'code-comment', title: 'Fix', body: 'Body', file: 'src/a.ts',
+        start: 4, end: 7, priority: 2,
+      },
+    ],
+  ] as const)('extracts official %s', (_label, source, directive) => {
+    expect(parseCodexDirectiveText(source)).toEqual({ text: '', directives: [directive] })
+  })
+
   it('parses an unknown valid directive into ordered generic attributes', () => {
     expect(parseCodexDirectiveText(
       '::future-directive{phase="done" url="https://example.com"}',
@@ -203,6 +232,20 @@ describe('parseCodexDirectiveText', () => {
     ['a name containing Unicode', '::未来{x="1"}', undefined, 'invalid-name'],
     ['incomplete final output', '::future{x="1"', 'future', 'incomplete'],
   ])('renders %s as a warning directive', (_label, source, name, reason) => {
+    expect(parseCodexDirectiveText(source)).toEqual({
+      text: '',
+      directives: [{ kind: 'invalid', name, reason }],
+    })
+  })
+
+  it.each([
+    ['boolean in a string field', '::git-push{cwd=true branch="main"}', 'git-push', 'invalid-schema'],
+    ['integer in a string field', '::git-stage{cwd=123}', 'git-stage', 'invalid-schema'],
+    ['typed unknown attribute', '::future-directive{enabled=true}', 'future-directive', 'invalid-syntax'],
+    ['decimal literal', '::code-comment{title="Fix" body="Body" file="a.ts" start=1.5}', 'code-comment', 'invalid-syntax'],
+    ['signed integer', '::code-comment{title="Fix" body="Body" file="a.ts" start=-1}', 'code-comment', 'invalid-syntax'],
+    ['bare word', '::git-create-pr{cwd="/tmp/repo" branch="main" url="https://example.com/1" isDraft=no}', 'git-create-pr', 'invalid-syntax'],
+  ] as const)('rejects %s', (_label, source, name, reason) => {
     expect(parseCodexDirectiveText(source)).toEqual({
       text: '',
       directives: [{ kind: 'invalid', name, reason }],
