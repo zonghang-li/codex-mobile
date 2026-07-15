@@ -20,9 +20,14 @@ const SUPPORTED_DIRECTIVE_NAMES = [
   'code-comment',
 ] as const
 
+type ParsedDirectiveAttributeSyntax = 'quoted' | 'boolean' | 'integer'
+type ParsedDirectiveAttribute = {
+  value: string
+  syntax: ParsedDirectiveAttributeSyntax
+}
 type ParsedDirectiveAttributes = {
-  values: Record<string, string>
-  ordered: Array<{ key: string; value: string }>
+  values: Record<string, ParsedDirectiveAttribute>
+  ordered: Array<{ key: string } & ParsedDirectiveAttribute>
 }
 
 const SENSITIVE_ATTRIBUTE_PARTS = [
@@ -35,12 +40,22 @@ const SENSITIVE_ATTRIBUTE_PARTS = [
   'apikey',
 ] as const
 
-function hasOnlyKeys(attributes: Record<string, string>, allowed: readonly string[]): boolean {
+function hasOnlyKeys(attributes: Record<string, unknown>, allowed: readonly string[]): boolean {
   const allowedSet = new Set(allowed)
   return Object.keys(attributes).every((key) => allowedSet.has(key))
 }
 
-function isHttpsUrl(value: string | undefined): value is string {
+function readAttribute(
+  attributes: ParsedDirectiveAttributes,
+  key: string,
+  allowedSyntax: readonly ParsedDirectiveAttributeSyntax[],
+): string | undefined | null {
+  const attribute = attributes.values[key]
+  if (!attribute) return undefined
+  return allowedSyntax.includes(attribute.syntax) ? attribute.value : null
+}
+
+function isHttpsUrl(value: string | undefined | null): value is string {
   if (!value) return false
   try {
     return new URL(value).protocol === 'https:'
@@ -57,7 +72,7 @@ function readPositiveInteger(value: string | undefined): number | undefined | nu
 }
 
 function readAttributes(source: string): ParsedDirectiveAttributes | null {
-  const values: Record<string, string> = {}
+  const values: Record<string, ParsedDirectiveAttribute> = {}
   const ordered: ParsedDirectiveAttributes['ordered'] = []
   let index = 0
   let hasAttribute = false
@@ -75,31 +90,43 @@ function readAttributes(source: string): ParsedDirectiveAttributes | null {
     index += key.length
     if (source[index] !== '=') return null
     index += 1
-    if (source[index] !== '"') return null
-    index += 1
-
     let value = ''
-    let closed = false
-    while (index < source.length) {
-      const character = source[index]
-      if (character === '"') {
-        index += 1
-        closed = true
-        break
-      }
-      if (character === '\\') {
-        const escaped = source[index + 1]
-        if (escaped !== '"' && escaped !== '\\') return null
-        value += escaped
-        index += 2
-        continue
-      }
-      value += character
+    let syntax: ParsedDirectiveAttributeSyntax
+    if (source[index] === '"') {
+      syntax = 'quoted'
       index += 1
+
+      let closed = false
+      while (index < source.length) {
+        const character = source[index]
+        if (character === '"') {
+          index += 1
+          closed = true
+          break
+        }
+        if (character === '\\') {
+          const escaped = source[index + 1]
+          if (escaped !== '"' && escaped !== '\\') return null
+          value += escaped
+          index += 2
+          continue
+        }
+        value += character
+        index += 1
+      }
+      if (!closed) return null
+    } else {
+      const remainder = source.slice(index)
+      const booleanMatch = /^(?:true|false)(?=\s|$)/u.exec(remainder)
+      const integerMatch = /^\d+(?=\s|$)/u.exec(remainder)
+      const literal = booleanMatch?.[0] ?? integerMatch?.[0]
+      if (!literal) return null
+      value = literal
+      syntax = booleanMatch ? 'boolean' : 'integer'
+      index += literal.length
     }
-    if (!closed) return null
-    values[key] = value
-    ordered.push({ key, value })
+    values[key] = { value, syntax }
+    ordered.push({ key, value, syntax })
     hasAttribute = true
   }
 
@@ -131,55 +158,79 @@ function toGenericDirective(
 
 function toDirective(
   name: string,
-  attributes: Record<string, string>,
+  attributes: ParsedDirectiveAttributes,
 ): UiCodexDirective | null {
+  const quoted = ['quoted'] as const
+  const legacyBoolean = ['quoted', 'boolean'] as const
+  const legacyInteger = ['quoted', 'integer'] as const
+
   switch (name) {
     case 'git-stage':
-    case 'git-commit':
-      return hasOnlyKeys(attributes, ['cwd']) && attributes.cwd
-        ? { kind: name, cwd: attributes.cwd }
+    case 'git-commit': {
+      const cwd = readAttribute(attributes, 'cwd', quoted)
+      return hasOnlyKeys(attributes.values, ['cwd']) && cwd
+        ? { kind: name, cwd }
         : null
+    }
     case 'git-create-branch':
-    case 'git-push':
-      return hasOnlyKeys(attributes, ['cwd', 'branch']) && attributes.cwd && attributes.branch
-        ? { kind: name, cwd: attributes.cwd, branch: attributes.branch }
+    case 'git-push': {
+      const cwd = readAttribute(attributes, 'cwd', quoted)
+      const branch = readAttribute(attributes, 'branch', quoted)
+      return hasOnlyKeys(attributes.values, ['cwd', 'branch']) && cwd && branch
+        ? { kind: name, cwd, branch }
         : null
+    }
     case 'git-create-pr': {
-      if (!hasOnlyKeys(attributes, ['cwd', 'branch', 'url', 'isDraft'])) return null
-      if (!attributes.cwd || !attributes.branch || !isHttpsUrl(attributes.url)) return null
-      if (attributes.isDraft !== 'true' && attributes.isDraft !== 'false') return null
+      if (!hasOnlyKeys(attributes.values, ['cwd', 'branch', 'url', 'isDraft'])) return null
+      const cwd = readAttribute(attributes, 'cwd', quoted)
+      const branch = readAttribute(attributes, 'branch', quoted)
+      const url = readAttribute(attributes, 'url', quoted)
+      const isDraft = readAttribute(attributes, 'isDraft', legacyBoolean)
+      if (!cwd || !branch || !isHttpsUrl(url)) return null
+      if (isDraft !== 'true' && isDraft !== 'false') return null
       return {
         kind: name,
-        cwd: attributes.cwd,
-        branch: attributes.branch,
-        url: attributes.url,
-        isDraft: attributes.isDraft === 'true',
+        cwd,
+        branch,
+        url,
+        isDraft: isDraft === 'true',
       }
     }
-    case 'created-thread':
-      if (!hasOnlyKeys(attributes, ['threadId', 'clientThreadId'])) return null
-      if (Boolean(attributes.threadId) === Boolean(attributes.clientThreadId)) return null
-      return attributes.threadId
-        ? { kind: name, threadId: attributes.threadId }
-        : { kind: name, clientThreadId: attributes.clientThreadId }
+    case 'created-thread': {
+      if (!hasOnlyKeys(attributes.values, ['threadId', 'clientThreadId'])) return null
+      const threadId = readAttribute(attributes, 'threadId', quoted)
+      const clientThreadId = readAttribute(attributes, 'clientThreadId', quoted)
+      if (threadId === null || clientThreadId === null) return null
+      if (Boolean(threadId) === Boolean(clientThreadId)) return null
+      return threadId
+        ? { kind: name, threadId }
+        : { kind: name, clientThreadId }
+    }
     case 'code-comment': {
-      if (!hasOnlyKeys(attributes, ['title', 'body', 'file', 'start', 'end', 'priority'])) return null
-      if (!attributes.title || !attributes.body || !attributes.file) return null
-      const start = readPositiveInteger(attributes.start)
-      const end = readPositiveInteger(attributes.end)
-      const priority = attributes.priority === undefined
+      if (!hasOnlyKeys(attributes.values, ['title', 'body', 'file', 'start', 'end', 'priority'])) return null
+      const title = readAttribute(attributes, 'title', quoted)
+      const body = readAttribute(attributes, 'body', quoted)
+      const file = readAttribute(attributes, 'file', quoted)
+      if (!title || !body || !file) return null
+      const startText = readAttribute(attributes, 'start', legacyInteger)
+      const endText = readAttribute(attributes, 'end', legacyInteger)
+      const priorityText = readAttribute(attributes, 'priority', legacyInteger)
+      if (startText === null || endText === null || priorityText === null) return null
+      const start = readPositiveInteger(startText)
+      const end = readPositiveInteger(endText)
+      const priority = priorityText === undefined
         ? undefined
-        : /^(?:0|1|2|3)$/u.test(attributes.priority)
-          ? Number.parseInt(attributes.priority, 10)
+        : /^(?:0|1|2|3)$/u.test(priorityText)
+          ? Number.parseInt(priorityText, 10)
           : null
       if (start === null || end === null || priority === null) return null
       if (end !== undefined && start === undefined) return null
       if (start !== undefined && end !== undefined && end < start) return null
       return {
         kind: name,
-        title: attributes.title,
-        body: attributes.body,
-        file: attributes.file,
+        title,
+        body,
+        file,
         start,
         end,
         priority,
@@ -210,9 +261,11 @@ function readDirective(line: string): UiCodexDirective | null {
   if (!attributes) return { kind: 'invalid', name, reason: 'invalid-syntax' }
 
   if (!SUPPORTED_DIRECTIVE_NAMES.includes(name as typeof SUPPORTED_DIRECTIVE_NAMES[number])) {
-    return toGenericDirective(name, attributes.ordered)
+    return attributes.ordered.every(({ syntax }) => syntax === 'quoted')
+      ? toGenericDirective(name, attributes.ordered)
+      : { kind: 'invalid', name, reason: 'invalid-syntax' }
   }
-  return toDirective(name, attributes.values)
+  return toDirective(name, attributes)
     ?? { kind: 'invalid', name, reason: 'invalid-schema' }
 }
 
