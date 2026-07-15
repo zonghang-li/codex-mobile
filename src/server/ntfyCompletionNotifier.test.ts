@@ -348,6 +348,11 @@ describe('long-turn notification decisions', () => {
   it.each([
     ['unknown source', async () => ({ thread: { parentThreadId: null, source: 'unknown', turns: [] } })],
     ['malformed parent', async () => ({ thread: { parentThreadId: 42, source: 'appServer', turns: [] } })],
+    ['malformed nested thread', async () => ({
+      thread: null,
+      parentThreadId: null,
+      source: 'appServer',
+    })],
     ['read failure', async () => { throw new Error('thread unavailable') }],
   ] as const)('fails closed for %s at send time', async (_label, readThread) => {
     const fixture = await runTurn(NTFY_MIN_DURATION_MS, { readThread })
