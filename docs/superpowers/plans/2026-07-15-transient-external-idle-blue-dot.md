@@ -4,7 +4,7 @@
 
 **Goal:** Prevent a still-running Desktop or CLI turn from becoming a blue unread dot when one runtime poll temporarily cannot find its rollout writer.
 
-**Architecture:** Keep terminal rollout records authoritative. Change the external runtime probe so an unmatched start without writer evidence is `unknown`, then lock the existing browser lease behavior with a cross-poll regression that proves `running → unknown → running` never clears the spinner and only a later confirmed `idle` can create unread state.
+**Architecture:** Keep terminal rollout records authoritative. Change the external runtime probe so an unmatched start without writer evidence is `unknown`, then lock the existing browser lease behavior with a cross-poll regression that proves `running → unknown → unknown → running` never clears the spinner and only a later confirmed `idle` can create unread state. Terminal outcome remains outside the runtime response because every authoritative terminal stops the spinner and follows the same existing unread-summary rule.
 
 **Tech Stack:** TypeScript, Vue 3 composables, Linux rollout runtime probe, Vitest, systemd user service.
 
@@ -18,6 +18,7 @@
 - The existing runtime HTTP response schema is reused; do not add routes, fields, listeners, or authentication changes.
 - Do not log rollout paths, process details, thread IDs, prompts, or output.
 - Background polling remains paused while the browser document is hidden.
+- Successful, failed, interrupted, and declined turns all stop the spinner when completion is authoritative, and all may show a blue unread dot when an unselected thread has new summary content.
 
 ## File Structure
 
@@ -134,7 +135,7 @@ git commit -m "fix: keep missing external writers inconclusive"
 
 **Interfaces:**
 - Consumes: `getThreadRuntimeStates()` results and the existing external lease stored in `runtimeOwnershipByThreadId`/`backgroundExternalThreadIds`.
-- Produces: regression evidence that `unknown` retains `inProgress` and suppresses `unread`, while confirmed `idle` performs the existing refresh exactly once.
+- Produces: regression evidence that repeated `unknown` retains `inProgress` and suppresses `unread`, while confirmed `idle` performs the existing refresh exactly once regardless of terminal outcome.
 
 - [ ] **Step 1: Add the full running/unknown/recovery/terminal regression**
 
@@ -153,6 +154,7 @@ it('keeps the working indicator through missing writer evidence until confirmed 
       },
     })
     .mockResolvedValueOnce({ 'thread-running': { state: 'unknown' } })
+    .mockResolvedValueOnce({ 'thread-running': { state: 'unknown' } })
     .mockResolvedValueOnce({
       'thread-running': {
         state: 'running',
@@ -167,6 +169,10 @@ it('keeps the working indicator through missing writer evidence until confirmed 
   pollingCleanups.push(() => state.stopPolling())
 
   await vi.advanceTimersByTimeAsync(0)
+  await flushMicrotasks()
+  expect(state.projectGroups.value[0]?.threads[0]).toMatchObject({ inProgress: true, unread: false })
+
+  await vi.advanceTimersByTimeAsync(2_000)
   await flushMicrotasks()
   expect(state.projectGroups.value[0]?.threads[0]).toMatchObject({ inProgress: true, unread: false })
 
@@ -202,7 +208,7 @@ Run:
 pnpm exec vitest run src/composables/useDesktopState.test.ts
 ```
 
-Expected: the regression passes with the existing browser `unknown` behavior. If it fails, make only the smallest browser fix needed to retain an established external lease; do not add idle debounce timers.
+Expected: the regression passes with the existing browser `unknown` behavior, including both consecutive `unknown` polls. If it fails, make only the smallest browser fix needed to retain an established external lease; do not add idle debounce timers.
 
 - [ ] **Step 3: Document the runtime invariant**
 
@@ -210,6 +216,7 @@ Add to the external runtime section in `docs/AGENT_GUIDE.md`:
 
 ```markdown
 - An unmatched external `task_started` record with temporarily missing writer evidence is `unknown`, not `idle`. The browser retains an already-established working indicator across `unknown`; only a matching terminal lifecycle clears it and may create unread state.
+- Terminal outcome does not change the sidebar indicator contract: successful, failed, interrupted, and declined turns all stop the spinner and may become unread when an unselected thread has new summary content. Keep the runtime response terminal-neutral.
 ```
 
 - [ ] **Step 4: Run focused and complete verification**
