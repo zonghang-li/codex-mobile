@@ -446,6 +446,7 @@ export function createExternalTurnMonitor(
   }
 
   async function scan(): Promise<void> {
+    const inconclusiveCursorKeys = new Set<string>()
     for (const cursor of [...cursors.values()]) {
       try {
         const identity = await system.statFile(cursor.path)
@@ -470,6 +471,7 @@ export function createExternalTurnMonitor(
           }
         }
       } catch {
+        inconclusiveCursorKeys.add(cursor.key)
         warnOnce('Unable to inspect tracked external turn lifecycle')
       }
     }
@@ -483,6 +485,7 @@ export function createExternalTurnMonitor(
     const writerKeys = new Set(writers.map((writer) => `${writer.dev}:${writer.ino}`))
     const observedAt = now()
     for (const cursor of [...cursors.values()]) {
+      if (inconclusiveCursorKeys.has(cursor.key)) continue
       if (writerKeys.has(cursor.key)) {
         cursor.lastWriterSeenAt = observedAt
         continue
