@@ -131,8 +131,14 @@ class FakeMonitorSystem implements ExternalRuntimeSystem {
   }
 }
 
-function sessionMeta(threadId: string): string {
-  return `${JSON.stringify({ type: 'session_meta', payload: { id: threadId } })}\n`
+function sessionMeta(
+  threadId: string,
+  metadata: Record<string, unknown> = { source: 'vscode' },
+): string {
+  return `${JSON.stringify({
+    type: 'session_meta',
+    payload: { id: threadId, ...metadata },
+  })}\n`
 }
 
 function started(turnId: string, occurredAt: number): string {
@@ -226,6 +232,25 @@ function monitorFixture(options: {
 }
 
 describe('ExternalTurnMonitor', () => {
+  it.each([
+    ['child-parent', { source: 'vscode', parent_thread_id: 'parent-1' }],
+    ['child-source', { source: { subagent: 'review' } }],
+    ['unknown-source', { source: 'unknown' }],
+  ] as const)('does not emit lifecycle events for %s rollouts', async (_label, metadata) => {
+    const fixture = monitorFixture({ now: 1_000 })
+    const rollout = fixture.system.add(
+      '/sessions/rollout-1.jsonl',
+      sessionMeta('thread-1', metadata) + started('turn-1', 1_000),
+      '1',
+    )
+
+    await fixture.monitor.start()
+    fixture.system.append(rollout, completed('turn-1', 601_000, 600_000))
+    await fixture.runScheduledScan()
+
+    expect(fixture.events).toEqual([])
+  })
+
   it('emits an external start and later completion without a browser', async () => {
     const fixture = monitorFixture({ now: 1_000 })
     const rollout = fixture.system.add(
