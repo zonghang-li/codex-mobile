@@ -38,7 +38,13 @@ The existing browser behavior for `unknown` is retained:
 - no unread state is created and no completion summary refresh runs;
 - later `running` evidence refreshes the lease normally;
 - only authoritative terminal lifecycle evidence changes the thread to idle,
-  after which a successful background completion may become unread.
+  after which the existing summary rules may mark an unselected thread unread.
+
+Terminal outcome does not change the sidebar indicator contract. Successful,
+failed, interrupted, and declined turns all stop the spinner when completion is
+authoritative, and all may show a blue unread dot when the unselected thread has
+new summary content. The runtime response therefore remains terminal-neutral:
+it does not need to expose a terminal outcome that the indicator does not use.
 
 For a cold observation with no previously established external lease,
 `unknown` does not invent a running state. This fix prevents false completion;
@@ -81,10 +87,11 @@ Automated tests must prove:
   unread after one or repeated `unknown` results;
 - writer evidence can disappear for one poll, recover, and later deliver a
   terminal without an intermediate blue dot;
-- a confirmed successful terminal clears `inProgress` and becomes unread only
-  when the thread is not selected;
-- failed, interrupted, declined, and unknown terminal statuses do not create a
-  blue unread dot.
+- consecutive `unknown` results followed by recovered `running` evidence keep
+  `inProgress` and suppress unread throughout the nonterminal sequence;
+- any authoritative terminal clears `inProgress`, and successful, failed,
+  interrupted, or declined completion may become unread when the thread is not
+  selected and its summary has advanced.
 
 Manual acceptance uses a Desktop/CLI task that continuously produces output:
 observe the working spinner, force or simulate one missing-writer probe, verify
