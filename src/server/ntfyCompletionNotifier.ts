@@ -7,6 +7,7 @@ import {
   type PendingNtfyRecord,
 } from '../safe/ntfyState'
 import type { ObservedTurnLifecycle } from './externalTurnMonitor'
+import { classifyNtfyThreadScope } from './ntfyThreadScope'
 
 export const NTFY_MIN_DURATION_MS = 600_000
 export const NTFY_SUMMARY_MAX_LENGTH = 180
@@ -91,6 +92,11 @@ export function readLatestAssistantText(threadReadResult: unknown, turnId: strin
     }
   }
   return ''
+}
+
+function readThreadObject(threadReadResult: unknown): Record<string, unknown> | null {
+  const response = asRecord(threadReadResult)
+  return asRecord(response?.thread) ?? response
 }
 
 function readEvent(notification: unknown): TurnEvent | null {
@@ -282,13 +288,23 @@ export class NtfyCompletionNotifier {
       return
     }
 
-    const classification = classifyStatus(event.status)
-    let assistantText = ''
+    let threadReadResult: unknown
     try {
-      assistantText = readLatestAssistantText(await this.options.readThread(event.threadId), event.turnId)
+      threadReadResult = await this.options.readThread(event.threadId)
     } catch {
-      this.warn('Unable to read final assistant response for long-task notification')
+      await this.persistState(stateWithoutActive)
+      this.warn('Unable to verify top-level long-task notification')
+      return
     }
+
+    const thread = readThreadObject(threadReadResult)
+    if (classifyNtfyThreadScope(thread) !== 'topLevel') {
+      await this.persistState(stateWithoutActive)
+      return
+    }
+
+    const classification = classifyStatus(event.status)
+    const assistantText = readLatestAssistantText(threadReadResult, event.turnId)
     const message = summarizeAssistantResponse(assistantText) || classification.fallback
     await this.persistState(boundNtfyState({
       ...stateWithoutActive,
