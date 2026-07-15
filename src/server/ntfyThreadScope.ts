@@ -13,14 +13,15 @@ function hasOwn(value: Record<string, unknown>, key: string): boolean {
 }
 
 function parentEvidence(value: Record<string, unknown>): 'none' | 'child' | 'invalid' {
+  let invalid = false
   for (const key of ['parentThreadId', 'parent_thread_id'] as const) {
     if (!hasOwn(value, key)) continue
     const candidate = value[key]
     if (candidate === null || candidate === undefined || candidate === '') continue
     if (typeof candidate === 'string') return 'child'
-    return 'invalid'
+    invalid = true
   }
-  return 'none'
+  return invalid ? 'invalid' : 'none'
 }
 
 export function classifyNtfyThreadScope(value: unknown): NtfyThreadScope {
