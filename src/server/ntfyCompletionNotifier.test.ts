@@ -230,6 +230,34 @@ describe('long-turn notification decisions', () => {
     },
   )
 
+  it('uses an authoritative 600,000 ms duration when the timestamp delta is 599,999 ms', async () => {
+    const fixture = harness({ now: () => 9_999_999 })
+    await fixture.notifier.start()
+    await fixture.notifier.handleObserved(observedStarted())
+    await fixture.notifier.handleObserved(observedCompleted(
+      'thread-1',
+      'turn-1',
+      600_999,
+      600_000,
+    ))
+    await fixture.notifier.dispose()
+    expect(fixture.send).toHaveBeenCalledTimes(1)
+  })
+
+  it('rejects an authoritative 599,999 ms duration when the timestamp delta is 600,000 ms', async () => {
+    const fixture = harness({ now: () => 9_999_999 })
+    await fixture.notifier.start()
+    await fixture.notifier.handleObserved(observedStarted())
+    await fixture.notifier.handleObserved(observedCompleted(
+      'thread-1',
+      'turn-1',
+      601_000,
+      599_999,
+    ))
+    await fixture.notifier.dispose()
+    expect(fixture.send).not.toHaveBeenCalled()
+  })
+
   it('deduplicates direct and external observations for one turn', async () => {
     let now = 1_000
     const fixture = harness({ now: () => now })

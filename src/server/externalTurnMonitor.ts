@@ -447,27 +447,30 @@ export function createExternalTurnMonitor(
 
   async function scan(): Promise<void> {
     for (const cursor of [...cursors.values()]) {
-      const identity = await system.statFile(cursor.path).catch(() => null)
-      if (
-        !identity
-        || !hasStableIdentity(identity, cursor)
-        || identity.size < cursor.offset
-      ) {
-        cursors.delete(cursor.key)
-        continue
-      }
-      const stableIdentity = identityFor(cursor, identity.size)
-      if (!await hasMatchingCheckpoint(cursor, stableIdentity)) {
-        cursors.delete(cursor.key)
-        continue
-      }
-      await applyPendingInitialLifecycle(cursor)
-      if (identity.size > cursor.offset) {
-        if (!await readForward(cursor, identity.size)) {
+      try {
+        const identity = await system.statFile(cursor.path)
+        if (
+          !hasStableIdentity(identity, cursor)
+          || identity.size < cursor.offset
+        ) {
           cursors.delete(cursor.key)
-        } else {
-          cursor.lastFileActivityAt = now()
+          continue
         }
+        const stableIdentity = identityFor(cursor, identity.size)
+        if (!await hasMatchingCheckpoint(cursor, stableIdentity)) {
+          cursors.delete(cursor.key)
+          continue
+        }
+        await applyPendingInitialLifecycle(cursor)
+        if (identity.size > cursor.offset) {
+          if (!await readForward(cursor, identity.size)) {
+            cursors.delete(cursor.key)
+          } else {
+            cursor.lastFileActivityAt = now()
+          }
+        }
+      } catch {
+        warnOnce('Unable to inspect tracked external turn lifecycle')
       }
     }
 
@@ -493,7 +496,12 @@ export function createExternalTurnMonitor(
 
     for (const writer of writers) {
       const key = `${writer.dev}:${writer.ino}`
-      if (!cursors.has(key) && makeRoomForCursor()) await register(writer)
+      if (cursors.has(key) || !makeRoomForCursor()) continue
+      try {
+        await register(writer)
+      } catch {
+        warnOnce('Unable to register external turn lifecycle')
+      }
     }
   }
 
