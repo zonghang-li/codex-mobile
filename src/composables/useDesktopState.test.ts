@@ -2933,6 +2933,51 @@ describe('external runtime ownership', () => {
     expect(replied).toBe(true)
   })
 
+  it('waits for an edited-message rollback before starting the replacement turn', async () => {
+    const { state } = await setupExternalRuntimeState()
+    gatewayMocks.resumeThread.mockResolvedValue({
+      ...idleDetail(),
+      messages: [{
+        id: 'interrupted-user-message',
+        role: 'user',
+        text: 'original prompt',
+        turnId: 'turn-interrupted',
+        turnIndex: 0,
+      }],
+    })
+    const reverted = deferred<{ success: boolean }>()
+    gatewayMocks.revertThreadFileChanges.mockReturnValue(reverted.promise)
+    gatewayMocks.rollbackThread.mockResolvedValue([])
+    gatewayMocks.startThreadTurn.mockResolvedValue('turn-replacement')
+    await state.loadMessages('thread-1')
+
+    const rollback = state.rollbackSelectedThread('turn-interrupted')
+    await flushMicrotasks()
+    const resend = state.sendMessageToSelectedThread('edited prompt')
+    await flushMicrotasks()
+
+    expect(gatewayMocks.startThreadTurn).not.toHaveBeenCalled()
+
+    reverted.resolve({ success: true })
+    await rollback
+    await resend
+
+    expect(gatewayMocks.rollbackThread).toHaveBeenCalledWith('thread-1', 1)
+    expect(gatewayMocks.startThreadTurn).toHaveBeenCalledWith(
+      'thread-1',
+      'edited prompt',
+      [],
+      undefined,
+      'medium',
+      undefined,
+      [],
+      'default',
+    )
+    expect(gatewayMocks.rollbackThread.mock.invocationCallOrder[0]).toBeLessThan(
+      gatewayMocks.startThreadTurn.mock.invocationCallOrder[0]!,
+    )
+  })
+
   it('rejects a pending request owned by an external thread after selection changes', async () => {
     const { state, emit } = await setupExternalRuntimeState()
     gatewayMocks.resumeThread.mockResolvedValue(externalDetail())
