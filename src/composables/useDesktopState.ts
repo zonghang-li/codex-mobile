@@ -1571,6 +1571,7 @@ export function useDesktopState() {
   const delayedTurnSyncTimerByThreadId = new Map<string, number>()
   let loadThreadsPromise: Promise<void> | null = null
   const loadMessagePromiseByThreadId = new Map<string, Promise<void>>()
+  const rollbackPromiseByThreadId = new Map<string, Promise<void>>()
   const detailRequestEpochByThreadId = new Map<string, number>()
   const detailRequestByThreadId = new Map<string, {
     epoch: number
@@ -5517,6 +5518,12 @@ export function useDesktopState() {
     if (!threadId || isExternallyOwned(threadId)) return
     if (!nextText && imageUrls.length === 0 && fileAttachments.length === 0) return
 
+    const pendingRollback = rollbackPromiseByThreadId.get(threadId)
+    if (pendingRollback) {
+      await pendingRollback
+      if (selectedThreadId.value !== threadId || isExternallyOwned(threadId)) return
+    }
+
     if (await maybeReplyToPendingUserInputRequest(threadId, nextText, imageUrls, skills, fileAttachments)) {
       return
     }
@@ -5906,26 +5913,35 @@ export function useDesktopState() {
 
     isRollingBack.value = true
     error.value = ''
+    const rollbackPromise = (async () => {
+      try {
+        const threadCwd = selectedThread.value?.cwd?.trim() ?? ''
+        if (threadCwd) {
+          await revertThreadFileChanges(threadId, turnId, threadCwd)
+        }
+        const nextMessages = await rollbackThread(threadId, numTurns)
+        setPersistedMessagesForThread(threadId, nextMessages)
+        setLiveAgentMessagesForThread(threadId, [])
+        clearLiveReasoningForThread(threadId)
+        if (liveCommandsByThreadId.value[threadId]) {
+          liveCommandsByThreadId.value = omitKey(liveCommandsByThreadId.value, threadId)
+        }
+        setTurnSummaryForThread(threadId, null)
+        setTurnActivityForThread(threadId, null)
+        setTurnErrorForThread(threadId, null)
+        pendingThreadsRefresh = true
+        await syncFromNotifications()
+      } catch (unknownError) {
+        error.value = unknownError instanceof Error ? unknownError.message : 'Failed to rollback thread'
+      }
+    })()
+    rollbackPromiseByThreadId.set(threadId, rollbackPromise)
     try {
-      const threadCwd = selectedThread.value?.cwd?.trim() ?? ''
-      if (threadCwd) {
-        await revertThreadFileChanges(threadId, turnId, threadCwd)
-      }
-      const nextMessages = await rollbackThread(threadId, numTurns)
-      setPersistedMessagesForThread(threadId, nextMessages)
-      setLiveAgentMessagesForThread(threadId, [])
-      clearLiveReasoningForThread(threadId)
-      if (liveCommandsByThreadId.value[threadId]) {
-        liveCommandsByThreadId.value = omitKey(liveCommandsByThreadId.value, threadId)
-      }
-      setTurnSummaryForThread(threadId, null)
-      setTurnActivityForThread(threadId, null)
-      setTurnErrorForThread(threadId, null)
-      pendingThreadsRefresh = true
-      await syncFromNotifications()
-    } catch (unknownError) {
-      error.value = unknownError instanceof Error ? unknownError.message : 'Failed to rollback thread'
+      await rollbackPromise
     } finally {
+      if (rollbackPromiseByThreadId.get(threadId) === rollbackPromise) {
+        rollbackPromiseByThreadId.delete(threadId)
+      }
       isRollingBack.value = false
     }
   }
