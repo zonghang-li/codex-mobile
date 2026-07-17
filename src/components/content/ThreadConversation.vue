@@ -349,7 +349,7 @@
                 <div
                   v-else
                   class="message-text-flow"
-                  v-memo="[message.id, message.text, props.cwd, highlightCacheVersion, markdownImageFailureVersion]"
+                  v-memo="[message.id, message.text, props.cwd, highlightCacheVersion, mathRenderVersion, markdownImageFailureVersion]"
                 >
                   <template v-for="(block, blockIndex) in getMessageBlocks(message)" :key="`block-${blockIndex}`">
                     <p v-if="block.kind === 'paragraph'" class="message-text">
@@ -378,6 +378,11 @@
                         >
                           {{ segment.value }}
                         </a>
+                        <span
+                          v-else-if="segment.kind === 'math'"
+                          class="message-inline-math"
+                          v-html="renderInlineMathAsHtml(segment)"
+                        />
                         <code v-else class="message-inline-code">{{ segment.value }}</code>
                       </template>
                     </p>
@@ -412,6 +417,11 @@
                         >
                           {{ segment.value }}
                         </a>
+                        <span
+                          v-else-if="segment.kind === 'math'"
+                          class="message-inline-math"
+                          v-html="renderInlineMathAsHtml(segment)"
+                        />
                         <code v-else class="message-inline-code">{{ segment.value }}</code>
                       </template>
                     </component>
@@ -441,6 +451,11 @@
                         >
                           {{ segment.value }}
                         </a>
+                        <span
+                          v-else-if="segment.kind === 'math'"
+                          class="message-inline-math"
+                          v-html="renderInlineMathAsHtml(segment)"
+                        />
                         <code v-else class="message-inline-code">{{ segment.value }}</code>
                       </template>
                     </blockquote>
@@ -485,6 +500,11 @@
                             >
                               {{ segment.value }}
                             </a>
+                            <span
+                              v-else-if="segment.kind === 'math'"
+                              class="message-inline-math"
+                              v-html="renderInlineMathAsHtml(segment)"
+                            />
                             <code v-else class="message-inline-code">{{ segment.value }}</code>
                           </template>
                         </div>
@@ -541,6 +561,11 @@
                                 >
                                   {{ segment.value }}
                                 </a>
+                                <span
+                                  v-else-if="segment.kind === 'math'"
+                                  class="message-inline-math"
+                                  v-html="renderInlineMathAsHtml(segment)"
+                                />
                                 <code v-else class="message-inline-code">{{ segment.value }}</code>
                               </template>
                             </th>
@@ -579,6 +604,11 @@
                                 >
                                   {{ segment.value }}
                                 </a>
+                                <span
+                                  v-else-if="segment.kind === 'math'"
+                                  class="message-inline-math"
+                                  v-html="renderInlineMathAsHtml(segment)"
+                                />
                                 <code v-else class="message-inline-code">{{ segment.value }}</code>
                               </template>
                             </td>
@@ -586,6 +616,11 @@
                         </tbody>
                       </table>
                     </div>
+                    <div
+                      v-else-if="block.kind === 'mathBlock'"
+                      class="message-math-block"
+                      v-html="renderDisplayMathInnerAsHtml(block)"
+                    />
                     <div v-else-if="block.kind === 'codeBlock'" class="message-code-block">
                       <CopyableOutputBlock :copy-text="block.value" label="Copy code block">
                         <div v-if="block.language" class="message-code-language">{{ block.language }}</div>
@@ -947,6 +982,13 @@ import {
   filterRenderableThreadMessages,
   latestThreadRenderWindowStart,
 } from './threadConversationWindow'
+import { splitDisplayMathSpans } from './displayMath'
+import { splitInlineMathSpans } from './inlineMath'
+import {
+  tryRenderDisplayMathToHtml,
+  tryRenderMathToHtml,
+  type DisplayMathRenderFunction,
+} from './displayMathRenderer'
 import type { ListItem, MessageBlock, TableAlignment, TaskListItem } from './messageBlockTypes'
 
 import CopyableOutputBlock from './CopyableOutputBlock.vue'
@@ -1386,6 +1428,7 @@ const CODE_LANGUAGE_ALIASES: Record<string, string> = {
 }
 type InlineSegment =
   | { kind: 'text'; value: string }
+  | { kind: 'math'; value: string; source: string }
   | { kind: 'bold'; value: string }
   | { kind: 'italic'; value: string }
   | { kind: 'strikethrough'; value: string }
@@ -1400,12 +1443,16 @@ let conversationScrollPromise: Promise<void> | null = null
 const trackedPendingImages = new WeakSet<HTMLImageElement>()
 const highlightJsModule = ref<HighlightJsModule | null>(null)
 const highlightCacheVersion = ref(0)
+const displayMathRenderer = ref<DisplayMathRenderFunction | null>(null)
+const mathRenderVersion = ref(0)
 const markdownImageFailureVersion = ref(0)
 let highlightJsLoader: Promise<void> | null = null
+let displayMathLoader: Promise<void> | null = null
 const MESSAGE_BLOCK_CACHE_LIMIT = 300
 const INLINE_SEGMENT_CACHE_LIMIT = 1200
 const MARKDOWN_HTML_CACHE_LIMIT = 300
 const HIGHLIGHT_HTML_CACHE_LIMIT = 250
+const DISPLAY_MATH_HTML_CACHE_LIMIT = 250
 
 type MessageBlockCacheEntry = {
   text: string
@@ -1417,6 +1464,7 @@ type MarkdownHtmlCacheEntry = {
   text: string
   cwd: string
   highlightVersion: number
+  mathVersion: number
   html: string
 }
 
@@ -1424,6 +1472,7 @@ const messageBlockCache = new Map<string, MessageBlockCacheEntry>()
 const inlineSegmentCache = new Map<string, InlineSegment[]>()
 const markdownHtmlCache = new Map<string, MarkdownHtmlCacheEntry>()
 const highlightHtmlCache = new Map<string, string>()
+const displayMathHtmlCache = new Map<string, string | null>()
 
 function setBoundedCacheEntry<K, V>(cache: Map<K, V>, key: K, value: V, limit: number): V {
   if (cache.has(key)) cache.delete(key)
@@ -1460,6 +1509,29 @@ function ensureHighlightJsLoaded(): Promise<void> {
       })
   }
   return highlightJsLoader
+}
+
+function ensureDisplayMathLoaded(): Promise<void> {
+  if (displayMathRenderer.value) return Promise.resolve()
+  if (!displayMathLoader) {
+    displayMathLoader = Promise.all([
+      import('katex'),
+      import('katex/dist/katex.min.css'),
+    ])
+      .then(([module]) => {
+        displayMathRenderer.value = module.default.renderToString as DisplayMathRenderFunction
+        displayMathHtmlCache.clear()
+        markdownHtmlCache.clear()
+        mathRenderVersion.value += 1
+      })
+      .catch(() => {
+        // Keep the escaped source visible. A later relevant message change retries loading.
+      })
+      .finally(() => {
+        displayMathLoader = null
+      })
+  }
+  return displayMathLoader
 }
 
 type ParsedToolQuestion = {
@@ -2707,7 +2779,7 @@ function splitTextByFileUrls(
   return segments
 }
 
-function parseInlineSegmentsUncached(text: string): InlineSegment[] {
+function parseNonMathInlineSegments(text: string): InlineSegment[] {
   const hasInlineCodeMarker = text.includes('`')
   const linkFirstSegments = splitTextByFileUrls(text, {
     applyMarkdownMarkers: !hasInlineCodeMarker,
@@ -2845,6 +2917,14 @@ function parseInlineSegmentsUncached(text: string): InlineSegment[] {
     segment.kind === 'text'
       ? parseCodeAwareTextSegments(segment.value)
       : [segment]
+  ))
+}
+
+function parseInlineSegmentsUncached(text: string): InlineSegment[] {
+  return splitInlineMathSpans(text).flatMap((span): InlineSegment[] => (
+    span.kind === 'math'
+      ? [{ kind: 'math', value: span.value, source: span.source }]
+      : parseNonMathInlineSegments(span.value)
   ))
 }
 
@@ -3516,7 +3596,7 @@ function parseTextBlocks(text: string): MessageBlock[] {
   return blocks
 }
 
-function parseNonCodeMessageBlocks(text: string): MessageBlock[] {
+function parseTextAndImageBlocks(text: string): MessageBlock[] {
   if (!text.includes('![') || !text.includes('](')) {
     return parseTextBlocks(text)
   }
@@ -3547,6 +3627,15 @@ function parseNonCodeMessageBlocks(text: string): MessageBlock[] {
   }
 
   return blocks
+}
+
+function parseNonCodeMessageBlocks(text: string): MessageBlock[] {
+  return splitDisplayMathSpans(text).flatMap((span): MessageBlock[] => {
+    if (span.kind === 'math') {
+      return [{ kind: 'mathBlock', value: span.value, source: span.source }]
+    }
+    return parseTextAndImageBlocks(span.value)
+  })
 }
 
 function parseMessageBlocks(text: string): MessageBlock[] {
@@ -3619,6 +3708,42 @@ function escapeHtml(value: string): string {
     .replace(/'/gu, '&#39;')
 }
 
+function renderDisplayMathInnerAsHtml(
+  block: Extract<MessageBlock, { kind: 'mathBlock' }>,
+): string {
+  const cacheKey = `${mathRenderVersion.value}\u0000display\u0000${block.value}`
+  if (!displayMathHtmlCache.has(cacheKey)) {
+    setBoundedCacheEntry(
+      displayMathHtmlCache,
+      cacheKey,
+      tryRenderDisplayMathToHtml(displayMathRenderer.value, block.value),
+      DISPLAY_MATH_HTML_CACHE_LIMIT,
+    )
+  }
+  const rendered = displayMathHtmlCache.get(cacheKey) ?? null
+  return rendered === null
+    ? `<div class="message-math-source">${escapeHtml(block.source)}</div>`
+    : `<div class="message-math-katex">${rendered}</div>`
+}
+
+function renderInlineMathAsHtml(
+  segment: Extract<InlineSegment, { kind: 'math' }>,
+): string {
+  const cacheKey = `${mathRenderVersion.value}\u0000inline\u0000${segment.value}`
+  if (!displayMathHtmlCache.has(cacheKey)) {
+    setBoundedCacheEntry(
+      displayMathHtmlCache,
+      cacheKey,
+      tryRenderMathToHtml(displayMathRenderer.value, segment.value, false),
+      DISPLAY_MATH_HTML_CACHE_LIMIT,
+    )
+  }
+  const rendered = displayMathHtmlCache.get(cacheKey) ?? null
+  return rendered === null
+    ? `<span class="message-math-source">${escapeHtml(segment.source)}</span>`
+    : `<span class="message-math-katex">${rendered}</span>`
+}
+
 function normalizeCodeLanguage(language: string): string {
   const token = language.trim().split(/\s+/u)[0]?.toLowerCase() ?? ''
   if (!token) return ''
@@ -3681,6 +3806,9 @@ function renderInlineSegmentsAsHtml(text: string): string {
       }
       if (segment.kind === 'url') {
         return `<a class="message-file-link" href="${escapeHtml(segment.href)}" target="_blank" rel="noopener noreferrer" title="${escapeHtml(segment.href)}">${escapeHtml(segment.value)}</a>`
+      }
+      if (segment.kind === 'math') {
+        return `<span class="message-inline-math">${renderInlineMathAsHtml(segment)}</span>`
       }
       return `<code class="message-inline-code">${escapeHtml(segment.value)}</code>`
     })
@@ -3754,6 +3882,9 @@ function renderMessageBlockAsHtml(block: MessageBlock): string {
     const body = rows ? `<tbody>${rows}</tbody>` : ''
     return `<div class="message-table-wrap"><table class="message-table"><thead><tr>${headerCells}</tr></thead>${body}</table></div>`
   }
+  if (block.kind === 'mathBlock') {
+    return `<div class="message-math-block">${renderDisplayMathInnerAsHtml(block)}</div>`
+  }
   if (block.kind === 'codeBlock') {
     const language = block.language
       ? `<div class="message-code-language">${escapeHtml(block.language)}</div>`
@@ -3767,9 +3898,15 @@ function renderMessageBlockAsHtml(block: MessageBlock): string {
 }
 
 function renderMarkdownBlocksAsHtml(text: string): string {
-  const cacheKey = `${props.cwd}\u0000${highlightCacheVersion.value}\u0000${text}`
+  const cacheKey = `${props.cwd}\u0000${highlightCacheVersion.value}\u0000${mathRenderVersion.value}\u0000${text}`
   const cached = markdownHtmlCache.get(cacheKey)
-  if (cached && cached.text === text && cached.cwd === props.cwd && cached.highlightVersion === highlightCacheVersion.value) {
+  if (
+    cached
+    && cached.text === text
+    && cached.cwd === props.cwd
+    && cached.highlightVersion === highlightCacheVersion.value
+    && cached.mathVersion === mathRenderVersion.value
+  ) {
     markdownHtmlCache.delete(cacheKey)
     markdownHtmlCache.set(cacheKey, cached)
     return cached.html
@@ -3784,6 +3921,7 @@ function renderMarkdownBlocksAsHtml(text: string): string {
       text,
       cwd: props.cwd,
       highlightVersion: highlightCacheVersion.value,
+      mathVersion: mathRenderVersion.value,
       html,
     },
     MARKDOWN_HTML_CACHE_LIMIT,
@@ -4340,6 +4478,7 @@ function clearRenderCaches(): void {
   inlineSegmentCache.clear()
   markdownHtmlCache.clear()
   highlightHtmlCache.clear()
+  displayMathHtmlCache.clear()
 }
 
 watch(
@@ -4384,6 +4523,18 @@ watch(
   (hasCodeBlocks) => {
     if (!hasCodeBlocks || highlightJsModule.value) return
     void ensureHighlightJsLoaded()
+  },
+  { immediate: true },
+)
+
+watch(
+  () => props.messages
+    .filter((message) => message.text.includes('\\[') || message.text.includes('\\('))
+    .map((message) => `${message.id}:${message.text.length}`)
+    .join('\u0000'),
+  (displayMathSignature) => {
+    if (!displayMathSignature || displayMathRenderer.value) return
+    void ensureDisplayMathLoaded()
   },
   { immediate: true },
 )
@@ -4826,6 +4977,7 @@ onBeforeUnmount(() => {
 .plan-card-markdown :deep(.message-list),
 .plan-card-markdown :deep(.message-table-wrap),
 .plan-card-markdown :deep(.message-code-block),
+.plan-card-markdown :deep(.message-math-block),
 .plan-card-markdown :deep(.message-divider) {
   @apply m-0;
 }
