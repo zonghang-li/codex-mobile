@@ -2687,6 +2687,46 @@ export function useDesktopState() {
 
       const ownership = runtimeOwnershipByThreadId.value[threadId] ?? 'idle'
       const locallyRunning = inProgressById.value[threadId] === true && ownership !== 'external'
+      if (runtime.state === 'idle' && ownership === 'local') {
+        if (!isSelectedNow) {
+          clearCompletedTurnLiveState(threadId)
+          setThreadRuntimeOwnership(threadId, 'idle')
+          setThreadInProgress(threadId, false)
+          shouldRefreshThreads = true
+          continue
+        }
+
+        const detailRequest = acquireThreadDetailRequest(
+          threadId,
+          () => getThreadDetail(threadId, signal),
+        )
+        try {
+          const detail = await detailRequest.promise
+          if (generation !== backgroundRuntimeGeneration) continue
+          if (selectedThreadId.value !== threadId) continue
+          if (!loadedIds.has(threadId)) continue
+          if (!isCurrentThreadDetailEpoch(threadId, detailRequest.epoch)) continue
+          if ((selectionVersionByThreadId.get(threadId) ?? 0) !== requestedSelectionVersion) continue
+          if (
+            (localRuntimeAuthorityVersionByThreadId.get(threadId) ?? 0)
+            !== requestedLocalAuthorityVersion
+          ) continue
+          if (runtimeOwnershipByThreadId.value[threadId] !== 'local') continue
+
+          reconcileThreadDetailSnapshot(threadId, detail, {
+            preserveMissing: true,
+            markRead: true,
+            requestedVersion: '',
+            detailEpoch: detailRequest.epoch,
+            allowIdleLocalLeaseRelease: true,
+          })
+        } catch {
+          // Keep the local lease until a later batch can confirm and load terminal detail.
+        } finally {
+          releaseThreadDetailRequest(threadId, detailRequest)
+        }
+        continue
+      }
       if (ownership === 'local' || locallyRunning || (isSelectedNow && ownership === 'external')) {
         backgroundExternalThreadIds.delete(threadId)
         continue
@@ -4333,6 +4373,12 @@ export function useDesktopState() {
         ...activeTurnIdByThreadId.value,
         [startedTurn.threadId]: startedTurn.turnId,
       }
+      if (runtimeOwnershipByThreadId.value[startedTurn.threadId] === 'local') {
+        localRuntimeAuthorityVersionByThreadId.set(
+          startedTurn.threadId,
+          (localRuntimeAuthorityVersionByThreadId.get(startedTurn.threadId) ?? 0) + 1,
+        )
+      }
       setThreadRuntimeOwnership(startedTurn.threadId, 'local')
       maybeUnblockInterruptForActiveTurn(startedTurn.threadId, startedTurn.turnId)
       clearLivePlansForThread(startedTurn.threadId)
@@ -4972,6 +5018,7 @@ export function useDesktopState() {
       markRead: boolean
       requestedVersion: string
       detailEpoch: number
+      allowIdleLocalLeaseRelease?: boolean
     },
   ): void {
     if (!isCurrentThreadDetailEpoch(threadId, options.detailEpoch)) return
@@ -4984,17 +5031,22 @@ export function useDesktopState() {
 
     const { messages: nextMessages, inProgress: serverInProgress, activeTurnId, turnIndexByTurnId } = detail
     const localActiveTurnId = activeTurnIdByThreadId.value[threadId] ?? ''
-    const retainLocal =
-      localActiveTurnId.length > 0 ||
-      (
-        inProgressById.value[threadId] === true &&
-        pendingTurnRequestByThreadId.value[threadId]?.fallbackRetried === true
-      )
     const detailOwnership: ThreadRuntimeOwnership = detail.ownership === 'external'
       ? 'external'
       : detail.ownership === 'local' || serverInProgress
         ? 'local'
         : 'idle'
+    const allowLocalLeaseRelease = options.allowIdleLocalLeaseRelease === true
+      && detailOwnership === 'idle'
+    const retainLocal =
+      !allowLocalLeaseRelease
+      && (
+        localActiveTurnId.length > 0
+        || (
+          inProgressById.value[threadId] === true
+          && pendingTurnRequestByThreadId.value[threadId]?.fallbackRetried === true
+        )
+      )
     const retainEstablishedExternal =
       !retainLocal &&
       runtimeOwnershipByThreadId.value[threadId] === 'external' &&

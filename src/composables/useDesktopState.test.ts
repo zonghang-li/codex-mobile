@@ -1682,6 +1682,163 @@ describe('external runtime ownership', () => {
     expect(state.selectedThreadRuntimeOwnership.value).toBe('local')
   })
 
+  it('repairs a missed local completion in the background and refreshes unread state', async () => {
+    let notificationHandler: ((notification: { method: string; params?: unknown }) => void) | undefined
+    gatewayMocks.subscribeCodexNotifications.mockImplementation((handler) => {
+      notificationHandler = handler as typeof notificationHandler
+      return vi.fn()
+    })
+    const state = await setupBackgroundRuntimeState()
+    gatewayMocks.getThreadRuntimeStates.mockResolvedValue({
+      'thread-running': { state: 'idle' },
+      'thread-selected': { state: 'idle' },
+    })
+
+    state.startPolling()
+    pollingCleanups.push(() => state.stopPolling())
+    expect(notificationHandler).toBeDefined()
+    notificationHandler!({
+      method: 'turn/started',
+      params: { threadId: 'thread-running', turn: { id: 'turn-local' } },
+    })
+    expect(state.projectGroups.value[0]?.threads[0]).toMatchObject({
+      inProgress: true,
+      unread: false,
+    })
+
+    await vi.advanceTimersByTimeAsync(0)
+    await flushMicrotasks()
+
+    expect(state.projectGroups.value[0]?.threads[0]).toMatchObject({
+      inProgress: false,
+      unread: true,
+    })
+    expect(gatewayMocks.getThreadGroupsPage).toHaveBeenCalledTimes(2)
+  })
+
+  it('loads the final assistant output before releasing a selected missed local completion', async () => {
+    let notificationHandler: ((notification: { method: string; params?: unknown }) => void) | undefined
+    gatewayMocks.subscribeCodexNotifications.mockImplementation((handler) => {
+      notificationHandler = handler as typeof notificationHandler
+      return vi.fn()
+    })
+    const state = await setupBackgroundRuntimeState()
+    gatewayMocks.getThreadRuntimeStates.mockResolvedValue({
+      'thread-selected': { state: 'idle' },
+    })
+    gatewayMocks.getThreadDetail.mockResolvedValue({
+      ...idleDetail(),
+      messages: [{
+        id: 'final-agent',
+        role: 'assistant',
+        text: 'final desktop output',
+        messageType: 'agentMessage',
+        turnId: 'turn-local',
+      }],
+    })
+
+    state.startPolling()
+    pollingCleanups.push(() => state.stopPolling())
+    notificationHandler!({
+      method: 'turn/started',
+      params: { threadId: 'thread-selected', turn: { id: 'turn-local' } },
+    })
+    await vi.advanceTimersByTimeAsync(0)
+    await flushMicrotasks()
+
+    expect(gatewayMocks.getThreadDetail).toHaveBeenCalledWith(
+      'thread-selected',
+      expect.any(AbortSignal),
+    )
+    expect(state.messages.value).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: 'final-agent', text: 'final desktop output' }),
+    ]))
+    expect(state.selectedThreadRuntimeOwnership.value).toBe('idle')
+    expect(state.selectedThread.value).toMatchObject({ inProgress: false })
+  })
+
+  it('retains a selected local lease when terminal detail recovery fails', async () => {
+    let notificationHandler: ((notification: { method: string; params?: unknown }) => void) | undefined
+    gatewayMocks.subscribeCodexNotifications.mockImplementation((handler) => {
+      notificationHandler = handler as typeof notificationHandler
+      return vi.fn()
+    })
+    const state = await setupBackgroundRuntimeState()
+    gatewayMocks.getThreadRuntimeStates.mockResolvedValue({
+      'thread-selected': { state: 'idle' },
+    })
+    gatewayMocks.getThreadDetail.mockRejectedValue(new Error('temporary detail failure'))
+
+    state.startPolling()
+    pollingCleanups.push(() => state.stopPolling())
+    notificationHandler!({
+      method: 'turn/started',
+      params: { threadId: 'thread-selected', turn: { id: 'turn-local' } },
+    })
+    await vi.advanceTimersByTimeAsync(0)
+    await flushMicrotasks()
+
+    expect(state.selectedThreadRuntimeOwnership.value).toBe('local')
+    expect(state.selectedThread.value).toMatchObject({ inProgress: true })
+  })
+
+  it('does not let stale terminal detail clear a newer local turn', async () => {
+    let notificationHandler: ((notification: { method: string; params?: unknown }) => void) | undefined
+    gatewayMocks.subscribeCodexNotifications.mockImplementation((handler) => {
+      notificationHandler = handler as typeof notificationHandler
+      return vi.fn()
+    })
+    const state = await setupBackgroundRuntimeState()
+    const pendingDetail = deferred<ReturnType<typeof idleDetail>>()
+    gatewayMocks.getThreadRuntimeStates.mockResolvedValue({
+      'thread-selected': { state: 'idle' },
+    })
+    gatewayMocks.getThreadDetail.mockReturnValue(pendingDetail.promise)
+
+    state.startPolling()
+    pollingCleanups.push(() => state.stopPolling())
+    notificationHandler!({
+      method: 'turn/started',
+      params: { threadId: 'thread-selected', turn: { id: 'turn-old' } },
+    })
+    await vi.advanceTimersByTimeAsync(0)
+    expect(gatewayMocks.getThreadDetail).toHaveBeenCalledTimes(1)
+    notificationHandler!({
+      method: 'turn/started',
+      params: { threadId: 'thread-selected', turn: { id: 'turn-new' } },
+    })
+    pendingDetail.resolve(idleDetail())
+    await flushMicrotasks()
+
+    expect(state.selectedThreadRuntimeOwnership.value).toBe('local')
+    expect(state.selectedThread.value).toMatchObject({ inProgress: true })
+  })
+
+  it('retains a local lease when unified runtime observation is unknown', async () => {
+    let notificationHandler: ((notification: { method: string; params?: unknown }) => void) | undefined
+    gatewayMocks.subscribeCodexNotifications.mockImplementation((handler) => {
+      notificationHandler = handler as typeof notificationHandler
+      return vi.fn()
+    })
+    const state = await setupBackgroundRuntimeState()
+    gatewayMocks.getThreadRuntimeStates.mockResolvedValue({
+      'thread-selected': { state: 'unknown' },
+    })
+
+    state.startPolling()
+    pollingCleanups.push(() => state.stopPolling())
+    notificationHandler!({
+      method: 'turn/started',
+      params: { threadId: 'thread-selected', turn: { id: 'turn-local' } },
+    })
+    await vi.advanceTimersByTimeAsync(0)
+    await flushMicrotasks()
+
+    expect(gatewayMocks.getThreadDetail).not.toHaveBeenCalled()
+    expect(state.selectedThreadRuntimeOwnership.value).toBe('local')
+    expect(state.selectedThread.value).toMatchObject({ inProgress: true })
+  })
+
   it('rotates batches so every loaded task is probed without exceeding the limit', async () => {
     vi.useFakeTimers()
     installFakeTimerWindow()
