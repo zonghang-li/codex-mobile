@@ -18,6 +18,7 @@ export type MessageBlock =
   | { kind: 'taskList'; items: TaskListItem[] }
   | { kind: 'orderedList'; items: ListItem[]; start: number }
   | { kind: 'table'; headers: string[]; rows: string[][]; alignments: TableAlignment[] }
+  | { kind: 'mathBlock'; value: string; source: string }
   | { kind: 'codeBlock'; language: string; value: string }
   | { kind: 'thematicBreak' }
   | { kind: 'image'; url: string; alt: string; markdown: string }

@@ -593,6 +593,7 @@
                       </CopyableOutputBlock>
                     </div>
                     <hr v-else-if="block.kind === 'thematicBreak'" class="message-divider" />
+                    <p v-else-if="block.kind === 'mathBlock'" class="message-text">{{ block.source }}</p>
                     <p v-else-if="isMarkdownImageFailed(message.id, blockIndex)" class="message-text">{{ block.markdown }}</p>
                     <button
                       v-else
@@ -3762,6 +3763,9 @@ function renderMessageBlockAsHtml(block: MessageBlock): string {
   }
   if (block.kind === 'thematicBreak') {
     return '<hr class="message-divider">'
+  }
+  if (block.kind === 'mathBlock') {
+    return `<p class="message-text">${escapeHtml(block.source)}</p>`
   }
   return `<img class="message-image-preview message-markdown-image" src="${escapeHtml(block.url)}" alt="${escapeHtml(block.alt || 'Embedded message image')}" loading="lazy">`
 }
