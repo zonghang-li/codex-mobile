@@ -830,6 +830,29 @@ a.codex-directive-title {
   color: rgb(228 228 231);
 }
 
+.message-inline-math {
+  display: inline-block;
+  max-width: 100%;
+  overflow-x: auto;
+  overflow-y: hidden;
+  vertical-align: -0.15em;
+  color: inherit;
+  -webkit-overflow-scrolling: touch;
+}
+
+.message-inline-math .katex {
+  color: inherit;
+}
+
+.message-inline-math .message-math-source {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+:root.dark .message-inline-math {
+  color: rgb(228 228 231);
+}
+
 :root.dark .message-table {
   @apply border-zinc-700 bg-zinc-900/90 text-zinc-100;
 }
