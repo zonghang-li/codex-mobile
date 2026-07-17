@@ -1563,6 +1563,7 @@ export function useDesktopState() {
     controller: AbortController
     promise: Promise<void>
   } | null = null
+  let backgroundRuntimeCursor = 0
   let backgroundRuntimePollingEnabled = false
   let runtimeVisibilityListenerInstalled = false
   const backgroundExternalThreadIds = new Set<string>()
@@ -2548,25 +2549,30 @@ export function useDesktopState() {
   function backgroundRuntimeCandidateIds(): string[] {
     const selectedId = selectedThreadId.value
     const ids: string[] = []
-    const selectedThreadLoaded = flattenThreads(sourceGroups.value)
-      .some((thread) => thread.id === selectedId)
+    const loadedThreads = flattenThreads(sourceGroups.value)
+    const selectedThreadLoaded = loadedThreads.some((thread) => thread.id === selectedId)
     if (selectedId && selectedThreadLoaded) {
       const selectedOwnership = runtimeOwnershipByThreadId.value[selectedId] ?? 'idle'
-      const selectedLocallyRunning = inProgressById.value[selectedId] === true
-        && selectedOwnership !== 'external'
-      if (selectedOwnership === 'idle' && !selectedLocallyRunning) {
+      if (selectedOwnership !== 'external') {
         ids.push(selectedId)
       }
     }
-    for (const thread of flattenThreads(sourceGroups.value)) {
-      if (ids.length >= BACKGROUND_RUNTIME_BATCH_LIMIT) break
-      if (!thread.id || thread.id === selectedId) continue
+
+    const candidates = loadedThreads.filter((thread) => thread.id && thread.id !== selectedId)
+    const availableSlots = BACKGROUND_RUNTIME_BATCH_LIMIT - ids.length
+    const takeCount = Math.min(availableSlots, candidates.length)
+    const startIndex = candidates.length > 0
+      ? backgroundRuntimeCursor % candidates.length
+      : 0
+    for (let offset = 0; offset < takeCount; offset += 1) {
+      const thread = candidates[(startIndex + offset) % candidates.length]
       const ownership = runtimeOwnershipByThreadId.value[thread.id] ?? 'idle'
-      const locallyRunning = inProgressById.value[thread.id] === true && ownership !== 'external'
-      if (ownership === 'local' || locallyRunning) continue
       ids.push(thread.id)
       if (ownership === 'external') backgroundExternalThreadIds.add(thread.id)
     }
+    backgroundRuntimeCursor = candidates.length > 0
+      ? (startIndex + takeCount) % candidates.length
+      : 0
     return ids
   }
 
@@ -2667,13 +2673,24 @@ export function useDesktopState() {
         backgroundExternalThreadIds.delete(threadId)
         continue
       }
+      const runtime = states[threadId] ?? { state: 'unknown' }
+      if (runtime.state === 'running' && runtime.source === 'local-app-server') {
+        activeTurnIdByThreadId.value = {
+          ...activeTurnIdByThreadId.value,
+          [threadId]: runtime.turnId,
+        }
+        backgroundExternalThreadIds.delete(threadId)
+        setThreadRuntimeOwnership(threadId, 'local')
+        setThreadInProgress(threadId, true)
+        continue
+      }
+
       const ownership = runtimeOwnershipByThreadId.value[threadId] ?? 'idle'
       const locallyRunning = inProgressById.value[threadId] === true && ownership !== 'external'
       if (ownership === 'local' || locallyRunning || (isSelectedNow && ownership === 'external')) {
         backgroundExternalThreadIds.delete(threadId)
         continue
       }
-      const runtime = states[threadId] ?? { state: 'unknown' }
       if (runtime.state === 'running') {
         if (!isSelectedNow) backgroundExternalThreadIds.add(threadId)
         setThreadRuntimeOwnership(threadId, 'external', {
@@ -6270,6 +6287,7 @@ export function useDesktopState() {
     cancelExternalRuntimePolling()
     backgroundRuntimePollingEnabled = false
     cancelBackgroundRuntimeRequest()
+    backgroundRuntimeCursor = 0
     backgroundExternalThreadIds.clear()
     localRuntimeAuthorityVersionByThreadId.clear()
     selectionVersionByThreadId.clear()
