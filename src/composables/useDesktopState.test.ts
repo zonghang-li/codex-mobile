@@ -1430,7 +1430,7 @@ describe('external runtime ownership', () => {
     expect(state.selectedThreadRuntimeOwnership.value).toBe('idle')
   })
 
-  it('excludes a locally running selected task from idle discovery', async () => {
+  it('keeps a locally running selected task in unified runtime discovery', async () => {
     let notificationHandler: ((notification: { method: string; params?: unknown }) => void) | undefined
     gatewayMocks.subscribeCodexNotifications.mockImplementation((handler) => {
       notificationHandler = handler as typeof notificationHandler
@@ -1449,7 +1449,7 @@ describe('external runtime ownership', () => {
     await flushMicrotasks()
 
     expect(gatewayMocks.getThreadRuntimeStates).toHaveBeenCalledWith(
-      ['thread-running'],
+      ['thread-selected', 'thread-running'],
       expect.any(AbortSignal),
     )
     expect(state.selectedThreadRuntimeOwnership.value).toBe('local')
@@ -1652,6 +1652,235 @@ describe('external runtime ownership', () => {
       ['thread-selected', 'thread-running'],
       expect.any(AbortSignal),
     )
+  })
+
+  it('repairs a missed local start and removes the false unread dot', async () => {
+    const state = await setupBackgroundRuntimeState()
+    gatewayMocks.getThreadRuntimeStates.mockResolvedValue({
+      'thread-running': {
+        state: 'running',
+        turnId: 'turn-local',
+        interruptible: true,
+        source: 'local-app-server',
+      },
+    })
+
+    expect(state.projectGroups.value[0]?.threads[0]).toMatchObject({
+      inProgress: false,
+      unread: true,
+    })
+    state.startPolling()
+    pollingCleanups.push(() => state.stopPolling())
+    await vi.advanceTimersByTimeAsync(0)
+    await flushMicrotasks()
+
+    expect(state.projectGroups.value[0]?.threads[0]).toMatchObject({
+      inProgress: true,
+      unread: false,
+    })
+    state.primeSelectedThread('thread-running')
+    expect(state.selectedThreadRuntimeOwnership.value).toBe('local')
+  })
+
+  it('repairs a missed local completion in the background and refreshes unread state', async () => {
+    let notificationHandler: ((notification: { method: string; params?: unknown }) => void) | undefined
+    gatewayMocks.subscribeCodexNotifications.mockImplementation((handler) => {
+      notificationHandler = handler as typeof notificationHandler
+      return vi.fn()
+    })
+    const state = await setupBackgroundRuntimeState()
+    gatewayMocks.getThreadRuntimeStates.mockResolvedValue({
+      'thread-running': { state: 'idle' },
+      'thread-selected': { state: 'idle' },
+    })
+
+    state.startPolling()
+    pollingCleanups.push(() => state.stopPolling())
+    expect(notificationHandler).toBeDefined()
+    notificationHandler!({
+      method: 'turn/started',
+      params: { threadId: 'thread-running', turn: { id: 'turn-local' } },
+    })
+    expect(state.projectGroups.value[0]?.threads[0]).toMatchObject({
+      inProgress: true,
+      unread: false,
+    })
+
+    await vi.advanceTimersByTimeAsync(0)
+    await flushMicrotasks()
+
+    expect(state.projectGroups.value[0]?.threads[0]).toMatchObject({
+      inProgress: false,
+      unread: true,
+    })
+    expect(gatewayMocks.getThreadGroupsPage).toHaveBeenCalledTimes(2)
+  })
+
+  it('loads the final assistant output before releasing a selected missed local completion', async () => {
+    let notificationHandler: ((notification: { method: string; params?: unknown }) => void) | undefined
+    gatewayMocks.subscribeCodexNotifications.mockImplementation((handler) => {
+      notificationHandler = handler as typeof notificationHandler
+      return vi.fn()
+    })
+    const state = await setupBackgroundRuntimeState()
+    gatewayMocks.getThreadRuntimeStates.mockResolvedValue({
+      'thread-selected': { state: 'idle' },
+    })
+    gatewayMocks.getThreadDetail.mockResolvedValue({
+      ...idleDetail(),
+      messages: [{
+        id: 'final-agent',
+        role: 'assistant',
+        text: 'final desktop output',
+        messageType: 'agentMessage',
+        turnId: 'turn-local',
+      }],
+    })
+
+    state.startPolling()
+    pollingCleanups.push(() => state.stopPolling())
+    notificationHandler!({
+      method: 'turn/started',
+      params: { threadId: 'thread-selected', turn: { id: 'turn-local' } },
+    })
+    await vi.advanceTimersByTimeAsync(0)
+    await flushMicrotasks()
+
+    expect(gatewayMocks.getThreadDetail).toHaveBeenCalledWith(
+      'thread-selected',
+      expect.any(AbortSignal),
+    )
+    expect(state.messages.value).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: 'final-agent', text: 'final desktop output' }),
+    ]))
+    expect(state.selectedThreadRuntimeOwnership.value).toBe('idle')
+    expect(state.selectedThread.value).toMatchObject({ inProgress: false })
+  })
+
+  it('retains a selected local lease when terminal detail recovery fails', async () => {
+    let notificationHandler: ((notification: { method: string; params?: unknown }) => void) | undefined
+    gatewayMocks.subscribeCodexNotifications.mockImplementation((handler) => {
+      notificationHandler = handler as typeof notificationHandler
+      return vi.fn()
+    })
+    const state = await setupBackgroundRuntimeState()
+    gatewayMocks.getThreadRuntimeStates.mockResolvedValue({
+      'thread-selected': { state: 'idle' },
+    })
+    gatewayMocks.getThreadDetail.mockRejectedValue(new Error('temporary detail failure'))
+
+    state.startPolling()
+    pollingCleanups.push(() => state.stopPolling())
+    notificationHandler!({
+      method: 'turn/started',
+      params: { threadId: 'thread-selected', turn: { id: 'turn-local' } },
+    })
+    await vi.advanceTimersByTimeAsync(0)
+    await flushMicrotasks()
+
+    expect(state.selectedThreadRuntimeOwnership.value).toBe('local')
+    expect(state.selectedThread.value).toMatchObject({ inProgress: true })
+  })
+
+  it('does not let stale terminal detail clear a newer local turn', async () => {
+    let notificationHandler: ((notification: { method: string; params?: unknown }) => void) | undefined
+    gatewayMocks.subscribeCodexNotifications.mockImplementation((handler) => {
+      notificationHandler = handler as typeof notificationHandler
+      return vi.fn()
+    })
+    const state = await setupBackgroundRuntimeState()
+    const pendingDetail = deferred<ReturnType<typeof idleDetail>>()
+    gatewayMocks.getThreadRuntimeStates.mockResolvedValue({
+      'thread-selected': { state: 'idle' },
+    })
+    gatewayMocks.getThreadDetail.mockReturnValue(pendingDetail.promise)
+
+    state.startPolling()
+    pollingCleanups.push(() => state.stopPolling())
+    notificationHandler!({
+      method: 'turn/started',
+      params: { threadId: 'thread-selected', turn: { id: 'turn-old' } },
+    })
+    await vi.advanceTimersByTimeAsync(0)
+    expect(gatewayMocks.getThreadDetail).toHaveBeenCalledTimes(1)
+    notificationHandler!({
+      method: 'turn/started',
+      params: { threadId: 'thread-selected', turn: { id: 'turn-new' } },
+    })
+    pendingDetail.resolve(idleDetail())
+    await flushMicrotasks()
+
+    expect(state.selectedThreadRuntimeOwnership.value).toBe('local')
+    expect(state.selectedThread.value).toMatchObject({ inProgress: true })
+  })
+
+  it('retains a local lease when unified runtime observation is unknown', async () => {
+    let notificationHandler: ((notification: { method: string; params?: unknown }) => void) | undefined
+    gatewayMocks.subscribeCodexNotifications.mockImplementation((handler) => {
+      notificationHandler = handler as typeof notificationHandler
+      return vi.fn()
+    })
+    const state = await setupBackgroundRuntimeState()
+    gatewayMocks.getThreadRuntimeStates.mockResolvedValue({
+      'thread-selected': { state: 'unknown' },
+    })
+
+    state.startPolling()
+    pollingCleanups.push(() => state.stopPolling())
+    notificationHandler!({
+      method: 'turn/started',
+      params: { threadId: 'thread-selected', turn: { id: 'turn-local' } },
+    })
+    await vi.advanceTimersByTimeAsync(0)
+    await flushMicrotasks()
+
+    expect(gatewayMocks.getThreadDetail).not.toHaveBeenCalled()
+    expect(state.selectedThreadRuntimeOwnership.value).toBe('local')
+    expect(state.selectedThread.value).toMatchObject({ inProgress: true })
+  })
+
+  it('rotates batches so every loaded task is probed without exceeding the limit', async () => {
+    vi.useFakeTimers()
+    installFakeTimerWindow()
+    vi.stubGlobal('document', {
+      visibilityState: 'visible',
+      addEventListener: vi.fn(),
+      removeEventListener: vi.fn(),
+    })
+    gatewayMocks.getPendingServerRequests.mockResolvedValue([])
+    const backgroundThreads = Array.from({ length: 55 }, (_value, index) => (
+      thread(`thread-${index.toString().padStart(2, '0')}`, '/tmp/project')
+    ))
+    gatewayMocks.getThreadGroupsPage.mockResolvedValue({
+      groups: [{
+        projectName: 'Project',
+        threads: [...backgroundThreads, thread('thread-selected', '/tmp/project')],
+      }],
+      nextCursor: null,
+    })
+    gatewayMocks.getThreadRuntimeStates.mockImplementation(async (threadIds: readonly string[]) => (
+      Object.fromEntries(threadIds.map((threadId) => [threadId, { state: 'idle' }]))
+    ))
+
+    const state = useDesktopState()
+    state.primeSelectedThread('thread-selected')
+    await state.refreshAll({ includeSelectedThreadMessages: false })
+    state.startPolling()
+    pollingCleanups.push(() => state.stopPolling())
+    await vi.advanceTimersByTimeAsync(0)
+    await flushMicrotasks()
+    await vi.advanceTimersByTimeAsync(2_000)
+    await flushMicrotasks()
+
+    const batches = gatewayMocks.getThreadRuntimeStates.mock.calls.slice(0, 2)
+      .map(([threadIds]) => threadIds as string[])
+    expect(batches).toHaveLength(2)
+    expect(batches.every((threadIds) => threadIds.length <= 50)).toBe(true)
+    expect(batches.every((threadIds) => threadIds.includes('thread-selected'))).toBe(true)
+    expect(new Set(batches.flat())).toEqual(new Set([
+      'thread-selected',
+      ...backgroundThreads.map((row) => row.id),
+    ]))
   })
 
   it('clears an externally running background task on idle and refreshes its unread summary once', async () => {
@@ -2072,7 +2301,7 @@ describe('external runtime ownership', () => {
     ])
   })
 
-  it('polls the first 50 eligible loaded rows in group order', async () => {
+  it('polls local and idle rows in group order within the 50-row limit', async () => {
     vi.useFakeTimers()
     installFakeTimerWindow()
     vi.stubGlobal('document', {
@@ -2112,7 +2341,9 @@ describe('external runtime ownership', () => {
     expect(gatewayMocks.getThreadRuntimeStates).toHaveBeenCalledWith(
       [
         'thread-selected',
-        ...Array.from({ length: 49 }, (_, index) => `thread-${index}`),
+        ...Array.from({ length: 28 }, (_, index) => `thread-${index}`),
+        'thread-local',
+        ...Array.from({ length: 20 }, (_, index) => `thread-${index + 28}`),
       ],
       expect.any(AbortSignal),
     )

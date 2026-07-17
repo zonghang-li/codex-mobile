@@ -579,6 +579,12 @@ describe('getThreadRuntimeStates', () => {
             source: 'external-session-writer',
           },
           'thread-b': { state: 'idle' },
+          'thread-local': {
+            state: 'running',
+            turnId: 'turn-local',
+            interruptible: true,
+            source: 'local-app-server',
+          },
         },
       }), {
         status: 200,
@@ -586,7 +592,7 @@ describe('getThreadRuntimeStates', () => {
       })
     }))
 
-    await expect(getThreadRuntimeStates(['thread-a', 'thread-b'])).resolves.toEqual({
+    await expect(getThreadRuntimeStates(['thread-a', 'thread-b', 'thread-local'])).resolves.toEqual({
       'thread-a': {
         state: 'running',
         turnId: 'turn-a',
@@ -594,13 +600,57 @@ describe('getThreadRuntimeStates', () => {
         source: 'external-session-writer',
       },
       'thread-b': { state: 'idle' },
+      'thread-local': {
+        state: 'running',
+        turnId: 'turn-local',
+        interruptible: true,
+        source: 'local-app-server',
+      },
     })
     expect(requestUrl).toBe('/codex-api/thread-runtime-states')
     expect(requestInit).toMatchObject({
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
     })
-    expect(JSON.parse(String(requestInit?.body))).toEqual({ threadIds: ['thread-a', 'thread-b'] })
+    expect(JSON.parse(String(requestInit?.body))).toEqual({
+      threadIds: ['thread-a', 'thread-b', 'thread-local'],
+    })
+  })
+
+  it.each([
+    [
+      'non-interruptible local source',
+      { state: 'running', turnId: 'turn-a', interruptible: false, source: 'local-app-server' },
+    ],
+    [
+      'interruptible external source',
+      { state: 'running', turnId: 'turn-a', interruptible: true, source: 'external-session-writer' },
+    ],
+    [
+      'empty local turn ID',
+      { state: 'running', turnId: '', interruptible: true, source: 'local-app-server' },
+    ],
+    [
+      'extra local property',
+      {
+        state: 'running',
+        turnId: 'turn-a',
+        interruptible: true,
+        source: 'local-app-server',
+        extra: true,
+      },
+    ],
+  ])('normalizes a malformed %s record to unknown', async (_label, runtime) => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({
+      states: { 'thread-a': runtime },
+    }), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' },
+    })))
+
+    await expect(getThreadRuntimeStates(['thread-a'])).resolves.toEqual({
+      'thread-a': { state: 'unknown' },
+    })
   })
 
   it('normalizes missing and malformed requested states to unknown', async () => {
