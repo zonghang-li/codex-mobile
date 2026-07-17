@@ -5183,30 +5183,6 @@ onBeforeUnmount(() => {
   line-height: inherit;
 }
 
-.message-math-block {
-  width: 100%;
-  max-width: 100%;
-  overflow-x: auto;
-  overflow-y: hidden;
-  padding-block: 0.25rem;
-  color: inherit;
-  -webkit-overflow-scrolling: touch;
-}
-
-.message-math-block :deep(.katex-display) {
-  margin: 0;
-  width: max-content;
-  min-width: 100%;
-  text-align: center;
-}
-
-.message-math-block :deep(.message-math-source) {
-  white-space: pre-wrap;
-  overflow-wrap: anywhere;
-  font-size: 0.875rem;
-  line-height: 1.625;
-}
-
 .message-code-block {
   @apply overflow-hidden rounded-xl border border-slate-200 bg-slate-950 text-slate-100;
 }

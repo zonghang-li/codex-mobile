@@ -39,8 +39,9 @@ describe('ThreadConversation display math integration', () => {
       readFile(conversationUrl, 'utf8'),
       readFile(new URL('../../style.css', import.meta.url), 'utf8'),
     ])
-    expect(conversation).toMatch(/\.message-math-block\s*\{[^}]*max-width:\s*100%[^}]*overflow-x:\s*auto/su)
-    expect(conversation).toContain('-webkit-overflow-scrolling: touch')
+    expect(conversation).toContain('class="plan-card-explanation plan-card-markdown"')
+    expect(globalStyle).toMatch(/\.message-math-block\s*\{[^}]*max-width:\s*100%[^}]*overflow-x:\s*auto/su)
+    expect(globalStyle).toContain('-webkit-overflow-scrolling: touch')
     expect(globalStyle).toMatch(/:root\.dark \.message-math-block\s*\{/u)
   })
 })
