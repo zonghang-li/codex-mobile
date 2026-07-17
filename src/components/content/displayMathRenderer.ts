@@ -1,5 +1,5 @@
 export type DisplayMathRenderOptions = {
-  displayMode: true
+  displayMode: boolean
   throwOnError: true
   trust: false
   strict: 'warn'
@@ -10,21 +10,27 @@ export type DisplayMathRenderFunction = (
   options: DisplayMathRenderOptions,
 ) => string
 
-const DISPLAY_MATH_OPTIONS: DisplayMathRenderOptions = {
-  displayMode: true,
-  throwOnError: true,
-  trust: false,
-  strict: 'warn',
+export function tryRenderMathToHtml(
+  renderer: DisplayMathRenderFunction | null,
+  value: string,
+  displayMode: boolean,
+): string | null {
+  if (!renderer) return null
+  try {
+    return renderer(value, {
+      displayMode,
+      throwOnError: true,
+      trust: false,
+      strict: 'warn',
+    })
+  } catch {
+    return null
+  }
 }
 
 export function tryRenderDisplayMathToHtml(
   renderer: DisplayMathRenderFunction | null,
   value: string,
 ): string | null {
-  if (!renderer) return null
-  try {
-    return renderer(value, DISPLAY_MATH_OPTIONS)
-  } catch {
-    return null
-  }
+  return tryRenderMathToHtml(renderer, value, true)
 }
