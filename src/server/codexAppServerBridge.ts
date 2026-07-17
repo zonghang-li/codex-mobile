@@ -41,6 +41,7 @@ import { handleOpenRouterProxyRequest } from './openRouterProxy.js'
 import { handleZenProxyRequest } from './zenProxy.js'
 import { handleCustomEndpointProxyRequest } from './customEndpointProxy.js'
 import { ExternalThreadRuntimeProbe } from './externalThreadRuntime.js'
+import { LocalThreadRuntimeLedger } from './localThreadRuntime.js'
 import { ThreadTerminalManager } from './terminalManager.js'
 import { getSpawnInvocation } from '../utils/commandInvocation.js'
 import {
@@ -48,6 +49,7 @@ import {
   resolveRipgrepCommand,
 } from '../commandResolution.js'
 import type { CollaborationModeKind, ReasoningEffort } from '../types/codex.js'
+import type { ThreadRuntimeObservation } from '../types/threadRuntime.js'
 import { isAbsoluteLikePath } from '../pathUtils.js'
 import {
   PERMISSIVE_SECURITY_POLICY,
@@ -937,6 +939,28 @@ type ThreadRuntimeProbe = Pick<
   ExternalThreadRuntimeProbe,
   'registerThread' | 'inspect' | 'inspectMany'
 >
+
+export async function observeThreadRuntimeStates(
+  threadIds: readonly string[],
+  runtimeProbe: Pick<ExternalThreadRuntimeProbe, 'inspectMany'>,
+  localRuntimeLedger: Pick<LocalThreadRuntimeLedger, 'getRunning'>,
+  excludedPid: number | null,
+): Promise<Record<string, ThreadRuntimeObservation>> {
+  const states: Record<string, ThreadRuntimeObservation> = {
+    ...await runtimeProbe.inspectMany(threadIds, excludedPid),
+  }
+  for (const threadId of threadIds) {
+    const local = localRuntimeLedger.getRunning(threadId)
+    if (!local) continue
+    states[threadId] = {
+      state: 'running',
+      turnId: local.turnId,
+      interruptible: true,
+      source: 'local-app-server',
+    }
+  }
+  return states
+}
 
 function readRuntimeBatchThreadIds(value: unknown): string[] | null {
   const body = asRecord(value)
@@ -6495,6 +6519,8 @@ class AppServerProcess {
   private chatgptAuthRefreshPromise: Promise<ChatgptAuthTokensRefreshResponse> | null = null
   private activeConfigSignature = ''
 
+  constructor(private readonly localRuntimeLedger: LocalThreadRuntimeLedger) {}
+
 
   private getCodexCommand(): string {
     const codexCommand = resolveCodexCommand()
@@ -6586,6 +6612,7 @@ class AppServerProcess {
 
       this.pending.clear()
       this.pendingServerRequests.clear()
+      this.localRuntimeLedger.clear()
       this.process = null
       this.initialized = false
       this.initializePromise = null
@@ -6638,6 +6665,7 @@ class AppServerProcess {
   }
 
   private emitNotification(notification: { method: string; params: unknown }): void {
+    this.localRuntimeLedger.record(notification)
     this.recordStreamEvent(notification)
     this.captureItemFromNotification(notification)
     const nThreadId = this.extractThreadIdFromParams(notification.params)
@@ -7023,6 +7051,7 @@ class AppServerProcess {
   }
 
   dispose(): void {
+    this.localRuntimeLedger.clear()
     if (!this.process) return
 
     const proc = this.process
@@ -7441,10 +7470,11 @@ type SharedBridgeState = {
   telegramBridge: TelegramThreadBridge
   backendQueueProcessor: BackendQueueProcessor
   runtimeProbe: ExternalThreadRuntimeProbe
+  localRuntimeLedger: LocalThreadRuntimeLedger
 }
 
 const SHARED_BRIDGE_KEY = '__codexRemoteSharedBridge__'
-const SHARED_BRIDGE_VERSION = 'experimental-api-v3-external-runtime'
+const SHARED_BRIDGE_VERSION = 'experimental-api-v4-unified-runtime'
 
 function getSharedBridgeState(): SharedBridgeState {
   const globalScope = globalThis as typeof globalThis & {
@@ -7462,7 +7492,8 @@ function getSharedBridgeState(): SharedBridgeState {
     existing.runtimeProbe?.clear()
   }
 
-  const appServer = new AppServerProcess()
+  const localRuntimeLedger = new LocalThreadRuntimeLedger()
+  const appServer = new AppServerProcess(localRuntimeLedger)
   const terminalManager = new ThreadTerminalManager()
   const runtimeProbe = new ExternalThreadRuntimeProbe({
     sessionsRoot: join(getCodexHomeDir(), 'sessions'),
@@ -7475,6 +7506,7 @@ function getSharedBridgeState(): SharedBridgeState {
     methodCatalog: new MethodCatalog(),
     backendQueueProcessor,
     runtimeProbe,
+    localRuntimeLedger,
     telegramBridge: new TelegramThreadBridge(appServer, {
       onChatSeen: (chatId) => {
         void rememberTelegramChatId(chatId).catch(() => {})
@@ -7565,7 +7597,15 @@ export function createCodexBridgeMiddleware(options: {
   securityPolicy?: ServerSecurityPolicy
 } = {}): CodexBridgeMiddleware {
   const securityPolicy = options.securityPolicy ?? PERMISSIVE_SECURITY_POLICY
-  const { appServer, terminalManager, methodCatalog, telegramBridge, backendQueueProcessor, runtimeProbe } = getSharedBridgeState()
+  const {
+    appServer,
+    terminalManager,
+    methodCatalog,
+    telegramBridge,
+    backendQueueProcessor,
+    runtimeProbe,
+    localRuntimeLedger,
+  } = getSharedBridgeState()
   let threadSearchIndex: ThreadSearchIndex | null = null
   let threadSearchIndexPromise: Promise<ThreadSearchIndex> | null = null
 
@@ -7673,7 +7713,12 @@ export function createCodexBridgeMiddleware(options: {
           setJson(res, 400, { error: 'Expected 1-50 unique non-empty threadIds' })
           return
         }
-        const states = await runtimeProbe.inspectMany(threadIds, appServer.getPid())
+        const states = await observeThreadRuntimeStates(
+          threadIds,
+          runtimeProbe,
+          localRuntimeLedger,
+          appServer.getPid(),
+        )
         setJson(res, 200, { states })
         return
       }

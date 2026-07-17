@@ -123,6 +123,9 @@ afterEach(() => {
 function sharedBridgeForTest() {
   return (globalThis as typeof globalThis & {
     __codexRemoteSharedBridge__: {
+      localRuntimeLedger: {
+        record: (notification: { method: string; params: unknown }) => void
+      }
       runtimeProbe: {
         inspect: (threadId: string, excludedPid: number | null) => Promise<ExternalThreadRuntime>
         inspectMany: (
@@ -204,6 +207,103 @@ describe('GET /codex-api/thread-runtime-state', () => {
 })
 
 describe('POST /codex-api/thread-runtime-states', () => {
+  it('prefers a currently running local app-server turn over external idle', async () => {
+    const middleware = createCodexBridgeMiddleware()
+    const shared = sharedBridgeForTest()
+    vi.spyOn(shared.appServer, 'getPid').mockReturnValue(4242)
+    vi.spyOn(shared.runtimeProbe, 'inspectMany').mockResolvedValue({
+      'thread-local': { state: 'idle' },
+    })
+    shared.localRuntimeLedger.record({
+      method: 'turn/started',
+      params: { threadId: 'thread-local', turn: { id: 'turn-local' } },
+    })
+    const port = await listenWithMiddleware(middleware)
+
+    const response = await fetch(`http://127.0.0.1:${port}/codex-api/thread-runtime-states`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ threadIds: ['thread-local'] }),
+    })
+
+    expect(response.status).toBe(200)
+    await expect(response.json()).resolves.toEqual({
+      states: {
+        'thread-local': {
+          state: 'running',
+          turnId: 'turn-local',
+          interruptible: true,
+          source: 'local-app-server',
+        },
+      },
+    })
+  })
+
+  it('reads local authority after the external scan settles', async () => {
+    const middleware = createCodexBridgeMiddleware()
+    const shared = sharedBridgeForTest()
+    vi.spyOn(shared.appServer, 'getPid').mockReturnValue(4242)
+    let resolveInspection!: (value: Record<string, ExternalThreadRuntime>) => void
+    const inspectMany = vi.spyOn(shared.runtimeProbe, 'inspectMany').mockImplementation(
+      () => new Promise((resolve) => {
+        resolveInspection = resolve
+      }),
+    )
+    const port = await listenWithMiddleware(middleware)
+
+    const responsePromise = fetch(`http://127.0.0.1:${port}/codex-api/thread-runtime-states`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ threadIds: ['thread-local'] }),
+    })
+    await vi.waitFor(() => expect(inspectMany).toHaveBeenCalledTimes(1))
+    shared.localRuntimeLedger.record({
+      method: 'turn/started',
+      params: { threadId: 'thread-local', turn: { id: 'turn-during-scan' } },
+    })
+    resolveInspection({ 'thread-local': { state: 'idle' } })
+
+    const response = await responsePromise
+    await expect(response.json()).resolves.toEqual({
+      states: {
+        'thread-local': {
+          state: 'running',
+          turnId: 'turn-during-scan',
+          interruptible: true,
+          source: 'local-app-server',
+        },
+      },
+    })
+  })
+
+  it('returns external idle after the matching local turn completes', async () => {
+    const middleware = createCodexBridgeMiddleware()
+    const shared = sharedBridgeForTest()
+    vi.spyOn(shared.appServer, 'getPid').mockReturnValue(4242)
+    vi.spyOn(shared.runtimeProbe, 'inspectMany').mockResolvedValue({
+      'thread-local': { state: 'idle' },
+    })
+    shared.localRuntimeLedger.record({
+      method: 'turn/started',
+      params: { threadId: 'thread-local', turn: { id: 'turn-local' } },
+    })
+    shared.localRuntimeLedger.record({
+      method: 'turn/completed',
+      params: { threadId: 'thread-local', turn: { id: 'turn-local' } },
+    })
+    const port = await listenWithMiddleware(middleware)
+
+    const response = await fetch(`http://127.0.0.1:${port}/codex-api/thread-runtime-states`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ threadIds: ['thread-local'] }),
+    })
+
+    await expect(response.json()).resolves.toEqual({
+      states: { 'thread-local': { state: 'idle' } },
+    })
+  })
+
   it('returns runtime states for a validated batch and excludes the mobile child PID', async () => {
     const middleware = createCodexBridgeMiddleware()
     const shared = sharedBridgeForTest()

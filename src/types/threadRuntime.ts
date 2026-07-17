@@ -8,6 +8,17 @@ export type ExternalThreadRuntime =
   | { state: 'idle' }
   | { state: 'unknown' }
 
+export type LocalAppServerRunningRuntime = {
+  state: 'running'
+  turnId: string
+  interruptible: true
+  source: 'local-app-server'
+}
+
+export type ThreadRuntimeObservation =
+  | ExternalThreadRuntime
+  | LocalAppServerRunningRuntime
+
 export type ThreadRuntimeOwnership = 'idle' | 'local' | 'external'
 
 export type ThreadDetailRuntime = {
