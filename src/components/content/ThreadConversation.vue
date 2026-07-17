@@ -349,7 +349,7 @@
                 <div
                   v-else
                   class="message-text-flow"
-                  v-memo="[message.id, message.text, props.cwd, highlightCacheVersion, markdownImageFailureVersion]"
+                  v-memo="[message.id, message.text, props.cwd, highlightCacheVersion, mathRenderVersion, markdownImageFailureVersion]"
                 >
                   <template v-for="(block, blockIndex) in getMessageBlocks(message)" :key="`block-${blockIndex}`">
                     <p v-if="block.kind === 'paragraph'" class="message-text">
@@ -586,6 +586,11 @@
                         </tbody>
                       </table>
                     </div>
+                    <div
+                      v-else-if="block.kind === 'mathBlock'"
+                      class="message-math-block"
+                      v-html="renderDisplayMathInnerAsHtml(block)"
+                    />
                     <div v-else-if="block.kind === 'codeBlock'" class="message-code-block">
                       <CopyableOutputBlock :copy-text="block.value" label="Copy code block">
                         <div v-if="block.language" class="message-code-language">{{ block.language }}</div>
@@ -593,7 +598,6 @@
                       </CopyableOutputBlock>
                     </div>
                     <hr v-else-if="block.kind === 'thematicBreak'" class="message-divider" />
-                    <p v-else-if="block.kind === 'mathBlock'" class="message-text">{{ block.source }}</p>
                     <p v-else-if="isMarkdownImageFailed(message.id, blockIndex)" class="message-text">{{ block.markdown }}</p>
                     <button
                       v-else
@@ -948,6 +952,11 @@ import {
   filterRenderableThreadMessages,
   latestThreadRenderWindowStart,
 } from './threadConversationWindow'
+import { splitDisplayMathSpans } from './displayMath'
+import {
+  tryRenderDisplayMathToHtml,
+  type DisplayMathRenderFunction,
+} from './displayMathRenderer'
 import type { ListItem, MessageBlock, TableAlignment, TaskListItem } from './messageBlockTypes'
 
 import CopyableOutputBlock from './CopyableOutputBlock.vue'
@@ -1401,12 +1410,16 @@ let conversationScrollPromise: Promise<void> | null = null
 const trackedPendingImages = new WeakSet<HTMLImageElement>()
 const highlightJsModule = ref<HighlightJsModule | null>(null)
 const highlightCacheVersion = ref(0)
+const displayMathRenderer = ref<DisplayMathRenderFunction | null>(null)
+const mathRenderVersion = ref(0)
 const markdownImageFailureVersion = ref(0)
 let highlightJsLoader: Promise<void> | null = null
+let displayMathLoader: Promise<void> | null = null
 const MESSAGE_BLOCK_CACHE_LIMIT = 300
 const INLINE_SEGMENT_CACHE_LIMIT = 1200
 const MARKDOWN_HTML_CACHE_LIMIT = 300
 const HIGHLIGHT_HTML_CACHE_LIMIT = 250
+const DISPLAY_MATH_HTML_CACHE_LIMIT = 250
 
 type MessageBlockCacheEntry = {
   text: string
@@ -1418,6 +1431,7 @@ type MarkdownHtmlCacheEntry = {
   text: string
   cwd: string
   highlightVersion: number
+  mathVersion: number
   html: string
 }
 
@@ -1425,6 +1439,7 @@ const messageBlockCache = new Map<string, MessageBlockCacheEntry>()
 const inlineSegmentCache = new Map<string, InlineSegment[]>()
 const markdownHtmlCache = new Map<string, MarkdownHtmlCacheEntry>()
 const highlightHtmlCache = new Map<string, string>()
+const displayMathHtmlCache = new Map<string, string | null>()
 
 function setBoundedCacheEntry<K, V>(cache: Map<K, V>, key: K, value: V, limit: number): V {
   if (cache.has(key)) cache.delete(key)
@@ -1461,6 +1476,29 @@ function ensureHighlightJsLoaded(): Promise<void> {
       })
   }
   return highlightJsLoader
+}
+
+function ensureDisplayMathLoaded(): Promise<void> {
+  if (displayMathRenderer.value) return Promise.resolve()
+  if (!displayMathLoader) {
+    displayMathLoader = Promise.all([
+      import('katex'),
+      import('katex/dist/katex.min.css'),
+    ])
+      .then(([module]) => {
+        displayMathRenderer.value = module.default.renderToString as DisplayMathRenderFunction
+        displayMathHtmlCache.clear()
+        markdownHtmlCache.clear()
+        mathRenderVersion.value += 1
+      })
+      .catch(() => {
+        // Keep the escaped source visible. A later relevant message change retries loading.
+      })
+      .finally(() => {
+        displayMathLoader = null
+      })
+  }
+  return displayMathLoader
 }
 
 type ParsedToolQuestion = {
@@ -3517,7 +3555,7 @@ function parseTextBlocks(text: string): MessageBlock[] {
   return blocks
 }
 
-function parseNonCodeMessageBlocks(text: string): MessageBlock[] {
+function parseTextAndImageBlocks(text: string): MessageBlock[] {
   if (!text.includes('![') || !text.includes('](')) {
     return parseTextBlocks(text)
   }
@@ -3548,6 +3586,15 @@ function parseNonCodeMessageBlocks(text: string): MessageBlock[] {
   }
 
   return blocks
+}
+
+function parseNonCodeMessageBlocks(text: string): MessageBlock[] {
+  return splitDisplayMathSpans(text).flatMap((span): MessageBlock[] => {
+    if (span.kind === 'math') {
+      return [{ kind: 'mathBlock', value: span.value, source: span.source }]
+    }
+    return parseTextAndImageBlocks(span.value)
+  })
 }
 
 function parseMessageBlocks(text: string): MessageBlock[] {
@@ -3618,6 +3665,24 @@ function escapeHtml(value: string): string {
     .replace(/>/gu, '&gt;')
     .replace(/"/gu, '&quot;')
     .replace(/'/gu, '&#39;')
+}
+
+function renderDisplayMathInnerAsHtml(
+  block: Extract<MessageBlock, { kind: 'mathBlock' }>,
+): string {
+  const cacheKey = `${mathRenderVersion.value}\u0000${block.value}`
+  if (!displayMathHtmlCache.has(cacheKey)) {
+    setBoundedCacheEntry(
+      displayMathHtmlCache,
+      cacheKey,
+      tryRenderDisplayMathToHtml(displayMathRenderer.value, block.value),
+      DISPLAY_MATH_HTML_CACHE_LIMIT,
+    )
+  }
+  const rendered = displayMathHtmlCache.get(cacheKey) ?? null
+  return rendered === null
+    ? `<div class="message-math-source">${escapeHtml(block.source)}</div>`
+    : `<div class="message-math-katex">${rendered}</div>`
 }
 
 function normalizeCodeLanguage(language: string): string {
@@ -3755,6 +3820,9 @@ function renderMessageBlockAsHtml(block: MessageBlock): string {
     const body = rows ? `<tbody>${rows}</tbody>` : ''
     return `<div class="message-table-wrap"><table class="message-table"><thead><tr>${headerCells}</tr></thead>${body}</table></div>`
   }
+  if (block.kind === 'mathBlock') {
+    return `<div class="message-math-block">${renderDisplayMathInnerAsHtml(block)}</div>`
+  }
   if (block.kind === 'codeBlock') {
     const language = block.language
       ? `<div class="message-code-language">${escapeHtml(block.language)}</div>`
@@ -3764,16 +3832,19 @@ function renderMessageBlockAsHtml(block: MessageBlock): string {
   if (block.kind === 'thematicBreak') {
     return '<hr class="message-divider">'
   }
-  if (block.kind === 'mathBlock') {
-    return `<p class="message-text">${escapeHtml(block.source)}</p>`
-  }
   return `<img class="message-image-preview message-markdown-image" src="${escapeHtml(block.url)}" alt="${escapeHtml(block.alt || 'Embedded message image')}" loading="lazy">`
 }
 
 function renderMarkdownBlocksAsHtml(text: string): string {
-  const cacheKey = `${props.cwd}\u0000${highlightCacheVersion.value}\u0000${text}`
+  const cacheKey = `${props.cwd}\u0000${highlightCacheVersion.value}\u0000${mathRenderVersion.value}\u0000${text}`
   const cached = markdownHtmlCache.get(cacheKey)
-  if (cached && cached.text === text && cached.cwd === props.cwd && cached.highlightVersion === highlightCacheVersion.value) {
+  if (
+    cached
+    && cached.text === text
+    && cached.cwd === props.cwd
+    && cached.highlightVersion === highlightCacheVersion.value
+    && cached.mathVersion === mathRenderVersion.value
+  ) {
     markdownHtmlCache.delete(cacheKey)
     markdownHtmlCache.set(cacheKey, cached)
     return cached.html
@@ -3788,6 +3859,7 @@ function renderMarkdownBlocksAsHtml(text: string): string {
       text,
       cwd: props.cwd,
       highlightVersion: highlightCacheVersion.value,
+      mathVersion: mathRenderVersion.value,
       html,
     },
     MARKDOWN_HTML_CACHE_LIMIT,
@@ -4344,6 +4416,7 @@ function clearRenderCaches(): void {
   inlineSegmentCache.clear()
   markdownHtmlCache.clear()
   highlightHtmlCache.clear()
+  displayMathHtmlCache.clear()
 }
 
 watch(
@@ -4388,6 +4461,18 @@ watch(
   (hasCodeBlocks) => {
     if (!hasCodeBlocks || highlightJsModule.value) return
     void ensureHighlightJsLoaded()
+  },
+  { immediate: true },
+)
+
+watch(
+  () => props.messages
+    .filter((message) => message.text.includes('\\['))
+    .map((message) => `${message.id}:${message.text.length}`)
+    .join('\u0000'),
+  (displayMathSignature) => {
+    if (!displayMathSignature || displayMathRenderer.value) return
+    void ensureDisplayMathLoaded()
   },
   { immediate: true },
 )
