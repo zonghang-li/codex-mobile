@@ -4915,6 +4915,7 @@ onBeforeUnmount(() => {
 .plan-card-markdown :deep(.message-list),
 .plan-card-markdown :deep(.message-table-wrap),
 .plan-card-markdown :deep(.message-code-block),
+.plan-card-markdown :deep(.message-math-block),
 .plan-card-markdown :deep(.message-divider) {
   @apply m-0;
 }
@@ -5180,6 +5181,30 @@ onBeforeUnmount(() => {
 .message-inline-code {
   @apply bg-transparent p-0 font-sans text-[1em] font-semibold text-inherit;
   line-height: inherit;
+}
+
+.message-math-block {
+  width: 100%;
+  max-width: 100%;
+  overflow-x: auto;
+  overflow-y: hidden;
+  padding-block: 0.25rem;
+  color: inherit;
+  -webkit-overflow-scrolling: touch;
+}
+
+.message-math-block :deep(.katex-display) {
+  margin: 0;
+  width: max-content;
+  min-width: 100%;
+  text-align: center;
+}
+
+.message-math-block :deep(.message-math-source) {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font-size: 0.875rem;
+  line-height: 1.625;
 }
 
 .message-code-block {

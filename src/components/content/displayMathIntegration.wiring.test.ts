@@ -33,4 +33,14 @@ describe('ThreadConversation display math integration', () => {
     expect(source).toContain("message.text.includes('\\\\[')")
     expect(source).toContain('void ensureDisplayMathLoaded()')
   })
+
+  it('contains wide formulas and has a decisive dark rule', async () => {
+    const [conversation, globalStyle] = await Promise.all([
+      readFile(conversationUrl, 'utf8'),
+      readFile(new URL('../../style.css', import.meta.url), 'utf8'),
+    ])
+    expect(conversation).toMatch(/\.message-math-block\s*\{[^}]*max-width:\s*100%[^}]*overflow-x:\s*auto/su)
+    expect(conversation).toContain('-webkit-overflow-scrolling: touch')
+    expect(globalStyle).toMatch(/:root\.dark \.message-math-block\s*\{/u)
+  })
 })
