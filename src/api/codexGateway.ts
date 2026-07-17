@@ -57,7 +57,11 @@ import type {
   UiThreadAutomationStatus,
 } from '../types/codex'
 import { normalizePathForUi } from '../pathUtils.js'
-import type { ExternalThreadRuntime, ThreadDetailRuntime } from '../types/threadRuntime'
+import type {
+  ExternalThreadRuntime,
+  ThreadDetailRuntime,
+  ThreadRuntimeObservation,
+} from '../types/threadRuntime'
 
 type CurrentModelConfig = {
   model: string
@@ -472,7 +476,31 @@ function parseExternalThreadRuntime(value: unknown): ExternalThreadRuntime {
   return { state: 'unknown' }
 }
 
-function unknownRuntimeMap(threadIds: readonly string[]): Record<string, ExternalThreadRuntime> {
+function parseThreadRuntimeObservation(value: unknown): ThreadRuntimeObservation {
+  const external = parseExternalThreadRuntime(value)
+  if (external.state !== 'unknown') return external
+
+  const runtime = asRecord(value)
+  if (
+    runtime
+    && runtime.state === 'running'
+    && hasOnlyKeys(runtime, ['state', 'turnId', 'interruptible', 'source'])
+    && typeof runtime.turnId === 'string'
+    && runtime.turnId.trim().length > 0
+    && runtime.interruptible === true
+    && runtime.source === 'local-app-server'
+  ) {
+    return {
+      state: 'running',
+      turnId: runtime.turnId.trim(),
+      interruptible: true,
+      source: 'local-app-server',
+    }
+  }
+  return { state: 'unknown' }
+}
+
+function unknownRuntimeMap(threadIds: readonly string[]): Record<string, ThreadRuntimeObservation> {
   return Object.fromEntries(threadIds.map((threadId) => [threadId, { state: 'unknown' }]))
 }
 
@@ -526,7 +554,7 @@ export async function getThreadRuntimeState(
 export async function getThreadRuntimeStates(
   threadIds: readonly string[],
   signal?: AbortSignal,
-): Promise<Record<string, ExternalThreadRuntime>> {
+): Promise<Record<string, ThreadRuntimeObservation>> {
   const fallback = unknownRuntimeMap(threadIds)
   try {
     const response = await fetch('/codex-api/thread-runtime-states', {
@@ -541,7 +569,7 @@ export async function getThreadRuntimeStates(
     if (!states) return fallback
     return Object.fromEntries(threadIds.map((threadId) => [
       threadId,
-      parseExternalThreadRuntime(states[threadId]),
+      parseThreadRuntimeObservation(states[threadId]),
     ]))
   } catch {
     return fallback
