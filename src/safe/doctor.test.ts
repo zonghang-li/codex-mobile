@@ -1,12 +1,25 @@
 import { describe, expect, it } from 'vitest'
 import { inspectSafeSources } from './doctor'
 
+const VALID_BRIDGE_SOURCE = [
+  'securityPolicy.isRouteDisabled',
+  'securityPolicy.isRpcMethodAllowed',
+  'securityPolicy.terminalInputEnabled',
+  'readThreadForNotifier',
+  'getAppServerPidForNotifier',
+  'getSessionsRootForNotifier',
+  "appServer.rpc('thread/read', { threadId, includeTurns: true })",
+  'readMergedThreadTitleCache',
+  'augmentThreadReadWithNotificationTitle',
+  'notificationTitle',
+].join(' ')
+
 describe('safe doctor', () => {
   it('accepts required safe invariants', () => {
     const result = inspectSafeSources({
       runtimePolicy: "bindHost: '127.0.0.1'; approvalPolicy: 'on-request'; sandboxMode: 'workspace-write'",
       featureGate: 'isDisabledRoute isAllowedRpcMethod',
-      bridge: "securityPolicy.isRouteDisabled securityPolicy.isRpcMethodAllowed securityPolicy.terminalInputEnabled readThreadForNotifier getAppServerPidForNotifier getSessionsRootForNotifier appServer.rpc('thread/read', { threadId, includeTurns: true })",
+      bridge: VALID_BRIDGE_SOURCE,
       safeCli: "exposeTailscale(state.port); option('--password-file <path>', 'description'); option('--ntfy-url-file <path>', 'description'); loadNtfyPublishUrl({ explicitPath: options.ntfyUrlFile })",
       ntfyConfig: "url.origin !== 'https://ntfy.sh'; url.username; url.password; url.search; url.hash; !/^\\/[A-Za-z0-9_-]+$/u.test(url.pathname)",
       httpServer: 'options.ntfyNotifications createNtfyNotifierLifecycle bridge.subscribeNotifications NtfyCompletionNotifier createExternalTurnMonitor getSessionsRootForNotifier return notifier.handleObserved(event)',
@@ -47,7 +60,7 @@ describe('safe doctor', () => {
     const result = inspectSafeSources({
       runtimePolicy: "bindHost: '127.0.0.1'; approvalPolicy: 'on-request'; sandboxMode: 'workspace-write'",
       featureGate: 'isDisabledRoute isAllowedRpcMethod',
-      bridge: "securityPolicy.isRouteDisabled securityPolicy.isRpcMethodAllowed securityPolicy.terminalInputEnabled readThreadForNotifier getAppServerPidForNotifier getSessionsRootForNotifier appServer.rpc('thread/read', { threadId, includeTurns: true })",
+      bridge: VALID_BRIDGE_SOURCE,
       safeCli: "exposeTailscale(state.port); option('--password-file <path>', 'description'); option('--ntfy-url-file <path>', 'description'); loadNtfyPublishUrl({ explicitPath: options.ntfyUrlFile })",
       ntfyConfig: "url.origin !== 'https://ntfy.sh'; url.username; url.password; url.search; url.hash; !/^\\/[A-Za-z0-9_-]+$/u.test(url.pathname)",
       httpServer: 'options.ntfyNotifications createNtfyNotifierLifecycle bridge.subscribeNotifications NtfyCompletionNotifier createExternalTurnMonitor getSessionsRootForNotifier void notifier.handleObserved(event)',
@@ -64,7 +77,7 @@ describe('safe doctor', () => {
     const result = inspectSafeSources({
       runtimePolicy: "bindHost: '127.0.0.1'; approvalPolicy: 'on-request'; sandboxMode: 'workspace-write'",
       featureGate: 'isDisabledRoute isAllowedRpcMethod',
-      bridge: "securityPolicy.isRouteDisabled securityPolicy.isRpcMethodAllowed securityPolicy.terminalInputEnabled readThreadForNotifier getAppServerPidForNotifier getSessionsRootForNotifier appServer.rpc('thread/read', { threadId, includeTurns: true })",
+      bridge: VALID_BRIDGE_SOURCE,
       safeCli: "exposeTailscale(state.port); option('--password-file <path>', 'description'); option('--ntfy-url-file <path>', 'description'); loadNtfyPublishUrl({ explicitPath: options.ntfyUrlFile })",
       ntfyConfig: "url.origin !== 'https://ntfy.sh'; url.username; url.password; url.search; url.hash; !/^\\/[A-Za-z0-9_-]+$/u.test(url.pathname)"
         .replace(`${missingInvariant}; `, ''),
@@ -74,5 +87,24 @@ describe('safe doctor', () => {
 
     expect(result.ok).toBe(false)
     expect(result.failures.join('\n')).toContain(expectedFailure)
+  })
+
+  it.each([
+    'readMergedThreadTitleCache',
+    'augmentThreadReadWithNotificationTitle',
+    'notificationTitle',
+  ] as const)('rejects bridge source missing ntfy title invariant %s', (invariant) => {
+    const result = inspectSafeSources({
+      runtimePolicy: "bindHost: '127.0.0.1'; approvalPolicy: 'on-request'; sandboxMode: 'workspace-write'",
+      featureGate: 'isDisabledRoute isAllowedRpcMethod',
+      bridge: VALID_BRIDGE_SOURCE.replace(invariant, ''),
+      safeCli: "exposeTailscale(state.port); option('--password-file <path>', 'description'); option('--ntfy-url-file <path>', 'description'); loadNtfyPublishUrl({ explicitPath: options.ntfyUrlFile })",
+      ntfyConfig: "url.origin !== 'https://ntfy.sh'; url.username; url.password; url.search; url.hash; !/^\\/[A-Za-z0-9_-]+$/u.test(url.pathname)",
+      httpServer: 'options.ntfyNotifications createNtfyNotifierLifecycle bridge.subscribeNotifications NtfyCompletionNotifier createExternalTurnMonitor getSessionsRootForNotifier return notifier.handleObserved(event)',
+      securityPolicy: 'backgroundIntegrationsEnabled: false',
+    })
+
+    expect(result.ok).toBe(false)
+    expect(result.failures.join('\n')).toContain('title')
   })
 })
