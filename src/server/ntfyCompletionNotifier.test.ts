@@ -308,7 +308,7 @@ describe('long-turn notification decisions', () => {
     ))
     await fixture.notifier.dispose()
     expect(fixture.send.mock.calls[0]?.[0].record).toMatchObject({
-      title: 'Codex 任务已中断',
+      title: 'Codex 任务已中断：未命名会话（thread-1）',
       message: '任务已中断。',
     })
   })
@@ -397,12 +397,38 @@ describe('long-turn notification decisions', () => {
   })
 
   it.each([
-    ['completed', 'Codex 任务完成'],
-    ['failed', 'Codex 任务失败'],
-    ['cancelled', 'Codex 任务已中断'],
-  ] as const)('maps %s to the exact title %s', async (status, title) => {
-    const fixture = await runTurn(NTFY_MIN_DURATION_MS, {}, status)
-    expect(fixture.send.mock.calls[0]?.[0].record.title).toBe(title)
+    ['completed', 'Codex 任务完成：移动端状态同步'],
+    ['failed', 'Codex 任务失败：移动端状态同步'],
+    ['cancelled', 'Codex 任务已中断：移动端状态同步'],
+  ] as const)('includes the conversation name for %s', async (status, title) => {
+    const fixture = await runTurn(NTFY_MIN_DURATION_MS, {
+      readThread: async () => ({
+        thread: {
+          parentThreadId: null,
+          source: 'appServer',
+          notificationTitle: '移动端状态同步',
+          name: 'lower-priority name',
+          title: 'lower-priority title',
+          turns: [{ id: 'turn-1', items: [{ type: 'agentMessage', text: '工作完成。' }] }],
+        },
+      }),
+    }, status)
+
+    expect(fixture.send.mock.calls[0]?.[0].record).toMatchObject({
+      title,
+      message: '工作完成。',
+    })
+  })
+
+  it('falls back to an identifiable unnamed conversation label', async () => {
+    const fixture = await runTurn(NTFY_MIN_DURATION_MS, {
+      readThread: async () => topLevelThread([
+        { id: 'turn-1', items: [{ type: 'agentMessage', text: '工作完成。' }] },
+      ]),
+    })
+
+    expect(fixture.send.mock.calls[0]?.[0].record.title)
+      .toBe('Codex 任务完成：未命名会话（thread-1）')
   })
 
   it.each([
@@ -456,7 +482,8 @@ describe('long-turn notification decisions', () => {
       params: { thread_id: 'nested-thread', turn_id: 'nested-turn', status: 'failed' },
     })
     await fixture.notifier.dispose()
-    expect(fixture.send.mock.calls[0]?.[0].record.title).toBe('Codex 任务失败')
+    expect(fixture.send.mock.calls[0]?.[0].record.title)
+      .toBe('Codex 任务失败：未命名会话（d-thread）')
   })
 
   it('keeps the earliest timestamp for duplicate starts', async () => {
