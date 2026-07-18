@@ -306,7 +306,7 @@ export class NtfyCompletionNotifier {
     }
 
     const thread = readThreadObject(threadReadResult)
-    if (classifyNtfyThreadScope(thread) !== 'topLevel') {
+    if (!thread || classifyNtfyThreadScope(thread) !== 'topLevel') {
       await this.persistState(stateWithoutActive)
       return
     }
