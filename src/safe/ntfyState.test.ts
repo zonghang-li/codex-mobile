@@ -45,6 +45,34 @@ describe('durable ntfy state', () => {
     await expect(store.load()).resolves.toEqual(populatedState())
   })
 
+  it('loads a pending notification with a rendered conversation title', async () => {
+    const path = await temporaryStatePath()
+    const store = new FileNtfyStateStore(path)
+    await store.save(createEmptyNtfyState())
+    const state = populatedState()
+    state.pending[0] = { ...state.pending[0]!, title: 'Codex 任务完成：状态同步修复' }
+    await writeFile(path, JSON.stringify(state), { mode: 0o600 })
+
+    await expect(store.load()).resolves.toEqual(state)
+  })
+
+  it.each([
+    'Codex unknown：状态同步修复',
+    'Codex 任务完成：bad\nname',
+    `Codex 任务完成：${'A'.repeat(81)}`,
+  ])('rejects unsafe pending title %j', async (title) => {
+    const path = await temporaryStatePath()
+    const warn = vi.fn()
+    const store = new FileNtfyStateStore(path, warn)
+    await store.save(createEmptyNtfyState())
+    const state = populatedState()
+    state.pending[0] = { ...state.pending[0]!, title }
+    await writeFile(path, JSON.stringify(state), { mode: 0o600 })
+
+    await expect(store.load()).resolves.toEqual(createEmptyNtfyState())
+    expect(warn).toHaveBeenCalledWith('Unable to load ntfy notifier state; starting with empty state')
+  })
+
   it('refuses to load state through a symlink', async () => {
     const path = await temporaryStatePath()
     const target = `${path}-target-with-secret-topic`
