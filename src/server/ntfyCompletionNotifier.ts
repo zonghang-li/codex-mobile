@@ -6,6 +6,11 @@ import {
   type NtfyNotifierState,
   type PendingNtfyRecord,
 } from '../safe/ntfyState'
+import {
+  composeNtfyNotificationTitle,
+  resolveNtfyThreadLabel,
+  type NtfyResultTitle,
+} from '../safe/ntfyTitle'
 import type { ObservedTurnLifecycle } from './externalTurnMonitor'
 import { classifyNtfyThreadScope } from './ntfyThreadScope'
 
@@ -14,7 +19,6 @@ export const NTFY_SUMMARY_MAX_LENGTH = 180
 export const NTFY_REQUEST_TIMEOUT_MS = 5_000
 export const NTFY_IMMEDIATE_ATTEMPTS = 3
 
-type TerminalTitle = PendingNtfyRecord['title']
 type Notification = { method: string; params?: unknown }
 type StateStore = Pick<FileNtfyStateStore, 'load' | 'save'>
 type TurnEvent = {
@@ -130,7 +134,7 @@ function readEvent(notification: unknown): TurnEvent | null {
   }
 }
 
-function classifyStatus(status: string): { title: TerminalTitle; fallback: string } {
+function classifyStatus(status: string): { title: NtfyResultTitle; fallback: string } {
   if (status === 'completed') return { title: 'Codex 任务完成', fallback: '任务已完成。' }
   if (status === 'failed') return { title: 'Codex 任务失败', fallback: '任务执行失败。' }
   return { title: 'Codex 任务已中断', fallback: '任务已中断。' }
@@ -302,12 +306,18 @@ export class NtfyCompletionNotifier {
     }
 
     const thread = readThreadObject(threadReadResult)
-    if (classifyNtfyThreadScope(thread) !== 'topLevel') {
+    if (!thread || classifyNtfyThreadScope(thread) !== 'topLevel') {
       await this.persistState(stateWithoutActive)
       return
     }
 
     const classification = classifyStatus(event.status)
+    const threadLabel = resolveNtfyThreadLabel([
+      thread.notificationTitle,
+      thread.name,
+      thread.title,
+    ], event.threadId)
+    const title = composeNtfyNotificationTitle(classification.title, threadLabel)
     const assistantText = readLatestAssistantText(threadReadResult, event.turnId)
     const message = summarizeAssistantResponse(assistantText) || classification.fallback
     await this.persistState(boundNtfyState({
@@ -316,7 +326,7 @@ export class NtfyCompletionNotifier {
         ...stateWithoutActive.pending,
         {
           key,
-          title: classification.title,
+          title,
           message,
           createdAt: receivedAt,
         },

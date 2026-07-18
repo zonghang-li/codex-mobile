@@ -106,15 +106,15 @@ codex-mobile-safe start /path/to/project \
 
 This example reuses the password file created by an earlier safe foreground start or `service:install`. If it is absent, omit `--password-file` and let the safe CLI generate it securely.
 
-Qualifying turns use these titles:
+Qualifying turns use these title prefixes, followed by the conversation name:
 
 | Turn result | Notification title |
 | --- | --- |
-| Completed | `Codex 任务完成` |
-| Failed | `Codex 任务失败` |
-| Cancelled or another terminal status | `Codex 任务已中断` |
+| Completed | `Codex 任务完成：<会话名称>` |
+| Failed | `Codex 任务失败：<会话名称>` |
+| Cancelled or another terminal status | `Codex 任务已中断：<会话名称>` |
 
-The body is the first non-empty sentence of the latest assistant response, with whitespace collapsed and a maximum length of 180 characters. If no assistant response is available, a fixed status-specific sentence is used. This is deterministic and does not make another AI request. Tasks shorter than 10 minutes do not read the final thread for notification purposes and do not notify.
+The name comes from the locally cached desktop/mobile rename first, then the app-server thread name or title. Prompt and preview text are never used as a name. Control characters and repeated whitespace are normalized, and the name is capped at 80 Unicode code points. If no usable name exists, the title uses `未命名会话（<thread ID last 8 characters>）`. The body is the first non-empty sentence of the latest assistant response, with whitespace collapsed and a maximum length of 180 characters. If no assistant response is available, a fixed status-specific sentence is used. This is deterministic and does not make another AI request. Tasks shorter than 10 minutes do not read the final thread for notification purposes and do not notify.
 
 Ordinary duplicate completion events are suppressed with bounded local state. Retries reuse one stable ntfy sequence ID so supported clients treat them as one logical notification. This is not transport-level exactly-once delivery: after an ambiguous network timeout, or a crash after ntfy accepts a request but before local state is committed, the phone may alert again.
 

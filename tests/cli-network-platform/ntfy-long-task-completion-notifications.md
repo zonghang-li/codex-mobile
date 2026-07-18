@@ -25,11 +25,11 @@ pnpm run service:restart
 1. Run the focused notification suite:
 
    ```bash
-   pnpm exec vitest run src/safe/ntfyConfig.test.ts src/safe/ntfyState.test.ts src/server/externalThreadRuntime.test.ts src/server/ntfyThreadScope.test.ts src/server/rolloutLifecycle.test.ts src/server/externalTurnMonitor.test.ts src/server/ntfyCompletionNotifier.test.ts src/server/securityPolicy.test.ts src/cli/safe.entry.test.ts src/safe/doctor.test.ts src/safe/packaging.test.ts
+   pnpm exec vitest run src/safe/ntfyConfig.test.ts src/safe/ntfyTitle.test.ts src/safe/ntfyState.test.ts src/server/externalThreadRuntime.test.ts src/server/ntfyThreadScope.test.ts src/server/rolloutLifecycle.test.ts src/server/externalTurnMonitor.test.ts src/server/ntfyCompletionNotifier.test.ts src/server/codexAppServerBridge.notifierTitle.test.ts src/server/securityPolicy.test.ts src/cli/safe.entry.test.ts src/safe/doctor.test.ts src/safe/packaging.test.ts
    ```
 
 2. Confirm the tests cover `599_999` ms with no thread read/send and exactly `600_000` ms with a send. Also confirm an authoritative `duration_ms` of `600_000` qualifies when the timestamp delta is `599_999`, while an authoritative `duration_ms` of `599_999` does not qualify when the timestamp delta is `600_000`; direct events without a duration continue using the timestamp delta.
-3. Confirm completed, failed, and interrupted/cancelled terminal statuses produce the exact titles `Codex 任务完成`, `Codex 任务失败`, and `Codex 任务已中断`.
+3. Confirm completed, failed, and interrupted/cancelled terminal statuses produce `Codex 任务完成：<会话名称>`, `Codex 任务失败：<会话名称>`, and `Codex 任务已中断：<会话名称>`. Confirm name precedence is cached desktop/mobile rename, app-server `name`, then app-server `title`; prompt/preview text is ignored. Confirm controls and whitespace are normalized, names are capped at 80 Unicode code points, missing names use `未命名会话（<thread ID last 8 characters>）`, and legacy pending records with fixed titles remain loadable.
 4. Confirm the body uses the first non-empty final-assistant sentence, collapses whitespace, truncates to 180 characters, uses a fixed status fallback when needed, and makes no additional AI request.
 5. Confirm active timing survives notifier reconstruction, pending delivery is durable before sending, a startup retries pending work, each attempt has a five-second timeout, and each drain makes at most three immediate attempts per pending record.
 6. Confirm ordinary duplicate completion events create one local pending/sent key and reuse the same bounded ASCII ntfy sequence ID; distinct turn keys use distinct sequence IDs.
@@ -48,9 +48,9 @@ pnpm run service:restart
 Use only synthetic topic placeholders in deterministic harness output. Do not print, paste, or record the production topic or publish URL.
 
 1. Open and authenticate the mobile browser UI, then put the browser in the background while leaving its tab open.
-2. Under the same operating-system user as `codex-mobile-safe`, start a controlled Codex Desktop turn, let its authoritative duration reach at least `600_000` ms, and complete it. With the browser still backgrounded but open, verify the real ntfy app receives exactly one notification according to the device's ntfy notification, Focus, sound, and vibration settings.
+2. Under the same operating-system user as `codex-mobile-safe`, rename a controlled Codex Desktop conversation, start a turn, let its authoritative duration reach at least `600_000` ms, and complete it. With the browser still backgrounded but open, verify the real ntfy app receives exactly one notification whose title contains that renamed conversation, according to the device's ntfy notification, Focus, sound, and vibration settings.
 3. Close every mobile browser tab and lock the subscribed phone.
-4. Under the same operating-system user, start a separate controlled Codex CLI turn, let its authoritative duration reach at least `600_000` ms, and complete it. With the browser closed and phone locked, verify the real ntfy app receives exactly one notification according to the same device settings.
+4. Under the same operating-system user, start a separate controlled Codex CLI turn with a known app-server title, let its authoritative duration reach at least `600_000` ms, and complete it. With the browser closed and phone locked, verify the real ntfy app receives exactly one notification whose title identifies that conversation, according to the same device settings.
 5. Start one controlled top-level task that runs for at least `600_000` ms and launches a subagent. Let the subagent finish while the parent remains active and confirm no ntfy notification is delivered. Complete the parent and confirm exactly one notification is then delivered, using the parent turn's understandable final sentence rather than a child worker report.
 6. During all production turns, repeat `ss -ltnp` and `tailscale serve status`. Verify no new inbound or public listener appears: the backend remains on `127.0.0.1:5900`, Tailscale Serve remains non-Funnel, and notification delivery is outbound-only.
 7. In the deterministic external-monitor/notifier harness, complete a turn at `599_999` ms and observe no captured ntfy send.
@@ -84,7 +84,7 @@ Use only synthetic topic placeholders in deterministic harness output. Do not pr
 ## End-to-end phone checks
 
 1. Run both production cases from **Cross-client and restart acceptance**: one qualifying Codex Desktop turn while an authenticated mobile tab remains open in the background, then one separate qualifying Codex CLI turn after all mobile tabs are closed and the phone is locked. Leave sound/vibration behavior controlled by the phone's ntfy settings and Focus/Do Not Disturb state.
-2. Confirm each turn lasts at least 10 minutes (`600_000` ms) from its authoritative rollout timestamp and produces exactly one notification with the correct status title and only the first concise sentence of the final assistant response.
+2. Confirm each turn lasts at least 10 minutes (`600_000` ms) from its authoritative rollout timestamp and produces exactly one notification with the correct result prefix, the expected conversation name, and only the first concise sentence of the final assistant response.
 3. Run a normal turn that finishes in less than 10 minutes. Wait beyond its completion long enough to distinguish it from delivery latency and confirm it does not notify.
 4. For failure and interruption coverage, rely on the deterministic focused tests unless deliberately running additional real ten-minute turns. If run end to end, confirm the failure and interruption titles exactly match the table above and no conversation history is included.
 5. For restart recovery, run the exact reconstruction and pending-startup cases without changing the production threshold:
@@ -101,7 +101,7 @@ Use only synthetic topic placeholders in deterministic harness output. Do not pr
 
 - Notifications are disabled when the default file is absent and enabled only after a valid current-user mode-`0600` regular file is present and the service restarts.
 - Only `https://ntfy.sh/<single-topic>` is accepted. The topic segment contains only letters, numbers, `_`, or `-`; credentials, queries, fragments, other origins, extra segments, and symlinks are rejected.
-- Tasks shorter than 10 minutes never notify. Successful, failed, and interrupted qualifying turns use the exact titles and one-sentence summary behavior above.
+- Tasks shorter than 10 minutes never notify. Successful, failed, and interrupted qualifying turns use the result-and-conversation titles and one-sentence summary behavior above; prompt/preview text never becomes the conversation name.
 - With ntfy enabled, only verified top-level same-user turns started from the mobile UI, Codex Desktop, Codex CLI, or another supported client source are eligible. Child/subagent turns never notify; unknown, malformed, or unreadable hierarchy fails closed. External detection is server-side, polls on a serialized 15-second cadence, reads tracked rollouts before bounded discovery, survives a safe-service restart using authoritative rollout timestamps, and never replays already-terminal history. A missing writer is not completion; its cursor expires only after 24 inactive hours.
 - Notification sending is outbound-only and does not block or fail the Codex turn. Active/pending/sent state is private, durable, and bounded to 256 records per collection.
 - Ordinary duplicates and cross-source observations of the same logical turn are locally suppressed through one durable key and reuse one stable sequence ID, without duplicate pending/sent records. Ambiguous delivery remains a documented possible re-alert boundary.

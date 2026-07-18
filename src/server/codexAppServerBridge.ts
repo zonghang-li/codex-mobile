@@ -940,6 +940,21 @@ type ThreadRuntimeProbe = Pick<
   'registerThread' | 'inspect' | 'inspectMany'
 >
 
+export function augmentThreadReadWithNotificationTitle(result: unknown, title: string): unknown {
+  const normalizedTitle = title.trim()
+  if (!normalizedTitle) return result
+  const response = asRecord(result)
+  const thread = asRecord(response?.thread)
+  if (!response || !thread) return result
+  return {
+    ...response,
+    thread: {
+      ...thread,
+      notificationTitle: normalizedTitle,
+    },
+  }
+}
+
 export async function observeThreadRuntimeStates(
   threadIds: readonly string[],
   runtimeProbe: Pick<ExternalThreadRuntimeProbe, 'inspectMany'>,
@@ -9881,9 +9896,16 @@ export function createCodexBridgeMiddleware(options: {
       unsubscribeTerminal()
     }
   }
-  middleware.readThreadForNotifier = (threadId: string) => (
-    appServer.rpc('thread/read', { threadId, includeTurns: true })
-  )
+  middleware.readThreadForNotifier = async (threadId: string) => {
+    const result = await appServer.rpc('thread/read', { threadId, includeTurns: true })
+    let cachedTitle = ''
+    try {
+      cachedTitle = (await readMergedThreadTitleCache()).titles[threadId] ?? ''
+    } catch {
+      cachedTitle = ''
+    }
+    return augmentThreadReadWithNotificationTitle(result, cachedTitle)
+  }
   middleware.getAppServerPidForNotifier = () => appServer.getPid()
   middleware.getSessionsRootForNotifier = () => join(getCodexHomeDir(), 'sessions')
 

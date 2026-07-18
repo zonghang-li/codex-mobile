@@ -2,11 +2,12 @@ import { constants } from 'node:fs'
 import { lstat, mkdir, open, rename, rm, type FileHandle } from 'node:fs/promises'
 import { randomUUID } from 'node:crypto'
 import { basename, dirname, join, parse, resolve, sep } from 'node:path'
+import { isValidNtfyNotificationTitle } from './ntfyTitle'
 
 export type ActiveTurnRecord = { key: string; threadId: string; turnId: string; startedAt: number }
 export type PendingNtfyRecord = {
   key: string
-  title: 'Codex 任务完成' | 'Codex 任务失败' | 'Codex 任务已中断'
+  title: string
   message: string
   createdAt: number
 }
@@ -32,12 +33,6 @@ type DirectoryIdentity = {
 }
 
 class UnsafeStatePathError extends Error {}
-
-const TITLES = new Set<PendingNtfyRecord['title']>([
-  'Codex 任务完成',
-  'Codex 任务失败',
-  'Codex 任务已中断',
-])
 
 export function createEmptyNtfyState(): NtfyNotifierState {
   return { active: [], pending: [], sent: [] }
@@ -74,8 +69,7 @@ function isPendingNtfyRecord(value: unknown): value is PendingNtfyRecord {
   return isRecord(value)
     && hasExactKeys(value, ['key', 'title', 'message', 'createdAt'])
     && isNonEmptyString(value.key)
-    && typeof value.title === 'string'
-    && TITLES.has(value.title as PendingNtfyRecord['title'])
+    && isValidNtfyNotificationTitle(value.title)
     && typeof value.message === 'string'
     && isTimestamp(value.createdAt)
 }
