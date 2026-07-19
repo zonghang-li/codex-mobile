@@ -604,6 +604,8 @@ const reasoningOptions: Array<{ value: ReasoningEffort; label: string }> = [
   { value: 'medium', label: 'Medium' },
   { value: 'high', label: 'High' },
   { value: 'xhigh', label: 'Extra high' },
+  { value: 'max', label: 'Max' },
+  { value: 'ultra', label: 'Ultra' },
 ]
 function formatModelLabel(modelId: string): string {
   return modelId.trim().replace(/^gpt/i, 'GPT')
@@ -671,7 +673,7 @@ const standaloneFileAttachments = computed(() => {
 const isExternallyOwned = computed(() => props.runtimeOwnership === 'external')
 const isInteractionDisabled = computed(() => isExternallyOwned.value || props.disabled || !props.activeThreadId)
 const isComposerConfigDisabled = computed(() => isExternallyOwned.value || props.disabled || !props.activeThreadId)
-const isFastModeSupported = computed(() => /^gpt-5\.(?:4|5)(?:$|-)/.test(props.selectedModel.trim()))
+const isFastModeSupported = computed(() => /^gpt-5\.(?:4|5|6)(?:$|-)/.test(props.selectedModel.trim()))
 const showFastModeModelIcon = computed(() =>
   props.selectedSpeedMode === 'fast' && isFastModeSupported.value,
 )

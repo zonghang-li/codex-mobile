@@ -113,8 +113,11 @@ const TURN_START_FOLLOW_UP_SYNC_DELAY_MS = 3000
 const RECENT_THREAD_MESSAGE_LOAD_REUSE_MS = 2000
 const RECENT_THREAD_LIST_LOAD_REUSE_MS = 2000
 const RECENT_SKILLS_LOAD_REUSE_MS = 2000
-const REASONING_EFFORT_OPTIONS: ReasoningEffort[] = ['none', 'minimal', 'low', 'medium', 'high', 'xhigh']
+const REASONING_EFFORT_OPTIONS: ReasoningEffort[] = ['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra']
 const GLOBAL_SERVER_REQUEST_SCOPE = '__global__'
+const DEFAULT_CODEX_NEW_THREAD_MODEL_ID = 'gpt-5.6-sol'
+const DEFAULT_CODEX_NEW_THREAD_REASONING_EFFORT: ReasoningEffort = 'max'
+const DEFAULT_CODEX_NEW_THREAD_SPEED_MODE: SpeedMode = 'fast'
 const MODEL_FALLBACK_ID = 'gpt-5.4-mini'
 const OPENCODE_ZEN_DEFAULT_MODEL = 'big-pickle'
 const CODEX_CLI_MISSING_MESSAGE = 'Codex CLI not found. Install @openai/codex or set CODEXUI_CODEX_COMMAND.'
@@ -295,6 +298,12 @@ function readSelectedModel(
   const contextModelId = normalizeStoredModelId(state[contextId])
   if (contextModelId) return contextModelId
   return normalizeStoredModelId(state[NEW_THREAD_COLLABORATION_MODE_CONTEXT])
+}
+
+function pickDefaultCodexNewThreadModel(modelIds: string[]): string {
+  return modelIds.includes(DEFAULT_CODEX_NEW_THREAD_MODEL_ID)
+    ? DEFAULT_CODEX_NEW_THREAD_MODEL_ID
+    : ''
 }
 
 function saveSelectedModelMap(state: Record<string, string>): void {
@@ -2100,6 +2109,7 @@ export function useDesktopState() {
       const targetProviderId = readProviderIdForThread(selectedThreadId.value)
       const isProviderBacked = targetProviderId !== 'codex'
       const normalizedSelectedModelId = readModelIdForThread(selectedThreadId.value)
+      const isCodexNewThreadContext = selectedThreadId.value.trim().length === 0 && !isProviderBacked
       const modelIds = await getAvailableModelIds({
         includeProviderModels: isProviderBacked || options?.includeProviderModels !== false,
         requireProviderModels: isProviderBacked,
@@ -2110,6 +2120,9 @@ export function useDesktopState() {
         ? normalizeStoredModelId(selectedModelIdByContext.value[providerModelContextId])
         : ''
       const nextModelIds = [...modelIds]
+      const defaultCodexNewThreadModelId = isCodexNewThreadContext
+        ? pickDefaultCodexNewThreadModel(nextModelIds)
+        : ''
       if (
         !options?.providerChanged
         && isProviderBacked
@@ -2131,6 +2144,8 @@ export function useDesktopState() {
           } else {
             setSelectedModelId(nextModelIds[0])
           }
+        } else if (!normalizedSelectedModelId && defaultCodexNewThreadModelId) {
+          setSelectedModelId(defaultCodexNewThreadModelId)
         } else if (targetProviderId === normalizedProviderId && normalizedConfiguredModelId && nextModelIds.includes(normalizedConfiguredModelId)) {
           setSelectedModelId(currentConfig.model)
         } else if (nextModelIds.length > 0) {
@@ -2157,12 +2172,28 @@ export function useDesktopState() {
       }
 
       if (
+        isCodexNewThreadContext &&
+        defaultCodexNewThreadModelId &&
+        selectedModelId.value.trim() === defaultCodexNewThreadModelId
+      ) {
+        selectedReasoningEffort.value = DEFAULT_CODEX_NEW_THREAD_REASONING_EFFORT
+        selectedSpeedMode.value = DEFAULT_CODEX_NEW_THREAD_SPEED_MODE
+        if (currentConfig.speedMode !== DEFAULT_CODEX_NEW_THREAD_SPEED_MODE) {
+          await setCodexSpeedMode(DEFAULT_CODEX_NEW_THREAD_SPEED_MODE)
+        }
+      } else if (
         currentConfig.reasoningEffort &&
         REASONING_EFFORT_OPTIONS.includes(currentConfig.reasoningEffort)
       ) {
         selectedReasoningEffort.value = currentConfig.reasoningEffort
       }
-      selectedSpeedMode.value = currentConfig.speedMode
+      if (
+        !isCodexNewThreadContext ||
+        !defaultCodexNewThreadModelId ||
+        selectedModelId.value.trim() !== defaultCodexNewThreadModelId
+      ) {
+        selectedSpeedMode.value = currentConfig.speedMode
+      }
     } catch (unknownError) {
       if (isCodexCliMissingError(unknownError)) {
         codexCliMissingError.value = CODEX_CLI_MISSING_MESSAGE

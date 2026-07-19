@@ -39,6 +39,14 @@ describe('external thread runtime read-only wiring', () => {
     expect(composerSource).toContain('canApplyAttachmentMutation(props.runtimeOwnership, sessionToken, attachmentSessionToken)')
   })
 
+  it('offers max and ultra reasoning plus fast mode for GPT 5.6 families', async () => {
+    const composerSource = await readFile(new URL('./ThreadComposer.vue', import.meta.url), 'utf8')
+
+    expect(composerSource).toContain("{ value: 'max', label: 'Max' }")
+    expect(composerSource).toContain("{ value: 'ultra', label: 'Ultra' }")
+    expect(composerSource).toContain("const isFastModeSupported = computed(() => /^gpt-5\\.(?:4|5|6)(?:$|-)/.test(props.selectedModel.trim()))")
+  })
+
   it('disables every queued-message action and guards drag handlers', async () => {
     const queueSource = await readFile(new URL('./QueuedMessages.vue', import.meta.url), 'utf8')
 
