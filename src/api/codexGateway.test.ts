@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { ThreadReadResponse } from './appServerDtos'
 import {
   getAvailableModelIds,
+  getCurrentModelConfig,
   getExternalThreadLiveSnapshot,
   getThreadDetail,
   getThreadRuntimeState,
@@ -72,6 +73,42 @@ describe('startThreadTurn collaboration mode payloads', () => {
         reasoning_effort: 'medium',
         developer_instructions: null,
       },
+    })
+  })
+
+  it('allows max and ultra reasoning efforts in turn payloads and config reads', async () => {
+    const { requests } = mockRpcFetch()
+
+    await startThreadTurn('thread-1', 'solve hard task', [], 'gpt-5.6-sol', 'max', undefined, [], 'default')
+    await startThreadTurn('thread-1', 'solve hardest task', [], 'gpt-5.6-sol', 'ultra', undefined, [], 'default')
+
+    expect(requests[0].params.effort).toBe('max')
+    expect(requests[0].params.collaborationMode).toMatchObject({
+      settings: { reasoning_effort: 'max' },
+    })
+    expect(requests[1].params.effort).toBe('ultra')
+    expect(requests[1].params.collaborationMode).toMatchObject({
+      settings: { reasoning_effort: 'ultra' },
+    })
+
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({
+      result: {
+        config: {
+          model: 'gpt-5.6-sol',
+          model_provider: '',
+          model_reasoning_effort: 'ultra',
+          service_tier: 'fast',
+        },
+      },
+    }), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' },
+    })))
+
+    await expect(getCurrentModelConfig()).resolves.toMatchObject({
+      model: 'gpt-5.6-sol',
+      reasoningEffort: 'ultra',
+      speedMode: 'fast',
     })
   })
 })

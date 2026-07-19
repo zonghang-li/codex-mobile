@@ -50,6 +50,31 @@ codex-mobile-safe expose tailscale
 
 If the service should survive logout, enable user lingering once with `loginctl enable-linger "$USER"`.
 
+For quick runtime switching on Linux, use the network mode helper:
+
+```bash
+codex-mobile-network lan      # LAN-only: http://192.168.x.x:5900, Tailscale stopped
+codex-mobile-network tailnet  # Tailnet HTTPS through Tailscale Serve
+codex-mobile-network stop     # Stop managed services and remove Tailscale Serve
+codex-mobile-network status   # Show service, listener, LAN URLs, and Tailscale state
+```
+
+The same commands are also available from the repository checkout:
+
+```bash
+pnpm run network:lan      # LAN-only: http://192.168.x.x:5900, Tailscale stopped
+pnpm run network:tailnet  # Tailnet HTTPS through Tailscale Serve
+pnpm run network:stop     # Stop managed services and remove Tailscale Serve
+pnpm run network:status   # Show service, listener, LAN URLs, and Tailscale state
+```
+
+The helper starts transient user services instead of editing the installed unit. Both LAN and Tailnet modes default to `--sandbox-mode workspace-write --approval-policy never`, reuse `~/.codex/codex-mobile-safe-password`, and keep password authentication enabled. LAN mode binds `0.0.0.0:5900`, removes Tailscale Serve, and runs `tailscale down` so only the local network remains. Tailnet mode binds `127.0.0.1:5900`, runs `tailscale up`, and recreates Tailscale Serve. Override the project or policy only through explicit environment variables:
+
+```bash
+CODEX_MOBILE_PROJECT_DIR=/path/to/project pnpm run network:lan
+CODEX_MOBILE_SANDBOX_MODE=danger-full-access pnpm run network:tailnet
+```
+
 To update a foreground/manual installation that has already completed its first safe start:
 
 ```bash

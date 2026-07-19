@@ -12,7 +12,6 @@ import type {
   ConfigReadResponse,
   GetAccountRateLimitsResponse,
   ModelListResponse,
-  ReasoningEffort,
   ThreadForkResponse,
   ThreadListResponse,
   ThreadReadResponse,
@@ -30,6 +29,7 @@ import {
 } from './normalizers/v2'
 import type {
   SpeedMode,
+  ReasoningEffort,
   UiAccountEntry,
   UiAccountQuotaStatus,
   UiAccountUnavailableReason,
@@ -833,7 +833,7 @@ async function enrichThreadMessagesWithFallback(threadId: string, messages: UiMe
 }
 
 function normalizeReasoningEffort(value: unknown): ReasoningEffort | '' {
-  const allowed: ReasoningEffort[] = ['none', 'minimal', 'low', 'medium', 'high', 'xhigh']
+  const allowed: ReasoningEffort[] = ['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra']
   return typeof value === 'string' && allowed.includes(value as ReasoningEffort)
     ? (value as ReasoningEffort)
     : ''

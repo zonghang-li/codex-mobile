@@ -11,6 +11,7 @@ Return to the [manual test index](../../tests.md).
 | [Missing Codex CLI chat error](missing-codex-cli-chat-error.md) |
 | [Startup avoids duplicate setup probes](startup-avoids-duplicate-setup-probes.md) |
 | [Feature: modular safe CLI local install and tailnet service](modular-safe-cli-local-install-and-tailnet-service.md) |
+| [Feature: network mode helper LAN and Tailnet switching](network-mode-helper-lan-tailnet-switching.md) |
 | [Feature: Safe long-task completion notifications](ntfy-long-task-completion-notifications.md) |
 | [CLI password output redaction](cli-password-output-redaction.md) |
 | [npx run dev compatibility shim](npx-run-dev-compatibility-shim.md) |

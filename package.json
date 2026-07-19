@@ -28,13 +28,15 @@
     "codexapp": "dist-cli/index.js",
     "codexui": "dist-cli/index.js",
     "codex-mobile": "dist-cli/index.js",
-    "codex-mobile-safe": "dist-cli/safe.js"
+    "codex-mobile-safe": "dist-cli/safe.js",
+    "codex-mobile-network": "scripts/codex-mobile-network-mode.sh"
   },
   "files": [
     "dist/",
     "dist-cli/",
     "src/",
     "packaging/",
+    "scripts/codex-mobile-network-mode.sh",
     "scripts/dev.cjs",
     "scripts/dev-random-home.cjs",
     "scripts/fix-pty-native-build.cjs"
@@ -64,7 +66,11 @@
     "service:install": "sh scripts/install-user-service.sh",
     "service:restart": "systemctl --user restart codex-mobile-safe.service",
     "service:status": "systemctl --user --no-pager --full status codex-mobile-safe.service",
-    "service:uninstall": "sh scripts/uninstall-user-service.sh"
+    "service:uninstall": "sh scripts/uninstall-user-service.sh",
+    "network:lan": "sh scripts/codex-mobile-network-mode.sh lan",
+    "network:tailnet": "sh scripts/codex-mobile-network-mode.sh tailnet",
+    "network:stop": "sh scripts/codex-mobile-network-mode.sh stop",
+    "network:status": "sh scripts/codex-mobile-network-mode.sh status"
   },
   "dependencies": {
     "@composio/client": "0.1.0-alpha.66",
