@@ -120,6 +120,21 @@ pnpm run service:restart
 journalctl --user -u codex-mobile-safe -n 100
 ```
 
+For operator-controlled network switching:
+
+```bash
+codex-mobile-network lan
+codex-mobile-network tailnet
+codex-mobile-network stop
+codex-mobile-network status
+pnpm run network:lan
+pnpm run network:tailnet
+pnpm run network:stop
+pnpm run network:status
+```
+
+The network helper lives at `scripts/codex-mobile-network-mode.sh`. It starts transient user services and intentionally does not rewrite the installed unit. `network:lan` removes Tailscale Serve, runs `tailscale down`, stops the installed and Tailnet units, then starts `codex-mobile-safe-lan.service` with `--lan`, password-file authentication, `workspace-write`, and `approval-policy never`. `network:tailnet` removes stale Serve state, runs `tailscale up`, stops LAN/default units, starts `codex-mobile-safe-tailnet.service` on loopback with `workspace-write` and `approval-policy never`, then runs `codex-mobile-safe expose tailscale`. `network:stop` removes Serve state, stops all managed safe units, and runs `tailscale down`.
+
 The systemd service auto-detects the optional default ntfy file and intentionally has no ntfy argument or secret environment variable. Configure it locally with:
 
 ```bash
