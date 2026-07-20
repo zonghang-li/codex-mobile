@@ -206,6 +206,89 @@ describe('GET /codex-api/thread-runtime-state', () => {
   })
 })
 
+describe('GET /codex-api/thread-live-state external runtime parity', () => {
+  it('marks a stale idle thread read as in progress when an external writer is active', async () => {
+    const middleware = createCodexBridgeMiddleware()
+    const shared = sharedBridgeForTest() as ReturnType<typeof sharedBridgeForTest> & {
+      appServer: ReturnType<typeof sharedBridgeForTest>['appServer'] & {
+        rpc: (method: string, params: unknown) => Promise<unknown>
+      }
+    }
+    vi.spyOn(shared.appServer, 'getPid').mockReturnValue(4242)
+    vi.spyOn(shared.appServer, 'rpc').mockResolvedValue({
+      thread: {
+        id: 'thread-external',
+        path: '/sessions/thread-external.jsonl',
+        turns: [{ id: 'turn-complete', status: 'completed', items: [] }],
+      },
+    })
+    const inspect = vi.spyOn(shared.runtimeProbe, 'inspect').mockResolvedValue({
+      state: 'running',
+      turnId: 'turn-external',
+      interruptible: false,
+      source: 'external-session-writer',
+    })
+    const port = await listenWithMiddleware(middleware)
+
+    const response = await fetch(`http://127.0.0.1:${port}/codex-api/thread-live-state?threadId=thread-external`)
+
+    expect(response.status).toBe(200)
+    await expect(response.json()).resolves.toMatchObject({
+      threadId: 'thread-external',
+      isInProgress: true,
+      externalRuntime: {
+        state: 'running',
+        turnId: 'turn-external',
+        interruptible: false,
+        source: 'external-session-writer',
+      },
+    })
+    expect(inspect).toHaveBeenCalledWith('thread-external', 4242)
+  })
+
+  it('does not serve a cached idle live-state while an external writer is active', async () => {
+    const middleware = createCodexBridgeMiddleware()
+    const shared = sharedBridgeForTest() as ReturnType<typeof sharedBridgeForTest> & {
+      appServer: ReturnType<typeof sharedBridgeForTest>['appServer'] & {
+        rpc: (method: string, params: unknown) => Promise<unknown>
+      }
+    }
+    vi.spyOn(shared.appServer, 'getPid').mockReturnValue(4242)
+    vi.spyOn(shared.appServer, 'rpc').mockResolvedValue({
+      thread: {
+        id: 'thread-cached',
+        path: '/sessions/thread-cached.jsonl',
+        turns: [{ id: 'turn-complete', status: 'completed', items: [] }],
+      },
+    })
+    const inspect = vi.spyOn(shared.runtimeProbe, 'inspect')
+    inspect.mockResolvedValueOnce({ state: 'idle' })
+    inspect.mockResolvedValueOnce({
+      state: 'running',
+      turnId: 'turn-external',
+      interruptible: false,
+      source: 'external-session-writer',
+    })
+    const port = await listenWithMiddleware(middleware)
+
+    const first = await fetch(`http://127.0.0.1:${port}/codex-api/thread-live-state?threadId=thread-cached`)
+    await expect(first.json()).resolves.toMatchObject({ isInProgress: false })
+
+    const second = await fetch(`http://127.0.0.1:${port}/codex-api/thread-live-state?threadId=thread-cached`)
+
+    await expect(second.json()).resolves.toMatchObject({
+      isInProgress: true,
+      externalRuntime: {
+        state: 'running',
+        turnId: 'turn-external',
+        interruptible: false,
+        source: 'external-session-writer',
+      },
+    })
+    expect(inspect).toHaveBeenCalledTimes(2)
+  })
+})
+
 describe('POST /codex-api/thread-runtime-states', () => {
   it('prefers a currently running local app-server turn over external idle', async () => {
     const middleware = createCodexBridgeMiddleware()

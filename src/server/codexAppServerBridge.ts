@@ -8369,18 +8369,13 @@ export function createCodexBridgeMiddleware(options: {
           const rawTurns = Array.isArray(thread?.turns) ? thread.turns : []
 
           const sessionPath = readNonEmptyString(thread?.path)
+          runtimeProbe.registerThread(threadId, sessionPath)
           let sessionSize = 0
           if (sessionPath && isAbsolute(sessionPath)) {
             try {
               const s = await stat(sessionPath)
               sessionSize = s.size
             } catch { /* missing */ }
-          }
-
-          const cached = appServer.getCachedLiveState(threadId, rawTurns.length, sessionSize)
-          if (cached) {
-            setJson(res, 200, cached)
-            return
           }
 
           let turns = appServer.mergeItemsIntoTurns(threadId, rawTurns)
@@ -8395,7 +8390,19 @@ export function createCodexBridgeMiddleware(options: {
           }
 
           const lastTurn = turns.length > 0 ? asRecord(turns[turns.length - 1]) : null
-          const isInProgress = lastTurn?.status === 'inProgress'
+          const isLocallyInProgress = lastTurn?.status === 'inProgress'
+          const externalRuntime = isLocallyInProgress
+            ? { state: 'unknown' }
+            : await runtimeProbe.inspect(threadId, appServer.getPid())
+          const isExternalInProgress = asRecord(externalRuntime)?.state === 'running'
+          const cached = isExternalInProgress
+            ? null
+            : appServer.getCachedLiveState(threadId, rawTurns.length, sessionSize)
+          if (cached) {
+            setJson(res, 200, cached)
+            return
+          }
+          const isInProgress = isLocallyInProgress || isExternalInProgress
 
           const responseData = {
             threadId,
@@ -8405,6 +8412,7 @@ export function createCodexBridgeMiddleware(options: {
             ownerClientId: null,
             liveStateError: null,
             isInProgress,
+            externalRuntime,
           }
 
           if (!isInProgress) {
