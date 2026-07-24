@@ -42,8 +42,8 @@ describe('external thread runtime read-only wiring', () => {
   it('offers max and ultra reasoning plus fast mode for GPT 5.6 families', async () => {
     const composerSource = await readFile(new URL('./ThreadComposer.vue', import.meta.url), 'utf8')
 
-    expect(composerSource).toContain("{ value: 'max', label: 'Max' }")
-    expect(composerSource).toContain("{ value: 'ultra', label: 'Ultra' }")
+    expect(composerSource).toContain('getSupportedReasoningEfforts')
+    expect(composerSource).toContain('supportedReasoningOptions')
     expect(composerSource).toContain("const isFastModeSupported = computed(() => /^gpt-5\\.(?:4|5|6)(?:$|-)/.test(props.selectedModel.trim()))")
   })
 

@@ -3369,6 +3369,17 @@ describe('external runtime ownership', () => {
     expect(gatewayMocks.setCodexSpeedMode).toHaveBeenCalledTimes(3)
   })
 
+  it('rejects reasoning efforts that are not supported by the selected model', async () => {
+    const { state } = await setupExternalRuntimeState()
+    state.primeSelectedThread('', { persist: false })
+    state.setSelectedModelIdForThread('', 'gpt-5.5')
+    state.setSelectedReasoningEffort('high')
+
+    state.setSelectedReasoningEffort('max')
+
+    expect(state.selectedReasoningEffort.value).toBe('high')
+  })
+
   it('keeps model setters available for local, idle, and home contexts', async () => {
     const { state, emit } = await setupExternalRuntimeState()
     emit({ method: 'turn/started', params: { threadId: 'thread-1', turn: { id: 'turn-local' } } })

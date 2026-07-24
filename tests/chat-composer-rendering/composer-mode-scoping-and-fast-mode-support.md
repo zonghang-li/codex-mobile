@@ -16,18 +16,20 @@ Plan mode is scoped to the current chat instead of becoming the default for ever
 4. Open Start new thread, enable Plan mode, send a first message, and confirm the created thread starts in Plan mode.
 5. Return to Start new thread again and confirm Plan mode is off for the next new chat.
 6. Open Start new thread with no saved model override and confirm the composer shows `GPT-5.6-sol`, `Max`, and Fast mode enabled by default.
-7. Open the Thinking dropdown and confirm it includes `Extra high`, `Max`, and `Ultra`.
-8. Select `gpt-5.4` or a `gpt-5.4-*` model and confirm the Fast mode switch is visible.
-9. Select `gpt-5.5` or a `gpt-5.5-*` model and confirm the Fast mode switch is visible.
-10. Select `gpt-5.6-sol` and confirm the Fast mode switch is visible.
-11. Select an unsupported model family and confirm the Fast mode switch is hidden.
-12. Switch to dark theme and repeat steps 1-11.
+7. Open the Thinking dropdown for `gpt-5.6-sol` and confirm it includes `Extra high`, `Max`, and `Ultra`.
+8. Select `gpt-5.5` or a `gpt-5.5-*` model and confirm the Thinking dropdown stops at `Extra high` and does not show `Max` or `Ultra`.
+9. Select `gpt-5.6-luna` and confirm the Thinking dropdown includes `Max` but does not show `Ultra`.
+10. Select `gpt-5.4` or a `gpt-5.4-*` model and confirm the Fast mode switch is visible.
+11. Select `gpt-5.5` or a `gpt-5.5-*` model and confirm the Fast mode switch is visible.
+12. Select `gpt-5.6-sol` and confirm the Fast mode switch is visible.
+13. Select an unsupported model family and confirm the Fast mode switch is hidden.
+14. Switch to dark theme and repeat steps 1-13.
 
 #### Expected Results
 - Enabling Plan mode in one existing thread does not enable it in other existing threads.
 - A new-chat Plan mode selection applies to the created chat but does not persist as the default for later new chats.
 - Fresh Codex new chats prefer `gpt-5.6-sol`, `Max`, and Fast mode when `gpt-5.6-sol` is available and no saved model override exists.
-- The Thinking dropdown includes `Extra high`, `Max`, and `Ultra`.
+- The Thinking dropdown reflects the selected model: GPT 5.4/5.5 stop at `Extra high`, GPT 5.6 Luna allows `Max`, and GPT 5.6 Sol/Terra allow `Ultra`.
 - Fast mode is visible for GPT 5.4, GPT 5.5, and GPT 5.6 model IDs, including dashed variants.
 - Fast mode remains hidden for unsupported model families.
 - Composer controls and menus remain readable in light and dark themes.

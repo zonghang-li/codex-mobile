@@ -291,7 +291,7 @@
           <ComposerDropdown
             class="thread-composer-control"
             :model-value="selectedReasoningEffort"
-            :options="reasoningOptions"
+            :options="supportedReasoningOptions"
             :placeholder="t('Thinking')"
             open-direction="up"
             :disabled="isComposerConfigDisabled"
@@ -407,6 +407,7 @@ import type { ThreadRuntimeOwnership } from '../../types/threadRuntime'
 import { useDictation } from '../../composables/useDictation'
 import { useMobile } from '../../composables/useMobile'
 import { useUiLanguage } from '../../composables/useUiLanguage'
+import { getSupportedReasoningEfforts } from '../../utils/modelReasoningEfforts'
 import {
   createComposerPrompt,
   getComposerPrompts,
@@ -607,6 +608,10 @@ const reasoningOptions: Array<{ value: ReasoningEffort; label: string }> = [
   { value: 'max', label: 'Max' },
   { value: 'ultra', label: 'Ultra' },
 ]
+const supportedReasoningOptions = computed(() => {
+  const supported = new Set(getSupportedReasoningEfforts(props.selectedModel))
+  return reasoningOptions.filter((option) => supported.has(option.value))
+})
 function formatModelLabel(modelId: string): string {
   return modelId.trim().replace(/^gpt/i, 'GPT')
 }
@@ -1157,6 +1162,8 @@ function toggleCollaborationMode(): void {
 
 function onReasoningEffortSelect(value: string): void {
   if (isComposerConfigDisabled.value) return
+  const supported = getSupportedReasoningEfforts(props.selectedModel)
+  if (!supported.includes(value as ReasoningEffort)) return
   emit('update:selected-reasoning-effort', value as ReasoningEffort)
 }
 

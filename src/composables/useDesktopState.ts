@@ -66,6 +66,11 @@ import type { ThreadRuntimeOwnership } from '../types/threadRuntime'
 import { getPathParent, isProjectlessChatPath, normalizePathForUi, toProjectName } from '../pathUtils.js'
 import { parseCodexDirectiveText } from '../utils/codexDirectives'
 import {
+  ALL_REASONING_EFFORTS,
+  coerceReasoningEffortForModel,
+  isReasoningEffortSupportedByModel,
+} from '../utils/modelReasoningEfforts'
+import {
   mergeExternalReasoningSnapshots,
   readExternalReasoningSnapshot,
   type ExternalReasoningSnapshot,
@@ -114,7 +119,7 @@ const TURN_START_FOLLOW_UP_SYNC_DELAY_MS = 3000
 const RECENT_THREAD_MESSAGE_LOAD_REUSE_MS = 2000
 const RECENT_THREAD_LIST_LOAD_REUSE_MS = 2000
 const RECENT_SKILLS_LOAD_REUSE_MS = 2000
-const REASONING_EFFORT_OPTIONS: ReasoningEffort[] = ['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra']
+const REASONING_EFFORT_OPTIONS: ReasoningEffort[] = ALL_REASONING_EFFORTS
 const GLOBAL_SERVER_REQUEST_SCOPE = '__global__'
 const DEFAULT_CODEX_NEW_THREAD_MODEL_ID = 'gpt-5.6-sol'
 const DEFAULT_CODEX_NEW_THREAD_REASONING_EFFORT: ReasoningEffort = 'max'
@@ -1821,6 +1826,10 @@ export function useDesktopState() {
     }
     if (threadId.trim() === selectedThreadId.value) {
       selectedModelId.value = readModelIdForThread(selectedThreadId.value)
+      selectedReasoningEffort.value = coerceReasoningEffortForModel(
+        selectedModelId.value,
+        selectedReasoningEffort.value,
+      )
       ensureAvailableModelIds(selectedModelId.value)
     } else {
       ensureAvailableModelIds(normalizedModelId)
@@ -2050,6 +2059,9 @@ export function useDesktopState() {
     if (effort && !REASONING_EFFORT_OPTIONS.includes(effort)) {
       return
     }
+    if (effort && !isReasoningEffortSupportedByModel(selectedModelId.value, effort)) {
+      return
+    }
     selectedReasoningEffort.value = effort
   }
 
@@ -2177,7 +2189,10 @@ export function useDesktopState() {
         defaultCodexNewThreadModelId &&
         selectedModelId.value.trim() === defaultCodexNewThreadModelId
       ) {
-        selectedReasoningEffort.value = DEFAULT_CODEX_NEW_THREAD_REASONING_EFFORT
+        selectedReasoningEffort.value = coerceReasoningEffortForModel(
+          selectedModelId.value,
+          DEFAULT_CODEX_NEW_THREAD_REASONING_EFFORT,
+        )
         selectedSpeedMode.value = DEFAULT_CODEX_NEW_THREAD_SPEED_MODE
         if (currentConfig.speedMode !== DEFAULT_CODEX_NEW_THREAD_SPEED_MODE) {
           await setCodexSpeedMode(DEFAULT_CODEX_NEW_THREAD_SPEED_MODE)
@@ -2186,7 +2201,10 @@ export function useDesktopState() {
         currentConfig.reasoningEffort &&
         REASONING_EFFORT_OPTIONS.includes(currentConfig.reasoningEffort)
       ) {
-        selectedReasoningEffort.value = currentConfig.reasoningEffort
+        selectedReasoningEffort.value = coerceReasoningEffortForModel(
+          selectedModelId.value,
+          currentConfig.reasoningEffort,
+        )
       }
       if (
         !isCodexNewThreadContext ||
