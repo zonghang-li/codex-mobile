@@ -825,7 +825,7 @@ describe('startup request deduplication', () => {
       .mockResolvedValueOnce({ titles: { 'thread-1': 'Imported title' } })
 
     const state = useDesktopState()
-    await state.refreshAll({ includeSelectedThreadMessages: false })
+    await state.refreshAll({ includeSelectedThreadMessages: false, awaitAncillaryRefreshes: true })
     expect(state.projectGroups.value[0]?.threads[0]?.title).toBe('thread-1')
 
     await state.refreshAll({ includeSelectedThreadMessages: false, forceThreadRefresh: true })
@@ -851,6 +851,29 @@ describe('startup request deduplication', () => {
     } finally {
       nowSpy.mockRestore()
     }
+  })
+
+  it('does not automatically load older history pages after startup', async () => {
+    vi.useFakeTimers()
+    installFakeTimerWindow()
+    gatewayMocks.getThreadGroupsPage
+      .mockResolvedValueOnce({
+        groups: [{ projectName: 'Project', threads: [thread('thread-1', '/tmp/project')] }],
+        nextCursor: 'older-page',
+      })
+
+    const state = useDesktopState()
+    await state.refreshAll({ includeSelectedThreadMessages: false })
+
+    expect(state.projectGroups.value[0]?.threads.map((row) => row.id)).toEqual(['thread-1'])
+    expect(state.isThreadListFullyLoaded.value).toBe(false)
+    expect(gatewayMocks.getThreadGroupsPage).toHaveBeenCalledTimes(1)
+
+    await vi.advanceTimersByTimeAsync(10_000)
+    await flushMicrotasks()
+
+    expect(state.projectGroups.value[0]?.threads.map((row) => row.id)).toEqual(['thread-1'])
+    expect(gatewayMocks.getThreadGroupsPage).toHaveBeenCalledTimes(1)
   })
 
   it('reuses a just-loaded skills list for the same selected cwd', async () => {

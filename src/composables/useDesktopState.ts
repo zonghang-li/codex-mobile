@@ -105,6 +105,7 @@ const NEW_THREAD_COLLABORATION_MODE_CONTEXT = '__new-thread__'
 const NEW_THREAD_PROVIDER_MODEL_CONTEXT_PREFIX = '__new-thread-provider__::'
 const EVENT_SYNC_DEBOUNCE_MS = 220
 const BACKGROUND_THREAD_PAGINATION_DELAY_MS = 10_000
+const ENABLE_AUTOMATIC_BACKGROUND_THREAD_PAGINATION = false
 const RATE_LIMIT_REFRESH_DEBOUNCE_MS = 500
 const EXTERNAL_RUNTIME_POLL_MS = 2_000
 const BACKGROUND_RUNTIME_POLL_MS = 2_000
@@ -4915,6 +4916,10 @@ export function useDesktopState() {
   }
 
   function scheduleRemainingThreadPages(rootsState: WorkspaceRootsState | null = loadedThreadListRootsState): void {
+    if (!ENABLE_AUTOMATIC_BACKGROUND_THREAD_PAGINATION) {
+      loadedThreadListRootsState = rootsState
+      return
+    }
     if (!threadListNextCursor || isLoadingRemainingThreadPages || hasActiveInProgressThreads()) return
 
     loadedThreadListRootsState = rootsState

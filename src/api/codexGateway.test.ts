@@ -5,6 +5,7 @@ import {
   getCurrentModelConfig,
   getExternalThreadLiveSnapshot,
   getThreadDetail,
+  getThreadGroupsPage,
   getThreadRuntimeState,
   getThreadRuntimeStates,
   listDirectoryComposioConnectors,
@@ -109,6 +110,44 @@ describe('startThreadTurn collaboration mode payloads', () => {
       model: 'gpt-5.6-sol',
       reasoningEffort: 'ultra',
       speedMode: 'fast',
+    })
+  })
+})
+
+describe('thread list pagination', () => {
+  afterEach(() => {
+    vi.unstubAllGlobals()
+  })
+
+  it('loads only the 10 most recent threads by default', async () => {
+    const requests: Array<{ method: string, params: Record<string, unknown> }> = []
+    vi.stubGlobal('fetch', vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+      const body = typeof init?.body === 'string'
+        ? JSON.parse(init.body) as { method: string, params: Record<string, unknown> }
+        : { method: '', params: {} }
+      requests.push(body)
+      return new Response(JSON.stringify({
+        result: {
+          data: [],
+          nextCursor: null,
+        },
+      }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      })
+    }))
+
+    await getThreadGroupsPage()
+
+    expect(requests[0]).toMatchObject({
+      method: 'thread/list',
+      params: {
+        archived: false,
+        limit: 10,
+        sortKey: 'updated_at',
+        modelProviders: [],
+        cursor: null,
+      },
     })
   })
 })
