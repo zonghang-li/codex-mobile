@@ -845,8 +845,8 @@ function normalizeSpeedMode(value: unknown): SpeedMode {
     : 'standard'
 }
 
-const INITIAL_THREAD_LIST_LIMIT = 10
-const BACKGROUND_THREAD_LIST_LIMIT = 10
+const INITIAL_THREAD_LIST_LIMIT = 5
+const BACKGROUND_THREAD_LIST_LIMIT = 5
 
 export type ThreadGroupsPage = {
   groups: UiProjectGroup[]

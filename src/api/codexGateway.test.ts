@@ -119,7 +119,7 @@ describe('thread list pagination', () => {
     vi.unstubAllGlobals()
   })
 
-  it('loads only the 10 most recent threads by default', async () => {
+  it('loads only the 5 most recent threads by default', async () => {
     const requests: Array<{ method: string, params: Record<string, unknown> }> = []
     vi.stubGlobal('fetch', vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
       const body = typeof init?.body === 'string'
@@ -143,7 +143,7 @@ describe('thread list pagination', () => {
       method: 'thread/list',
       params: {
         archived: false,
-        limit: 10,
+        limit: 5,
         sortKey: 'updated_at',
         modelProviders: [],
         cursor: null,
