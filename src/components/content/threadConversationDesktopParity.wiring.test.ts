@@ -18,7 +18,7 @@ describe('ThreadConversation Codex desktop activity parity wiring', () => {
 
   it('renders subagent chips and expandable command details from a summary segment', () => {
     expect(source).toContain('class="codex-agent-activity-chip"')
-    expect(source).toContain('{{ activitySegmentAgentStatus(readActivitySegment(message)) }}')
+    expect(source).toContain('activitySegmentAgents(readActivitySegment(message))')
     expect(source).toContain('activitySegmentCommands(readActivitySegment(message))')
     expect(source).toContain('@click="toggleActivitySegment(message.id)"')
     expect(source).not.toContain('activitySegmentStatus(')

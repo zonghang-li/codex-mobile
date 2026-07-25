@@ -31,10 +31,16 @@
             <article
               v-if="readActivitySegment(message)?.kind === 'subAgent'"
               class="codex-agent-activity-row"
+              aria-label="Subagent status"
             >
-              <span class="codex-agent-activity-chip">
-                <IconTablerGitFork class="icon-svg codex-agent-activity-icon" />
-                <span class="codex-agent-activity-label">{{ readActivitySegment(message)?.label }}</span>
+              <span
+                v-for="agent in activitySegmentAgents(readActivitySegment(message))"
+                :key="agent.id"
+                class="codex-agent-activity-chip"
+                :data-agent-state="agent.state"
+              >
+                <IconTablerBolt class="icon-svg codex-agent-activity-icon" aria-hidden="true" />
+                <span class="codex-agent-activity-label">{{ agent.label }}</span>
               </span>
               <span v-if="activitySegmentAgentStatus(readActivitySegment(message))" class="codex-agent-activity-status">
                 {{ activitySegmentAgentStatus(readActivitySegment(message)) }}
@@ -419,12 +425,21 @@
                       :key="`worked-activity-${segment.id}`"
                       class="worked-activity-item"
                     >
-                      <article v-if="segment.kind === 'subAgent'" class="codex-agent-activity-row">
-                        <span class="codex-agent-activity-chip">
-                          <IconTablerGitFork class="icon-svg codex-agent-activity-icon" />
-                          <span class="codex-agent-activity-label">{{ segment.label }}</span>
+                      <article
+                        v-if="segment.kind === 'subAgent'"
+                        class="codex-agent-activity-row"
+                        aria-label="Subagent status"
+                      >
+                        <span
+                          v-for="agent in segment.agents"
+                          :key="agent.id"
+                          class="codex-agent-activity-chip"
+                          :data-agent-state="agent.state"
+                        >
+                          <IconTablerBolt class="icon-svg codex-agent-activity-icon" aria-hidden="true" />
+                          <span class="codex-agent-activity-label">{{ agent.label }}</span>
                         </span>
-                        <span v-if="segment.status" class="codex-agent-activity-status">{{ segment.status }}</span>
+                        <span class="codex-agent-activity-status">{{ segment.status }}</span>
                       </article>
                       <button
                         v-else-if="segment.kind === 'summary' && activitySegmentCanExpand(segment)"
@@ -1427,6 +1442,10 @@ function activitySegmentCanExpand(segment: ThreadActivitySegment | null): boolea
 
 function activitySegmentAgentStatus(segment: ThreadActivitySegment | null): string {
   return segment?.kind === 'subAgent' ? segment.status ?? '' : ''
+}
+
+function activitySegmentAgents(segment: ThreadActivitySegment | null) {
+  return segment?.kind === 'subAgent' ? segment.agents : []
 }
 
 function isActivitySegmentExpanded(segmentId: string): boolean {
@@ -5665,15 +5684,15 @@ onBeforeUnmount(() => {
 }
 
 .codex-agent-activity-row {
-  @apply flex w-full max-w-[min(var(--chat-card-max,76ch),100%)] min-w-0 items-center gap-2 py-1 text-[14px] leading-[22px] text-zinc-500;
+  @apply flex w-full max-w-[min(var(--chat-card-max,76ch),100%)] min-w-0 flex-wrap items-center gap-2 py-1 text-[14px] leading-[22px] text-zinc-500;
 }
 
 .codex-agent-activity-chip {
-  @apply inline-flex min-w-0 items-center gap-2 rounded-full border border-zinc-200 bg-zinc-50 px-3 py-1;
+  @apply inline-flex max-w-full min-w-0 items-center gap-2 rounded-full border border-zinc-200/80 bg-zinc-100/60 px-3 py-1 text-zinc-500;
 }
 
 .codex-agent-activity-icon {
-  @apply h-4 w-4 shrink-0 text-amber-500;
+  @apply h-4 w-4 shrink-0 text-zinc-400;
 }
 
 .codex-agent-activity-label {
@@ -5967,7 +5986,11 @@ onBeforeUnmount(() => {
 }
 
 :global(.dark) .codex-agent-activity-chip {
-  @apply border-zinc-800 bg-zinc-900 text-zinc-300;
+  @apply border-zinc-800/80 bg-zinc-900/60 text-zinc-400;
+}
+
+:global(.dark) .codex-agent-activity-icon {
+  @apply text-zinc-600;
 }
 
 :global(.dark) .worked-separator-line {
