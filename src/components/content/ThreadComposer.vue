@@ -2050,6 +2050,9 @@ watch(
 
 .thread-composer {
   @apply w-full max-w-[min(var(--chat-column-max,72rem),100%)] mx-auto;
+  min-width: 0;
+  max-width: min(var(--chat-column-max, 72rem), 100%);
+  font-family: var(--codex-conversation-font);
 }
 
 .thread-composer:has(.thread-composer-input-wrap--expanded) {
@@ -2293,6 +2296,8 @@ watch(
 
 .thread-composer-controls {
   @apply relative mt-2 sm:mt-3 flex items-center gap-2 sm:gap-4 overflow-visible pb-px;
+  min-width: 0;
+  max-width: 100%;
 }
 
 :global(.dark) .thread-composer-controls {
@@ -2559,6 +2564,7 @@ watch(
 @media (max-width: 640px) {
   .thread-composer-input {
     @apply text-base;
+    font-size: 16px;
   }
 
   .thread-composer-controls {

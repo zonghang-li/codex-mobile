@@ -5039,6 +5039,8 @@ onBeforeUnmount(() => {
 
 .conversation-root {
   @apply relative h-full min-h-0 min-w-0 p-0 flex flex-col overflow-y-hidden overflow-x-hidden bg-transparent border-none rounded-none;
+  max-width: 100%;
+  font-family: var(--codex-conversation-font);
 }
 
 .conversation-loading {
@@ -5625,10 +5627,15 @@ onBeforeUnmount(() => {
   border-radius: 0.45rem;
   background: rgb(39 39 42 / 0.10);
   line-height: inherit;
+  font-family: var(--codex-conversation-mono);
+  overflow-wrap: anywhere;
+  word-break: break-word;
 }
 
 .message-code-block {
   @apply min-w-0 max-w-full overflow-hidden rounded-xl border border-slate-200 bg-slate-950 text-slate-100;
+  min-width: 0;
+  max-width: 100%;
 }
 
 .message-code-language {
@@ -5637,6 +5644,9 @@ onBeforeUnmount(() => {
 
 .message-code-pre {
   @apply m-0 overflow-x-auto px-3 py-3 text-[13px] leading-relaxed font-mono whitespace-pre;
+  max-width: 100%;
+  font-family: var(--codex-conversation-mono);
+  overscroll-behavior-x: contain;
 }
 
 .message-code-pre :deep(.hljs) {
@@ -5645,6 +5655,8 @@ onBeforeUnmount(() => {
 
 .message-file-link {
   @apply text-sm leading-relaxed text-[#0969da] no-underline hover:text-[#1f6feb] hover:underline underline-offset-2;
+  overflow-wrap: anywhere;
+  word-break: break-word;
 }
 
 .file-link-context-menu {

@@ -521,7 +521,13 @@
         :style="contentStyle"
       >
         <span v-if="isVirtualKeyboardOpen" class="content-keyboard-spacer" aria-hidden="true" />
-        <ContentHeader :title="contentTitle" :accent="isSkillsRoute || isAutomationsRoute">
+        <ContentHeader
+          :title="contentTitle"
+          :accent="isSkillsRoute || isAutomationsRoute"
+          :editable="route.name === 'thread' && selectedThreadId.length > 0"
+          :disabled="!selectedThreadId"
+          @rename="onRenameSelectedThread"
+        >
           <template #leading>
             <SidebarThreadControls
               v-if="isSidebarCollapsed || isMobile"
@@ -558,12 +564,14 @@
               :placeholder="terminalCommandPlaceholder"
               :selected-prefix-icon="IconTablerTerminal"
               :icon-only="true"
+              :disabled="isComposerTerminalControlDisabled"
               menu-align="end"
               :empty-label="t('No commands')"
               @update:model-value="onSelectHeaderTerminalCommand"
             />
             <HeaderGitBranchDropdown
               v-if="canShowContentHeaderBranchDropdown"
+              :key="selectedThreadId"
               class="content-header-branch-dropdown"
               :current-branch="currentThreadBranch"
               :head-sha="currentThreadHeadSha"
@@ -1814,6 +1822,9 @@ const canShowTerminalToggle = computed(() => (
     (isHomeRoute.value && composerCwd.value.length > 0) ||
     (route.name === 'thread' && selectedThreadId.value.length > 0)
   )
+))
+const isComposerTerminalControlDisabled = computed(() => (
+  route.name === 'thread' && selectedThreadRuntimeOwnership.value === 'external'
 ))
 const canShowContentHeaderBranchDropdown = computed(() => (
   (route.name === 'thread' && selectedThreadId.value.length > 0) ||
@@ -3497,6 +3508,13 @@ function onEditQueuedMessage(messageId: string): void {
   removeQueuedMessage(messageId)
 }
 
+function onRenameSelectedThread(title: string): void {
+  const threadId = selectedThreadId.value.trim()
+  const nextTitle = title.trim()
+  if (!threadId || !nextTitle) return
+  onRenameThread({ threadId, title: nextTitle })
+}
+
 
 function scheduleMobileConversationJumpToLatest(): void {
   if (!isMobile.value || isHomeRoute.value) return
@@ -5047,6 +5065,13 @@ async function loadWorktreeBranches(sourceCwd: string): Promise<void> {
 
 .content-root {
   @apply h-full min-h-0 min-w-0 w-full flex flex-col overflow-y-hidden overflow-x-hidden bg-white;
+  --codex-conversation-font:
+    ui-sans-serif, -apple-system, BlinkMacSystemFont, "SF Pro Text", "PingFang SC", "Segoe UI", sans-serif;
+  --codex-conversation-mono:
+    ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+  max-width: 100%;
+  overflow-x: hidden;
+  overscroll-behavior-x: none;
 }
 
 .content-root.is-virtual-keyboard-open {
@@ -5184,6 +5209,10 @@ async function loadWorktreeBranches(sourceCwd: string): Promise<void> {
 
 .content-grid {
   @apply flex-1 min-h-0 flex flex-col gap-3;
+  min-width: 0;
+  width: 100%;
+  max-width: 100%;
+  overflow-x: hidden;
 }
 
 .content-grid-home {
@@ -5192,10 +5221,16 @@ async function loadWorktreeBranches(sourceCwd: string): Promise<void> {
 
 .content-thread {
   @apply flex-1 min-h-0;
+  min-width: 0;
+  max-width: 100%;
+  overflow-x: hidden;
 }
 
 .composer-with-queue {
   @apply w-full shrink-0 px-2 sm:px-6 flex flex-col gap-2;
+  min-width: 0;
+  max-width: 100%;
+  overflow-x: clip;
 }
 
 .composer-runtime-error {

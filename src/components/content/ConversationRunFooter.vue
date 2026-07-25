@@ -219,14 +219,20 @@ function saveGoalEdit(): void {
 
 .conversation-run-footer {
   @apply flex w-full min-w-0 flex-col items-center gap-2;
+  max-width: 100%;
 }
 
 .conversation-run-footer-pill {
   @apply inline-flex min-w-0 max-w-full items-center gap-1.5 rounded-2xl border border-zinc-300 bg-zinc-100/95 px-3 py-1.5 text-sm leading-5 text-zinc-600 shadow-sm backdrop-blur;
+  min-width: 0;
+  max-width: 100%;
+  overflow: hidden;
 }
 
 .conversation-goal-strip {
   @apply w-full min-w-0 overflow-hidden rounded-2xl border border-zinc-300 bg-zinc-100/95 text-sm text-zinc-600 shadow-sm backdrop-blur;
+  min-width: 0;
+  max-width: 100%;
 }
 
 .conversation-goal-row {
@@ -247,6 +253,9 @@ function saveGoalEdit(): void {
 
 .conversation-goal-objective {
   @apply min-w-0 flex-1 truncate text-zinc-500;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .conversation-goal-duration {
