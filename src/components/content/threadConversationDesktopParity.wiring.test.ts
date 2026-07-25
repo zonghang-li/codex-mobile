@@ -28,4 +28,11 @@ describe('ThreadConversation Codex desktop activity parity wiring', () => {
     expect(source).toContain('getTurnActivitySegmentsForWorked(messages, messages.indexOf(message))')
     expect(source).not.toContain('v-for="activity in getTurnActivityMessagesForWorked(')
   })
+
+  it('uses the desktop turn projector for completion folding and final-response identity', () => {
+    expect(source).toContain('projectConversationTurns({')
+    expect(source).toContain('section.isCollapsed && section.completionMessageId !== null')
+    expect(source).toContain('projectedActivityMessageIds.value.has(message.id)')
+    expect(source).toContain(':data-turn-final-response="isProjectedFinalResponse(message)')
+  })
 })

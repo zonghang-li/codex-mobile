@@ -25,6 +25,7 @@
         class="conversation-item"
         :data-role="message.role"
         :data-message-type="message.messageType || ''"
+        :data-turn-final-response="isProjectedFinalResponse(message) ? 'true' : undefined"
       >
         <div v-if="readActivitySegment(message)" class="message-row" data-role="system">
           <div class="message-stack codex-activity-stack" data-role="system">
@@ -1164,11 +1165,11 @@ import {
 } from './threadConversationWindow'
 import {
   buildThreadActivitySegments,
-  getHiddenCompletedActivityMessageIds,
   getTurnActivitySegmentsForWorked,
   isThreadActivityMessage,
   type ThreadActivitySegment,
 } from './threadConversationActivity'
+import { projectConversationTurns } from './conversationTurnPresentation'
 import { splitDisplayMathSpans } from './displayMath'
 import { splitInlineMathSpans } from './inlineMath'
 import {
@@ -1363,6 +1364,7 @@ function activityMessageLabel(message: UiMessage): string {
 function isCopyableAssistantMessage(message: UiMessage): boolean {
   return message.role === 'assistant'
     && !isCommandMessage(message)
+    && !projectedActivityMessageIds.value.has(message.id)
     && message.messageType !== 'worked'
     && !(message.messageType ?? '').endsWith('.live')
 }
@@ -1390,6 +1392,22 @@ const isLiveTurnRuntime = computed(() =>
 )
 
 const activitySegments = computed(() => buildThreadActivitySegments(props.messages))
+const conversationTurnSections = computed(() => projectConversationTurns({
+  messages: props.messages,
+  activeTurnId: props.activeTurnId?.trim() || null,
+}))
+const projectedActivityMessageIds = computed(() => new Set(
+  conversationTurnSections.value.flatMap((section) => section.activityMessageIds),
+))
+const projectedFinalMessageIds = computed(() => new Set(
+  conversationTurnSections.value
+    .map((section) => section.finalMessageId)
+    .filter((messageId): messageId is string => messageId !== null),
+))
+
+function isProjectedFinalResponse(message: UiMessage): boolean {
+  return projectedFinalMessageIds.value.has(message.id)
+}
 
 const activitySegmentByAnchorId = computed<Record<string, ThreadActivitySegment>>(() => {
   const next: Record<string, ThreadActivitySegment> = {}
@@ -1679,6 +1697,7 @@ const props = defineProps<{
   liveOverlay: UiLiveOverlay | null
   isLoading: boolean
   activeThreadId: string
+  activeTurnId?: string
   cwd: string
   readOnly?: boolean
   hasMorePersistedAbove?: boolean
@@ -2384,7 +2403,11 @@ const hiddenFileChangeMessageIds = computed(() => {
   return next
 })
 
-const hiddenCompletedActivityMessageIds = computed(() => getHiddenCompletedActivityMessageIds(props.messages))
+const hiddenCompletedActivityMessageIds = computed(() => new Set(
+  conversationTurnSections.value
+    .filter((section) => section.isCollapsed && section.completionMessageId !== null)
+    .flatMap((section) => section.activityMessageIds),
+))
 
 const renderableMessages = computed(() => filterRenderableThreadMessages(
   props.messages,

@@ -990,6 +990,7 @@
                 <div class="content-thread">
                   <ThreadConversation ref="threadConversationRef" :messages="filteredMessages" :is-loading="isLoadingMessages"
                     :active-thread-id="composerThreadContextId" :cwd="composerCwd"
+                    :active-turn-id="isSelectedThreadInProgress ? latestUserTurnId : ''"
                     :read-only="selectedThreadRuntimeOwnership === 'external'"
                     :live-overlay="liveOverlay"
                     :pending-requests="selectedThreadServerRequests"
