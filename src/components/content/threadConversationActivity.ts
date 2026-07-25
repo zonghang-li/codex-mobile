@@ -97,9 +97,14 @@ function appendCommandActivity(state: ActionSummaryState, message: UiMessage): v
 }
 
 function activityLabel(message: UiMessage): string {
-  const label = message.activity?.label?.replace(/\s+/gu, ' ').trim()
+  const compact = (value: string): string => value
+    .replace(/\*\*([^*]+)\*\*/gu, '$1')
+    .replace(/__([^_]+)__/gu, '$1')
+    .replace(/\s+/gu, ' ')
+    .trim()
+  const label = compact(message.activity?.label ?? '')
   if (label) return label
-  const text = message.text.replace(/\s+/gu, ' ').trim()
+  const text = compact(message.text)
   if (text) return text
   if (message.messageType === 'imageGeneration') return 'Generated an image'
   if (message.messageType === 'imageView') return 'Viewed an image'

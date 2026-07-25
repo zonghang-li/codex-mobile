@@ -161,6 +161,22 @@ describe('thread conversation completed activity grouping', () => {
     ])
   })
 
+  it('removes desktop reasoning emphasis markers from compact activity labels', () => {
+    expect(buildThreadActivitySegments([
+      message(
+        'reasoning-markdown',
+        'assistant',
+        '**Planning diagnostic instrumentation**\n\n__Assessing socket failure causes__',
+        'reasoning',
+      ),
+    ])).toEqual([{
+      kind: 'reasoning',
+      id: 'reasoning-markdown',
+      label: 'Planning diagnostic instrumentation Assessing socket failure causes',
+      sourceMessageIds: ['reasoning-markdown'],
+    }])
+  })
+
   it('folds completed turn activity under the worked separator without hiding the final answer', () => {
     const messages: UiMessage[] = [
       message('user-1', 'user', 'do it', 'userMessage'),
