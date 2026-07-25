@@ -110,6 +110,40 @@ describe('thread inline media sanitization', () => {
     expect(result.thread.turns[0].items[0].result).toBe(textResult)
   })
 
+  it('caps command execution output in thread payloads', async () => {
+    const longOutput = `first-line\n${'x'.repeat(70_000)}\nlast-line`
+    const result = await sanitizeThreadTurnsInlinePayloads('thread/read', {
+      thread: {
+        turns: [
+          {
+            id: 'turn-1',
+            items: [
+              {
+                id: 'command-1',
+                type: 'commandExecution',
+                command: 'journalctl --user -n 5000',
+                aggregatedOutput: longOutput,
+              },
+            ],
+          },
+        ],
+      },
+    }) as {
+      thread: {
+        turns: Array<{
+          items: Array<{ aggregatedOutput: string }>
+        }>
+      }
+    }
+
+    const output = result.thread.turns[0].items[0].aggregatedOutput
+
+    expect(output.length).toBeLessThan(20_000)
+    expect(output).toContain('first-line')
+    expect(output).toContain('last-line')
+    expect(output).toContain('truncated')
+  })
+
   it('leaves non-image data URLs untouched in image-like fields', async () => {
     const dataUrl = 'data:text/plain;base64,aGVsbG8='
     const result = await sanitizeThreadTurnsInlinePayloads('thread/read', {

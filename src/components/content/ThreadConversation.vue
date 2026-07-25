@@ -4758,7 +4758,7 @@ onBeforeUnmount(() => {
 }
 
 .conversation-list {
-  @apply h-full min-h-0 list-none m-0 px-2 sm:px-6 py-0 overflow-y-auto overflow-x-visible flex flex-col gap-2 sm:gap-3;
+  @apply h-full min-h-0 min-w-0 max-w-full list-none m-0 px-2 sm:px-6 py-0 overflow-y-auto overflow-x-hidden flex flex-col gap-2 sm:gap-3;
 }
 
 .conversation-load-more {
@@ -5336,7 +5336,7 @@ onBeforeUnmount(() => {
 }
 
 .message-code-block {
-  @apply overflow-hidden rounded-xl border border-slate-200 bg-slate-950 text-slate-100;
+  @apply min-w-0 max-w-full overflow-hidden rounded-xl border border-slate-200 bg-slate-950 text-slate-100;
 }
 
 .message-code-language {

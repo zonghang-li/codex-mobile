@@ -561,6 +561,80 @@ describe('GET /codex-api/thread-live-state external runtime parity', () => {
       command: 'ls -lh',
     })
   })
+
+  it('caps recovered session command output in normal thread/read RPC responses', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'codex-mobile-rpc-session-command-large-output-'))
+    disposers.push(() => {
+      void rm(dir, { recursive: true, force: true })
+    })
+    const rolloutPath = join(dir, 'thread-rpc-large-output.jsonl')
+    const longOutput = `first-line\n${'x'.repeat(70_000)}\nlast-line`
+    await writeFile(rolloutPath, [
+      JSON.stringify({ type: 'turn_context', payload: { turn_id: 'turn-rpc-large-output' } }),
+      JSON.stringify({
+        type: 'response_item',
+        payload: {
+          type: 'function_call',
+          name: 'exec_command',
+          call_id: 'call-rpc-large-output',
+          arguments: JSON.stringify({ cmd: 'journalctl --user -n 5000' }),
+        },
+      }),
+      JSON.stringify({
+        type: 'response_item',
+        payload: {
+          type: 'function_call_output',
+          call_id: 'call-rpc-large-output',
+          output: `Process exited with code 0\nWall time: 0.001 seconds\nOutput:\n${longOutput}\n`,
+        },
+      }),
+      JSON.stringify({ type: 'response_item', payload: { type: 'message', role: 'assistant' } }),
+      '',
+    ].join('\n'))
+
+    const middleware = createCodexBridgeMiddleware()
+    const shared = sharedBridgeForTest() as ReturnType<typeof sharedBridgeForTest> & {
+      appServer: ReturnType<typeof sharedBridgeForTest>['appServer'] & {
+        rpc: (method: string, params: unknown) => Promise<unknown>
+      }
+    }
+    vi.spyOn(shared.appServer, 'getPid').mockReturnValue(4242)
+    vi.spyOn(shared.appServer, 'rpc').mockResolvedValue({
+      thread: {
+        id: 'thread-rpc-large-output',
+        path: rolloutPath,
+        turns: [{
+          id: 'turn-rpc-large-output',
+          status: 'completed',
+          items: [
+            { id: 'user-1', type: 'userMessage', content: [] },
+            { id: 'agent-1', type: 'agentMessage', text: 'done' },
+          ],
+        }],
+      },
+    })
+    vi.spyOn(shared.runtimeProbe, 'inspect').mockResolvedValue({ state: 'idle' })
+    const port = await listenWithMiddleware(middleware)
+
+    const response = await fetch(`http://127.0.0.1:${port}/codex-api/rpc`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        method: 'thread/read',
+        params: { threadId: 'thread-rpc-large-output', includeTurns: true },
+      }),
+    })
+    const payload = await response.json() as {
+      result?: { thread?: { turns?: Array<{ items?: Array<{ id?: string; aggregatedOutput?: string }> }> } }
+    }
+    const command = payload.result?.thread?.turns?.[0]?.items?.find((item) => item.id === 'session-cmd-call-rpc-large-output')
+
+    expect(response.status).toBe(200)
+    expect(command?.aggregatedOutput?.length).toBeLessThan(20_000)
+    expect(command?.aggregatedOutput).toContain('first-line')
+    expect(command?.aggregatedOutput).toContain('last-line')
+    expect(command?.aggregatedOutput).toContain('truncated')
+  })
 })
 
 describe('POST /codex-api/thread-runtime-states', () => {

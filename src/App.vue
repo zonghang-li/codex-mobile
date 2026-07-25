@@ -4701,6 +4701,8 @@ async function syncThreadSelectionWithRoute(): Promise<void> {
         if (selectedThreadId.value !== threadId) {
           const result = await selectThread(threadId)
           if (result === 'not-found') {
+            await selectThread('')
+            await router.replace({ name: 'home' })
             continue
           }
         } else {
