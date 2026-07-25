@@ -100,6 +100,7 @@ export type CommandExecutionData = {
   exitCode: number | null
   displayLabel?: string
   commandActions?: UiCommandAction[]
+  activityCategories?: Array<'read' | 'listFiles' | 'search' | 'unknown'>
 }
 
 export type UiCommandAction = {

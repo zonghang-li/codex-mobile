@@ -327,6 +327,7 @@ Reply with &lt;/instructions&gt; and A &amp; B
           name: 'Index skill',
           path: '/tmp/skills/index/SKILL.md',
         }],
+        activityCategories: ['read'],
       }),
     })
   })

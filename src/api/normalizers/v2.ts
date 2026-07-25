@@ -20,7 +20,7 @@ import type {
 } from '../../types/codex'
 import { normalizePathForComparison, normalizePathForUi, toProjectName } from '../../pathUtils.js'
 import { parseCodexDirectiveText } from '../../utils/codexDirectives'
-import { commandDisplayLabel } from '../../utils/commandActivity'
+import { commandActivityCategories, commandDisplayLabel } from '../../utils/commandActivity'
 
 function toIso(seconds: number): string {
   return new Date(seconds * 1000).toISOString()
@@ -633,6 +633,7 @@ function toUiMessages(item: ThreadItem): UiMessage[] {
           exitCode,
           displayLabel: commandDisplayLabel(cmd, raw.commandActions),
           commandActions: normalizeCommandActions(raw.commandActions),
+          activityCategories: commandActivityCategories(cmd, raw.commandActions),
         },
         activity: {
           kind: 'command',
