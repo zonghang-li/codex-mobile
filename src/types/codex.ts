@@ -243,6 +243,16 @@ export type UiPlanData = {
   isStreaming?: boolean
 }
 
+export type ConversationFooterState = {
+  turnId: string
+  stepNumber: number | null
+  stepCount: number
+  completedPercent: number
+  fileCount: number
+  additions: number
+  deletions: number
+}
+
 export type UiGenericCodexDirectiveAttribute = {
   key: string
   value: string
