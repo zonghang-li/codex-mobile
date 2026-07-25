@@ -2403,6 +2403,27 @@ const hiddenFileChangeMessageIds = computed(() => {
   return next
 })
 
+const hiddenActiveFooterMessageIds = computed(() => {
+  const turnId = props.activeTurnId?.trim() ?? ''
+  if (!turnId) return new Set<string>()
+  return new Set(
+    props.messages
+      .filter((message) =>
+        message.turnId === turnId
+        && (
+          message.messageType === 'fileChange'
+          || message.messageType === 'plan.live'
+        ),
+      )
+      .map((message) => message.id),
+  )
+})
+
+const hiddenFileAndFooterMessageIds = computed(() => new Set([
+  ...hiddenFileChangeMessageIds.value,
+  ...hiddenActiveFooterMessageIds.value,
+]))
+
 const hiddenCompletedActivityMessageIds = computed(() => new Set(
   conversationTurnSections.value
     .filter((section) => section.isCollapsed && section.completionMessageId !== null)
@@ -2412,7 +2433,7 @@ const hiddenCompletedActivityMessageIds = computed(() => new Set(
 const renderableMessages = computed(() => filterRenderableThreadMessages(
   props.messages,
   hiddenGroupedCommandIds.value,
-  hiddenFileChangeMessageIds.value,
+  hiddenFileAndFooterMessageIds.value,
   hiddenCompletedActivityMessageIds.value,
   hiddenActivitySegmentSourceIds.value,
 ))

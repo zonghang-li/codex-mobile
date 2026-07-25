@@ -990,7 +990,7 @@
                 <div class="content-thread">
                   <ThreadConversation ref="threadConversationRef" :messages="filteredMessages" :is-loading="isLoadingMessages"
                     :active-thread-id="composerThreadContextId" :cwd="composerCwd"
-                    :active-turn-id="isSelectedThreadInProgress ? latestUserTurnId : ''"
+                    :active-turn-id="selectedActiveTurnId"
                     :read-only="selectedThreadRuntimeOwnership === 'external'"
                     :live-overlay="liveOverlay"
                     :pending-requests="selectedThreadServerRequests"
@@ -1024,6 +1024,9 @@
                     :cwd="composerCwd"
                     @hide="onHideSelectedThreadTerminal"
                     @terminal-focus-change="onTerminalFocusChange"
+                  />
+                  <ConversationRunFooter
+                    :footer-state="selectedConversationFooterState"
                   />
                   <ThreadPendingRequestPanel
                     v-if="selectedThreadPendingRequest"
@@ -1189,6 +1192,7 @@ import SidebarThreadTree from './components/sidebar/SidebarThreadTree.vue'
 import ContentHeader from './components/content/ContentHeader.vue'
 import ThreadComposer from './components/content/ThreadComposer.vue'
 import ThreadPendingRequestPanel from './components/content/ThreadPendingRequestPanel.vue'
+import ConversationRunFooter from './components/content/ConversationRunFooter.vue'
 import QueuedMessages from './components/content/QueuedMessages.vue'
 import RateLimitStatus from './components/content/RateLimitStatus.vue'
 import ComposerDropdown from './components/content/ComposerDropdown.vue'
@@ -1206,6 +1210,7 @@ import { useDesktopState } from './composables/useDesktopState'
 import { useMobile } from './composables/useMobile'
 import { useUiLanguage } from './composables/useUiLanguage'
 import { useFeedbackDiagnostics } from './composables/useFeedbackDiagnostics'
+import { deriveConversationFooterState } from './components/content/conversationFooterState'
 import {
   checkoutGitBranch,
   cloneGithubRepository,
@@ -1433,6 +1438,7 @@ const {
   selectedThreadTerminalOpen,
   selectedThreadServerRequests,
   selectedLiveOverlay,
+  selectedActiveTurnId,
   codexQuota,
   selectedThreadId,
   availableCollaborationModes,
@@ -1777,15 +1783,6 @@ const filteredMessages = computed(() =>
     return true
   }),
 )
-const latestUserTurnId = computed(() => {
-  for (let index = messages.value.length - 1; index >= 0; index -= 1) {
-    const message = messages.value[index]
-    if (message.role !== 'user') continue
-    const turnId = message.turnId?.trim() ?? ''
-    if (turnId.length > 0) return turnId
-  }
-  return ''
-})
 const liveOverlay = computed(() => selectedLiveOverlay.value)
 const composerThreadContextId = computed(() => (isHomeRoute.value ? '__new-thread__' : selectedThreadId.value))
 const composerSelectedModelId = computed(() => readModelIdForThread(composerThreadContextId.value))
@@ -1821,6 +1818,11 @@ const isTerminalKeyboardLayoutActive = computed(() => (
 ))
 const directoryCwd = computed(() => selectedThread.value?.cwd?.trim() ?? newThreadCwd.value.trim())
 const isSelectedThreadInProgress = computed(() => !isHomeRoute.value && selectedThread.value?.inProgress === true)
+const selectedConversationFooterState = computed(() => deriveConversationFooterState({
+  messages: filteredMessages.value,
+  turnId: selectedActiveTurnId.value,
+  isTurnInProgress: isSelectedThreadInProgress.value,
+}))
 const showThreadContextBadge = computed(() => !isHomeRoute.value && !isSkillsRoute.value && !isAutomationsRoute.value && selectedThreadId.value.trim().length > 0)
 const isAccountSwitchBlocked = computed(() =>
   isSendingMessage.value ||

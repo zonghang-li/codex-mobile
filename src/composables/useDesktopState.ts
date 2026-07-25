@@ -1689,6 +1689,10 @@ export function useDesktopState() {
       errorText,
     }
   })
+  const selectedActiveTurnId = computed(() => {
+    const threadId = selectedThreadId.value
+    return threadId ? activeTurnIdByThreadId.value[threadId] ?? '' : ''
+  })
   const codexQuota = computed<UiRateLimitSnapshot | null>(() => codexRateLimit.value)
   const selectedThreadTokenUsage = computed<UiThreadTokenUsage | null>(() => {
     const threadId = selectedThreadId.value
@@ -6533,6 +6537,7 @@ export function useDesktopState() {
     isSelectedThreadInterruptPending,
     selectedThreadServerRequests,
     selectedLiveOverlay,
+    selectedActiveTurnId,
     codexQuota,
     selectedThreadId,
     availableCollaborationModes,

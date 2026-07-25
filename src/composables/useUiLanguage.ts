@@ -430,6 +430,9 @@ const zhCN: Record<string, string> = {
   'Standard': '标准',
   'Wide': '宽',
   'Extra wide': '超宽',
+  'Step {step} / {count}': '步骤 {step} / {count}',
+  '1 file changed': '1 个文件已更改',
+  '{count} files changed': '{count} 个文件已更改',
 }
 
 const LANGUAGE_LABELS: Record<UiLanguage, string> = {
