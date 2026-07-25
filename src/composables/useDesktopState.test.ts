@@ -1393,6 +1393,51 @@ describe('turn completion lifecycle', () => {
   )
 })
 
+describe('subagent item notification synchronization', () => {
+  it('authoritatively reloads the selected parent thread after a child lifecycle item', async () => {
+    vi.useFakeTimers()
+    installFakeTimerWindow()
+    let notificationHandler: ((notification: { method: string; params?: unknown }) => void) | undefined
+    gatewayMocks.subscribeCodexNotifications.mockImplementation((handler) => {
+      notificationHandler = handler as typeof notificationHandler
+      return vi.fn()
+    })
+    gatewayMocks.getPendingServerRequests.mockResolvedValue([])
+    gatewayMocks.getThreadGroupsPage.mockResolvedValue({
+      groups: [{ projectName: 'Project', threads: [thread('thread-1', '/tmp/project')] }],
+      nextCursor: null,
+    })
+    gatewayMocks.resumeThread.mockResolvedValue(idleDetail())
+
+    const state = useDesktopState()
+    state.primeSelectedThread('thread-1')
+    await state.refreshAll({ includeSelectedThreadMessages: false })
+    state.startPolling()
+    pollingCleanups.push(() => state.stopPolling())
+
+    notificationHandler?.({
+      method: 'item/completed',
+      params: {
+        threadId: 'thread-1',
+        item: {
+          id: 'child-state',
+          type: 'collabAgentToolCall',
+          tool: 'wait',
+          status: 'completed',
+        },
+      },
+    })
+    const eventSyncCallback = vi.mocked(window.setTimeout).mock.calls
+      .filter(([, delay]) => delay === 220)
+      .pop()?.[0]
+    expect(eventSyncCallback).toBeTypeOf('function')
+    eventSyncCallback?.()
+    await flushMicrotasks()
+
+    expect(gatewayMocks.resumeThread).toHaveBeenCalledWith('thread-1')
+  })
+})
+
 describe('external runtime ownership', () => {
   it('discovers a new desktop turn for the selected idle task and immediately loads its output', async () => {
     const state = await setupBackgroundRuntimeState()
