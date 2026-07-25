@@ -8,6 +8,7 @@ import type {
 } from '../appServerDtos'
 import type {
   CommandExecutionData,
+  UiCommandAction,
   UiFileAttachment,
   UiFileChange,
   UiFileChangeStatus,
@@ -93,6 +94,68 @@ function toImageGenerationUrl(value: string): string {
   const compact = trimmed.replace(/\s+/gu, '')
   if (!/^[A-Za-z0-9+/]+={0,2}$/u.test(compact)) return ''
   return `data:image/png;base64,${compact}`
+}
+
+function normalizeCommandActions(value: unknown): UiCommandAction[] {
+  if (!Array.isArray(value)) return []
+  const actions: UiCommandAction[] = []
+  for (const item of value) {
+    const action = asRecord(item)
+    if (!action) continue
+    const rawType = readString(action.type)
+    const type: UiCommandAction['type'] =
+      rawType === 'read' || rawType === 'listFiles' || rawType === 'search'
+        ? rawType
+        : 'unknown'
+    const command = readString(action.command)
+    const name = readString(action.name)
+    const path = typeof action.path === 'string' ? action.path : null
+    const query = typeof action.query === 'string' ? action.query : null
+    actions.push({
+      type,
+      ...(command ? { command } : {}),
+      ...(name ? { name } : {}),
+      ...(path !== null ? { path } : {}),
+      ...(query !== null ? { query } : {}),
+    })
+  }
+  return actions
+}
+
+function humanizeActivityName(value: string): string {
+  return value
+    .replace(/([a-z0-9])([A-Z])/gu, '$1 $2')
+    .replace(/[_-]+/gu, ' ')
+    .replace(/\s+/gu, ' ')
+    .trim()
+    .toLowerCase()
+}
+
+function normalizeSubAgentActivity(item: Record<string, unknown>): UiMessage {
+  const agentPath = readString(item.agentPath)
+  const rawName = agentPath.split('/').filter(Boolean).at(-1) ?? ''
+  const normalizedName = humanizeActivityName(rawName) || 'agent'
+  const name = normalizedName.charAt(0).toUpperCase() + normalizedName.slice(1)
+  const rawKind = readString(item.kind)
+  const status = rawKind === 'started'
+    ? 'started'
+    : rawKind === 'interrupted'
+      ? 'interrupted'
+      : 'updated'
+  const label = name
+  return {
+    id: readString(item.id),
+    role: 'system',
+    text: label,
+    messageType: 'subAgentActivity',
+    rawPayload: toRawPayload(item),
+    activity: {
+      kind: 'subAgent',
+      label,
+      status,
+      agentPath,
+    },
+  }
 }
 
 function decodeHeartbeatXmlText(value: string): string {
@@ -402,6 +465,46 @@ export function toUiFileChanges(changes: unknown): UiFileChange[] {
 }
 
 function toUiMessages(item: ThreadItem): UiMessage[] {
+  const rawItem = item as unknown as Record<string, unknown>
+  const rawType = readString(rawItem.type)
+
+  if (rawType === 'subAgentActivity') {
+    return [normalizeSubAgentActivity(rawItem)]
+  }
+
+  if (rawType === 'dynamicToolCall') {
+    const tool = humanizeActivityName(readString(rawItem.tool) || readString(rawItem.name))
+    const label = tool ? `Used ${tool}` : 'Used tool'
+    const status = readString(rawItem.status)
+    return [{
+      id: item.id,
+      role: 'system',
+      text: label,
+      messageType: 'dynamicToolCall',
+      rawPayload: toRawPayload(item),
+      activity: {
+        kind: 'tool',
+        label,
+        status: status || undefined,
+      },
+    }]
+  }
+
+  if (rawType === 'sleep') {
+    const label = 'Waited briefly'
+    return [{
+      id: item.id,
+      role: 'system',
+      text: label,
+      messageType: 'sleep',
+      rawPayload: toRawPayload(item),
+      activity: {
+        kind: 'status',
+        label,
+      },
+    }]
+  }
+
   if (item.type === 'agentMessage') {
     const parsed = parseCodexDirectiveText(typeof item.text === 'string' ? item.text : '')
     return [
@@ -452,25 +555,30 @@ function toUiMessages(item: ThreadItem): UiMessage[] {
         text: 'Viewed an image',
         images: [toLocalImageUrl(path)],
         messageType: 'imageView',
+        activity: {
+          kind: 'image',
+          label: 'Viewed an image',
+        },
       },
     ]
   }
 
-  {
-    const rawItem = item as unknown as Record<string, unknown>
-    if (rawItem.type === 'imageGeneration' || rawItem.type === 'image_generation') {
-      const result = typeof rawItem.result === 'string' ? toImageGenerationUrl(rawItem.result) : ''
-      if (!result) return []
-      return [
-        {
-          id: item.id,
-          role: 'assistant',
-          text: 'Viewed an image',
-          images: [result],
-          messageType: 'imageView',
+  if (rawType === 'imageGeneration' || rawType === 'image_generation') {
+    const result = typeof rawItem.result === 'string' ? toImageGenerationUrl(rawItem.result) : ''
+    if (!result) return []
+    return [
+      {
+        id: item.id,
+        role: 'assistant',
+        text: 'Generated an image',
+        images: [result],
+        messageType: 'imageGeneration',
+        activity: {
+          kind: 'image',
+          label: 'Generated an image',
         },
-      ]
-    }
+      },
+    ]
   }
 
   if (item.type === 'reasoning') {
@@ -493,15 +601,19 @@ function toUiMessages(item: ThreadItem): UiMessage[] {
       {
         id: item.id,
         role: 'assistant',
-        text,
-        messageType: 'plan',
-        plan: parsePlanText(text) ?? undefined,
+      text,
+      messageType: 'plan',
+      plan: parsePlanText(text) ?? undefined,
+      activity: {
+        kind: 'plan',
+        label: 'Planning',
+      },
       },
     ]
   }
 
   if (item.type === 'commandExecution') {
-    const raw = item as Record<string, unknown>
+    const raw = item as unknown as Record<string, unknown>
     const status = normalizeCommandStatus(raw.status)
     const cmd = typeof raw.command === 'string' ? raw.command : ''
     const cwd = typeof raw.cwd === 'string' ? raw.cwd : null
@@ -520,6 +632,12 @@ function toUiMessages(item: ThreadItem): UiMessage[] {
           aggregatedOutput,
           exitCode,
           displayLabel: commandDisplayLabel(cmd, raw.commandActions),
+          commandActions: normalizeCommandActions(raw.commandActions),
+        },
+        activity: {
+          kind: 'command',
+          label: commandDisplayLabel(cmd, raw.commandActions),
+          status,
         },
       },
     ]
@@ -539,6 +657,11 @@ function toUiMessages(item: ThreadItem): UiMessage[] {
         messageType: 'fileChange',
         fileChangeStatus,
         fileChanges,
+        activity: {
+          kind: 'fileChange',
+          label: 'Edited files',
+          status: fileChangeStatus,
+        },
       },
     ]
   }
@@ -549,6 +672,10 @@ function toUiMessages(item: ThreadItem): UiMessage[] {
       role: 'system',
       text: 'Context automatically compacting',
       messageType: 'contextCompaction',
+      activity: {
+        kind: 'status',
+        label: 'Context automatically compacting',
+      },
     }]
   }
 
@@ -560,6 +687,10 @@ function toUiMessages(item: ThreadItem): UiMessage[] {
       text: normalizeWebSearchLabel(raw),
       messageType: 'webSearch',
       rawPayload: toRawPayload(item),
+      activity: {
+        kind: 'search',
+        label: normalizeWebSearchLabel(raw),
+      },
     }]
   }
 
@@ -574,6 +705,11 @@ function toUiMessages(item: ThreadItem): UiMessage[] {
       text: label,
       messageType: 'mcpToolCall',
       rawPayload: toRawPayload(item),
+      activity: {
+        kind: 'tool',
+        label,
+        status: readString(raw.status) || undefined,
+      },
     }]
   }
 
@@ -585,6 +721,11 @@ function toUiMessages(item: ThreadItem): UiMessage[] {
       text: normalizeCollabAgentLabel(readString(raw.tool)),
       messageType: 'collabAgentToolCall',
       rawPayload: toRawPayload(item),
+      activity: {
+        kind: 'tool',
+        label: normalizeCollabAgentLabel(readString(raw.tool)),
+        status: readString(raw.status) || undefined,
+      },
     }]
   }
 
@@ -594,6 +735,10 @@ function toUiMessages(item: ThreadItem): UiMessage[] {
       role: 'system',
       text: item.type === 'enteredReviewMode' ? 'Entered review mode' : 'Exited review mode',
       messageType: item.type,
+      activity: {
+        kind: 'status',
+        label: item.type === 'enteredReviewMode' ? 'Entered review mode' : 'Exited review mode',
+      },
     }]
   }
 

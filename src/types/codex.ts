@@ -99,6 +99,22 @@ export type CommandExecutionData = {
   aggregatedOutput: string
   exitCode: number | null
   displayLabel?: string
+  commandActions?: UiCommandAction[]
+}
+
+export type UiCommandAction = {
+  type: 'read' | 'listFiles' | 'search' | 'unknown'
+  command?: string
+  name?: string
+  path?: string | null
+  query?: string | null
+}
+
+export type UiActivityData = {
+  kind: 'command' | 'fileChange' | 'tool' | 'subAgent' | 'image' | 'search' | 'status' | 'plan'
+  label: string
+  status?: string
+  agentPath?: string
 }
 
 export type UiFileAttachment = { label: string; path: string }
@@ -247,6 +263,7 @@ export type UiMessage = {
   messageType?: string
   rawPayload?: string
   isUnhandled?: boolean
+  activity?: UiActivityData
   commandExecution?: CommandExecutionData
   plan?: UiPlanData
   turnId?: string
