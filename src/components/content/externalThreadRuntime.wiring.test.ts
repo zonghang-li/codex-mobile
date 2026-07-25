@@ -52,7 +52,8 @@ describe('external thread runtime read-only wiring', () => {
     const composerSource = await readFile(new URL('./ThreadComposer.vue', import.meta.url), 'utf8')
 
     expect(composerSource).toContain('getSupportedReasoningEfforts')
-    expect(composerSource).toContain('supportedReasoningOptions')
+    expect(composerSource).toContain('desktopModelEffortOptions')
+    expect(composerSource).toContain('composerControlState.value.selectedEffort')
     expect(composerSource).toContain("const isFastModeSupported = computed(() => /^gpt-5\\.(?:4|5|6)(?:$|-)/.test(props.selectedModel.trim()))")
   })
 

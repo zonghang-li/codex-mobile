@@ -447,6 +447,13 @@ const zhCN: Record<string, string> = {
   'Goal objective': '目标内容',
   '{used} / {budget} tokens': '{used} / {budget} tokens',
   '{count} tokens used': '已使用 {count} tokens',
+  'Approve for me': '帮我批准',
+  'Codex handles routine approvals automatically': 'Codex 会自动处理常规批准',
+  'Goal': '目标',
+  'Start goal': '开始目标',
+  'This task already has a goal. Edit it from the goal strip above.': '当前任务已有目标，请在上方目标栏中编辑。',
+  'Skills and prompts': '技能与提示词',
+  'Do anything': '做任何事',
 }
 
 const LANGUAGE_LABELS: Record<UiLanguage, string> = {

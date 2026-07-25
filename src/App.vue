@@ -1054,6 +1054,9 @@
                     :selected-reasoning-effort="selectedReasoningEffort"
                     :selected-speed-mode="selectedSpeedMode"
                     :is-updating-speed-mode="isUpdatingSpeedMode"
+                    :goal-supported="selectedThreadGoalSupported"
+                    :has-goal="selectedThreadGoal !== null"
+                    :is-updating-goal="isUpdatingThreadGoal"
                     :skills="installedSkills"
                     :thread-token-usage="selectedThreadTokenUsage"
                     :codex-quota="codexQuota"
@@ -1069,6 +1072,7 @@
                     @submit="onSubmitThreadMessage" @update:selected-model="onSelectModel"
                     @update:selected-reasoning-effort="onSelectReasoningEffort"
                     @update:selected-speed-mode="onSelectSpeedMode"
+                    @set-goal="updateSelectedThreadGoal"
                     @interrupt="onInterruptTurn" />
                 </div>
               </template>

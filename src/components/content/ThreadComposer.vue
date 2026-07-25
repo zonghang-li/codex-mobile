@@ -190,6 +190,22 @@
               {{ t('Take photo') }}
             </button>
             <div class="thread-composer-attach-separator" />
+            <ComposerSearchDropdown
+              class="thread-composer-attach-skills"
+              :options="skillDropdownOptions"
+              :selected-values="selectedSkillPaths"
+              :placeholder="t('Skills and prompts')"
+              :search-placeholder="t('Search skills and prompts...')"
+              :create-label="t('Add new prompt')"
+              :allow-remove="true"
+              :remove-label="t('Remove prompt')"
+              open-direction="up"
+              :disabled="isComposerConfigDisabled"
+              @toggle="onSkillDropdownToggle"
+              @create="onCreatePrompt"
+              @remove="onRemovePrompt"
+            />
+            <div class="thread-composer-attach-separator" />
             <div class="thread-composer-attach-mode">
               <span class="thread-composer-attach-mode-label">{{ t('In-progress send') }}</span>
               <div class="thread-composer-attach-mode-buttons">
@@ -259,50 +275,75 @@
         </div>
 
         <template v-if="!isDictationRecording">
-          <ComposerDropdown
-            class="thread-composer-control"
-            :model-value="selectedModel"
-            :options="modelOptions"
-            :selected-prefix-icon="showFastModeModelIcon ? IconTablerBolt : null"
-            :placeholder="t('Model')"
-            open-direction="up"
-            :disabled="isComposerConfigDisabled || models.length === 0"
-            enable-search
-            :search-placeholder="t('Search models...')"
-            @update:model-value="onModelSelect"
-          />
+          <button
+            class="thread-composer-permission-trigger"
+            type="button"
+            :title="t('Codex handles routine approvals automatically')"
+            disabled
+          >
+            {{ composerControlState.permissionLabel }}
+          </button>
 
-          <ComposerSearchDropdown
-            class="thread-composer-control"
-            :options="skillDropdownOptions"
-            :selected-values="selectedSkillPaths"
-            :placeholder="t('Skills')"
-            :search-placeholder="t('Search skills and prompts...')"
-            :create-label="t('Add new prompt')"
-            :allow-remove="true"
-            :remove-label="t('Remove prompt')"
-            open-direction="up"
-            :disabled="isComposerConfigDisabled"
-            @toggle="onSkillDropdownToggle"
-            @create="onCreatePrompt"
-            @remove="onRemovePrompt"
-          />
-
-          <ComposerDropdown
-            class="thread-composer-control"
-            :model-value="selectedReasoningEffort"
-            :options="supportedReasoningOptions"
-            :placeholder="t('Thinking')"
-            open-direction="up"
-            :disabled="isComposerConfigDisabled"
-            @update:model-value="onReasoningEffortSelect"
-          />
+          <div v-if="goalSupported" ref="goalMenuRootRef" class="thread-composer-goal-control">
+            <button
+              class="thread-composer-goal-trigger"
+              type="button"
+              :disabled="!composerControlState.canToggleGoal || isUpdatingGoal"
+              :aria-expanded="isGoalMenuOpen"
+              @click="toggleGoalMenu"
+            >
+              {{ t('Goal') }}
+            </button>
+            <div v-if="isGoalMenuOpen" class="thread-composer-goal-menu">
+              <template v-if="hasGoal">
+                <p class="thread-composer-goal-menu-copy">
+                  {{ t('This task already has a goal. Edit it from the goal strip above.') }}
+                </p>
+              </template>
+              <template v-else>
+                <label class="thread-composer-goal-menu-label" for="thread-composer-goal-objective">
+                  {{ t('Goal objective') }}
+                </label>
+                <textarea
+                  id="thread-composer-goal-objective"
+                  v-model="goalObjectiveDraft"
+                  class="thread-composer-goal-menu-input"
+                  rows="3"
+                  :disabled="isUpdatingGoal"
+                  @keydown.enter.exact.prevent="submitGoal"
+                  @keydown.esc.prevent="closeGoalMenu"
+                />
+                <button
+                  class="thread-composer-goal-menu-submit"
+                  type="button"
+                  :disabled="isUpdatingGoal || !goalObjectiveDraft.trim()"
+                  @click="submitGoal"
+                >
+                  {{ t('Start goal') }}
+                </button>
+              </template>
+            </div>
+          </div>
         </template>
 
         <div
           class="thread-composer-actions"
           :class="{ 'thread-composer-actions--recording': isDictationRecording }"
         >
+          <ComposerDropdown
+            v-if="!isDictationRecording"
+            class="thread-composer-model-effort"
+            :model-value="desktopModelEffortValue"
+            :options="desktopModelEffortOptions"
+            :selected-prefix-icon="composerControlState.showFastIcon ? IconTablerBolt : null"
+            :placeholder="composerControlState.modelEffortLabel"
+            open-direction="up"
+            :disabled="isComposerConfigDisabled || models.length === 0"
+            enable-search
+            :search-placeholder="t('Search models...')"
+            @update:model-value="onDesktopModelEffortSelect"
+          />
+
           <div v-if="dictationState === 'recording'" class="thread-composer-dictation-waveform-wrap" aria-hidden="true">
             <canvas ref="dictationWaveformCanvasRef" class="thread-composer-dictation-waveform" />
           </div>
@@ -334,12 +375,12 @@
           </button>
 
           <button
-            v-if="isTurnInProgress && (!hasSubmitContent || isExternallyOwned)"
+            v-if="composerControlState.primaryAction === 'stop' || composerControlState.primaryAction === 'externalRunning'"
             class="thread-composer-stop"
             type="button"
             :aria-label="isExternallyOwned ? t('Running in another client') : stopControlLabel"
             :title="isExternallyOwned ? t('Running in another client') : stopControlLabel"
-            :disabled="isExternallyOwned || disabled || !activeThreadId || isInterruptingTurn || isStopPending"
+            :disabled="!composerControlState.canStop || isInterruptingTurn || isStopPending"
             @click="onInterrupt"
           >
             <span v-if="isStopPending && !isExternallyOwned" class="thread-composer-stop-spinner" aria-hidden="true" />
@@ -432,6 +473,7 @@ import {
   canApplyAttachmentMutation,
   canApplyThreadUiMutation,
 } from './externalThreadRuntimeUi'
+import { deriveComposerControlState } from './composerControlState'
 
 type SkillSourceBadge = {
   badge: string
@@ -465,6 +507,9 @@ const props = defineProps<{
   dictationClickToToggle?: boolean
   dictationAutoSend?: boolean
   dictationLanguage?: string
+  goalSupported?: boolean
+  hasGoal?: boolean
+  isUpdatingGoal?: boolean
 }>()
 
 export type FileAttachment = { label: string; path: string; fsPath: string }
@@ -497,6 +542,7 @@ const emit = defineEmits<{
   'update:selected-model': [modelId: string]
   'update:selected-reasoning-effort': [effort: ReasoningEffort | '']
   'update:selected-speed-mode': [mode: SpeedMode]
+  'set-goal': [input: { objective: string; status: 'active' }]
 }>()
 const { t } = useUiLanguage()
 
@@ -574,12 +620,15 @@ const {
   },
 })
 const attachMenuRootRef = ref<HTMLElement | null>(null)
+const goalMenuRootRef = ref<HTMLElement | null>(null)
 const photoLibraryInputRef = ref<HTMLInputElement | null>(null)
 const cameraCaptureInputRef = ref<HTMLInputElement | null>(null)
 const folderPickerInputRef = ref<HTMLInputElement | null>(null)
 const inputRef = ref<HTMLTextAreaElement | null>(null)
 const { isMobile } = useMobile()
 const isAttachMenuOpen = ref(false)
+const isGoalMenuOpen = ref(false)
+const goalObjectiveDraft = ref('')
 const mentionStartIndex = ref<number | null>(null)
 const mentionQuery = ref('')
 const fileMentionSuggestions = ref<ComposerFileSuggestion[]>([])
@@ -608,17 +657,33 @@ const reasoningOptions: Array<{ value: ReasoningEffort; label: string }> = [
   { value: 'max', label: 'Max' },
   { value: 'ultra', label: 'Ultra' },
 ]
-const supportedReasoningOptions = computed(() => {
-  const supported = new Set(getSupportedReasoningEfforts(props.selectedModel))
-  return reasoningOptions.filter((option) => supported.has(option.value))
-})
 function formatModelLabel(modelId: string): string {
   return modelId.trim().replace(/^gpt/i, 'GPT')
 }
 
-const modelOptions = computed(() =>
-  props.models.map((modelId) => ({ value: modelId, label: formatModelLabel(modelId) })),
-)
+const composerControlState = computed(() => deriveComposerControlState({
+  runtimeOwnership: props.runtimeOwnership ?? 'idle',
+  isTurnInProgress: props.isTurnInProgress === true,
+  hasSubmitContent: hasSubmitContent.value,
+  disabled: props.disabled === true || !props.activeThreadId,
+  hasPendingRequest: false,
+  goalSupported: props.goalSupported === true,
+  selectedModel: props.selectedModel,
+  selectedReasoningEffort: props.selectedReasoningEffort,
+  selectedSpeedMode: props.selectedSpeedMode,
+}))
+const desktopModelEffortOptions = computed(() => props.models.flatMap((modelId) => {
+  const supported = new Set(getSupportedReasoningEfforts(modelId))
+  return reasoningOptions
+    .filter((option) => supported.has(option.value))
+    .map((option) => ({
+      value: `${modelId}\u001f${option.value}`,
+      label: `${formatModelLabel(modelId)} ${option.label}`,
+    }))
+}))
+const desktopModelEffortValue = computed(() => (
+  `${props.selectedModel}\u001f${composerControlState.value.selectedEffort}`
+))
 const isPlanModeSelected = computed(() => props.selectedCollaborationMode === 'plan')
 
 const isPlanModeWaitingForModel = computed(() =>
@@ -677,11 +742,8 @@ const standaloneFileAttachments = computed(() => {
 })
 const isExternallyOwned = computed(() => props.runtimeOwnership === 'external')
 const isInteractionDisabled = computed(() => isExternallyOwned.value || props.disabled || !props.activeThreadId)
-const isComposerConfigDisabled = computed(() => isExternallyOwned.value || props.disabled || !props.activeThreadId)
+const isComposerConfigDisabled = computed(() => !composerControlState.value.canEditConfiguration)
 const isFastModeSupported = computed(() => /^gpt-5\.(?:4|5|6)(?:$|-)/.test(props.selectedModel.trim()))
-const showFastModeModelIcon = computed(() =>
-  props.selectedSpeedMode === 'fast' && isFastModeSupported.value,
-)
 const isSpeedToggleDisabled = computed(() =>
   isInteractionDisabled.value || props.isUpdatingSpeedMode === true,
 )
@@ -743,7 +805,7 @@ const placeholderText = computed(() =>
     ? t('Select a thread to send a message')
     : isPlanModeWaitingForModel.value
       ? t('Loading models for plan mode...')
-      : t('Type a message... (@ for files)'),
+      : t('Do anything'),
 )
 const hasSubmitContent = computed(() =>
   draft.value.trim().length > 0 || selectedImages.value.length > 0 || fileAttachments.value.length > 0,
@@ -992,6 +1054,7 @@ function onSubmit(mode: 'steer' | 'queue' = 'steer'): void {
   isComposerExpanded.value = false
   folderUploadGroups.value = []
   isAttachMenuOpen.value = false
+  isGoalMenuOpen.value = false
   closeFileMention()
   if (isAndroid || isMobile.value) {
     inputRef.value?.blur()
@@ -1023,6 +1086,7 @@ function replaceDraftState(payload: ComposerDraftPayload): void {
   attachmentBatchStats.value = null
   pendingAttachmentCount.value = 0
   isAttachMenuOpen.value = false
+  isGoalMenuOpen.value = false
   closeFileMention()
   attachmentSessionToken += 1
 }
@@ -1150,21 +1214,20 @@ function toggleComposerExpanded(): void {
   void nextTick(() => inputRef.value?.focus())
 }
 
-function onModelSelect(value: string): void {
-  if (isComposerConfigDisabled.value) return
-  emit('update:selected-model', value)
-}
-
 function toggleCollaborationMode(): void {
   if (isComposerConfigDisabled.value) return
   emit('update:selected-collaboration-mode', isPlanModeSelected.value ? 'default' : 'plan')
 }
 
-function onReasoningEffortSelect(value: string): void {
+function onDesktopModelEffortSelect(value: string): void {
   if (isComposerConfigDisabled.value) return
-  const supported = getSupportedReasoningEfforts(props.selectedModel)
-  if (!supported.includes(value as ReasoningEffort)) return
-  emit('update:selected-reasoning-effort', value as ReasoningEffort)
+  const [modelId, effort] = value.split('\u001f')
+  if (!modelId || !effort) return
+  const supported = getSupportedReasoningEfforts(modelId)
+  if (!supported.includes(effort as ReasoningEffort)) return
+  if (modelId !== props.selectedModel) emit('update:selected-model', modelId)
+  emit('update:selected-reasoning-effort', effort as ReasoningEffort)
+  void nextTick(() => inputRef.value?.focus())
 }
 
 function onToggleSpeedMode(): void {
@@ -1216,7 +1279,33 @@ function onDictationPressEnd(): void {
 
 function toggleAttachMenu(): void {
   if (isInteractionDisabled.value) return
+  isGoalMenuOpen.value = false
   isAttachMenuOpen.value = !isAttachMenuOpen.value
+}
+
+function toggleGoalMenu(): void {
+  if (!composerControlState.value.canToggleGoal || props.isUpdatingGoal) return
+  isAttachMenuOpen.value = false
+  isGoalMenuOpen.value = !isGoalMenuOpen.value
+  if (isGoalMenuOpen.value && !props.hasGoal) {
+    void nextTick(() => {
+      const input = goalMenuRootRef.value?.querySelector('textarea')
+      if (input instanceof HTMLTextAreaElement) input.focus()
+    })
+  }
+}
+
+function closeGoalMenu(): void {
+  isGoalMenuOpen.value = false
+}
+
+function submitGoal(): void {
+  const objective = goalObjectiveDraft.value.trim()
+  if (!objective || props.hasGoal || props.isUpdatingGoal) return
+  emit('set-goal', { objective, status: 'active' })
+  goalObjectiveDraft.value = ''
+  closeGoalMenu()
+  void nextTick(() => inputRef.value?.focus())
 }
 
 function triggerPhotoLibrary(): void {
@@ -1844,12 +1933,16 @@ function onSkillDropdownToggle(path: string, checked: boolean): void {
 }
 
 function onDocumentClick(event: MouseEvent): void {
-  if (!isAttachMenuOpen.value) return
-  const root = attachMenuRootRef.value
-  if (!root) return
   const target = event.target as Node | null
-  if (!target || root.contains(target)) return
-  isAttachMenuOpen.value = false
+  if (!target) return
+  if (isAttachMenuOpen.value) {
+    const root = attachMenuRootRef.value
+    if (root && !root.contains(target)) isAttachMenuOpen.value = false
+  }
+  if (isGoalMenuOpen.value) {
+    const root = goalMenuRootRef.value
+    if (root && !root.contains(target)) isGoalMenuOpen.value = false
+  }
 }
 
 function invalidatePendingAttachments(): void {
@@ -1860,6 +1953,7 @@ function invalidatePendingAttachments(): void {
     group.isUploading ? { ...group, isUploading: false } : group
   ))
   isAttachMenuOpen.value = false
+  isGoalMenuOpen.value = false
   closeFileMention()
   resetDragState()
 }
@@ -2229,6 +2323,14 @@ watch(
   @apply block w-full rounded-lg border-0 bg-transparent px-3 py-2 text-left text-sm text-zinc-800 transition hover:bg-zinc-100 disabled:cursor-not-allowed disabled:text-zinc-400;
 }
 
+.thread-composer-attach-skills {
+  @apply block w-full;
+}
+
+.thread-composer-attach-skills :deep(.search-dropdown-trigger) {
+  @apply w-full justify-between rounded-lg border-0 bg-transparent px-3 py-2 text-left text-sm text-zinc-800 hover:bg-zinc-100;
+}
+
 .thread-composer-attach-separator {
   @apply my-1 h-px bg-zinc-100;
 }
@@ -2302,6 +2404,54 @@ watch(
   @apply truncate;
 }
 
+.thread-composer-permission-trigger,
+.thread-composer-goal-trigger {
+  @apply inline-flex h-8 min-w-0 shrink-0 items-center rounded-full border-0 bg-transparent px-2 text-sm text-zinc-500 transition;
+}
+
+.thread-composer-permission-trigger:disabled {
+  @apply cursor-default opacity-100;
+}
+
+.thread-composer-goal-trigger {
+  @apply hover:bg-zinc-100 hover:text-zinc-800 disabled:cursor-default disabled:opacity-40;
+}
+
+.thread-composer-goal-control {
+  @apply relative min-w-0 shrink-0;
+}
+
+.thread-composer-goal-menu {
+  @apply absolute bottom-11 left-0 z-30 w-80 max-w-[calc(100vw-1rem)] rounded-xl border border-zinc-200 bg-white p-3 text-zinc-800 shadow-xl;
+}
+
+.thread-composer-goal-menu-copy {
+  @apply text-sm leading-5 text-zinc-600;
+}
+
+.thread-composer-goal-menu-label {
+  @apply mb-1.5 block text-xs font-medium text-zinc-600;
+}
+
+.thread-composer-goal-menu-input {
+  @apply min-h-20 w-full resize-none rounded-lg border border-zinc-300 bg-white px-2.5 py-2 text-base text-zinc-900 outline-none focus:border-zinc-500;
+}
+
+.thread-composer-goal-menu-submit {
+  @apply mt-2 ml-auto block rounded-full border border-zinc-900 bg-zinc-900 px-3 py-1.5 text-xs font-medium text-white hover:bg-black disabled:cursor-default disabled:border-zinc-200 disabled:bg-zinc-200 disabled:text-zinc-500;
+}
+
+.thread-composer-model-effort {
+  @apply min-w-0 max-w-64 shrink;
+}
+
+.thread-composer-model-effort :deep(.composer-dropdown-trigger) {
+  @apply max-w-full rounded-full border-0 bg-transparent px-2 hover:bg-zinc-100;
+}
+
+.thread-composer-model-effort :deep(.composer-dropdown-value) {
+  @apply truncate;
+}
 
 .thread-composer-actions {
   @apply ml-auto flex min-w-0 items-center gap-2;
@@ -2318,6 +2468,32 @@ watch(
 
 :global(.dark) .thread-composer-mic {
   @apply bg-zinc-800 text-zinc-300 hover:bg-zinc-700 hover:text-zinc-50 disabled:bg-zinc-800/60 disabled:text-zinc-600;
+}
+
+:global(.dark) .thread-composer-goal-trigger,
+:global(.dark) .thread-composer-permission-trigger {
+  @apply text-zinc-400;
+}
+
+:global(.dark) .thread-composer-goal-trigger {
+  @apply hover:bg-zinc-800 hover:text-zinc-100;
+}
+
+:global(.dark) .thread-composer-goal-menu {
+  @apply border-zinc-700 bg-zinc-900 text-zinc-100;
+}
+
+:global(.dark) .thread-composer-goal-menu-copy,
+:global(.dark) .thread-composer-goal-menu-label {
+  @apply text-zinc-400;
+}
+
+:global(.dark) .thread-composer-goal-menu-input {
+  @apply border-zinc-600 bg-zinc-950 text-zinc-100 focus:border-zinc-400;
+}
+
+:global(.dark) .thread-composer-model-effort :deep(.composer-dropdown-trigger) {
+  @apply hover:bg-zinc-800;
 }
 
 .thread-composer-mic--active {
@@ -2378,5 +2554,31 @@ watch(
 
 .thread-composer-hidden-input {
   @apply hidden;
+}
+
+@media (max-width: 640px) {
+  .thread-composer-input {
+    @apply text-base;
+  }
+
+  .thread-composer-controls {
+    @apply gap-0.5;
+  }
+
+  .thread-composer-permission-trigger {
+    @apply max-w-28 truncate px-1.5 text-xs;
+  }
+
+  .thread-composer-goal-trigger {
+    @apply px-1.5 text-xs;
+  }
+
+  .thread-composer-actions {
+    @apply gap-1;
+  }
+
+  .thread-composer-model-effort {
+    @apply max-w-36;
+  }
 }
 </style>
