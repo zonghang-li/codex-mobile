@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest'
 import { normalizeThreadGroupsV2, normalizeThreadMessagesV2, readThreadInProgressFromResponse } from './v2'
 import type { ThreadListResponse, ThreadReadResponse } from '../appServerDtos'
 
-function threadReadResponseWithContent(content: ThreadReadResponse['thread']['turns'][number]['items'][number][]): ThreadReadResponse {
+function threadReadResponseWithContent(content: unknown[]): ThreadReadResponse {
   return {
     thread: {
       id: 'thread-1',
@@ -19,7 +19,7 @@ function threadReadResponseWithContent(content: ThreadReadResponse['thread']['tu
         id: 'turn-1',
         status: 'completed',
         error: null,
-        items: content,
+        items: content as ThreadReadResponse['thread']['turns'][number]['items'],
       }],
     },
   }
@@ -321,8 +321,86 @@ Reply with &lt;/instructions&gt; and A &amp; B
       commandExecution: expect.objectContaining({
         command: 'sed -n 1,120p /tmp/skills/index/SKILL.md',
         displayLabel: 'Read Index skill',
+        commandActions: [{
+          type: 'read',
+          command: 'sed -n 1,120p /tmp/skills/index/SKILL.md',
+          name: 'Index skill',
+          path: '/tmp/skills/index/SKILL.md',
+        }],
+        activityCategories: ['read'],
       }),
     })
+  })
+
+  it('preserves newer Codex desktop activity items as typed readable rows', () => {
+    const messages = normalizeThreadMessagesV2(threadReadResponseWithContent([
+      {
+        type: 'subAgentActivity',
+        id: 'subagent-updated',
+        agentPath: '/root/updated_docs_coverage_review',
+        kind: 'interacted',
+      },
+      {
+        type: 'dynamicToolCall',
+        id: 'dynamic-tool',
+        tool: 'codegraph_explore',
+        status: 'completed',
+        arguments: { query: 'ThreadConversation' },
+      },
+      {
+        type: 'sleep',
+        id: 'sleep-1',
+        durationMs: 250,
+      },
+      {
+        type: 'imageGeneration',
+        id: 'generated-image',
+        result: 'aGVsbG8=',
+      },
+    ]))
+
+    expect(messages).toEqual([
+      expect.objectContaining({
+        id: 'subagent-updated',
+        messageType: 'subAgentActivity',
+        text: 'Updated docs coverage review',
+        activity: {
+          kind: 'subAgent',
+          label: 'Updated docs coverage review',
+          status: 'updated',
+          agentPath: '/root/updated_docs_coverage_review',
+        },
+      }),
+      expect.objectContaining({
+        id: 'dynamic-tool',
+        messageType: 'dynamicToolCall',
+        text: 'Used codegraph explore',
+        activity: {
+          kind: 'tool',
+          label: 'Used codegraph explore',
+          status: 'completed',
+        },
+      }),
+      expect.objectContaining({
+        id: 'sleep-1',
+        messageType: 'sleep',
+        text: 'Waited briefly',
+        activity: {
+          kind: 'status',
+          label: 'Waited briefly',
+        },
+      }),
+      expect.objectContaining({
+        id: 'generated-image',
+        messageType: 'imageGeneration',
+        text: 'Generated an image',
+        activity: {
+          kind: 'image',
+          label: 'Generated an image',
+        },
+      }),
+    ])
+    expect(messages[3]?.images).toEqual(['data:image/png;base64,aGVsbG8='])
   })
 
   it('normalizes non-command desktop activity items as readable event rows', () => {

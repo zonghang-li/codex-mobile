@@ -5,10 +5,12 @@ import {
   collectWorkspaceRootPathsForProjectRemoval,
   filterGroupsByWorkspaceRoots,
   findAdjacentThreadId,
+  isThreadNotFoundError,
   removeThreadFromGroups,
   isThreadUnreadByLastRead,
   useDesktopState,
 } from './useDesktopState'
+import { CodexApiError } from '../api/codexErrors'
 import type { UiMessage, UiProjectGroup } from '../types/codex'
 import type { WorkspaceRootsState } from '../api/codexGateway'
 
@@ -44,6 +46,33 @@ const gatewayMocks = vi.hoisted(() => ({
   startThreadTurn: vi.fn(),
   subscribeCodexNotifications: vi.fn(),
 }))
+
+describe('isThreadNotFoundError', () => {
+  it('treats inaccessible thread-read failures as stale routes', () => {
+    expect(isThreadNotFoundError(new CodexApiError('forbidden', {
+      code: 'http_error',
+      method: 'thread/read',
+      status: 403,
+    }))).toBe(true)
+    expect(isThreadNotFoundError(new CodexApiError('gone', {
+      code: 'http_error',
+      method: 'thread/read',
+      status: 410,
+    }))).toBe(true)
+    expect(isThreadNotFoundError(new Error('no rollout found for thread archived-thread'))).toBe(true)
+    expect(isThreadNotFoundError(new Error('thread is archived'))).toBe(true)
+    expect(isThreadNotFoundError(new Error('thread is not accessible'))).toBe(true)
+  })
+
+  it('does not hide unrelated transport failures', () => {
+    expect(isThreadNotFoundError(new CodexApiError('bad gateway', {
+      code: 'http_error',
+      method: 'thread/read',
+      status: 502,
+    }))).toBe(false)
+    expect(isThreadNotFoundError(new Error('network failed'))).toBe(false)
+  })
+})
 
 const pollingCleanups: Array<() => void> = []
 

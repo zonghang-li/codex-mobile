@@ -909,13 +909,24 @@ export async function sanitizeThreadTurnsInlinePayloads(method: string, result: 
         nextItems.push(item)
         continue
       }
-      const sanitizedItem = await sanitizeInlinePayloadDeep(item, {
+      let itemForSanitization: unknown = item
+      if (itemRecord.type === 'commandExecution' && typeof itemRecord.aggregatedOutput === 'string') {
+        const nextAggregatedOutput = truncateThreadCommandOutput(itemRecord.aggregatedOutput)
+        if (nextAggregatedOutput !== itemRecord.aggregatedOutput) {
+          itemForSanitization = {
+            ...itemRecord,
+            aggregatedOutput: nextAggregatedOutput,
+          }
+          itemChanged = true
+        }
+      }
+      const sanitizedItem = await sanitizeInlinePayloadDeep(itemForSanitization, {
         turnId,
         itemId,
         blockIndex: itemIndex + turnIndex,
       })
       if (!sanitizedItem.changed) {
-        nextItems.push(item)
+        nextItems.push(itemForSanitization)
         continue
       }
       itemChanged = true
@@ -3487,6 +3498,20 @@ type SessionRecoveredCommand = {
   durationMs: number | null
 }
 
+const THREAD_COMMAND_OUTPUT_LIMIT = 8 * 1024
+
+function truncateThreadCommandOutput(output: string): string {
+  if (output.length <= THREAD_COMMAND_OUTPUT_LIMIT) return output
+  const headLength = Math.floor(THREAD_COMMAND_OUTPUT_LIMIT / 2)
+  const tailLength = THREAD_COMMAND_OUTPUT_LIMIT - headLength
+  const omittedLength = output.length - THREAD_COMMAND_OUTPUT_LIMIT
+  return [
+    output.slice(0, headLength).trimEnd(),
+    `[output truncated: ${omittedLength} characters omitted from command output]`,
+    output.slice(-tailLength).trimStart(),
+  ].join('\n\n')
+}
+
 function parseExecCommandOutput(output: string): { exitCode: number | null; wallTime: number | null; cleanOutput: string } {
   let exitCode: number | null = null
   let wallTime: number | null = null
@@ -3613,7 +3638,7 @@ function buildSessionItemOrder(sessionLogRaw: string, turnIds: Set<string> | nul
       if (!existing) continue
       const rawOutput = typeof payload.output === 'string' ? payload.output : ''
       const parsed = parseExecCommandOutput(rawOutput)
-      existing.aggregatedOutput = parsed.cleanOutput
+      existing.aggregatedOutput = truncateThreadCommandOutput(parsed.cleanOutput)
       existing.exitCode = parsed.exitCode
       existing.durationMs = parsed.wallTime
       existing.status = parsed.exitCode === 0 || parsed.exitCode === null ? 'completed' : 'failed'

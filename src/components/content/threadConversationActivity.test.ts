@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import type { UiMessage } from '../../types/codex'
 import {
+  buildThreadActivitySegments,
   getHiddenCompletedActivityMessageIds,
   getTurnActivityMessagesForWorked,
   isThreadActivityMessage,
@@ -27,6 +28,10 @@ describe('thread conversation completed activity grouping', () => {
       'contextCompaction',
       'fileChange',
       'plan',
+      'subAgentActivity',
+      'dynamicToolCall',
+      'sleep',
+      'imageGeneration',
     ]
 
     for (const messageType of activityTypes) {
@@ -35,6 +40,141 @@ describe('thread conversation completed activity grouping', () => {
 
     expect(isThreadActivityMessage(message('assistant', 'assistant', 'final answer', 'agentMessage'))).toBe(false)
     expect(isThreadActivityMessage(message('user', 'user', 'prompt', 'userMessage'))).toBe(false)
+  })
+
+  it('derives ordered desktop-style reasoning, action summaries, and agent chips', () => {
+    const messages: UiMessage[] = [
+      message('reasoning-1', 'assistant', 'Closing the final review', 'reasoning'),
+      {
+        ...message('file-1', 'system', '', 'fileChange'),
+        fileChangeStatus: 'completed',
+        fileChanges: [{
+          path: 'src/App.vue',
+          operation: 'update',
+          diff: '',
+          addedLineCount: 1,
+          removedLineCount: 1,
+        }],
+      },
+      {
+        ...message('read-1', 'system', 'sed -n 1,80p src/App.vue', 'commandExecution'),
+        commandExecution: {
+          command: 'sed -n 1,80p src/App.vue',
+          cwd: '/tmp/project',
+          status: 'completed',
+          aggregatedOutput: '',
+          exitCode: 0,
+          activityCategories: ['read'],
+        },
+      },
+      {
+        ...message('run-1', 'system', 'pnpm test', 'commandExecution'),
+        commandExecution: {
+          command: 'pnpm test',
+          cwd: '/tmp/project',
+          status: 'completed',
+          aggregatedOutput: '',
+          exitCode: 0,
+          activityCategories: ['unknown'],
+        },
+      },
+      {
+        ...message('agent-1', 'system', 'Updated docs coverage review', 'subAgentActivity'),
+        activity: {
+          kind: 'subAgent',
+          label: 'Updated docs coverage review',
+          status: 'updated',
+          agentPath: '/root/updated_docs_coverage_review',
+        },
+      },
+    ]
+
+    expect(buildThreadActivitySegments(messages)).toEqual([
+      {
+        kind: 'reasoning',
+        id: 'reasoning-1',
+        label: 'Closing the final review',
+        sourceMessageIds: ['reasoning-1'],
+      },
+      {
+        kind: 'summary',
+        id: 'run-1',
+        label: 'Edited a file, read a file, ran a command',
+        sourceMessageIds: ['file-1', 'read-1', 'run-1'],
+      },
+      {
+        kind: 'subAgent',
+        id: 'agent-1',
+        label: 'Updated docs coverage review',
+        status: 'updated',
+        sourceMessageIds: ['agent-1'],
+      },
+    ])
+  })
+
+  it('uses stable plural grammar and does not combine activity across turn boundaries', () => {
+    const command = (
+      id: string,
+      category: 'read' | 'listFiles' | 'search' | 'unknown',
+    ): UiMessage => ({
+      ...message(id, 'system', id, 'commandExecution'),
+      commandExecution: {
+        command: id,
+        cwd: null,
+        status: 'completed',
+        aggregatedOutput: '',
+        exitCode: 0,
+        activityCategories: [category],
+      },
+    })
+    const fileChange = (id: string, paths: string[]): UiMessage => ({
+      ...message(id, 'system', '', 'fileChange'),
+      fileChangeStatus: 'completed',
+      fileChanges: paths.map((path) => ({
+        path,
+        operation: 'update' as const,
+        diff: '',
+        addedLineCount: 1,
+        removedLineCount: 0,
+      })),
+    })
+
+    expect(buildThreadActivitySegments([
+      fileChange('files', ['a.ts', 'b.ts']),
+      command('read-1', 'read'),
+      command('read-2', 'read'),
+      command('list-1', 'listFiles'),
+      command('search-1', 'search'),
+      command('run-1', 'unknown'),
+      command('run-2', 'unknown'),
+      message('user-2', 'user', 'continue', 'userMessage'),
+      command('read-3', 'read'),
+    ])).toEqual([
+      expect.objectContaining({
+        id: 'run-2',
+        label: 'Edited files, read files, listed files, searched files, ran commands',
+      }),
+      expect.objectContaining({
+        id: 'read-3',
+        label: 'Read a file',
+      }),
+    ])
+  })
+
+  it('removes desktop reasoning emphasis markers from compact activity labels', () => {
+    expect(buildThreadActivitySegments([
+      message(
+        'reasoning-markdown',
+        'assistant',
+        '**Planning diagnostic instrumentation**\n\n__Assessing socket failure causes__',
+        'reasoning',
+      ),
+    ])).toEqual([{
+      kind: 'reasoning',
+      id: 'reasoning-markdown',
+      label: 'Planning diagnostic instrumentation Assessing socket failure causes',
+      sourceMessageIds: ['reasoning-markdown'],
+    }])
   })
 
   it('folds completed turn activity under the worked separator without hiding the final answer', () => {

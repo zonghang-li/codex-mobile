@@ -135,10 +135,13 @@ function isCodexCliMissingError(error: unknown): boolean {
   return message.includes('Codex CLI is not available')
 }
 
-function isThreadNotFoundError(error: unknown): boolean {
-  if (error instanceof CodexApiError && error.status === 404) return true
+export function isThreadNotFoundError(error: unknown): boolean {
+  if (
+    error instanceof CodexApiError &&
+    (error.status === 404 || error.status === 403 || error.status === 410)
+  ) return true
   const message = error instanceof Error ? error.message : String(error ?? '')
-  return /\b404\b|thread.*not found|conversation.*not found|no such thread|no rollout found for thread id/i.test(message)
+  return /\b(?:404|403|410)\b|thread.*(?:not found|archived|inaccessible|not accessible)|conversation.*not found|no such thread|no rollout found for thread(?: id)?/i.test(message)
 }
 
 function loadReadStateMap(): Record<string, string> {

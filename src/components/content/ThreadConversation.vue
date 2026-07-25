@@ -26,7 +26,107 @@
         :data-role="message.role"
         :data-message-type="message.messageType || ''"
       >
-        <div v-if="isCommandMessage(message)" class="message-row" data-role="system">
+        <div v-if="readActivitySegment(message)" class="message-row" data-role="system">
+          <div class="message-stack codex-activity-stack" data-role="system">
+            <article
+              v-if="readActivitySegment(message)?.kind === 'subAgent'"
+              class="codex-agent-activity-row"
+            >
+              <span class="codex-agent-activity-chip">
+                <IconTablerGitFork class="icon-svg codex-agent-activity-icon" />
+                <span class="codex-agent-activity-label">{{ readActivitySegment(message)?.label }}</span>
+              </span>
+              <span v-if="activitySegmentAgentStatus(readActivitySegment(message))" class="codex-agent-activity-status">
+                {{ activitySegmentAgentStatus(readActivitySegment(message)) }}
+              </span>
+            </article>
+            <button
+              v-else-if="readActivitySegment(message)?.kind === 'summary' && activitySegmentCanExpand(readActivitySegment(message))"
+              type="button"
+              class="codex-activity-row codex-activity-button"
+              :class="{ 'codex-activity-row-expanded': isActivitySegmentExpanded(message.id) }"
+              @click="toggleActivitySegment(message.id)"
+            >
+              <IconTablerTerminal class="icon-svg codex-activity-icon" />
+              <span class="codex-activity-label">{{ readActivitySegment(message)?.label }}</span>
+              <span class="cmd-chevron" :class="{ 'cmd-chevron-open': isActivitySegmentExpanded(message.id) }">›</span>
+            </button>
+            <article
+              v-else
+              class="codex-activity-row"
+              :data-activity-kind="readActivitySegment(message)?.kind"
+            >
+              <IconTablerTerminal v-if="readActivitySegment(message)?.kind === 'summary'" class="icon-svg codex-activity-icon" />
+              <IconTablerSearch v-else-if="message.messageType === 'webSearch'" class="icon-svg codex-activity-icon" />
+              <IconTablerFilePencil v-else-if="message.messageType === 'imageView' || message.messageType === 'imageGeneration' || message.messageType === 'contextCompaction'" class="icon-svg codex-activity-icon" />
+              <IconTablerBolt v-else class="icon-svg codex-activity-icon" />
+              <span class="codex-activity-label">{{ readActivitySegment(message)?.label }}</span>
+            </article>
+
+            <div
+              v-if="readActivitySegment(message)?.kind === 'summary'"
+              class="cmd-group-wrap codex-activity-details"
+              :class="{ 'cmd-group-visible': isActivitySegmentExpanded(message.id) }"
+            >
+              <div class="cmd-group-inner">
+                <div
+                  v-for="cmd in activitySegmentCommands(readActivitySegment(message))"
+                  :key="`activity-cmd-${cmd.id}`"
+                  class="worked-cmd-item"
+                >
+                  <button
+                    type="button"
+                    class="cmd-row cmd-compact"
+                    :class="[commandStatusClass(cmd), { 'cmd-expanded': isCommandExpanded(cmd) }]"
+                    @click="toggleCommandExpand(cmd)"
+                  >
+                    <IconTablerTerminal class="icon-svg cmd-icon" />
+                    <span class="cmd-label">{{ commandDisplayLabel(cmd) }}</span>
+                    <span class="cmd-status">{{ commandStatusLabel(cmd) }}</span>
+                    <span class="cmd-chevron" :class="{ 'cmd-chevron-open': isCommandExpanded(cmd) }">›</span>
+                  </button>
+                  <div class="cmd-output-wrap" :class="{ 'cmd-output-visible': isCommandExpanded(cmd) }">
+                    <div class="cmd-output-inner">
+                      <pre
+                        class="cmd-output"
+                        :class="{ 'cmd-output-condensed': isCommandOutputCondensed(cmd) }"
+                        v-text="cmd.commandExecution?.aggregatedOutput || '(no output)'"
+                      ></pre>
+                    </div>
+                  </div>
+                </div>
+                <article
+                  v-for="fileActivity in activitySegmentFileChanges(readActivitySegment(message))"
+                  :key="`activity-file-${fileActivity.id}`"
+                  class="codex-activity-row codex-activity-detail-row"
+                >
+                  <IconTablerFilePencil class="icon-svg codex-activity-icon" />
+                  <span class="codex-activity-label">{{ activityMessageLabel(fileActivity) }}</span>
+                </article>
+              </div>
+            </div>
+
+            <ul
+              v-if="message.images && message.images.length > 0"
+              class="codex-activity-image-list"
+              :data-role="message.role"
+            >
+              <li v-for="imageUrl in message.images" :key="imageUrl" class="message-image-item">
+                <button class="message-image-button" type="button" @click="openImageModal(imageUrl)">
+                  <img
+                    class="message-image-preview"
+                    :class="{ 'message-generated-image-preview': message.messageType === 'imageGeneration' }"
+                    :src="imageUrl"
+                    alt="Message image preview"
+                    loading="lazy"
+                  />
+                </button>
+              </li>
+            </ul>
+          </div>
+        </div>
+
+        <div v-else-if="isCommandMessage(message)" class="message-row" data-role="system">
           <div class="message-stack" data-role="system">
             <button
               v-if="getGroupedCommandsForLatest(message).length > 0"
@@ -315,47 +415,67 @@
                   </button>
                   <div v-if="isWorkedExpanded(message)" class="worked-details">
                     <div
-                      v-for="activity in getTurnActivityMessagesForWorked(messages, messages.indexOf(message))"
-                      :key="`worked-activity-${activity.id}`"
+                      v-for="segment in getTurnActivitySegmentsForWorked(messages, messages.indexOf(message))"
+                      :key="`worked-activity-${segment.id}`"
                       class="worked-activity-item"
                     >
+                      <article v-if="segment.kind === 'subAgent'" class="codex-agent-activity-row">
+                        <span class="codex-agent-activity-chip">
+                          <IconTablerGitFork class="icon-svg codex-agent-activity-icon" />
+                          <span class="codex-agent-activity-label">{{ segment.label }}</span>
+                        </span>
+                        <span v-if="segment.status" class="codex-agent-activity-status">{{ segment.status }}</span>
+                      </article>
                       <button
-                        v-if="isCommandMessage(activity)"
+                        v-else-if="segment.kind === 'summary' && activitySegmentCanExpand(segment)"
                         type="button"
-                        class="cmd-row"
-                        :class="[
-                          commandStatusClass(activity),
-                          {
-                            'cmd-expanded': isCommandExpanded(activity),
-                            'cmd-compact': isCommandCompact(activity),
-                          },
-                        ]"
-                        @click="toggleCommandExpand(activity)"
+                        class="codex-activity-row codex-activity-button"
+                        :class="{ 'codex-activity-row-expanded': isActivitySegmentExpanded(segment.id) }"
+                        @click="toggleActivitySegment(segment.id)"
                       >
-                        <IconTablerTerminal class="icon-svg cmd-icon" />
-                        <span class="cmd-label">{{ commandDisplayLabel(activity) }}</span>
-                        <span class="cmd-status">{{ commandStatusLabel(activity) }}</span>
-                        <span class="cmd-chevron" :class="{ 'cmd-chevron-open': isCommandExpanded(activity) }">›</span>
+                        <IconTablerTerminal class="icon-svg codex-activity-icon" />
+                        <span class="codex-activity-label">{{ segment.label }}</span>
+                        <span class="cmd-chevron" :class="{ 'cmd-chevron-open': isActivitySegmentExpanded(segment.id) }">›</span>
                       </button>
+                      <article v-else class="codex-activity-row" :data-activity-kind="segment.kind">
+                        <IconTablerTerminal v-if="segment.kind === 'summary'" class="icon-svg codex-activity-icon" />
+                        <IconTablerBolt v-else class="icon-svg codex-activity-icon" />
+                        <span class="codex-activity-label">{{ segment.label }}</span>
+                      </article>
                       <div
-                        v-if="isCommandMessage(activity)"
-                        class="cmd-output-wrap"
-                        :class="{ 'cmd-output-visible': isCommandExpanded(activity) }"
+                        v-if="segment.kind === 'summary'"
+                        class="cmd-group-wrap codex-activity-details"
+                        :class="{ 'cmd-group-visible': isActivitySegmentExpanded(segment.id) }"
                       >
-                        <div class="cmd-output-inner">
-                          <pre
-                            class="cmd-output"
-                            :class="{ 'cmd-output-condensed': isCommandOutputCondensed(activity) }"
-                            v-text="activity.commandExecution?.aggregatedOutput || '(no output)'"
-                          ></pre>
+                        <div class="cmd-group-inner">
+                          <div
+                            v-for="cmd in activitySegmentCommands(segment)"
+                            :key="`worked-activity-cmd-${cmd.id}`"
+                            class="worked-cmd-item"
+                          >
+                            <button
+                              type="button"
+                              class="cmd-row cmd-compact"
+                              :class="[commandStatusClass(cmd), { 'cmd-expanded': isCommandExpanded(cmd) }]"
+                              @click="toggleCommandExpand(cmd)"
+                            >
+                              <IconTablerTerminal class="icon-svg cmd-icon" />
+                              <span class="cmd-label">{{ commandDisplayLabel(cmd) }}</span>
+                              <span class="cmd-status">{{ commandStatusLabel(cmd) }}</span>
+                              <span class="cmd-chevron" :class="{ 'cmd-chevron-open': isCommandExpanded(cmd) }">›</span>
+                            </button>
+                            <div class="cmd-output-wrap" :class="{ 'cmd-output-visible': isCommandExpanded(cmd) }">
+                              <div class="cmd-output-inner">
+                                <pre
+                                  class="cmd-output"
+                                  :class="{ 'cmd-output-condensed': isCommandOutputCondensed(cmd) }"
+                                  v-text="cmd.commandExecution?.aggregatedOutput || '(no output)'"
+                                ></pre>
+                              </div>
+                            </div>
+                          </div>
                         </div>
                       </div>
-                      <article v-else class="codex-activity-row" :data-activity-type="activity.messageType || ''">
-                        <IconTablerSearch v-if="activityIconKind(activity) === 'search'" class="icon-svg codex-activity-icon" />
-                        <IconTablerFilePencil v-else-if="activityIconKind(activity) === 'file'" class="icon-svg codex-activity-icon" />
-                        <IconTablerBolt v-else class="icon-svg codex-activity-icon" />
-                        <span class="codex-activity-label">{{ activityMessageLabel(activity) }}</span>
-                      </article>
                     </div>
                   </div>
                 </div>
@@ -1028,9 +1148,11 @@ import {
   latestThreadRenderWindowStart,
 } from './threadConversationWindow'
 import {
+  buildThreadActivitySegments,
   getHiddenCompletedActivityMessageIds,
-  getTurnActivityMessagesForWorked,
+  getTurnActivitySegmentsForWorked,
   isThreadActivityMessage,
+  type ThreadActivitySegment,
 } from './threadConversationActivity'
 import { splitDisplayMathSpans } from './displayMath'
 import { splitInlineMathSpans } from './inlineMath'
@@ -1058,6 +1180,7 @@ type HighlightJsModule = (typeof import('highlight.js/lib/common'))['default']
 
 const expandedCommandIds = ref<Set<string>>(new Set())
 const collapsedAutoCommandIds = ref<Set<string>>(new Set())
+const expandedActivitySegmentIds = ref<Set<string>>(new Set())
 const expandedCommandGroupIds = ref<Set<string>>(new Set())
 const expandedWorkedIds = ref<Set<string>>(new Set())
 const expandedFileChangeSummaryIds = ref<Set<string>>(new Set())
@@ -1250,6 +1373,72 @@ const hasLiveAssistantText = computed(() =>
 const isLiveTurnRuntime = computed(() =>
   Boolean(props.liveOverlay) || activeCommandMessageId.value.length > 0 || hasLiveAssistantText.value,
 )
+
+const activitySegments = computed(() => buildThreadActivitySegments(props.messages))
+
+const activitySegmentByAnchorId = computed<Record<string, ThreadActivitySegment>>(() => {
+  const next: Record<string, ThreadActivitySegment> = {}
+  for (const segment of activitySegments.value) {
+    next[segment.id] = segment
+  }
+  return next
+})
+
+const activityMessageById = computed<Record<string, UiMessage>>(() => {
+  const next: Record<string, UiMessage> = {}
+  for (const message of props.messages) {
+    next[message.id] = message
+  }
+  return next
+})
+
+const hiddenActivitySegmentSourceIds = computed(() => {
+  const next = new Set<string>()
+  for (const segment of activitySegments.value) {
+    for (const messageId of segment.sourceMessageIds) {
+      if (messageId !== segment.id) next.add(messageId)
+    }
+  }
+  return next
+})
+
+function readActivitySegment(message: UiMessage): ThreadActivitySegment | null {
+  return activitySegmentByAnchorId.value[message.id] ?? null
+}
+
+function activitySegmentMessages(segment: ThreadActivitySegment | null): UiMessage[] {
+  if (!segment) return []
+  return segment.sourceMessageIds
+    .map((id) => activityMessageById.value[id])
+    .filter((message): message is UiMessage => Boolean(message))
+}
+
+function activitySegmentCommands(segment: ThreadActivitySegment | null): UiMessage[] {
+  return activitySegmentMessages(segment).filter((message) => isCommandMessage(message))
+}
+
+function activitySegmentFileChanges(segment: ThreadActivitySegment | null): UiMessage[] {
+  return activitySegmentMessages(segment).filter((message) => isFileChangeMessage(message))
+}
+
+function activitySegmentCanExpand(segment: ThreadActivitySegment | null): boolean {
+  return activitySegmentCommands(segment).length > 0 || activitySegmentFileChanges(segment).length > 0
+}
+
+function activitySegmentAgentStatus(segment: ThreadActivitySegment | null): string {
+  return segment?.kind === 'subAgent' ? segment.status ?? '' : ''
+}
+
+function isActivitySegmentExpanded(segmentId: string): boolean {
+  return expandedActivitySegmentIds.value.has(segmentId)
+}
+
+function toggleActivitySegment(segmentId: string): void {
+  const next = new Set(expandedActivitySegmentIds.value)
+  if (next.has(segmentId)) next.delete(segmentId)
+  else next.add(segmentId)
+  expandedActivitySegmentIds.value = next
+}
 
 const groupedCommandsByLatestId = computed<Record<string, UiMessage[]>>(() => {
   const next: Record<string, UiMessage[]> = {}
@@ -2179,6 +2368,7 @@ const renderableMessages = computed(() => filterRenderableThreadMessages(
   hiddenGroupedCommandIds.value,
   hiddenFileChangeMessageIds.value,
   hiddenCompletedActivityMessageIds.value,
+  hiddenActivitySegmentSourceIds.value,
 ))
 const effectiveRenderWindowStart = computed(() => clampThreadRenderWindowStart(
   renderWindowStart.value,
@@ -4583,6 +4773,10 @@ watch(
       expandedCommandGroupIds.value,
       new Set(Object.keys(groupedCommandsByLatestId.value)),
     )
+    expandedActivitySegmentIds.value = pruneCommandIdSet(
+      expandedActivitySegmentIds.value,
+      new Set(activitySegments.value.map((segment) => segment.id)),
+    )
     expandedFileChangeSummaryIds.value = pruneCommandIdSet(
       expandedFileChangeSummaryIds.value,
       new Set([
@@ -4758,7 +4952,7 @@ onBeforeUnmount(() => {
 }
 
 .conversation-list {
-  @apply h-full min-h-0 list-none m-0 px-2 sm:px-6 py-0 overflow-y-auto overflow-x-visible flex flex-col gap-2 sm:gap-3;
+  @apply h-full min-h-0 min-w-0 max-w-full list-none m-0 px-2 sm:px-6 py-0 overflow-y-auto overflow-x-hidden flex flex-col gap-2 sm:gap-3;
 }
 
 .conversation-load-more {
@@ -5207,7 +5401,7 @@ onBeforeUnmount(() => {
 }
 
 .message-text {
-  @apply m-0 text-base leading-8 whitespace-pre-wrap break-words text-slate-900;
+  @apply m-0 text-[15px] leading-6 whitespace-pre-wrap break-words text-slate-900;
   overflow-wrap: anywhere;
 }
 
@@ -5245,7 +5439,7 @@ onBeforeUnmount(() => {
 }
 
 .message-list {
-  @apply m-0 pl-5 text-base leading-8 text-slate-900 flex flex-col gap-1.5;
+  @apply m-0 pl-5 text-[15px] leading-6 text-slate-900 flex flex-col gap-1.5;
 }
 
 .message-list-unordered {
@@ -5336,7 +5530,7 @@ onBeforeUnmount(() => {
 }
 
 .message-code-block {
-  @apply overflow-hidden rounded-xl border border-slate-200 bg-slate-950 text-slate-100;
+  @apply min-w-0 max-w-full overflow-hidden rounded-xl border border-slate-200 bg-slate-950 text-slate-100;
 }
 
 .message-code-language {
@@ -5451,7 +5645,43 @@ onBeforeUnmount(() => {
 }
 
 .codex-activity-row {
-  @apply flex w-full max-w-[min(var(--chat-card-max,76ch),100%)] items-center gap-2 px-0 py-1 text-left text-sm font-medium leading-6 text-zinc-500;
+  @apply flex w-full max-w-[min(var(--chat-card-max,76ch),100%)] items-center gap-2 px-0 py-1 text-left text-[14px] font-medium leading-[22px] text-zinc-500;
+}
+
+.codex-activity-stack {
+  @apply min-w-0;
+}
+
+.codex-activity-button {
+  @apply cursor-pointer border-0 bg-transparent transition hover:text-zinc-700;
+}
+
+.codex-activity-details {
+  @apply w-full max-w-[min(var(--chat-card-max,76ch),100%)];
+}
+
+.codex-activity-detail-row {
+  @apply pl-2;
+}
+
+.codex-agent-activity-row {
+  @apply flex w-full max-w-[min(var(--chat-card-max,76ch),100%)] min-w-0 items-center gap-2 py-1 text-[14px] leading-[22px] text-zinc-500;
+}
+
+.codex-agent-activity-chip {
+  @apply inline-flex min-w-0 items-center gap-2 rounded-full border border-zinc-200 bg-zinc-50 px-3 py-1;
+}
+
+.codex-agent-activity-icon {
+  @apply h-4 w-4 shrink-0 text-amber-500;
+}
+
+.codex-agent-activity-label {
+  @apply min-w-0 truncate font-medium;
+}
+
+.codex-agent-activity-status {
+  @apply shrink-0 text-xs text-zinc-400;
 }
 
 .codex-activity-icon,
@@ -5506,7 +5736,7 @@ onBeforeUnmount(() => {
 }
 
 .cmd-row.cmd-compact .cmd-label {
-  font-size: 0.75rem;
+  font-size: 0.8125rem;
 }
 
 .cmd-row.cmd-compact .cmd-status {
@@ -5527,11 +5757,11 @@ onBeforeUnmount(() => {
 }
 
 .cmd-label {
-  @apply flex-1 min-w-0 truncate text-sm font-medium text-zinc-500;
+  @apply flex-1 min-w-0 truncate text-[13px] font-medium leading-5 text-zinc-500;
 }
 
 .cmd-group-label {
-  @apply flex-1 min-w-0 truncate text-sm font-medium text-zinc-500;
+  @apply flex-1 min-w-0 truncate text-[13px] font-medium leading-5 text-zinc-500;
 }
 
 .cmd-status {
@@ -5584,7 +5814,7 @@ onBeforeUnmount(() => {
 }
 
 .cmd-output {
-  @apply m-0 px-3 py-2 text-xs font-mono text-zinc-200 whitespace-pre-wrap break-words max-h-60 overflow-y-auto;
+  @apply m-0 px-3 py-2 text-[13px] leading-5 font-mono text-zinc-200 whitespace-pre-wrap break-words max-h-60 overflow-y-auto;
 }
 
 .cmd-output.cmd-output-condensed {
@@ -5730,6 +5960,14 @@ onBeforeUnmount(() => {
 
 :global(.dark) .codex-activity-row {
   @apply text-zinc-500;
+}
+
+:global(.dark) .codex-activity-button {
+  @apply hover:text-zinc-300;
+}
+
+:global(.dark) .codex-agent-activity-chip {
+  @apply border-zinc-800 bg-zinc-900 text-zinc-300;
 }
 
 :global(.dark) .worked-separator-line {
