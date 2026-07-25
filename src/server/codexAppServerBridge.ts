@@ -241,6 +241,8 @@ const THREAD_TURN_PAGE_READ_CACHE_TTL_MS = 30_000
 const THREAD_METHODS_WITH_TURNS = new Set(['thread/read', 'thread/resume', 'thread/fork', 'thread/rollback'])
 const THREAD_METHODS_WITH_THREAD_SNAPSHOT = new Set([...THREAD_METHODS_WITH_TURNS, 'thread/start'])
 const THREAD_SEARCH_FULL_TEXT_THREAD_LIMIT = 100
+const MOBILE_APPROVAL_POLICY = 'never'
+const MOBILE_TURN_SANDBOX_POLICY = { type: 'dangerFullAccess' } as const
 const PROJECTLESS_THREAD_DIRECTORY_MAX_ATTEMPTS = 100
 const PROJECTLESS_THREAD_READABLE_DIRECTORY_ATTEMPTS = 20
 const PROJECTLESS_THREAD_SLUG_MAX_LENGTH = 80
@@ -427,7 +429,12 @@ export function mergeSessionSkillInputsIntoTurns(turns: unknown[], sessionLogRaw
   return mergeSessionSkillInputsIntoTurnsFromMap(turns, buildSessionSkillInputsByTurn(sessionLogRaw))
 }
 
-async function mergeSessionSkillInputsIntoThreadResult(result: unknown): Promise<unknown> {
+function mergeSessionRecoveredItemsIntoTurns(turns: unknown[], sessionLogRaw: string): unknown[] {
+  const skillMergedTurns = mergeSessionSkillInputsIntoTurns(turns, sessionLogRaw)
+  return mergeSessionCommandsIntoTurns(skillMergedTurns, sessionLogRaw)
+}
+
+async function mergeSessionRecoveredItemsIntoThreadResult(result: unknown): Promise<unknown> {
   const record = asRecord(result)
   const thread = asRecord(record?.thread)
   const turns = Array.isArray(thread?.turns) ? thread.turns : null
@@ -437,8 +444,9 @@ async function mergeSessionSkillInputsIntoThreadResult(result: unknown): Promise
   }
 
   try {
-    const skillsByTurnId = await readCachedSessionSkillInputsByTurn(sessionPath)
-    const mergedTurns = mergeSessionSkillInputsIntoTurnsFromMap(turns, skillsByTurnId)
+    const recoveredItems = await readCachedSessionRecoveredItems(sessionPath)
+    const skillMergedTurns = mergeSessionSkillInputsIntoTurnsFromMap(turns, recoveredItems.skillsByTurnId)
+    const mergedTurns = mergeSessionCommandsIntoTurns(skillMergedTurns, '', recoveredItems.orderByTurnId)
     if (mergedTurns === turns) return result
     return {
       ...record,
@@ -456,7 +464,7 @@ export async function applySessionSkillEnrichmentForRpc(
   method: string,
   skipSessionSkillEnrichment: boolean,
   result: unknown,
-  enrich: (value: unknown) => Promise<unknown> = mergeSessionSkillInputsIntoThreadResult,
+  enrich: (value: unknown) => Promise<unknown> = mergeSessionRecoveredItemsIntoThreadResult,
 ): Promise<unknown> {
   if (!THREAD_METHODS_WITH_TURNS.has(method) || skipSessionSkillEnrichment) return result
   return enrich(result)
@@ -1009,13 +1017,28 @@ export async function augmentThreadResultWithExternalRuntime(
   if (method === 'thread/list') {
     const record = asRecord(result)
     const rows = Array.isArray(record?.data) ? record.data : []
+    const threadIds: string[] = []
     for (const row of rows) {
       const thread = asRecord(row)
       const threadId = readNonEmptyString(thread?.id)
       const rolloutPath = readNonEmptyString(thread?.path)
-      if (threadId && rolloutPath) runtimeProbe.registerThread(threadId, rolloutPath)
+      if (!threadId || !rolloutPath) continue
+      runtimeProbe.registerThread(threadId, rolloutPath)
+      threadIds.push(threadId)
     }
-    return result
+    if (threadIds.length === 0) return result
+    const runtimeByThreadId = await runtimeProbe.inspectMany(threadIds, excludedPid)
+    return {
+      ...record,
+      data: rows.map((row) => {
+        const thread = asRecord(row)
+        const threadId = readNonEmptyString(thread?.id)
+        const externalRuntime = threadId ? runtimeByThreadId[threadId] : undefined
+        return thread && externalRuntime
+          ? { ...thread, externalRuntime }
+          : row
+      }),
+    }
   }
   if (method !== 'thread/read' && method !== 'thread/resume') return result
   const record = asRecord(result)
@@ -3509,7 +3532,16 @@ type SessionItemSlot = {
   fileChange?: SessionRecoveredFileChangeItem
 }
 
-function buildSessionItemOrder(sessionLogRaw: string, turnIds: Set<string>): Map<string, SessionItemSlot[]> {
+type SessionRecoveredItemsCacheEntry = {
+  size: number
+  mtimeMs: number
+  skillsByTurnId: Map<string, SessionRecoveredSkillInput[]>
+  orderByTurnId: Map<string, SessionItemSlot[]>
+}
+
+const sessionRecoveredItemsCache = new Map<string, SessionRecoveredItemsCacheEntry>()
+
+function buildSessionItemOrder(sessionLogRaw: string, turnIds: Set<string> | null): Map<string, SessionItemSlot[]> {
   let currentTurnId = ''
   const orderByTurnId = new Map<string, SessionItemSlot[]>()
   const callIdToCommand = new Map<string, SessionRecoveredCommand>()
@@ -3536,7 +3568,7 @@ function buildSessionItemOrder(sessionLogRaw: string, turnIds: Set<string>): Map
       continue
     }
 
-    if (row.type !== 'response_item' || !currentTurnId || !turnIds.has(currentTurnId)) continue
+    if (row.type !== 'response_item' || !currentTurnId || (turnIds && !turnIds.has(currentTurnId))) continue
     const payload = asRecord(row.payload)
     if (!payload) continue
 
@@ -3607,6 +3639,28 @@ function buildSessionItemOrder(sessionLogRaw: string, turnIds: Set<string>): Map
   }
 
   return orderByTurnId
+}
+
+async function readCachedSessionRecoveredItems(sessionPath: string): Promise<SessionRecoveredItemsCacheEntry> {
+  const sessionStat = await stat(sessionPath)
+  const cached = sessionRecoveredItemsCache.get(sessionPath)
+  if (cached && cached.size === sessionStat.size && cached.mtimeMs === sessionStat.mtimeMs) {
+    return cached
+  }
+
+  const sessionLogRaw = await readFile(sessionPath, 'utf8')
+  const entry: SessionRecoveredItemsCacheEntry = {
+    size: sessionStat.size,
+    mtimeMs: sessionStat.mtimeMs,
+    skillsByTurnId: buildSessionSkillInputsByTurn(sessionLogRaw),
+    orderByTurnId: buildSessionItemOrder(sessionLogRaw, null),
+  }
+  sessionRecoveredItemsCache.set(sessionPath, entry)
+  if (sessionRecoveredItemsCache.size > SESSION_SKILL_INPUT_CACHE_LIMIT) {
+    const oldestKey = sessionRecoveredItemsCache.keys().next().value
+    if (oldestKey) sessionRecoveredItemsCache.delete(oldestKey)
+  }
+  return entry
 }
 
 function extractFilePathsFromCommand(cmd: string, cwd: string): string[] {
@@ -4078,7 +4132,11 @@ async function revertTurnFileChanges(
   return { reverted, errors, revertedPatchIds }
 }
 
-function mergeSessionCommandsIntoTurns(turns: unknown[], sessionLogRaw: string): unknown[] {
+function mergeSessionCommandsIntoTurns(
+  turns: unknown[],
+  sessionLogRaw: string,
+  cachedOrderByTurnId?: Map<string, SessionItemSlot[]>,
+): unknown[] {
   const turnIds = new Set<string>()
   for (const turn of turns) {
     const turnRecord = asRecord(turn)
@@ -4088,7 +4146,7 @@ function mergeSessionCommandsIntoTurns(turns: unknown[], sessionLogRaw: string):
 
   if (turnIds.size === 0) return turns
 
-  const orderByTurnId = buildSessionItemOrder(sessionLogRaw, turnIds)
+  const orderByTurnId = cachedOrderByTurnId ?? buildSessionItemOrder(sessionLogRaw, turnIds)
   if (orderByTurnId.size === 0) return turns
 
   return turns.map((turn) => {
@@ -4101,39 +4159,67 @@ function mergeSessionCommandsIntoTurns(turns: unknown[], sessionLogRaw: string):
     if (!slots || slots.length === 0) return turn
 
     const existingItems = Array.isArray(turnRecord.items) ? (turnRecord.items as Record<string, unknown>[]) : []
-    const alreadyHasRecoveredItems = existingItems.some((it) => it.type === 'commandExecution' || it.type === 'fileChange')
+    const alreadyHasRecoveredItems = existingItems.some((it) => {
+      const id = readNonEmptyString(it.id)
+      return id.startsWith('session-cmd-') || id.startsWith('session-fc-')
+    })
     if (alreadyHasRecoveredItems) return turn
 
-    const agentMessages = existingItems.filter((it) => it.type === 'agentMessage')
-    const nonAgentNonUserItems = existingItems.filter((it) => it.type !== 'agentMessage' && it.type !== 'userMessage')
-    const userMessages = existingItems.filter((it) => it.type === 'userMessage')
+    const existingIds = new Set(
+      existingItems
+        .map((it) => readNonEmptyString(it.id))
+        .filter((id): id is string => !!id),
+    )
 
-    let agentIdx = 0
-    const interleaved: Record<string, unknown>[] = [...userMessages]
+    const nextItems: Record<string, unknown>[] = []
+    let slotIndex = 0
 
-    for (const slot of slots) {
-      if (slot.type === 'agentMessage') {
-        if (agentIdx < agentMessages.length) {
-          interleaved.push(agentMessages[agentIdx]!)
-          agentIdx++
-        }
-      } else if (slot.type === 'commandExecution' && slot.command) {
-        interleaved.push(slot.command as unknown as Record<string, unknown>)
+    const appendRecoveredSlot = (slot: SessionItemSlot): void => {
+      let recovered: Record<string, unknown> | null = null
+      if (slot.type === 'commandExecution' && slot.command) {
+        recovered = slot.command as unknown as Record<string, unknown>
       } else if (slot.type === 'fileChange' && slot.fileChange) {
-        interleaved.push(slot.fileChange as unknown as Record<string, unknown>)
+        recovered = slot.fileChange as unknown as Record<string, unknown>
+      }
+
+      if (!recovered) return
+      const recoveredId = readNonEmptyString(recovered.id)
+      if (recoveredId && existingIds.has(recoveredId)) return
+      if (recoveredId) existingIds.add(recoveredId)
+      nextItems.push(recovered)
+    }
+
+    const flushRecoveredUntilNextAgentMessage = (): void => {
+      while (slotIndex < slots.length && slots[slotIndex]?.type !== 'agentMessage') {
+        appendRecoveredSlot(slots[slotIndex]!)
+        slotIndex += 1
       }
     }
 
-    while (agentIdx < agentMessages.length) {
-      interleaved.push(agentMessages[agentIdx]!)
-      agentIdx++
+    for (const item of existingItems) {
+      if (item.type === 'agentMessage') {
+        flushRecoveredUntilNextAgentMessage()
+        nextItems.push(item)
+        if (slots[slotIndex]?.type === 'agentMessage') {
+          slotIndex += 1
+        }
+        flushRecoveredUntilNextAgentMessage()
+      } else {
+        nextItems.push(item)
+      }
     }
 
-    interleaved.push(...nonAgentNonUserItems)
+    while (slotIndex < slots.length) {
+      const slot = slots[slotIndex]!
+      if (slot.type !== 'agentMessage') appendRecoveredSlot(slot)
+      slotIndex += 1
+    }
+
+    if (nextItems.length === existingItems.length) return turn
 
     return {
       ...turnRecord,
-      items: interleaved,
+      items: nextItems,
     }
   })
 }
@@ -7328,6 +7414,8 @@ export class BackendQueueProcessor {
     const params: Record<string, unknown> = {
       threadId: turn.threadId,
       input,
+      approvalPolicy: MOBILE_APPROVAL_POLICY,
+      sandboxPolicy: MOBILE_TURN_SANDBOX_POLICY,
     }
     if (dedupedFileAttachments.length > 0) {
       params.attachments = dedupedFileAttachments.map((f) => ({ label: f.label, path: f.path, fsPath: f.fsPath }))
@@ -8295,7 +8383,7 @@ export function createCodexBridgeMiddleware(options: {
             },
           }
           const sanitized = await sanitizeThreadTurnsInlinePayloads('thread/read', pagedResult)
-          const result = await mergeSessionSkillInputsIntoThreadResult(sanitized)
+          const result = await mergeSessionRecoveredItemsIntoThreadResult(sanitized)
 
           setJson(res, 200, {
             result,
@@ -8357,16 +8445,55 @@ export function createCodexBridgeMiddleware(options: {
         }
 
         try {
-          const threadReadResult = mergeStreamTurnErrorsIntoThreadResult(appServer, await appServer.rpc('thread/read', {
+          let precheckedExternalRuntime: unknown | null = null
+          const lastSnapshot = appServer.getLastThreadReadSnapshot(threadId)
+          if (lastSnapshot) {
+            const snapshotRecord = asRecord(lastSnapshot)
+            const snapshotThread = asRecord(snapshotRecord?.thread)
+            const snapshotTurns = Array.isArray(snapshotThread?.turns) ? snapshotThread.turns : []
+            const snapshotSessionPath = readNonEmptyString(snapshotThread?.path)
+            let snapshotSessionSize = 0
+            if (snapshotSessionPath && isAbsolute(snapshotSessionPath)) {
+              runtimeProbe.registerThread(threadId, snapshotSessionPath)
+              try {
+                const s = await stat(snapshotSessionPath)
+                snapshotSessionSize = s.size
+              } catch { /* missing */ }
+            }
+            const externalRuntime = await runtimeProbe.inspect(threadId, appServer.getPid())
+            precheckedExternalRuntime = externalRuntime
+            const cached = asRecord(appServer.getCachedLiveState(
+              threadId,
+              snapshotTurns.length,
+              snapshotSessionSize,
+            ))
+            const cachedExternalRuntime = asRecord(cached?.externalRuntime)
+            if (
+              asRecord(externalRuntime)?.state === 'running'
+              && cached?.isInProgress === true
+              && cachedExternalRuntime?.state === 'running'
+            ) {
+              setJson(res, 200, cached)
+              return
+            }
+          }
+
+          const rawThreadReadResult = await appServer.rpc('thread/read', {
             threadId,
             includeTurns: true,
-          }))
+          })
+          const trimmedThreadReadResult = trimThreadTurnsInRpcResult('thread/read', rawThreadReadResult)
+          const threadReadResult = mergeStreamTurnErrorsIntoThreadResult(appServer, trimmedThreadReadResult)
           const sanitized = await sanitizeThreadTurnsInlinePayloads('thread/read', threadReadResult)
           appServer.storeThreadReadSnapshot(threadId, sanitized)
 
           const record = asRecord(sanitized)
           const thread = asRecord(record?.thread)
           const rawTurns = Array.isArray(thread?.turns) ? thread.turns : []
+          const threadTurnStartIndexRaw = record?.threadTurnStartIndex
+          const threadTurnStartIndex = Math.max(0, Math.floor(
+            typeof threadTurnStartIndexRaw === 'number' ? threadTurnStartIndexRaw : 0,
+          ))
 
           const sessionPath = readNonEmptyString(thread?.path)
           runtimeProbe.registerThread(threadId, sessionPath)
@@ -8382,8 +8509,8 @@ export function createCodexBridgeMiddleware(options: {
 
           if (sessionPath && isAbsolute(sessionPath) && sessionSize > 0) {
             try {
-              const sessionLogRaw = await readFile(sessionPath, 'utf8')
-              turns = mergeSessionCommandsIntoTurns(turns, sessionLogRaw)
+              const recoveredItems = await readCachedSessionRecoveredItems(sessionPath)
+              turns = mergeSessionCommandsIntoTurns(turns, '', recoveredItems.orderByTurnId)
             } catch {
               // Session log not available — continue without command recovery
             }
@@ -8393,7 +8520,7 @@ export function createCodexBridgeMiddleware(options: {
           const isLocallyInProgress = lastTurn?.status === 'inProgress'
           const externalRuntime = isLocallyInProgress
             ? { state: 'unknown' }
-            : await runtimeProbe.inspect(threadId, appServer.getPid())
+            : precheckedExternalRuntime ?? await runtimeProbe.inspect(threadId, appServer.getPid())
           const isExternalInProgress = asRecord(externalRuntime)?.state === 'running'
           const cached = isExternalInProgress
             ? null
@@ -8406,6 +8533,8 @@ export function createCodexBridgeMiddleware(options: {
 
           const responseData = {
             threadId,
+            threadTurnStartIndex,
+            hasMoreOlder: threadTurnStartIndex > 0,
             conversationState: {
               turns,
             },
@@ -8415,7 +8544,7 @@ export function createCodexBridgeMiddleware(options: {
             externalRuntime,
           }
 
-          if (!isInProgress) {
+          if (!isLocallyInProgress) {
             appServer.cacheLiveState(threadId, responseData, rawTurns.length, sessionSize)
           }
 

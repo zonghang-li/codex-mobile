@@ -11,6 +11,7 @@ import {
   listDirectoryComposioConnectors,
   readThreadDetailRuntime,
   resumeThread,
+  startThread,
   startThreadTurn,
 } from './codexGateway'
 
@@ -110,6 +111,52 @@ describe('startThreadTurn collaboration mode payloads', () => {
       model: 'gpt-5.6-sol',
       reasoningEffort: 'ultra',
       speedMode: 'fast',
+    })
+  })
+
+  it('pins mobile-started turns to the unrestricted no-approval runtime policy', async () => {
+    const { requests } = mockRpcFetch()
+
+    await startThreadTurn('thread-1', 'run without more prompts', [], 'gpt-5.6-sol', 'max', undefined, [], 'default')
+
+    expect(requests[0].method).toBe('turn/start')
+    expect(requests[0].params).toMatchObject({
+      approvalPolicy: 'never',
+      sandboxPolicy: { type: 'dangerFullAccess' },
+    })
+  })
+})
+
+describe('startThread runtime policy payloads', () => {
+  afterEach(() => {
+    vi.unstubAllGlobals()
+  })
+
+  it('pins mobile-created threads to the unrestricted no-approval runtime policy', async () => {
+    let requestBody: { method: string; params: Record<string, unknown> } | null = null
+    vi.stubGlobal('fetch', vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+      requestBody = typeof init?.body === 'string'
+        ? JSON.parse(init.body) as { method: string; params: Record<string, unknown> }
+        : null
+      return new Response(JSON.stringify({
+        result: {
+          thread: { id: 'thread-new' },
+          model: 'gpt-5.6-sol',
+        },
+      }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    }))
+
+    await expect(startThread('/tmp/project', 'gpt-5.6-sol')).resolves.toMatchObject({
+      threadId: 'thread-new',
+    })
+    expect(requestBody).toMatchObject({
+      method: 'thread/start',
+      params: {
+        cwd: '/tmp/project',
+        model: 'gpt-5.6-sol',
+        approvalPolicy: 'never',
+        sandbox: 'danger-full-access',
+      },
     })
   })
 })
@@ -315,48 +362,48 @@ describe('getThreadDetail', () => {
     })
   })
 
-  it('marks external live snapshots as lightweight and preserves messages plus runtime', async () => {
-    let requestBody: { method: string; params: Record<string, unknown> } | null = null
-    vi.stubGlobal('fetch', vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
-      requestBody = JSON.parse(String(init?.body)) as typeof requestBody
+  it('loads external live snapshots from the lightweight live-state endpoint', async () => {
+    let requestUrl = ''
+    let requestSignal: AbortSignal | null | undefined
+    const controller = new AbortController()
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      requestUrl = String(input)
+      requestSignal = init?.signal
       return new Response(JSON.stringify({
-        result: {
-          threadTurnStartIndex: 8,
-          thread: {
-            id: 'external-thread',
-            turns: [{
-              id: 'turn-external',
-              status: 'completed',
-              items: [{
-                id: 'agent-live',
-                type: 'agentMessage',
-                text: 'live output',
-              }],
+        threadId: 'external-thread',
+        conversationState: {
+          turns: [{
+            id: 'turn-external',
+            status: 'completed',
+            items: [{
+              id: 'agent-live',
+              type: 'agentMessage',
+              text: 'live output',
             }],
-            externalRuntime: {
-              state: 'running',
-              turnId: 'turn-external',
-              interruptible: false,
-              source: 'external-session-writer',
-            },
-          },
+          }],
+        },
+        threadTurnStartIndex: 8,
+        hasMoreOlder: true,
+        isInProgress: true,
+        externalRuntime: {
+          state: 'running',
+          turnId: 'turn-external',
+          interruptible: false,
+          source: 'external-session-writer',
         },
       }), { status: 200, headers: { 'Content-Type': 'application/json' } })
     }))
 
-    await expect(getExternalThreadLiveSnapshot('external-thread')).resolves.toMatchObject({
+    await expect(getExternalThreadLiveSnapshot('external-thread', controller.signal)).resolves.toMatchObject({
       ownership: 'external',
       activeTurnId: 'turn-external',
+      inProgress: true,
+      hasMoreOlder: true,
+      turnIndexByTurnId: { 'turn-external': 8 },
       messages: [expect.objectContaining({ id: 'agent-live', text: 'live output' })],
     })
-    expect(requestBody).toEqual({
-      method: 'thread/read',
-      params: {
-        threadId: 'external-thread',
-        includeTurns: true,
-        __codexMobileLiveSnapshot: true,
-      },
-    })
+    expect(requestUrl).toBe('/codex-api/thread-live-state?threadId=external-thread')
+    expect(requestSignal).toBe(controller.signal)
   })
 
   it('reads modelProvider from nested thread payloads returned by thread/read', async () => {

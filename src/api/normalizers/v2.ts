@@ -19,6 +19,7 @@ import type {
 } from '../../types/codex'
 import { normalizePathForComparison, normalizePathForUi, toProjectName } from '../../pathUtils.js'
 import { parseCodexDirectiveText } from '../../utils/codexDirectives'
+import { commandDisplayLabel } from '../../utils/commandActivity'
 
 function toIso(seconds: number): string {
   return new Date(seconds * 1000).toISOString()
@@ -448,7 +449,7 @@ function toUiMessages(item: ThreadItem): UiMessage[] {
       {
         id: item.id,
         role: 'assistant',
-        text: '',
+        text: 'Viewed an image',
         images: [toLocalImageUrl(path)],
         messageType: 'imageView',
       },
@@ -464,7 +465,7 @@ function toUiMessages(item: ThreadItem): UiMessage[] {
         {
           id: item.id,
           role: 'assistant',
-          text: '',
+          text: 'Viewed an image',
           images: [result],
           messageType: 'imageView',
         },
@@ -512,7 +513,14 @@ function toUiMessages(item: ThreadItem): UiMessage[] {
         role: 'system' as const,
         text: cmd,
         messageType: 'commandExecution',
-        commandExecution: { command: cmd, cwd, status, aggregatedOutput, exitCode },
+        commandExecution: {
+          command: cmd,
+          cwd,
+          status,
+          aggregatedOutput,
+          exitCode,
+          displayLabel: commandDisplayLabel(cmd, raw.commandActions),
+        },
       },
     ]
   }
@@ -535,6 +543,60 @@ function toUiMessages(item: ThreadItem): UiMessage[] {
     ]
   }
 
+  if (item.type === 'contextCompaction') {
+    return [{
+      id: item.id,
+      role: 'system',
+      text: 'Context automatically compacting',
+      messageType: 'contextCompaction',
+    }]
+  }
+
+  if (item.type === 'webSearch') {
+    const raw = item as unknown as Record<string, unknown>
+    return [{
+      id: item.id,
+      role: 'system',
+      text: normalizeWebSearchLabel(raw),
+      messageType: 'webSearch',
+      rawPayload: toRawPayload(item),
+    }]
+  }
+
+  if (item.type === 'mcpToolCall') {
+    const raw = item as unknown as Record<string, unknown>
+    const server = readString(raw.server)
+    const tool = readString(raw.tool)
+    const label = server && tool ? `Called ${server}.${tool}` : tool ? `Called ${tool}` : 'Called tool'
+    return [{
+      id: item.id,
+      role: 'system',
+      text: label,
+      messageType: 'mcpToolCall',
+      rawPayload: toRawPayload(item),
+    }]
+  }
+
+  if (item.type === 'collabAgentToolCall') {
+    const raw = item as unknown as Record<string, unknown>
+    return [{
+      id: item.id,
+      role: 'system',
+      text: normalizeCollabAgentLabel(readString(raw.tool)),
+      messageType: 'collabAgentToolCall',
+      rawPayload: toRawPayload(item),
+    }]
+  }
+
+  if (item.type === 'enteredReviewMode' || item.type === 'exitedReviewMode') {
+    return [{
+      id: item.id,
+      role: 'system',
+      text: item.type === 'enteredReviewMode' ? 'Entered review mode' : 'Exited review mode',
+      messageType: item.type,
+    }]
+  }
+
   return []
 }
 
@@ -542,6 +604,52 @@ function normalizeCommandStatus(value: unknown): CommandExecutionData['status'] 
   if (value === 'completed' || value === 'failed' || value === 'declined' || value === 'interrupted') return value
   if (value === 'inProgress' || value === 'in_progress') return 'inProgress'
   return 'completed'
+}
+
+function asRecord(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === 'object' ? value as Record<string, unknown> : null
+}
+
+function readString(value: unknown): string {
+  return typeof value === 'string' ? value.trim() : ''
+}
+
+function normalizeWebSearchLabel(item: Record<string, unknown>): string {
+  const action = asRecord(item.action)
+  const actionType = readString(action?.type)
+  if (actionType === 'openPage') {
+    const url = readString(action?.url)
+    return url ? `Opened ${url}` : 'Opened web page'
+  }
+  if (actionType === 'findInPage') {
+    const pattern = readString(action?.pattern)
+    return pattern ? `Found ${pattern} in page` : 'Searched in page'
+  }
+
+  const query = readString(action?.query) || readString(item.query)
+  if (query) return `Searched ${query}`
+  const queries = Array.isArray(action?.queries)
+    ? action.queries.map((value) => readString(value)).filter(Boolean)
+    : []
+  if (queries.length > 0) return `Searched ${queries[0]}`
+  return 'Searched the web'
+}
+
+function normalizeCollabAgentLabel(tool: string): string {
+  switch (tool) {
+    case 'spawnAgent':
+      return 'Spawned agent'
+    case 'sendInput':
+      return 'Sent input to agent'
+    case 'resumeAgent':
+      return 'Resumed agent'
+    case 'wait':
+      return 'Waited for agents'
+    case 'closeAgent':
+      return 'Closed agent'
+    default:
+      return tool ? `Used agent tool ${tool}` : 'Used agent tool'
+  }
 }
 
 function pickThreadName(summary: Thread): string {
@@ -568,7 +676,7 @@ function isTurnInProgress(turn: Turn | null | undefined): boolean {
   return turn?.status === 'inProgress'
 }
 
-function readThreadInProgress(summary: Thread): boolean {
+function readThreadLocalInProgress(summary: Thread): boolean {
   const rawSummary = summary as Record<string, unknown>
   if (rawSummary.inProgress === true) return true
   if (rawSummary.status === 'inProgress' || rawSummary.turnStatus === 'inProgress') return true
@@ -581,6 +689,17 @@ function readThreadInProgress(summary: Thread): boolean {
   const turns = Array.isArray(summary.turns) ? summary.turns : []
   const lastTurn = turns.at(-1)
   return isTurnInProgress(lastTurn)
+}
+
+function readExternalRuntimeInProgress(summary: Thread): boolean {
+  const rawSummary = summary as Record<string, unknown>
+  const externalRuntime = rawSummary.externalRuntime
+  if (!externalRuntime || typeof externalRuntime !== 'object') return false
+  return (externalRuntime as Record<string, unknown>).state === 'running'
+}
+
+function readThreadInProgress(summary: Thread): boolean {
+  return readThreadLocalInProgress(summary) || readExternalRuntimeInProgress(summary)
 }
 
 function toUiThread(summary: Thread): UiThread {
@@ -671,7 +790,7 @@ export function normalizeThreadMessagesV2(payload: ThreadReadResponse, baseTurnI
 }
 
 export function readThreadInProgressFromResponse(payload: ThreadReadResponse): boolean {
-  if (readThreadInProgress(payload.thread)) return true
+  if (readThreadLocalInProgress(payload.thread)) return true
   const turns = Array.isArray(payload.thread.turns) ? payload.thread.turns : []
   return isTurnInProgress(turns.at(-1))
 }

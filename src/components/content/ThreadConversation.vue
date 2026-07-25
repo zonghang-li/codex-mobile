@@ -35,9 +35,10 @@
               :class="[commandStatusClass(message), { 'cmd-expanded': isCommandGroupExpanded(message) }]"
               @click="toggleCommandGroup(message)"
             >
-              <span class="cmd-chevron" :class="{ 'cmd-chevron-open': isCommandGroupExpanded(message) }">▶</span>
+              <IconTablerTerminal class="icon-svg cmd-icon" />
               <span class="cmd-group-label">{{ commandGroupSummaryLabel(message) }}</span>
               <span class="cmd-status">{{ commandGroupSummaryStatus(message) }}</span>
+              <span class="cmd-chevron" :class="{ 'cmd-chevron-open': isCommandGroupExpanded(message) }">›</span>
             </button>
             <div
               v-if="getGroupedCommandsForLatest(message).length > 0"
@@ -62,9 +63,10 @@
                     ]"
                     @click="toggleCommandExpand(cmd)"
                   >
-                    <span class="cmd-chevron" :class="{ 'cmd-chevron-open': isCommandExpanded(cmd) }">▶</span>
-                    <code class="cmd-label">{{ cmd.commandExecution?.command || '(command)' }}</code>
+                    <IconTablerTerminal class="icon-svg cmd-icon" />
+                    <span class="cmd-label">{{ commandDisplayLabel(cmd) }}</span>
                     <span class="cmd-status">{{ commandStatusLabel(cmd) }}</span>
+                    <span class="cmd-chevron" :class="{ 'cmd-chevron-open': isCommandExpanded(cmd) }">›</span>
                   </button>
                   <div
                     class="cmd-output-wrap"
@@ -94,9 +96,10 @@
                 ]"
                 @click="toggleCommandExpand(message)"
               >
-                <span class="cmd-chevron" :class="{ 'cmd-chevron-open': isCommandExpanded(message) }">▶</span>
-                <code class="cmd-label">{{ message.commandExecution?.command || '(command)' }}</code>
+                <IconTablerTerminal class="icon-svg cmd-icon" />
+                <span class="cmd-label">{{ commandDisplayLabel(message) }}</span>
                 <span class="cmd-status">{{ commandStatusLabel(message) }}</span>
+                <span class="cmd-chevron" :class="{ 'cmd-chevron-open': isCommandExpanded(message) }">›</span>
               </button>
               <div
                 class="cmd-output-wrap"
@@ -211,6 +214,39 @@
           </div>
         </div>
 
+        <div
+          v-else-if="isActivityMessage(message)"
+          class="message-row"
+          data-role="system"
+          :data-message-type="message.messageType || ''"
+        >
+          <div class="message-stack" data-role="system">
+            <article class="codex-activity-row" :data-activity-type="message.messageType || ''">
+              <IconTablerSearch v-if="activityIconKind(message) === 'search'" class="icon-svg codex-activity-icon" />
+              <IconTablerFilePencil v-else-if="activityIconKind(message) === 'file'" class="icon-svg codex-activity-icon" />
+              <IconTablerBolt v-else class="icon-svg codex-activity-icon" />
+              <span class="codex-activity-label">{{ activityMessageLabel(message) }}</span>
+            </article>
+            <ul
+              v-if="message.images && message.images.length > 0"
+              class="codex-activity-image-list"
+              :data-role="message.role"
+            >
+              <li v-for="imageUrl in message.images" :key="imageUrl" class="message-image-item">
+                <button class="message-image-button" type="button" @click="openImageModal(imageUrl)">
+                  <img
+                    class="message-image-preview"
+                    :class="{ 'message-generated-image-preview': message.messageType === 'imageView' }"
+                    :src="imageUrl"
+                    alt="Message image preview"
+                    loading="lazy"
+                  />
+                </button>
+              </li>
+            </ul>
+          </div>
+        </div>
+
         <div v-else class="message-row" :data-role="message.role" :data-message-type="message.messageType || ''">
           <div class="message-stack" :data-role="message.role">
             <article class="message-body" :data-role="message.role">
@@ -279,38 +315,47 @@
                   </button>
                   <div v-if="isWorkedExpanded(message)" class="worked-details">
                     <div
-                      v-for="cmd in getCommandsForWorked(messages, messages.indexOf(message))"
-                      :key="`worked-cmd-${cmd.id}`"
-                      class="worked-cmd-item"
+                      v-for="activity in getTurnActivityMessagesForWorked(messages, messages.indexOf(message))"
+                      :key="`worked-activity-${activity.id}`"
+                      class="worked-activity-item"
                     >
                       <button
+                        v-if="isCommandMessage(activity)"
                         type="button"
                         class="cmd-row"
                         :class="[
-                          commandStatusClass(cmd),
+                          commandStatusClass(activity),
                           {
-                            'cmd-expanded': isCommandExpanded(cmd),
-                            'cmd-compact': isCommandCompact(cmd),
+                            'cmd-expanded': isCommandExpanded(activity),
+                            'cmd-compact': isCommandCompact(activity),
                           },
                         ]"
-                        @click="toggleCommandExpand(cmd)"
+                        @click="toggleCommandExpand(activity)"
                       >
-                        <span class="cmd-chevron" :class="{ 'cmd-chevron-open': isCommandExpanded(cmd) }">▶</span>
-                        <code class="cmd-label">{{ cmd.commandExecution?.command || '(command)' }}</code>
-                        <span class="cmd-status">{{ commandStatusLabel(cmd) }}</span>
+                        <IconTablerTerminal class="icon-svg cmd-icon" />
+                        <span class="cmd-label">{{ commandDisplayLabel(activity) }}</span>
+                        <span class="cmd-status">{{ commandStatusLabel(activity) }}</span>
+                        <span class="cmd-chevron" :class="{ 'cmd-chevron-open': isCommandExpanded(activity) }">›</span>
                       </button>
                       <div
+                        v-if="isCommandMessage(activity)"
                         class="cmd-output-wrap"
-                        :class="{ 'cmd-output-visible': isCommandExpanded(cmd) }"
+                        :class="{ 'cmd-output-visible': isCommandExpanded(activity) }"
                       >
                         <div class="cmd-output-inner">
                           <pre
                             class="cmd-output"
-                            :class="{ 'cmd-output-condensed': isCommandOutputCondensed(cmd) }"
-                            v-text="cmd.commandExecution?.aggregatedOutput || '(no output)'"
+                            :class="{ 'cmd-output-condensed': isCommandOutputCondensed(activity) }"
+                            v-text="activity.commandExecution?.aggregatedOutput || '(no output)'"
                           ></pre>
                         </div>
                       </div>
+                      <article v-else class="codex-activity-row" :data-activity-type="activity.messageType || ''">
+                        <IconTablerSearch v-if="activityIconKind(activity) === 'search'" class="icon-svg codex-activity-icon" />
+                        <IconTablerFilePencil v-else-if="activityIconKind(activity) === 'file'" class="icon-svg codex-activity-icon" />
+                        <IconTablerBolt v-else class="icon-svg codex-activity-icon" />
+                        <span class="codex-activity-label">{{ activityMessageLabel(activity) }}</span>
+                      </article>
                     </div>
                   </div>
                 </div>
@@ -982,6 +1027,11 @@ import {
   filterRenderableThreadMessages,
   latestThreadRenderWindowStart,
 } from './threadConversationWindow'
+import {
+  getHiddenCompletedActivityMessageIds,
+  getTurnActivityMessagesForWorked,
+  isThreadActivityMessage,
+} from './threadConversationActivity'
 import { splitDisplayMathSpans } from './displayMath'
 import { splitInlineMathSpans } from './inlineMath'
 import {
@@ -996,9 +1046,12 @@ import CodexDirectiveNotices from './CodexDirectiveNotices.vue'
 import MessageBlockRenderer from './MessageBlockRenderer.vue'
 import IconTablerArrowBackUp from '../icons/IconTablerArrowBackUp.vue'
 import IconTablerArrowUp from '../icons/IconTablerArrowUp.vue'
+import IconTablerBolt from '../icons/IconTablerBolt.vue'
 import IconTablerCopy from '../icons/IconTablerCopy.vue'
 import IconTablerFilePencil from '../icons/IconTablerFilePencil.vue'
 import IconTablerGitFork from '../icons/IconTablerGitFork.vue'
+import IconTablerSearch from '../icons/IconTablerSearch.vue'
+import IconTablerTerminal from '../icons/IconTablerTerminal.vue'
 import IconTablerX from '../icons/IconTablerX.vue'
 
 type HighlightJsModule = (typeof import('highlight.js/lib/common'))['default']
@@ -1128,6 +1181,45 @@ function isFileChangeMessage(message: UiMessage): boolean {
     && message.fileChangeStatus === 'completed'
     && Array.isArray(message.fileChanges)
     && message.fileChanges.length > 0
+}
+
+function isActivityMessage(message: UiMessage): boolean {
+  if (isCommandMessage(message) || isFileChangeMessage(message) || isPlanMessage(message)) return false
+  return isThreadActivityMessage(message)
+}
+
+function commandDisplayLabel(message: UiMessage): string {
+  const label = message.commandExecution?.displayLabel?.trim()
+  if (label) return label
+  const command = message.commandExecution?.command?.replace(/\s+/gu, ' ').trim() ?? ''
+  return command ? `Ran ${command}` : 'Ran a command'
+}
+
+function activityIconKind(message: UiMessage): 'search' | 'file' | 'default' {
+  const type = message.messageType ?? ''
+  if (type === 'webSearch') return 'search'
+  if (type === 'reasoning' || type === 'imageView' || type === 'contextCompaction') return 'file'
+  return 'default'
+}
+
+function activityMessageLabel(message: UiMessage): string {
+  if (isFileChangeMessage(message)) {
+    return fileChangeSummaryLabel({
+      changes: message.fileChanges ?? [],
+      sourceMessageIds: [message.id],
+      source: 'metadata',
+      turnId: message.turnId ?? '',
+    })
+  }
+  if (isPlanMessage(message)) {
+    const firstStep = readPlanSteps(message)[0]?.step.trim()
+    return firstStep ? `Planning ${firstStep}` : 'Planning'
+  }
+  const text = message.text.replace(/\s+/gu, ' ').trim()
+  if (text) return text
+  if (message.messageType === 'imageView') return 'Viewed an image'
+  if (message.messageType === 'contextCompaction') return 'Context automatically compacting'
+  return 'Thinking'
 }
 
 function isCopyableAssistantMessage(message: UiMessage): boolean {
@@ -1275,7 +1367,8 @@ function isCommandGroupExpanded(message: UiMessage): boolean {
 function commandGroupSummaryLabel(message: UiMessage): string {
   const commands = getCommandBlockForLatest(message)
   const count = commands.length
-  const latestCommand = message.commandExecution?.command?.trim() || '(command)'
+  if (count > 1) return 'Ran commands'
+  const latestCommand = commandDisplayLabel(message)
   const countLabel = count === 1 ? '1 command' : `${count} commands`
   return `${countLabel} · latest: ${latestCommand}`
 }
@@ -1366,16 +1459,6 @@ function pruneCommandIdSet(source: Set<string>, validIds: Set<string>): Set<stri
     if (validIds.has(id)) next.add(id)
   }
   return next.size === source.size ? source : next
-}
-
-function getCommandsForWorked(messages: UiMessage[], workedIndex: number): UiMessage[] {
-  const result: UiMessage[] = []
-  for (let i = workedIndex - 1; i >= 0; i--) {
-    const m = messages[i]
-    if (m.messageType === 'commandExecution') result.unshift(m)
-    else if (m.role === 'user' || m.messageType === 'worked') break
-  }
-  return result
 }
 
 const props = defineProps<{
@@ -2089,10 +2172,13 @@ const hiddenFileChangeMessageIds = computed(() => {
   return next
 })
 
+const hiddenCompletedActivityMessageIds = computed(() => getHiddenCompletedActivityMessageIds(props.messages))
+
 const renderableMessages = computed(() => filterRenderableThreadMessages(
   props.messages,
   hiddenGroupedCommandIds.value,
   hiddenFileChangeMessageIds.value,
+  hiddenCompletedActivityMessageIds.value,
 ))
 const effectiveRenderWindowStart = computed(() => clampThreadRenderWindowStart(
   renderWindowStart.value,
@@ -4944,7 +5030,7 @@ onBeforeUnmount(() => {
 }
 
 .message-text-flow {
-  @apply flex flex-col gap-2;
+  @apply flex flex-col gap-3;
 }
 
 .plan-card {
@@ -5067,7 +5153,9 @@ onBeforeUnmount(() => {
 }
 
 .plan-card-markdown :deep(.message-inline-code) {
-  @apply bg-transparent p-0 font-sans text-[1em] font-semibold text-inherit;
+  @apply inline px-1.5 py-0 font-mono text-[0.92em] font-medium text-inherit;
+  border-radius: 0.45rem;
+  background: rgb(39 39 42 / 0.10);
 }
 
 .plan-card-markdown :deep(.message-file-link) {
@@ -5119,7 +5207,7 @@ onBeforeUnmount(() => {
 }
 
 .message-text {
-  @apply m-0 text-sm leading-relaxed whitespace-pre-wrap break-words text-slate-800;
+  @apply m-0 text-base leading-8 whitespace-pre-wrap break-words text-slate-900;
   overflow-wrap: anywhere;
 }
 
@@ -5157,7 +5245,7 @@ onBeforeUnmount(() => {
 }
 
 .message-list {
-  @apply m-0 pl-5 text-sm leading-relaxed text-slate-800 flex flex-col gap-1.5;
+  @apply m-0 pl-5 text-base leading-8 text-slate-900 flex flex-col gap-1.5;
 }
 
 .message-list-unordered {
@@ -5225,7 +5313,7 @@ onBeforeUnmount(() => {
 }
 
 .message-bold-text {
-  @apply font-semibold text-slate-900;
+  @apply font-semibold text-slate-950;
 }
 
 .message-italic-text {
@@ -5241,7 +5329,9 @@ onBeforeUnmount(() => {
 }
 
 .message-inline-code {
-  @apply bg-transparent p-0 font-sans text-[1em] font-semibold text-inherit;
+  @apply inline px-1.5 py-0 font-mono text-[0.92em] font-medium text-inherit;
+  border-radius: 0.45rem;
+  background: rgb(39 39 42 / 0.10);
   line-height: inherit;
 }
 
@@ -5356,6 +5446,27 @@ onBeforeUnmount(() => {
   @apply flex flex-col;
 }
 
+.worked-activity-item {
+  @apply flex flex-col;
+}
+
+.codex-activity-row {
+  @apply flex w-full max-w-[min(var(--chat-card-max,76ch),100%)] items-center gap-2 px-0 py-1 text-left text-sm font-medium leading-6 text-zinc-500;
+}
+
+.codex-activity-icon,
+.cmd-icon {
+  @apply h-4 w-4 shrink-0 text-zinc-400;
+}
+
+.codex-activity-label {
+  @apply min-w-0 flex-1 truncate;
+}
+
+.codex-activity-image-list {
+  @apply list-none m-0 mt-1 p-0 flex flex-wrap gap-2;
+}
+
 .image-modal-backdrop {
   @apply fixed inset-0 z-50 bg-black/40 p-6 flex items-center justify-center;
 }
@@ -5377,11 +5488,11 @@ onBeforeUnmount(() => {
 }
 
 .cmd-row {
-  @apply w-full flex items-center gap-2 px-3 py-1.5 rounded-lg border border-zinc-200 bg-zinc-50 cursor-pointer transition text-left hover:bg-zinc-100;
+  @apply w-full flex items-center gap-2 border-0 bg-transparent px-0 py-1 text-left text-zinc-500 transition hover:text-zinc-700;
 }
 
 .cmd-row.cmd-row-group {
-  @apply border-dashed border-zinc-300 bg-zinc-100/90 text-zinc-600;
+  @apply text-zinc-500;
 }
 
 .cmd-row.cmd-compact {
@@ -5404,11 +5515,11 @@ onBeforeUnmount(() => {
 }
 
 .cmd-row.cmd-expanded {
-  @apply rounded-b-none;
+  @apply rounded-none;
 }
 
 .cmd-chevron {
-  @apply text-[10px] text-zinc-400 transition-transform duration-150 flex-shrink-0;
+  @apply text-base leading-none text-zinc-400 transition-transform duration-150 flex-shrink-0;
 }
 
 .cmd-chevron-open {
@@ -5416,11 +5527,11 @@ onBeforeUnmount(() => {
 }
 
 .cmd-label {
-  @apply flex-1 min-w-0 truncate text-xs font-mono text-zinc-700;
+  @apply flex-1 min-w-0 truncate text-sm font-medium text-zinc-500;
 }
 
 .cmd-group-label {
-  @apply flex-1 min-w-0 truncate text-xs font-medium text-zinc-600;
+  @apply flex-1 min-w-0 truncate text-sm font-medium text-zinc-500;
 }
 
 .cmd-status {
@@ -5481,7 +5592,7 @@ onBeforeUnmount(() => {
 }
 
 .file-change-summary-block {
-  @apply mt-3 flex flex-col gap-0;
+  @apply mt-3 flex flex-col items-center gap-0;
 }
 
 .file-change-summary-block-inline {
@@ -5489,11 +5600,11 @@ onBeforeUnmount(() => {
 }
 
 .file-change-summary-row {
-  @apply border-dashed;
+  @apply w-auto max-w-full rounded-full border border-zinc-300 bg-zinc-100/80 px-4 py-2 shadow-sm;
 }
 
 .file-change-summary-label {
-  @apply flex-1 min-w-0 truncate text-xs font-medium text-zinc-700;
+  @apply flex-1 min-w-0 truncate text-sm font-medium text-zinc-600;
 }
 
 .file-change-summary-status {
@@ -5578,6 +5689,63 @@ onBeforeUnmount(() => {
 
 .file-change-signed-count[data-tone='remove'] {
   @apply text-rose-600;
+}
+
+:global(.dark) .message-text,
+:global(.dark) .message-heading,
+:global(.dark) .message-list,
+:global(.dark) .message-bold-text {
+  @apply text-zinc-100;
+}
+
+:global(.dark) .message-blockquote {
+  @apply border-zinc-700 bg-zinc-900/60 text-zinc-200;
+}
+
+:global(.dark) .message-inline-code,
+:global(.dark) .plan-card-markdown :deep(.message-inline-code) {
+  @apply font-mono font-medium text-zinc-100;
+  border-radius: 0.45rem;
+  background: rgb(63 63 70 / 0.85);
+}
+
+:global(.dark) .cmd-row {
+  @apply bg-transparent text-zinc-500 hover:bg-transparent hover:text-zinc-300;
+}
+
+:global(.dark) .cmd-row.cmd-row-group {
+  @apply bg-transparent text-zinc-500 hover:bg-transparent hover:text-zinc-300;
+}
+
+:global(.dark) .cmd-label,
+:global(.dark) .cmd-group-label {
+  @apply text-zinc-500;
+}
+
+:global(.dark) .cmd-icon,
+:global(.dark) .cmd-chevron,
+:global(.dark) .codex-activity-icon {
+  @apply text-zinc-500;
+}
+
+:global(.dark) .codex-activity-row {
+  @apply text-zinc-500;
+}
+
+:global(.dark) .worked-separator-line {
+  @apply bg-zinc-800;
+}
+
+:global(.dark) .worked-separator-text {
+  @apply text-zinc-500;
+}
+
+:global(.dark) .file-change-summary-row {
+  @apply border-zinc-700 bg-zinc-800/80 text-zinc-300 shadow-none;
+}
+
+:global(.dark) .file-change-summary-label {
+  @apply text-zinc-300;
 }
 
 .diff-viewer-backdrop {

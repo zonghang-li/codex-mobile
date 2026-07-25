@@ -502,6 +502,51 @@ describe('backend queue scheduling', () => {
       processor.dispose()
     }
   })
+
+  it('pins backend queued turns to the unrestricted no-approval runtime policy', async () => {
+    const processor = new BackendQueueProcessor({
+      rpc: vi.fn(async (method: string) => {
+        if (method === 'config/read') return { config: { model: 'gpt-test', model_reasoning_effort: 'high' } }
+        return {}
+      }),
+      getPid: () => 31337,
+      onNotification: () => () => undefined,
+    } as never)
+
+    try {
+      const params = await (processor as unknown as {
+        buildQueuedTurnParams: (turn: {
+          threadId: string
+          message: {
+            id: string
+            text: string
+            imageUrls: string[]
+            skills: Array<{ name: string; path: string }>
+            fileAttachments: Array<{ label: string; path: string; fsPath: string }>
+            collaborationMode: 'default'
+          }
+        }) => Promise<Record<string, unknown>>
+      }).buildQueuedTurnParams({
+        threadId: 'thread-queued',
+        message: {
+          id: 'queued-1',
+          text: 'continue queued work',
+          imageUrls: [],
+          skills: [],
+          fileAttachments: [],
+          collaborationMode: 'default',
+        },
+      })
+
+      expect(params).toMatchObject({
+        threadId: 'thread-queued',
+        approvalPolicy: 'never',
+        sandboxPolicy: { type: 'dangerFullAccess' },
+      })
+    } finally {
+      processor.dispose()
+    }
+  })
 })
 
 describe('automation TOML handling', () => {

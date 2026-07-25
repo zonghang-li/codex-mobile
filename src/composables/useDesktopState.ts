@@ -64,6 +64,7 @@ import type {
 } from '../types/codex'
 import type { ThreadRuntimeOwnership } from '../types/threadRuntime'
 import { getPathParent, isProjectlessChatPath, normalizePathForUi, toProjectName } from '../pathUtils.js'
+import { commandDisplayLabel } from '../utils/commandActivity'
 import { parseCodexDirectiveText } from '../utils/codexDirectives'
 import {
   ALL_REASONING_EFFORTS,
@@ -112,7 +113,7 @@ const EVENT_SYNC_DEBOUNCE_MS = 220
 const BACKGROUND_THREAD_PAGINATION_DELAY_MS = 10_000
 const ENABLE_AUTOMATIC_BACKGROUND_THREAD_PAGINATION = false
 const RATE_LIMIT_REFRESH_DEBOUNCE_MS = 500
-const EXTERNAL_RUNTIME_POLL_MS = 2_000
+const EXTERNAL_RUNTIME_POLL_MS = 1_000
 const BACKGROUND_RUNTIME_POLL_MS = 2_000
 const BACKGROUND_RUNTIME_BATCH_LIMIT = 50
 const TURN_START_FOLLOW_UP_SYNC_DELAY_MS = 3000
@@ -4196,7 +4197,7 @@ export function useDesktopState() {
       return {
         id,
         role: 'assistant',
-        text: '',
+        text: 'Viewed an image',
         images: [toLocalImageUrl(path)],
         messageType: 'imageView',
       }
@@ -4208,7 +4209,7 @@ export function useDesktopState() {
     return {
       id,
       role: 'assistant',
-      text: '',
+      text: 'Viewed an image',
       images: [imageUrl],
       messageType: 'imageView',
 
@@ -4234,7 +4235,14 @@ export function useDesktopState() {
       role: 'system',
       text: command,
       messageType: 'commandExecution',
-      commandExecution: { command, cwd, status: 'inProgress', aggregatedOutput: '', exitCode: null },
+      commandExecution: {
+        command,
+        cwd,
+        status: 'inProgress',
+        aggregatedOutput: '',
+        exitCode: null,
+        displayLabel: commandDisplayLabel(command, item.commandActions),
+      },
       turnId: turnId || undefined,
       turnIndex: typeof turnIndex === 'number' ? turnIndex : undefined,
     }
@@ -4274,7 +4282,14 @@ export function useDesktopState() {
       role: 'system',
       text: command,
       messageType: 'commandExecution',
-      commandExecution: { command, cwd, status, aggregatedOutput, exitCode },
+      commandExecution: {
+        command,
+        cwd,
+        status,
+        aggregatedOutput,
+        exitCode,
+        displayLabel: commandDisplayLabel(command, item.commandActions),
+      },
       turnId: turnId || undefined,
       turnIndex: typeof turnIndex === 'number' ? turnIndex : undefined,
     }

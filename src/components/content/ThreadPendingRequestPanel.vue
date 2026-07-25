@@ -36,7 +36,7 @@
               class="thread-pending-request-inline-input"
               :class="{ 'is-active': selectedApprovalDecision === 'decline' || approvalFreeformText.length > 0 }"
             >
-              <span class="thread-pending-request-option-index">3.</span>
+              <span class="thread-pending-request-option-index">{{ approvalOptions.length + 1 }}.</span>
               <input
                 class="thread-pending-request-inline-control"
                 type="text"
@@ -240,7 +240,7 @@ import type { UiServerRequest, UiServerRequestReply } from '../../types/codex'
 import { useUiLanguage } from '../../composables/useUiLanguage'
 import ComposerDropdown from './ComposerDropdown.vue'
 
-type ApprovalDecision = 'accept' | 'acceptForSession' | 'decline' | 'cancel'
+type ApprovalDecision = 'accept' | 'acceptForSession' | 'acceptWithExecpolicyAmendment' | 'decline' | 'cancel'
 
 type ApprovalOption = {
   id: Exclude<ApprovalDecision, 'cancel' | 'decline'>
@@ -332,6 +332,35 @@ function readCommandPreview(params: Record<string, unknown>): string {
 
 function isCommandApprovalRequest(request: UiServerRequest): boolean {
   return request.method === 'item/commandExecution/requestApproval' || request.method === 'execCommandApproval'
+}
+
+function readProposedExecpolicyAmendment(request: UiServerRequest | null): string[] {
+  const params = asRecord(request?.params)
+  const raw = params?.proposedExecpolicyAmendment ?? params?.proposed_execpolicy_amendment
+  if (!Array.isArray(raw)) return []
+  return raw
+    .filter((entry): entry is string => typeof entry === 'string' && entry.trim().length > 0)
+    .map((entry) => entry.trim())
+}
+
+function hasProposedExecpolicyAmendment(request: UiServerRequest | null): boolean {
+  return request !== null && isCommandApprovalRequest(request) && readProposedExecpolicyAmendment(request).length > 0
+}
+
+function buildExecpolicyApprovalDecision(request: UiServerRequest): unknown {
+  const amendment = readProposedExecpolicyAmendment(request)
+  if (request.method === 'execCommandApproval') {
+    return {
+      approved_execpolicy_amendment: {
+        proposed_execpolicy_amendment: amendment,
+      },
+    }
+  }
+  return {
+    acceptWithExecpolicyAmendment: {
+      execpolicy_amendment: amendment,
+    },
+  }
 }
 
 function isFileApprovalRequest(request: UiServerRequest): boolean {
@@ -441,10 +470,14 @@ function formatPermissionsPreview(value: unknown): string {
 
 function approvalOptionsForRequest(request: UiServerRequest | null): ApprovalOption[] {
   if (!request || !isApprovalRequest(request)) return []
-  return [
+  const options: ApprovalOption[] = [
     { id: 'accept', label: 'Yes' },
     { id: 'acceptForSession', label: 'Yes for Session' },
   ]
+  if (hasProposedExecpolicyAmendment(request)) {
+    options.push({ id: 'acceptWithExecpolicyAmendment', label: 'Approve for me' })
+  }
+  return options
 }
 
 const approvalOptions = computed(() => approvalOptionsForRequest(props.request))
@@ -882,7 +915,11 @@ function onRespondApproval(request: UiServerRequest, decision: ApprovalDecision)
 
   emit('respondServerRequest', {
     id: request.id,
-    result: { decision },
+    result: {
+      decision: decision === 'acceptWithExecpolicyAmendment' && isCommandApprovalRequest(request)
+        ? buildExecpolicyApprovalDecision(request)
+        : decision,
+    },
   })
 }
 
@@ -898,7 +935,9 @@ function onSubmitApproval(request: UiServerRequest): void {
   emit('respondServerRequest', {
     id: request.id,
     result: {
-      decision,
+      decision: decision === 'acceptWithExecpolicyAmendment' && isCommandApprovalRequest(request)
+        ? buildExecpolicyApprovalDecision(request)
+        : decision,
     },
     followUpMessageText: note || undefined,
   })

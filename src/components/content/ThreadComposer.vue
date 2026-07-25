@@ -1966,6 +1966,10 @@ watch(
   @apply relative rounded-2xl border border-zinc-300 bg-white p-2 sm:p-3 shadow-sm;
 }
 
+:global(.dark) .thread-composer-shell {
+  @apply rounded-[1.75rem] border-zinc-800 bg-zinc-900/95 shadow-2xl shadow-black/30;
+}
+
 .thread-composer:has(.thread-composer-input-wrap--expanded) .thread-composer-shell {
   @apply mx-auto flex h-full w-full max-w-[min(var(--chat-column-max,72rem),100%)] flex-col shadow-2xl;
 }
@@ -2169,6 +2173,10 @@ watch(
   @apply w-full min-w-0 min-h-10 sm:min-h-11 max-h-40 rounded-xl border-0 bg-transparent px-1 py-2 pr-10 text-sm text-zinc-900 outline-none transition resize-none overflow-y-auto;
 }
 
+:global(.dark) .thread-composer-input {
+  @apply text-zinc-100 placeholder:text-zinc-400;
+}
+
 .thread-composer-input-wrap--expanded .thread-composer-input {
   @apply h-full max-h-none pr-12 text-base leading-6;
 }
@@ -2193,6 +2201,10 @@ watch(
   @apply relative mt-2 sm:mt-3 flex items-center gap-2 sm:gap-4 overflow-visible pb-px;
 }
 
+:global(.dark) .thread-composer-controls {
+  @apply text-zinc-400;
+}
+
 .thread-composer-controls--recording {
   @apply gap-1 sm:gap-2;
 }
@@ -2203,6 +2215,10 @@ watch(
 
 .thread-composer-attach-trigger {
   @apply inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-none border-0 bg-transparent pb-px text-xl leading-tight text-zinc-700 transition hover:text-zinc-900 disabled:cursor-not-allowed disabled:text-zinc-400;
+}
+
+:global(.dark) .thread-composer-attach-trigger {
+  @apply text-zinc-400 hover:text-zinc-100 disabled:text-zinc-600;
 }
 
 .thread-composer-attach-menu {
@@ -2300,6 +2316,10 @@ watch(
   touch-action: none;
 }
 
+:global(.dark) .thread-composer-mic {
+  @apply bg-zinc-800 text-zinc-300 hover:bg-zinc-700 hover:text-zinc-50 disabled:bg-zinc-800/60 disabled:text-zinc-600;
+}
+
 .thread-composer-mic--active {
   @apply bg-red-100 text-red-600 hover:bg-red-200 hover:text-red-700;
 }
@@ -2328,6 +2348,10 @@ watch(
   @apply inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-full border-0 bg-zinc-900 text-white transition hover:bg-black disabled:cursor-not-allowed disabled:bg-zinc-200 disabled:text-zinc-500;
 }
 
+:global(.dark) .thread-composer-submit {
+  @apply bg-zinc-100 text-zinc-950 hover:bg-white disabled:bg-zinc-800 disabled:text-zinc-600;
+}
+
 .thread-composer-submit--queue {
   @apply bg-amber-600 hover:bg-amber-700;
 }
@@ -2338,6 +2362,10 @@ watch(
 
 .thread-composer-stop {
   @apply inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-full border-0 bg-zinc-900 text-white transition hover:bg-black disabled:cursor-not-allowed disabled:bg-zinc-200 disabled:text-zinc-500;
+}
+
+:global(.dark) .thread-composer-stop {
+  @apply bg-zinc-100 text-zinc-950 hover:bg-white disabled:bg-zinc-800 disabled:text-zinc-600;
 }
 
 .thread-composer-stop-icon {

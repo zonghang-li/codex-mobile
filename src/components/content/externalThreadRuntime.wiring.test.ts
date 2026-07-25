@@ -24,6 +24,15 @@ describe('external thread runtime read-only wiring', () => {
     expect(pendingRequestSource).toContain(':disabled="disabled"')
   })
 
+  it('offers command approval with persistent execpolicy amendments', async () => {
+    const pendingRequestSource = await readFile(new URL('./ThreadPendingRequestPanel.vue', import.meta.url), 'utf8')
+
+    expect(pendingRequestSource).toContain('Approve for me')
+    expect(pendingRequestSource).toContain('proposedExecpolicyAmendment')
+    expect(pendingRequestSource).toContain('acceptWithExecpolicyAmendment')
+    expect(pendingRequestSource).toContain('approved_execpolicy_amendment')
+  })
+
   it('makes an externally owned composer read-only while retaining a labelled stop control', async () => {
     const composerSource = await readFile(new URL('./ThreadComposer.vue', import.meta.url), 'utf8')
 

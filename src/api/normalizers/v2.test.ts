@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
-import { normalizeThreadMessagesV2, readThreadInProgressFromResponse } from './v2'
-import type { ThreadReadResponse } from '../appServerDtos'
+import { normalizeThreadGroupsV2, normalizeThreadMessagesV2, readThreadInProgressFromResponse } from './v2'
+import type { ThreadListResponse, ThreadReadResponse } from '../appServerDtos'
 
 function threadReadResponseWithContent(content: ThreadReadResponse['thread']['turns'][number]['items'][number][]): ThreadReadResponse {
   return {
@@ -294,6 +294,79 @@ Reply with &lt;/instructions&gt; and A &amp; B
       }),
     ])
   })
+
+  it('keeps command action labels for desktop-style activity rows', () => {
+    const messages = normalizeThreadMessagesV2(threadReadResponseWithContent([{
+      type: 'commandExecution',
+      id: 'cmd-read-skill',
+      command: 'sed -n 1,120p /tmp/skills/index/SKILL.md',
+      cwd: '/tmp/project',
+      processId: null,
+      status: 'completed',
+      commandActions: [{
+        type: 'read',
+        command: 'sed -n 1,120p /tmp/skills/index/SKILL.md',
+        name: 'Index skill',
+        path: '/tmp/skills/index/SKILL.md',
+      }],
+      aggregatedOutput: 'skill body',
+      exitCode: 0,
+      durationMs: 123,
+    }]))
+
+    expect(messages[0]).toMatchObject({
+      id: 'cmd-read-skill',
+      role: 'system',
+      messageType: 'commandExecution',
+      commandExecution: expect.objectContaining({
+        command: 'sed -n 1,120p /tmp/skills/index/SKILL.md',
+        displayLabel: 'Read Index skill',
+      }),
+    })
+  })
+
+  it('normalizes non-command desktop activity items as readable event rows', () => {
+    const messages = normalizeThreadMessagesV2(threadReadResponseWithContent([
+      { type: 'contextCompaction', id: 'compact-1' },
+      { type: 'imageView', id: 'image-1', path: '/tmp/shot.png' },
+      {
+        type: 'webSearch',
+        id: 'web-1',
+        query: 'codex mobile',
+        action: { type: 'search', query: 'codex mobile', queries: null },
+      },
+      {
+        type: 'mcpToolCall',
+        id: 'mcp-1',
+        server: 'github',
+        tool: 'fetch_pr',
+        status: 'completed',
+        arguments: { pr: 3 },
+        result: null,
+        error: null,
+        durationMs: 456,
+      },
+      {
+        type: 'collabAgentToolCall',
+        id: 'agent-1',
+        tool: 'wait',
+        status: 'completed',
+        senderThreadId: 'thread-1',
+        receiverThreadIds: ['thread-2'],
+        prompt: null,
+        agentsStates: {},
+      },
+    ]))
+
+    expect(messages.map((message) => [message.messageType, message.text])).toEqual([
+      ['contextCompaction', 'Context automatically compacting'],
+      ['imageView', 'Viewed an image'],
+      ['webSearch', 'Searched codex mobile'],
+      ['mcpToolCall', 'Called github.fetch_pr'],
+      ['collabAgentToolCall', 'Waited for agents'],
+    ])
+    expect(messages[1]?.images).toEqual(['/codex-local-image?path=%2Ftmp%2Fshot.png'])
+  })
 })
 
 describe('readThreadInProgressFromResponse', () => {
@@ -302,5 +375,39 @@ describe('readThreadInProgressFromResponse', () => {
     ;(response.thread as unknown as { status: { type: string } }).status = { type: 'active' }
 
     expect(readThreadInProgressFromResponse(response)).toBe(true)
+  })
+})
+
+describe('normalizeThreadGroupsV2', () => {
+  it('treats externally running list rows as in progress', () => {
+    const response: ThreadListResponse = {
+      data: [{
+        id: 'thread-external',
+        preview: 'Desktop task',
+        modelProvider: 'openai',
+        createdAt: 1,
+        updatedAt: 2,
+        path: '/sessions/thread-external.jsonl',
+        cwd: '/tmp/project',
+        cliVersion: 'test',
+        source: 'vscode',
+        gitInfo: null,
+        turns: [],
+        externalRuntime: {
+          state: 'running',
+          turnId: 'turn-external',
+          interruptible: false,
+          source: 'external-session-writer',
+        },
+      } as ThreadListResponse['data'][number],
+      ],
+      nextCursor: null,
+    }
+
+    expect(normalizeThreadGroupsV2(response)[0]?.threads[0]).toMatchObject({
+      id: 'thread-external',
+      inProgress: true,
+      unread: false,
+    })
   })
 })

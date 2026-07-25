@@ -147,6 +147,15 @@ function renderFrontendMissingHtml(message: string, details?: string[]): string 
   ].join('')
 }
 
+export function shouldBypassSpaFallbackForStaticAsset(pathname: string): boolean {
+  return (
+    pathname.startsWith('/assets/') ||
+    pathname.startsWith('/icons/') ||
+    pathname === '/sw.js' ||
+    pathname === '/manifest.webmanifest'
+  )
+}
+
 function normalizeLocalImagePath(rawPath: string): string {
   const trimmed = rawPath.trim()
   if (!trimmed) return ''
@@ -363,7 +372,16 @@ export function createServer(options: ServerOptions = {}): ServerInstance {
   }
 
   // 9. SPA fallback
-  app.use((_req, res) => {
+  app.use((req, res) => {
+    if (shouldBypassSpaFallbackForStaticAsset(req.path)) {
+      res
+        .status(404)
+        .setHeader('Cache-Control', 'private, no-store')
+        .type('text/plain; charset=utf-8')
+        .send('Frontend asset not found.')
+      return
+    }
+
     if (!hasFrontendAssets) {
       res
         .status(503)

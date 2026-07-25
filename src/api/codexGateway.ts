@@ -897,7 +897,6 @@ async function getThreadSummaryV2(threadId: string): Promise<UiThread> {
 async function getThreadDetailV2(
   threadId: string,
   signal?: AbortSignal,
-  options: { liveSnapshot?: boolean } = {},
 ): Promise<{
   model: string
   modelProvider: string
@@ -913,7 +912,6 @@ async function getThreadDetailV2(
   const payload = await callRpc<ThreadReadResponse>('thread/read', {
     threadId,
     includeTurns: true,
-    ...(options.liveSnapshot ? { __codexMobileLiveSnapshot: true } : {}),
   }, signal)
   const startTurnIndex = readThreadTurnStartIndex(payload)
   const normalized = normalizeThreadMessagesV2(payload, startTurnIndex)
@@ -925,6 +923,53 @@ async function getThreadDetailV2(
     ...runtime,
     hasMoreOlder: startTurnIndex > 0,
     turnIndexByTurnId: buildTurnIndexByTurnId(payload, startTurnIndex),
+  }
+}
+
+async function getExternalThreadLiveStateSnapshotV2(
+  threadId: string,
+  signal?: AbortSignal,
+): Promise<{
+  model: string
+  modelProvider: string
+  messages: UiMessage[]
+  inProgress: boolean
+  activeTurnId: string
+  hasMoreOlder: boolean
+  turnIndexByTurnId: ThreadTurnIndexById
+  ownership: ThreadDetailRuntime['ownership']
+  canInterrupt: boolean
+  externalRuntimeState: ThreadDetailRuntime['externalRuntimeState']
+}> {
+  const params = new URLSearchParams({ threadId })
+  const response = await fetch(`/codex-api/thread-live-state?${params.toString()}`, { signal })
+  const payload = asRecord(await response.json().catch(() => null))
+  if (!response.ok) {
+    throw new Error(extractErrorMessage(payload, `Live state request failed with ${response.status}`))
+  }
+  const threadTurnStartIndexRaw = payload?.threadTurnStartIndex
+  const threadTurnStartIndex = Math.max(0, Math.floor(
+    typeof threadTurnStartIndexRaw === 'number' ? threadTurnStartIndexRaw : 0,
+  ))
+  const conversationState = asRecord(payload?.conversationState)
+  const turns = Array.isArray(conversationState?.turns) ? conversationState.turns : []
+  const result = {
+    threadTurnStartIndex,
+    thread: {
+      id: readString(payload?.threadId) ?? threadId,
+      turns,
+      externalRuntime: payload?.externalRuntime,
+    },
+  } as unknown as ThreadReadResponse
+  const normalized = normalizeThreadMessagesV2(result, threadTurnStartIndex)
+  const runtime = readThreadDetailRuntime(result)
+  return {
+    model: normalizeThreadModelFromPayload(payload),
+    modelProvider: normalizeThreadModelProviderFromPayload(payload),
+    messages: normalized,
+    ...runtime,
+    hasMoreOlder: payload?.hasMoreOlder === true || threadTurnStartIndex > 0,
+    turnIndexByTurnId: buildTurnIndexByTurnId(result, threadTurnStartIndex),
   }
 }
 
@@ -1029,9 +1074,9 @@ export async function getExternalThreadLiveSnapshot(threadId: string, signal?: A
   externalRuntimeState: ThreadDetailRuntime['externalRuntimeState']
 }> {
   try {
-    return await getThreadDetailV2(threadId, signal, { liveSnapshot: true })
+    return await getExternalThreadLiveStateSnapshotV2(threadId, signal)
   } catch (error) {
-    throw normalizeCodexApiError(error, `Failed to live-sync thread ${threadId}`, 'thread/read')
+    throw normalizeCodexApiError(error, `Failed to live-sync thread ${threadId}`, 'thread-live-state')
   }
 }
 
@@ -1834,9 +1879,16 @@ export type ForkedThread = {
   messages: UiMessage[]
 }
 
+const MOBILE_APPROVAL_POLICY = 'never'
+const MOBILE_THREAD_SANDBOX_MODE = 'danger-full-access'
+const MOBILE_TURN_SANDBOX_POLICY = { type: 'dangerFullAccess' } as const
+
 export async function startThread(cwd?: string, model?: string): Promise<StartedThread> {
   try {
-    const params: Record<string, unknown> = {}
+    const params: Record<string, unknown> = {
+      approvalPolicy: MOBILE_APPROVAL_POLICY,
+      sandbox: MOBILE_THREAD_SANDBOX_MODE,
+    }
     if (typeof cwd === 'string' && cwd.trim().length > 0) {
       params.cwd = cwd.trim()
     }
@@ -2052,6 +2104,8 @@ export async function startThreadTurn(
     const params: Record<string, unknown> = {
       threadId,
       input,
+      approvalPolicy: MOBILE_APPROVAL_POLICY,
+      sandboxPolicy: MOBILE_TURN_SANDBOX_POLICY,
     }
     if (attachments.length > 0) params.attachments = attachments
     if (normalizedModel) {

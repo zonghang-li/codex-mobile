@@ -1594,7 +1594,7 @@ describe('external runtime ownership', () => {
     expect(state.selectedThreadRuntimeOwnership.value).toBe('external')
   })
 
-  it('keeps one selected detail read in flight and resumes two seconds after settlement', async () => {
+  it('keeps one selected detail read in flight and resumes one second after settlement', async () => {
     const state = await setupBackgroundRuntimeState()
     const firstDetail = deferred<ReturnType<typeof externalDetail>>()
     gatewayMocks.getThreadRuntimeStates.mockResolvedValue({
@@ -1621,7 +1621,7 @@ describe('external runtime ownership', () => {
 
     firstDetail.resolve(externalDetail())
     await flushMicrotasks()
-    await vi.advanceTimersByTimeAsync(1_999)
+    await vi.advanceTimersByTimeAsync(999)
     expect(gatewayMocks.getExternalThreadLiveSnapshot).toHaveBeenCalledTimes(1)
     await vi.advanceTimersByTimeAsync(1)
     expect(gatewayMocks.getExternalThreadLiveSnapshot).toHaveBeenCalledTimes(2)
@@ -2563,7 +2563,7 @@ describe('external runtime ownership', () => {
     )
   })
 
-  it('restores and polls an externally owned selected thread after 2 seconds', async () => {
+  it('restores and polls an externally owned selected thread after 1 second', async () => {
     const { state } = await setupExternalRuntimeState()
     gatewayMocks.resumeThread.mockResolvedValue(externalDetail())
     gatewayMocks.getThreadDetail.mockResolvedValue(externalDetail())
@@ -2574,7 +2574,7 @@ describe('external runtime ownership', () => {
     expect(state.selectedThread.value?.inProgress).toBe(true)
     expect(gatewayMocks.getThreadDetail).not.toHaveBeenCalled()
 
-    await vi.advanceTimersByTimeAsync(1_999)
+    await vi.advanceTimersByTimeAsync(999)
     expect(gatewayMocks.getThreadDetail).not.toHaveBeenCalled()
     await vi.advanceTimersByTimeAsync(1)
     expect(gatewayMocks.getThreadDetail).toHaveBeenCalledTimes(1)
@@ -2626,7 +2626,7 @@ describe('external runtime ownership', () => {
       })
     await state.loadMessages('thread-1')
 
-    await vi.advanceTimersByTimeAsync(2_000)
+    await vi.advanceTimersByTimeAsync(1_000)
     await flushMicrotasks()
 
     expect(gatewayMocks.getThreadDetail).toHaveBeenCalledWith(
@@ -2639,7 +2639,7 @@ describe('external runtime ownership', () => {
       expect.objectContaining({ id: 'agent-live', text: 'New desktop output' }),
     ]))
 
-    await vi.advanceTimersByTimeAsync(2_000)
+    await vi.advanceTimersByTimeAsync(1_000)
     await flushMicrotasks()
 
     expect(state.messages.value.filter((message) => message.id === 'agent-live')).toEqual([
@@ -2647,7 +2647,7 @@ describe('external runtime ownership', () => {
     ])
   })
 
-  it('starts the next external snapshot two seconds after settlement', async () => {
+  it('starts the next external snapshot one second after settlement', async () => {
     const { state } = await setupExternalRuntimeState()
     const pending = deferred<ReturnType<typeof externalDetail>>()
     gatewayMocks.resumeThread.mockResolvedValue(externalDetail())
@@ -2661,7 +2661,7 @@ describe('external runtime ownership', () => {
 
     pending.resolve(externalDetail())
     await flushMicrotasks()
-    await vi.advanceTimersByTimeAsync(1_999)
+    await vi.advanceTimersByTimeAsync(999)
     expect(gatewayMocks.getThreadDetail).toHaveBeenCalledTimes(1)
     await vi.advanceTimersByTimeAsync(1)
     expect(gatewayMocks.getThreadDetail).toHaveBeenCalledTimes(2)
@@ -2680,7 +2680,7 @@ describe('external runtime ownership', () => {
       return Promise.resolve(externalDetail())
     })
     await state.loadMessages('thread-1')
-    await vi.advanceTimersByTimeAsync(2_000)
+    await vi.advanceTimersByTimeAsync(1_000)
     expect(gatewayMocks.getThreadDetail).toHaveBeenCalledTimes(1)
 
     state.primeSelectedThread('thread-2')
@@ -2697,7 +2697,7 @@ describe('external runtime ownership', () => {
     expect(gatewayMocks.getThreadDetail).toHaveBeenCalledTimes(2)
     newRequest.resolve(externalDetail())
     await flushMicrotasks()
-    await vi.advanceTimersByTimeAsync(2_000)
+    await vi.advanceTimersByTimeAsync(1_000)
     expect(gatewayMocks.getThreadDetail).toHaveBeenCalledTimes(3)
     expect(gatewayMocks.getThreadRuntimeState).not.toHaveBeenCalled()
   })
@@ -2963,11 +2963,11 @@ describe('external runtime ownership', () => {
       .mockRejectedValueOnce(new Error('snapshot unavailable'))
     await state.loadMessages('thread-1')
 
-    await vi.advanceTimersByTimeAsync(2_000)
+    await vi.advanceTimersByTimeAsync(1_000)
     await flushMicrotasks()
     expect(state.selectedLiveOverlay.value?.activityLabel).toBe('Retaining detailed work')
 
-    await vi.advanceTimersByTimeAsync(2_000)
+    await vi.advanceTimersByTimeAsync(1_000)
     await flushMicrotasks()
 
     expect(gatewayMocks.getThreadDetail).toHaveBeenCalledTimes(2)
@@ -3083,7 +3083,7 @@ describe('external runtime ownership', () => {
     expect(gatewayMocks.getThreadDetail).not.toHaveBeenCalled()
 
     state.startPolling()
-    await vi.advanceTimersByTimeAsync(2_000)
+    await vi.advanceTimersByTimeAsync(1_000)
     expect(gatewayMocks.getThreadDetail).toHaveBeenCalledTimes(1)
     expect(gatewayMocks.getThreadRuntimeState).not.toHaveBeenCalled()
   })
