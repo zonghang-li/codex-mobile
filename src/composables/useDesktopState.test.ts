@@ -3333,6 +3333,30 @@ describe('external runtime ownership', () => {
     expect(replied).toBe(true)
   })
 
+  it('issues only one RPC when the same pending request is resolved twice concurrently', async () => {
+    const { state, emit } = await setupExternalRuntimeState()
+    const reply = deferred<void>()
+    gatewayMocks.replyToServerRequest.mockReturnValue(reply.promise)
+    emit({
+      method: 'server/request',
+      params: {
+        id: 102,
+        method: 'item/tool/requestUserInput',
+        params: { threadId: 'thread-2', questions: [] },
+      },
+    })
+
+    const first = state.respondToPendingServerRequest({ id: 102, result: {} })
+    const second = state.respondToPendingServerRequest({ id: 102, result: {} })
+    await flushMicrotasks()
+
+    expect(gatewayMocks.replyToServerRequest).toHaveBeenCalledTimes(1)
+    expect(await second).toBe(false)
+
+    reply.resolve()
+    expect(await first).toBe(true)
+  })
+
   it('waits for an edited-message rollback before starting the replacement turn', async () => {
     const { state } = await setupExternalRuntimeState()
     gatewayMocks.resumeThread.mockResolvedValue({

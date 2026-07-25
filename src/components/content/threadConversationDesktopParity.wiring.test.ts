@@ -29,6 +29,13 @@ describe('ThreadConversation Codex desktop activity parity wiring', () => {
     expect(source).not.toContain('v-for="activity in getTurnActivityMessagesForWorked(')
   })
 
+  it('only gives command rows disclosure affordances when output exists', () => {
+    expect(source).toContain('function commandCanExpand(message: UiMessage): boolean')
+    expect(source).toContain('v-if="commandCanExpand(cmd)"')
+    expect(source).toContain('v-if="commandCanExpand(message)"')
+    expect(source).toContain('class="cmd-row cmd-status-only"')
+  })
+
   it('uses the desktop turn projector for completion folding and final-response identity', () => {
     expect(source).toContain('projectConversationTurns({')
     expect(source).toContain('section.isCollapsed && section.completionMessageId !== null')

@@ -388,7 +388,7 @@ function requestPanelTitle(request: UiServerRequest): string {
   if (isApprovalRequest(request)) return 'Awaiting approval'
   if (isMcpElicitationRequest(request)) return 'MCP server input required'
   if (request.method === 'item/tool/requestUserInput') return 'Awaiting response'
-  if (request.method === 'item/tool/call') return 'Tool call waiting for response'
+  if (request.method === 'item/tool/call') return 'Tool response needed'
   return request.method
 }
 

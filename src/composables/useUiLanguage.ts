@@ -454,6 +454,9 @@ const zhCN: Record<string, string> = {
   'This task already has a goal. Edit it from the goal strip above.': '当前任务已有目标，请在上方目标栏中编辑。',
   'Skills and prompts': '技能与提示词',
   'Do anything': '做任何事',
+  'Move queued message up': '向上移动排队消息',
+  'Move queued message down': '向下移动排队消息',
+  'Tool response needed': '需要工具响应',
 }
 
 const LANGUAGE_LABELS: Record<UiLanguage, string> = {

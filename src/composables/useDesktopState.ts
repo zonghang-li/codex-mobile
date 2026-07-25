@@ -1639,6 +1639,7 @@ export function useDesktopState() {
   const pendingTurnStartsById = new Map<string, TurnStartedInfo>()
   const fallbackRetryInFlightThreadIds = new Set<string>()
   const nonSuccessCompletionReadBaselineByThreadId = new Map<string, string>()
+  const resolvingServerRequestIds = new Set<number>()
 
 
   const allThreads = computed(() => flattenThreads(projectGroups.value))
@@ -6505,9 +6506,11 @@ export function useDesktopState() {
   }
 
   async function respondToPendingServerRequest(reply: UiServerRequestReply): Promise<boolean> {
+    if (resolvingServerRequestIds.has(reply.id)) return false
     const requestScope = findPendingServerRequestScope(reply.id)
     if (!requestScope) return false
     if (requestScope !== GLOBAL_SERVER_REQUEST_SCOPE && isExternallyOwned(requestScope)) return false
+    resolvingServerRequestIds.add(reply.id)
     try {
       await replyToServerRequest(reply.id, {
         result: reply.result,
@@ -6517,7 +6520,10 @@ export function useDesktopState() {
       return true
     } catch (unknownError) {
       error.value = unknownError instanceof Error ? unknownError.message : 'Failed to reply to server request'
+      void loadPendingServerRequestsFromBridge()
       return false
+    } finally {
+      resolvingServerRequestIds.delete(reply.id)
     }
   }
 
@@ -6543,6 +6549,7 @@ export function useDesktopState() {
     pendingThreadMessageRefresh.clear()
     pendingTurnStartsById.clear()
     nonSuccessCompletionReadBaselineByThreadId.clear()
+    resolvingServerRequestIds.clear()
     if (eventSyncTimer !== null && typeof window !== 'undefined') {
       window.clearTimeout(eventSyncTimer)
       eventSyncTimer = null

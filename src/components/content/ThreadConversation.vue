@@ -82,6 +82,7 @@
                   class="worked-cmd-item"
                 >
                   <button
+                    v-if="commandCanExpand(cmd)"
                     type="button"
                     class="cmd-row cmd-compact"
                     :class="[commandStatusClass(cmd), { 'cmd-expanded': isCommandExpanded(cmd) }]"
@@ -92,7 +93,12 @@
                     <span class="cmd-status">{{ commandStatusLabel(cmd) }}</span>
                     <span class="cmd-chevron" :class="{ 'cmd-chevron-open': isCommandExpanded(cmd) }">›</span>
                   </button>
-                  <div class="cmd-output-wrap" :class="{ 'cmd-output-visible': isCommandExpanded(cmd) }">
+                  <article v-else class="cmd-row cmd-compact cmd-status-only" :class="commandStatusClass(cmd)">
+                    <IconTablerTerminal class="icon-svg cmd-icon" />
+                    <span class="cmd-label">{{ commandDisplayLabel(cmd) }}</span>
+                    <span class="cmd-status">{{ commandStatusLabel(cmd) }}</span>
+                  </article>
+                  <div v-if="commandCanExpand(cmd)" class="cmd-output-wrap" :class="{ 'cmd-output-visible': isCommandExpanded(cmd) }">
                     <div class="cmd-output-inner">
                       <pre
                         class="cmd-output"
@@ -159,6 +165,7 @@
                   class="worked-cmd-item"
                 >
                   <button
+                    v-if="commandCanExpand(cmd)"
                     type="button"
                     class="cmd-row"
                     :class="[
@@ -175,7 +182,13 @@
                     <span class="cmd-status">{{ commandStatusLabel(cmd) }}</span>
                     <span class="cmd-chevron" :class="{ 'cmd-chevron-open': isCommandExpanded(cmd) }">›</span>
                   </button>
+                  <article v-else class="cmd-row cmd-compact cmd-status-only" :class="commandStatusClass(cmd)">
+                    <IconTablerTerminal class="icon-svg cmd-icon" />
+                    <span class="cmd-label">{{ commandDisplayLabel(cmd) }}</span>
+                    <span class="cmd-status">{{ commandStatusLabel(cmd) }}</span>
+                  </article>
                   <div
+                    v-if="commandCanExpand(cmd)"
                     class="cmd-output-wrap"
                     :class="{ 'cmd-output-visible': isCommandExpanded(cmd) }"
                   >
@@ -192,6 +205,7 @@
             </div>
             <template v-else>
               <button
+                v-if="commandCanExpand(message)"
                 type="button"
                 class="cmd-row"
                 :class="[
@@ -208,7 +222,13 @@
                 <span class="cmd-status">{{ commandStatusLabel(message) }}</span>
                 <span class="cmd-chevron" :class="{ 'cmd-chevron-open': isCommandExpanded(message) }">›</span>
               </button>
+              <article v-else class="cmd-row cmd-status-only" :class="[commandStatusClass(message), { 'cmd-compact': isCommandCompact(message) }]">
+                <IconTablerTerminal class="icon-svg cmd-icon" />
+                <span class="cmd-label">{{ commandDisplayLabel(message) }}</span>
+                <span class="cmd-status">{{ commandStatusLabel(message) }}</span>
+              </article>
               <div
+                v-if="commandCanExpand(message)"
                 class="cmd-output-wrap"
                 :class="{ 'cmd-output-visible': isCommandExpanded(message) }"
               >
@@ -470,6 +490,7 @@
                             class="worked-cmd-item"
                           >
                             <button
+                              v-if="commandCanExpand(cmd)"
                               type="button"
                               class="cmd-row cmd-compact"
                               :class="[commandStatusClass(cmd), { 'cmd-expanded': isCommandExpanded(cmd) }]"
@@ -480,7 +501,12 @@
                               <span class="cmd-status">{{ commandStatusLabel(cmd) }}</span>
                               <span class="cmd-chevron" :class="{ 'cmd-chevron-open': isCommandExpanded(cmd) }">›</span>
                             </button>
-                            <div class="cmd-output-wrap" :class="{ 'cmd-output-visible': isCommandExpanded(cmd) }">
+                            <article v-else class="cmd-row cmd-compact cmd-status-only" :class="commandStatusClass(cmd)">
+                              <IconTablerTerminal class="icon-svg cmd-icon" />
+                              <span class="cmd-label">{{ commandDisplayLabel(cmd) }}</span>
+                              <span class="cmd-status">{{ commandStatusLabel(cmd) }}</span>
+                            </article>
+                            <div v-if="commandCanExpand(cmd)" class="cmd-output-wrap" :class="{ 'cmd-output-visible': isCommandExpanded(cmd) }">
                               <div class="cmd-output-inner">
                                 <pre
                                   class="cmd-output"
@@ -1536,8 +1562,13 @@ function isCommandAutoExpanded(message: UiMessage): boolean {
   return !hasLiveAssistantText.value && message.id === activeCommandMessageId.value
 }
 
+function commandCanExpand(message: UiMessage): boolean {
+  return isCommandMessage(message)
+    && (message.commandExecution?.aggregatedOutput ?? '').trim().length > 0
+}
+
 function isCommandExpanded(message: UiMessage): boolean {
-  if (!isCommandMessage(message)) return false
+  if (!commandCanExpand(message)) return false
   return expandedCommandIds.value.has(message.id)
     || (!collapsedAutoCommandIds.value.has(message.id) && isCommandAutoExpanded(message))
 }
@@ -1551,7 +1582,7 @@ function isCommandOutputCondensed(message: UiMessage): boolean {
 }
 
 function toggleCommandExpand(message: UiMessage): void {
-  if (!isCommandMessage(message)) return
+  if (!commandCanExpand(message)) return
 
   const nextExpanded = new Set(expandedCommandIds.value)
   const nextCollapsedAuto = new Set(collapsedAutoCommandIds.value)
@@ -4298,7 +4329,7 @@ function requestDisplayTitle(request: UiServerRequest): string {
   if (request.method === 'item/permissions/requestApproval') return 'Permissions approval required'
   if (request.method === 'mcpServer/elicitation/request') return 'MCP server input required'
   if (request.method === 'item/tool/requestUserInput') return 'Input required'
-  if (request.method === 'item/tool/call') return 'Tool call waiting for response'
+  if (request.method === 'item/tool/call') return 'Tool response needed'
   return request.method
 }
 
@@ -5786,6 +5817,10 @@ onBeforeUnmount(() => {
 
 .cmd-row {
   @apply w-full flex items-center gap-2 border-0 bg-transparent px-0 py-1 text-left text-zinc-500 transition hover:text-zinc-700;
+}
+
+.cmd-row.cmd-status-only {
+  @apply cursor-default hover:text-zinc-500;
 }
 
 .cmd-row.cmd-row-group {
