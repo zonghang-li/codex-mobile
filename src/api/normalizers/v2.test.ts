@@ -337,6 +337,7 @@ Reply with &lt;/instructions&gt; and A &amp; B
       {
         type: 'subAgentActivity',
         id: 'subagent-updated',
+        agentThreadId: 'thread-docs',
         agentPath: '/root/updated_docs_coverage_review',
         kind: 'interacted',
       },
@@ -368,7 +369,9 @@ Reply with &lt;/instructions&gt; and A &amp; B
           kind: 'subAgent',
           label: 'Updated docs coverage review',
           status: 'updated',
+          agentThreadId: 'thread-docs',
           agentPath: '/root/updated_docs_coverage_review',
+          subAgentKind: 'interacted',
         },
       }),
       expect.objectContaining({
@@ -432,7 +435,12 @@ Reply with &lt;/instructions&gt; and A &amp; B
         senderThreadId: 'thread-1',
         receiverThreadIds: ['thread-2'],
         prompt: null,
-        agentsStates: {},
+        agentsStates: {
+          'thread-2': {
+            status: 'completed',
+            message: 'private child result that must not render',
+          },
+        },
       },
     ]))
 
@@ -444,6 +452,23 @@ Reply with &lt;/instructions&gt; and A &amp; B
       ['collabAgentToolCall', 'Waited for agents'],
     ])
     expect(messages[1]?.images).toEqual(['/codex-local-image?path=%2Ftmp%2Fshot.png'])
+    expect(messages[4]?.activity).toEqual({
+      kind: 'subAgent',
+      label: 'Waited for agents',
+      status: 'completed',
+      collabAgent: {
+        tool: 'wait',
+        status: 'completed',
+        receiverThreadIds: ['thread-2'],
+        agentsStates: {
+          'thread-2': 'completed',
+        },
+      },
+    })
+    expect(JSON.stringify({
+      text: messages[4]?.text,
+      activity: messages[4]?.activity,
+    })).not.toContain('private child result')
   })
 })
 

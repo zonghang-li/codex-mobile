@@ -111,11 +111,32 @@ export type UiCommandAction = {
   query?: string | null
 }
 
+export type UiSubAgentActivityKind = 'started' | 'interacted' | 'interrupted'
+
+export type UiCollabAgentStatus =
+  | 'pendingInit'
+  | 'running'
+  | 'interrupted'
+  | 'completed'
+  | 'errored'
+  | 'shutdown'
+  | 'notFound'
+
+export type UiCollabAgentActivity = {
+  tool: string
+  status?: string
+  receiverThreadIds: string[]
+  agentsStates: Record<string, UiCollabAgentStatus>
+}
+
 export type UiActivityData = {
   kind: 'command' | 'fileChange' | 'tool' | 'subAgent' | 'image' | 'search' | 'status' | 'plan'
   label: string
   status?: string
+  agentThreadId?: string
   agentPath?: string
+  subAgentKind?: UiSubAgentActivityKind
+  collabAgent?: UiCollabAgentActivity
 }
 
 export type UiFileAttachment = { label: string; path: string }
