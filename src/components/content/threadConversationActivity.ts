@@ -197,6 +197,13 @@ export function getTurnActivityMessagesForWorked(messages: readonly UiMessage[],
   return activity
 }
 
+export function getTurnActivitySegmentsForWorked(
+  messages: readonly UiMessage[],
+  workedIndex: number,
+): ThreadActivitySegment[] {
+  return buildThreadActivitySegments(getTurnActivityMessagesForWorked(messages, workedIndex))
+}
+
 export function getHiddenCompletedActivityMessageIds(messages: readonly UiMessage[]): Set<string> {
   const hidden = new Set<string>()
   for (let index = 0; index < messages.length; index += 1) {
