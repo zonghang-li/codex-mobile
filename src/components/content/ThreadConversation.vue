@@ -54,7 +54,7 @@
               @click="toggleActivitySegment(message.id)"
             >
               <IconTablerTerminal class="icon-svg codex-activity-icon" />
-              <span class="codex-activity-label">{{ readActivitySegment(message)?.label }}</span>
+              <span class="codex-activity-label">{{ activitySegmentLabel(readActivitySegment(message)) }}</span>
               <span class="cmd-chevron" :class="{ 'cmd-chevron-open': isActivitySegmentExpanded(message.id) }">›</span>
             </button>
             <article
@@ -66,7 +66,7 @@
               <IconTablerSearch v-else-if="message.messageType === 'webSearch'" class="icon-svg codex-activity-icon" />
               <IconTablerFilePencil v-else-if="message.messageType === 'imageView' || message.messageType === 'imageGeneration' || message.messageType === 'contextCompaction'" class="icon-svg codex-activity-icon" />
               <IconTablerBolt v-else class="icon-svg codex-activity-icon" />
-              <span class="codex-activity-label">{{ readActivitySegment(message)?.label }}</span>
+              <span class="codex-activity-label">{{ activitySegmentLabel(readActivitySegment(message)) }}</span>
             </article>
 
             <div
@@ -1442,6 +1442,10 @@ function activitySegmentCanExpand(segment: ThreadActivitySegment | null): boolea
 
 function activitySegmentAgentStatus(segment: ThreadActivitySegment | null): string {
   return segment?.kind === 'subAgent' ? segment.status ?? '' : ''
+}
+
+function activitySegmentLabel(segment: ThreadActivitySegment | null): string {
+  return segment && segment.kind !== 'subAgent' ? segment.label : ''
 }
 
 function activitySegmentAgents(segment: ThreadActivitySegment | null) {
