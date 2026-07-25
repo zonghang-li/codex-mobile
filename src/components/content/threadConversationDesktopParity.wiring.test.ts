@@ -21,6 +21,7 @@ describe('ThreadConversation Codex desktop activity parity wiring', () => {
     expect(source).toContain('{{ activitySegmentAgentStatus(readActivitySegment(message)) }}')
     expect(source).toContain('activitySegmentCommands(readActivitySegment(message))')
     expect(source).toContain('@click="toggleActivitySegment(message.id)"')
+    expect(source).not.toContain('activitySegmentStatus(')
   })
 
   it('uses the same segment model inside completed Worked details', () => {

@@ -49,9 +49,6 @@
             >
               <IconTablerTerminal class="icon-svg codex-activity-icon" />
               <span class="codex-activity-label">{{ readActivitySegment(message)?.label }}</span>
-              <span v-if="activitySegmentStatus(readActivitySegment(message))" class="codex-activity-status">
-                {{ activitySegmentStatus(readActivitySegment(message)) }}
-              </span>
               <span class="cmd-chevron" :class="{ 'cmd-chevron-open': isActivitySegmentExpanded(message.id) }">›</span>
             </button>
             <article
@@ -438,9 +435,6 @@
                       >
                         <IconTablerTerminal class="icon-svg codex-activity-icon" />
                         <span class="codex-activity-label">{{ segment.label }}</span>
-                        <span v-if="activitySegmentStatus(segment)" class="codex-activity-status">
-                          {{ activitySegmentStatus(segment) }}
-                        </span>
                         <span class="cmd-chevron" :class="{ 'cmd-chevron-open': isActivitySegmentExpanded(segment.id) }">›</span>
                       </button>
                       <article v-else class="codex-activity-row" :data-activity-kind="segment.kind">
@@ -1444,13 +1438,6 @@ function toggleActivitySegment(segmentId: string): void {
   if (next.has(segmentId)) next.delete(segmentId)
   else next.add(segmentId)
   expandedActivitySegmentIds.value = next
-}
-
-function activitySegmentStatus(segment: ThreadActivitySegment | null): string {
-  const commands = activitySegmentCommands(segment)
-  if (commands.some((message) => message.commandExecution?.status === 'inProgress')) return 'Running'
-  if (commands.some((message) => message.commandExecution?.status === 'failed')) return 'Failed'
-  return commands.length > 0 ? 'Done' : ''
 }
 
 const groupedCommandsByLatestId = computed<Record<string, UiMessage[]>>(() => {
@@ -5667,10 +5654,6 @@ onBeforeUnmount(() => {
 
 .codex-activity-button {
   @apply cursor-pointer border-0 bg-transparent transition hover:text-zinc-700;
-}
-
-.codex-activity-status {
-  @apply shrink-0 text-xs font-medium text-zinc-400;
 }
 
 .codex-activity-details {
