@@ -84,7 +84,9 @@ describe('thread conversation completed activity grouping', () => {
           kind: 'subAgent',
           label: 'Updated docs coverage review',
           status: 'updated',
+          agentThreadId: 'thread-docs',
           agentPath: '/root/updated_docs_coverage_review',
+          subAgentKind: 'interacted',
         },
       },
     ]
@@ -105,10 +107,50 @@ describe('thread conversation completed activity grouping', () => {
       {
         kind: 'subAgent',
         id: 'agent-1',
-        label: 'Updated docs coverage review',
+        agents: [{
+          id: 'thread-docs',
+          label: 'Updated docs coverage review',
+          state: 'updated',
+        }],
         status: 'updated',
         sourceMessageIds: ['agent-1'],
       },
+    ])
+  })
+
+  it('groups adjacent subagent events but keeps clusters separated by parent transcript content', () => {
+    const agent = (id: string, threadId: string, label: string): UiMessage => ({
+      ...message(id, 'system', label, 'subAgentActivity'),
+      activity: {
+        kind: 'subAgent',
+        label,
+        status: 'started',
+        agentThreadId: threadId,
+        agentPath: `/root/${threadId}`,
+        subAgentKind: 'started',
+      },
+    })
+    const messages = [
+      agent('docs', 'thread-docs', 'Docs reviewer'),
+      agent('shell', 'thread-shell', 'Shell reviewer'),
+      message('parent-commentary', 'assistant', 'Both reviewers are running.', 'agentMessage'),
+      agent('tests', 'thread-tests', 'Test reviewer'),
+    ]
+
+    expect(buildThreadActivitySegments(messages)).toEqual([
+      expect.objectContaining({
+        kind: 'subAgent',
+        id: 'shell',
+        agents: [
+          expect.objectContaining({ id: 'thread-docs' }),
+          expect.objectContaining({ id: 'thread-shell' }),
+        ],
+      }),
+      expect.objectContaining({
+        kind: 'subAgent',
+        id: 'tests',
+        agents: [expect.objectContaining({ id: 'thread-tests' })],
+      }),
     ])
   })
 
