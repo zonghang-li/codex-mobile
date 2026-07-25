@@ -1027,6 +1027,12 @@
                   />
                   <ConversationRunFooter
                     :footer-state="selectedConversationFooterState"
+                    :goal="selectedThreadGoal"
+                    :goal-supported="selectedThreadGoalSupported"
+                    :read-only="selectedThreadRuntimeOwnership === 'external'"
+                    :is-updating-goal="isUpdatingThreadGoal"
+                    @set-goal="updateSelectedThreadGoal"
+                    @clear-goal="clearSelectedThreadGoal"
                   />
                   <ThreadPendingRequestPanel
                     v-if="selectedThreadPendingRequest"
@@ -1439,6 +1445,8 @@ const {
   selectedThreadServerRequests,
   selectedLiveOverlay,
   selectedActiveTurnId,
+  selectedThreadGoal,
+  selectedThreadGoalSupported,
   codexQuota,
   selectedThreadId,
   availableCollaborationModes,
@@ -1461,6 +1469,7 @@ const {
   isSelectedThreadInterruptPending,
   selectedThreadRuntimeOwnership,
   isUpdatingSpeedMode,
+  isUpdatingThreadGoal,
   error: desktopError,
   refreshAll,
   refreshSkills,
@@ -1480,6 +1489,8 @@ const {
   removeQueuedMessage,
   reorderQueuedMessage,
   steerQueuedMessage,
+  updateSelectedThreadGoal,
+  clearSelectedThreadGoal,
   setSelectedCollaborationMode,
   readModelIdForThread,
   setSelectedModelIdForThread,

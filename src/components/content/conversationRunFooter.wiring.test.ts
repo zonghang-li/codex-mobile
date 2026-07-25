@@ -38,6 +38,18 @@ describe('ConversationRunFooter desktop parity wiring', () => {
     expect(footerSource).toContain('aria-live="polite"')
   })
 
+  it('renders the desktop goal strip with edit, pause/resume, delete, and expansion controls', () => {
+    expect(appSource).toContain(':goal="selectedThreadGoal"')
+    expect(appSource).toContain('@set-goal="updateSelectedThreadGoal"')
+    expect(appSource).toContain('@clear-goal="clearSelectedThreadGoal"')
+    expect(footerSource).toContain('deriveThreadGoalPresentation')
+    expect(footerSource).toContain('goal-pause-button')
+    expect(footerSource).toContain('goal-resume-button')
+    expect(footerSource).toContain('goal-edit-button')
+    expect(footerSource).toContain('goal-clear-button')
+    expect(footerSource).toContain('goal-expand-button')
+  })
+
   it('uses an accessible progress primitive', () => {
     expect(donutSource).toContain('role="progressbar"')
     expect(donutSource).toContain(':aria-valuenow="roundedValue"')

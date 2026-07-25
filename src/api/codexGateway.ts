@@ -40,6 +40,8 @@ import type {
   UiMessage,
   UiProjectGroup,
   UiThread,
+  UiThreadGoal,
+  UiThreadGoalStatus,
   UiReviewAction,
   UiReviewActionLevel,
   UiReviewFile,
@@ -446,6 +448,44 @@ function readBoolean(value: unknown): boolean | null {
 
 function readStringArray(value: unknown): string[] {
   return Array.isArray(value) ? value.filter((item): item is string => typeof item === 'string' && item.length > 0) : []
+}
+
+const THREAD_GOAL_STATUSES = new Set<UiThreadGoalStatus>([
+  'active',
+  'paused',
+  'blocked',
+  'usageLimited',
+  'budgetLimited',
+  'complete',
+])
+
+function normalizeThreadGoal(value: unknown): UiThreadGoal | null {
+  const record = asRecord(value)
+  if (!record) return null
+  const objective = typeof record.objective === 'string' ? record.objective : ''
+  const status = readString(record.status)
+  const updatedAt = readNumber(record.updatedAt)
+  const timeUsedSeconds = readNumber(record.timeUsedSeconds)
+  const tokensUsed = readNumber(record.tokensUsed)
+  const tokenBudget = record.tokenBudget === null ? null : readNumber(record.tokenBudget)
+  if (
+    !status
+    || !THREAD_GOAL_STATUSES.has(status as UiThreadGoalStatus)
+    || updatedAt === null
+    || timeUsedSeconds === null
+    || tokensUsed === null
+    || (record.tokenBudget !== null && tokenBudget === null)
+  ) {
+    return null
+  }
+  return {
+    objective,
+    status: status as UiThreadGoalStatus,
+    updatedAt,
+    timeUsedSeconds,
+    tokensUsed,
+    tokenBudget,
+  }
 }
 
 function hasOnlyKeys(record: Record<string, unknown>, keys: string[]): boolean {
@@ -1763,6 +1803,35 @@ export async function archiveThread(threadId: string): Promise<void> {
 
 export async function renameThread(threadId: string, threadName: string): Promise<void> {
   await callRpc('thread/name/set', { threadId, name: threadName })
+}
+
+export async function getThreadGoal(threadId: string): Promise<UiThreadGoal | null> {
+  const payload = await callRpc<unknown>('thread/goal/get', { threadId })
+  const record = asRecord(payload)
+  if (record?.goal === null || record?.goal === undefined) return null
+  const goal = normalizeThreadGoal(record.goal)
+  if (!goal) throw new Error('Invalid thread goal response')
+  return goal
+}
+
+export async function setThreadGoal(input: {
+  threadId: string
+  objective?: string
+  status: UiThreadGoalStatus
+}): Promise<UiThreadGoal> {
+  const params: Record<string, unknown> = {
+    threadId: input.threadId,
+    status: input.status,
+  }
+  if (input.objective !== undefined) params.objective = input.objective
+  const payload = await callRpc<unknown>('thread/goal/set', params)
+  const goal = normalizeThreadGoal(asRecord(payload)?.goal)
+  if (!goal) throw new Error('Invalid thread goal response')
+  return goal
+}
+
+export async function clearThreadGoal(threadId: string): Promise<void> {
+  await callRpc('thread/goal/clear', { threadId })
 }
 
 export async function rollbackThread(threadId: string, numTurns: number): Promise<UiMessage[]> {

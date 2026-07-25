@@ -433,6 +433,20 @@ const zhCN: Record<string, string> = {
   'Step {step} / {count}': '步骤 {step} / {count}',
   '1 file changed': '1 个文件已更改',
   '{count} files changed': '{count} 个文件已更改',
+  'Pursuing goal': '正在追求目标',
+  'Paused goal': '目标已暂停',
+  'Goal blocked': '目标受阻',
+  'Goal usage limited': '目标用量受限',
+  'Goal limited': '目标受限',
+  'Goal achieved': '目标已达成',
+  'Show goal details': '显示目标详情',
+  'Edit goal': '编辑目标',
+  'Pause goal': '暂停目标',
+  'Resume goal': '继续目标',
+  'Clear goal': '清除目标',
+  'Goal objective': '目标内容',
+  '{used} / {budget} tokens': '{used} / {budget} tokens',
+  '{count} tokens used': '已使用 {count} tokens',
 }
 
 const LANGUAGE_LABELS: Record<UiLanguage, string> = {

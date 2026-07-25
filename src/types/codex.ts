@@ -76,6 +76,23 @@ export type UiThread = {
 
 export type UiPendingRequestState = 'approval' | 'response'
 
+export type UiThreadGoalStatus =
+  | 'active'
+  | 'paused'
+  | 'blocked'
+  | 'usageLimited'
+  | 'budgetLimited'
+  | 'complete'
+
+export type UiThreadGoal = {
+  objective: string
+  status: UiThreadGoalStatus
+  updatedAt: number
+  timeUsedSeconds: number
+  tokensUsed: number
+  tokenBudget: number | null
+}
+
 export type UiThreadAutomationStatus = 'ACTIVE' | 'PAUSED'
 
 export type UiThreadAutomation = {

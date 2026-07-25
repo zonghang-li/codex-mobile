@@ -9,6 +9,7 @@ import {
   getAvailableModelIds,
   getCurrentModelConfig,
   getExternalThreadLiveSnapshot,
+  getThreadGoal,
   getPendingServerRequests,
   getSkillsList,
   getThreadDetail,
@@ -24,6 +25,7 @@ import {
   getThreadQueueState,
   getWorkspaceRootsState,
   setCodexSpeedMode,
+  setThreadGoal,
   setThreadQueueState,
   setWorkspaceRootsState,
   getThreadTitleCache,
@@ -34,6 +36,7 @@ import {
   startThread,
   subscribeCodexNotifications,
   startThreadTurn,
+  clearThreadGoal,
   type RpcNotification,
   type SkillInfo,
   type ThreadQueueState,
@@ -61,6 +64,8 @@ import type {
   UiThreadTokenUsage,
   UiTokenUsageBreakdown,
   UiThread,
+  UiThreadGoal,
+  UiThreadGoalStatus,
 } from '../types/codex'
 import type { ThreadRuntimeOwnership } from '../types/threadRuntime'
 import { getPathParent, isProjectlessChatPath, normalizePathForUi, toProjectName } from '../pathUtils.js'
@@ -129,6 +134,14 @@ const DEFAULT_CODEX_NEW_THREAD_SPEED_MODE: SpeedMode = 'fast'
 const MODEL_FALLBACK_ID = 'gpt-5.4-mini'
 const OPENCODE_ZEN_DEFAULT_MODEL = 'big-pickle'
 const CODEX_CLI_MISSING_MESSAGE = 'Codex CLI not found. Install @openai/codex or set CODEXUI_CODEX_COMMAND.'
+const THREAD_GOAL_STATUSES = new Set<UiThreadGoalStatus>([
+  'active',
+  'paused',
+  'blocked',
+  'usageLimited',
+  'budgetLimited',
+  'complete',
+])
 type SelectThreadResult = 'ok' | 'not-found' | 'error'
 
 function isCodexCliMissingError(error: unknown): boolean {
@@ -1516,6 +1529,9 @@ export function useDesktopState() {
   const threadTokenUsageByThreadId = ref<Record<string, UiThreadTokenUsage>>(loadThreadTokenUsageMap())
   const terminalOpenByThreadId = ref<Record<string, boolean>>(loadThreadTerminalOpenMap())
   const threadModelProviderByThreadId = ref<Record<string, string>>({})
+  const threadGoalByThreadId = ref<Record<string, UiThreadGoal>>({})
+  const threadGoalSupportByThreadId = ref<Record<string, boolean>>({})
+  const isUpdatingThreadGoal = ref(false)
 
   const threadTitleById = ref<Record<string, string>>({})
 
@@ -1692,6 +1708,14 @@ export function useDesktopState() {
   const selectedActiveTurnId = computed(() => {
     const threadId = selectedThreadId.value
     return threadId ? activeTurnIdByThreadId.value[threadId] ?? '' : ''
+  })
+  const selectedThreadGoal = computed<UiThreadGoal | null>(() => {
+    const threadId = selectedThreadId.value
+    return threadId ? threadGoalByThreadId.value[threadId] ?? null : null
+  })
+  const selectedThreadGoalSupported = computed(() => {
+    const threadId = selectedThreadId.value
+    return threadId ? threadGoalSupportByThreadId.value[threadId] !== false : true
   })
   const codexQuota = computed<UiRateLimitSnapshot | null>(() => codexRateLimit.value)
   const selectedThreadTokenUsage = computed<UiThreadTokenUsage | null>(() => {
@@ -3386,6 +3410,63 @@ export function useDesktopState() {
     return typeof value === 'number' && Number.isFinite(value) ? value : null
   }
 
+  function readThreadGoal(value: unknown): UiThreadGoal | null {
+    const record = asRecord(value)
+    if (!record) return null
+    const status = readString(record.status) as UiThreadGoalStatus
+    const updatedAt = readNumber(record.updatedAt)
+    const timeUsedSeconds = readNumber(record.timeUsedSeconds)
+    const tokensUsed = readNumber(record.tokensUsed)
+    const tokenBudget = record.tokenBudget === null ? null : readNumber(record.tokenBudget)
+    if (
+      !THREAD_GOAL_STATUSES.has(status)
+      || updatedAt === null
+      || timeUsedSeconds === null
+      || tokensUsed === null
+      || (record.tokenBudget !== null && tokenBudget === null)
+    ) return null
+    return {
+      objective: readString(record.objective),
+      status,
+      updatedAt,
+      timeUsedSeconds,
+      tokensUsed,
+      tokenBudget,
+    }
+  }
+
+  function isThreadGoalUnsupportedError(value: unknown): boolean {
+    const message = value instanceof Error ? value.message : String(value ?? '')
+    return value instanceof CodexApiError && value.status === 404
+      || /(?:method|rpc).*(?:not found|unknown|unsupported)|-32601|thread\/goal.*(?:not found|unsupported)/iu.test(message)
+  }
+
+  async function refreshThreadGoal(threadId: string): Promise<void> {
+    try {
+      const goal = await getThreadGoal(threadId)
+      threadGoalSupportByThreadId.value = {
+        ...threadGoalSupportByThreadId.value,
+        [threadId]: true,
+      }
+      if (goal) {
+        threadGoalByThreadId.value = {
+          ...threadGoalByThreadId.value,
+          [threadId]: goal,
+        }
+      } else {
+        threadGoalByThreadId.value = omitKey(threadGoalByThreadId.value, threadId)
+      }
+    } catch (goalError) {
+      if (isThreadGoalUnsupportedError(goalError)) {
+        threadGoalSupportByThreadId.value = {
+          ...threadGoalSupportByThreadId.value,
+          [threadId]: false,
+        }
+        threadGoalByThreadId.value = omitKey(threadGoalByThreadId.value, threadId)
+      }
+    }
+  }
+
   function getRateLimitSnapshotKey(snapshot: UiRateLimitSnapshot): string {
     return snapshot.limitId?.trim() || snapshot.limitName?.trim() || '__default__'
   }
@@ -4420,6 +4501,35 @@ export function useDesktopState() {
       return
     }
 
+    if (notification.method === 'thread/goal/updated') {
+      const params = asRecord(notification.params)
+      const threadId = extractThreadIdFromNotification(notification)
+      const goal = readThreadGoal(params?.goal ?? notification.params)
+      if (threadId && goal) {
+        threadGoalByThreadId.value = {
+          ...threadGoalByThreadId.value,
+          [threadId]: goal,
+        }
+        threadGoalSupportByThreadId.value = {
+          ...threadGoalSupportByThreadId.value,
+          [threadId]: true,
+        }
+      }
+      return
+    }
+
+    if (notification.method === 'thread/goal/cleared') {
+      const threadId = extractThreadIdFromNotification(notification)
+      if (threadId) {
+        threadGoalByThreadId.value = omitKey(threadGoalByThreadId.value, threadId)
+        threadGoalSupportByThreadId.value = {
+          ...threadGoalSupportByThreadId.value,
+          [threadId]: true,
+        }
+      }
+      return
+    }
+
     const tokenUsageUpdate = readThreadTokenUsageUpdate(notification)
     if (tokenUsageUpdate) {
       setThreadTokenUsage(tokenUsageUpdate.threadId, tokenUsageUpdate.usage)
@@ -5229,6 +5339,9 @@ export function useDesktopState() {
 
     const loadPromise = (async () => {
       try {
+      if (!(threadId in threadGoalSupportByThreadId.value)) {
+        void refreshThreadGoal(threadId)
+      }
       const version = currentThreadVersion(threadId)
       const loadedVersion = loadedVersionByThreadId.value[threadId] ?? ''
       const loadedRecently =
@@ -6523,6 +6636,72 @@ export function useDesktopState() {
     void sendMessageToSelectedThread(msg.text, msg.imageUrls, msg.skills, 'steer', msg.fileAttachments)
   }
 
+  async function updateSelectedThreadGoal(input: {
+    objective?: string
+    status: UiThreadGoalStatus
+  }): Promise<boolean> {
+    const threadId = selectedThreadId.value.trim()
+    if (!threadId || isExternallyOwned(threadId) || threadGoalSupportByThreadId.value[threadId] === false) {
+      return false
+    }
+    isUpdatingThreadGoal.value = true
+    try {
+      const goal = await setThreadGoal({
+        threadId,
+        objective: input.objective,
+        status: input.status,
+      })
+      threadGoalByThreadId.value = {
+        ...threadGoalByThreadId.value,
+        [threadId]: goal,
+      }
+      threadGoalSupportByThreadId.value = {
+        ...threadGoalSupportByThreadId.value,
+        [threadId]: true,
+      }
+      return true
+    } catch (goalError) {
+      if (isThreadGoalUnsupportedError(goalError)) {
+        threadGoalSupportByThreadId.value = {
+          ...threadGoalSupportByThreadId.value,
+          [threadId]: false,
+        }
+      }
+      error.value = goalError instanceof Error ? goalError.message : 'Unable to update thread goal'
+      return false
+    } finally {
+      isUpdatingThreadGoal.value = false
+    }
+  }
+
+  async function clearSelectedThreadGoal(): Promise<boolean> {
+    const threadId = selectedThreadId.value.trim()
+    if (!threadId || isExternallyOwned(threadId) || threadGoalSupportByThreadId.value[threadId] === false) {
+      return false
+    }
+    isUpdatingThreadGoal.value = true
+    try {
+      await clearThreadGoal(threadId)
+      threadGoalByThreadId.value = omitKey(threadGoalByThreadId.value, threadId)
+      threadGoalSupportByThreadId.value = {
+        ...threadGoalSupportByThreadId.value,
+        [threadId]: true,
+      }
+      return true
+    } catch (goalError) {
+      if (isThreadGoalUnsupportedError(goalError)) {
+        threadGoalSupportByThreadId.value = {
+          ...threadGoalSupportByThreadId.value,
+          [threadId]: false,
+        }
+      }
+      error.value = goalError instanceof Error ? goalError.message : 'Unable to clear thread goal'
+      return false
+    } finally {
+      isUpdatingThreadGoal.value = false
+    }
+  }
+
   function primeSelectedThread(threadId: string, options: { persist?: boolean } = {}): void {
     setSelectedThreadId(threadId, options)
   }
@@ -6538,6 +6717,8 @@ export function useDesktopState() {
     selectedThreadServerRequests,
     selectedLiveOverlay,
     selectedActiveTurnId,
+    selectedThreadGoal,
+    selectedThreadGoalSupported,
     codexQuota,
     selectedThreadId,
     availableCollaborationModes,
@@ -6558,6 +6739,7 @@ export function useDesktopState() {
     isSendingMessage,
     isInterruptingTurn,
     isUpdatingSpeedMode,
+    isUpdatingThreadGoal,
     isRollingBack,
 
     error,
@@ -6582,6 +6764,8 @@ export function useDesktopState() {
     removeQueuedMessage,
     reorderQueuedMessage,
     steerQueuedMessage,
+    updateSelectedThreadGoal,
+    clearSelectedThreadGoal,
     setSelectedCollaborationMode,
     readModelIdForThread,
     setSelectedModelIdForThread,

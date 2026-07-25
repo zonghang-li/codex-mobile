@@ -26,6 +26,7 @@ const gatewayMocks = vi.hoisted(() => ({
   getExternalThreadLiveSnapshot: vi.fn(),
   getThreadDetail: vi.fn(),
   getThreadGroupsPage: vi.fn(),
+  getThreadGoal: vi.fn(),
   getThreadRuntimeState: vi.fn(),
   getThreadRuntimeStates: vi.fn(),
   getThreadQueueState: vi.fn(),
@@ -41,7 +42,9 @@ const gatewayMocks = vi.hoisted(() => ({
   rollbackThread: vi.fn(),
   setCodexSpeedMode: vi.fn(),
   setThreadQueueState: vi.fn(),
+  setThreadGoal: vi.fn(),
   setWorkspaceRootsState: vi.fn(),
+  clearThreadGoal: vi.fn(),
   startThread: vi.fn(),
   startThreadTurn: vi.fn(),
   subscribeCodexNotifications: vi.fn(),
@@ -295,10 +298,79 @@ beforeEach(() => {
     (threadId: string, signal?: AbortSignal) => gatewayMocks.getThreadDetail(threadId, signal),
   )
   gatewayMocks.getThreadQueueState.mockResolvedValue({})
+  gatewayMocks.getThreadGoal.mockResolvedValue(null)
   gatewayMocks.getThreadRuntimeStates.mockResolvedValue({})
   gatewayMocks.setThreadQueueState.mockResolvedValue(undefined)
   gatewayMocks.getThreadTitleCache.mockResolvedValue({ titles: {} })
   gatewayMocks.getWorkspaceRootsState.mockRejectedValue(new Error('no workspace roots state'))
+})
+
+describe('thread goal state', () => {
+  const activeGoal = {
+    objective: 'Match the Codex conversation page',
+    status: 'active' as const,
+    updatedAt: 1_785_000_000,
+    timeUsedSeconds: 75,
+    tokensUsed: 1200,
+    tokenBudget: 8000,
+  }
+
+  it('loads the selected thread goal without coupling it to thread detail errors', async () => {
+    installTestWindow()
+    gatewayMocks.resumeThread.mockResolvedValue(idleDetail())
+    gatewayMocks.getThreadGoal.mockResolvedValue(activeGoal)
+
+    const state = useDesktopState()
+    state.primeSelectedThread('thread-1')
+    await state.loadMessages('thread-1')
+    await flushMicrotasks()
+
+    expect(gatewayMocks.getThreadGoal).toHaveBeenCalledWith('thread-1')
+    expect(state.selectedThreadGoal.value).toEqual(activeGoal)
+    expect(state.selectedThreadGoalSupported.value).toBe(true)
+  })
+
+  it('applies goal update and clear notifications to the matching thread', async () => {
+    const { state, emit } = await setupTurnLifecycleNotificationState('thread-1')
+
+    emit({
+      method: 'thread/goal/updated',
+      params: { threadId: 'thread-1', goal: activeGoal },
+    })
+    expect(state.selectedThreadGoal.value).toEqual(activeGoal)
+    expect(state.selectedThreadGoalSupported.value).toBe(true)
+
+    emit({
+      method: 'thread/goal/cleared',
+      params: { threadId: 'thread-1' },
+    })
+    expect(state.selectedThreadGoal.value).toBeNull()
+    expect(state.selectedThreadGoalSupported.value).toBe(true)
+  })
+
+  it('updates, pauses, resumes, and clears the selected goal through Codex RPCs', async () => {
+    installTestWindow()
+    gatewayMocks.setThreadGoal.mockResolvedValue(activeGoal)
+    gatewayMocks.clearThreadGoal.mockResolvedValue(undefined)
+
+    const state = useDesktopState()
+    state.primeSelectedThread('thread-1')
+
+    await state.updateSelectedThreadGoal({
+      objective: activeGoal.objective,
+      status: 'active',
+    })
+    expect(gatewayMocks.setThreadGoal).toHaveBeenCalledWith({
+      threadId: 'thread-1',
+      objective: activeGoal.objective,
+      status: 'active',
+    })
+    expect(state.selectedThreadGoal.value).toEqual(activeGoal)
+
+    await state.clearSelectedThreadGoal()
+    expect(gatewayMocks.clearThreadGoal).toHaveBeenCalledWith('thread-1')
+    expect(state.selectedThreadGoal.value).toBeNull()
+  })
 })
 
 afterEach(() => {
