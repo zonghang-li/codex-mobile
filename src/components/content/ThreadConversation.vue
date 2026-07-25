@@ -5414,7 +5414,7 @@ onBeforeUnmount(() => {
 }
 
 .message-text {
-  @apply m-0 text-base leading-8 whitespace-pre-wrap break-words text-slate-900;
+  @apply m-0 text-[15px] leading-6 whitespace-pre-wrap break-words text-slate-900;
   overflow-wrap: anywhere;
 }
 
@@ -5452,7 +5452,7 @@ onBeforeUnmount(() => {
 }
 
 .message-list {
-  @apply m-0 pl-5 text-base leading-8 text-slate-900 flex flex-col gap-1.5;
+  @apply m-0 pl-5 text-[15px] leading-6 text-slate-900 flex flex-col gap-1.5;
 }
 
 .message-list-unordered {
@@ -5658,7 +5658,7 @@ onBeforeUnmount(() => {
 }
 
 .codex-activity-row {
-  @apply flex w-full max-w-[min(var(--chat-card-max,76ch),100%)] items-center gap-2 px-0 py-1 text-left text-sm font-medium leading-6 text-zinc-500;
+  @apply flex w-full max-w-[min(var(--chat-card-max,76ch),100%)] items-center gap-2 px-0 py-1 text-left text-[14px] font-medium leading-[22px] text-zinc-500;
 }
 
 .codex-activity-stack {
@@ -5682,7 +5682,7 @@ onBeforeUnmount(() => {
 }
 
 .codex-agent-activity-row {
-  @apply flex w-full max-w-[min(var(--chat-card-max,76ch),100%)] min-w-0 items-center gap-2 py-1 text-sm text-zinc-500;
+  @apply flex w-full max-w-[min(var(--chat-card-max,76ch),100%)] min-w-0 items-center gap-2 py-1 text-[14px] leading-[22px] text-zinc-500;
 }
 
 .codex-agent-activity-chip {
@@ -5753,7 +5753,7 @@ onBeforeUnmount(() => {
 }
 
 .cmd-row.cmd-compact .cmd-label {
-  font-size: 0.75rem;
+  font-size: 0.8125rem;
 }
 
 .cmd-row.cmd-compact .cmd-status {
@@ -5774,11 +5774,11 @@ onBeforeUnmount(() => {
 }
 
 .cmd-label {
-  @apply flex-1 min-w-0 truncate text-sm font-medium text-zinc-500;
+  @apply flex-1 min-w-0 truncate text-[13px] font-medium leading-5 text-zinc-500;
 }
 
 .cmd-group-label {
-  @apply flex-1 min-w-0 truncate text-sm font-medium text-zinc-500;
+  @apply flex-1 min-w-0 truncate text-[13px] font-medium leading-5 text-zinc-500;
 }
 
 .cmd-status {
@@ -5831,7 +5831,7 @@ onBeforeUnmount(() => {
 }
 
 .cmd-output {
-  @apply m-0 px-3 py-2 text-xs font-mono text-zinc-200 whitespace-pre-wrap break-words max-h-60 overflow-y-auto;
+  @apply m-0 px-3 py-2 text-[13px] leading-5 font-mono text-zinc-200 whitespace-pre-wrap break-words max-h-60 overflow-y-auto;
 }
 
 .cmd-output.cmd-output-condensed {
