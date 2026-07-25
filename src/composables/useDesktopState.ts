@@ -1531,7 +1531,7 @@ export function useDesktopState() {
   const threadModelProviderByThreadId = ref<Record<string, string>>({})
   const threadGoalByThreadId = ref<Record<string, UiThreadGoal>>({})
   const threadGoalSupportByThreadId = ref<Record<string, boolean>>({})
-  const isUpdatingThreadGoal = ref(false)
+  const updatingThreadGoalByThreadId = ref<Record<string, boolean>>({})
 
   const threadTitleById = ref<Record<string, string>>({})
 
@@ -1717,6 +1717,10 @@ export function useDesktopState() {
   const selectedThreadGoalSupported = computed(() => {
     const threadId = selectedThreadId.value
     return threadId ? threadGoalSupportByThreadId.value[threadId] !== false : true
+  })
+  const isUpdatingThreadGoal = computed(() => {
+    const threadId = selectedThreadId.value
+    return Boolean(threadId && updatingThreadGoalByThreadId.value[threadId] === true)
   })
   const codexQuota = computed<UiRateLimitSnapshot | null>(() => codexRateLimit.value)
   const selectedThreadTokenUsage = computed<UiThreadTokenUsage | null>(() => {
@@ -5340,55 +5344,55 @@ export function useDesktopState() {
 
     const loadPromise = (async () => {
       try {
-      if (!(threadId in threadGoalSupportByThreadId.value)) {
-        void refreshThreadGoal(threadId)
-      }
-      const version = currentThreadVersion(threadId)
-      const loadedVersion = loadedVersionByThreadId.value[threadId] ?? ''
-      const loadedRecently =
-        Date.now() - (lastMessageLoadAtByThreadId.get(threadId) ?? 0) < RECENT_THREAD_MESSAGE_LOAD_REUSE_MS
-      const canReuseLoadedMessages =
-        options.force !== true &&
-        alreadyLoaded &&
-        (
-          loadedRecently ||
-          (
-            (version.length === 0 || loadedVersion === version) &&
-            inProgressById.value[threadId] !== true
-          )
-        )
-
-      if (canReuseLoadedMessages) {
-        markThreadAsRead(threadId)
-        return
-      }
-
-      const needsResume = resumedThreadById.value[threadId] !== true
-      const detailRequest = acquireThreadDetailRequest(
-        threadId,
-        async () => {
-          if (!needsResume) return getThreadDetail(threadId)
-          return (await resumeThread(threadId)) ?? getThreadDetail(threadId)
-        },
-      )
-      try {
-        const detail = await detailRequest.promise
-
-        if (needsResume && detailRequest.ownsRequest) {
-          resumedThreadById.value = {
-            ...resumedThreadById.value,
-            [threadId]: true,
-          }
+        if (!(threadId in threadGoalSupportByThreadId.value)) {
+          void refreshThreadGoal(threadId)
         }
-        reconcileThreadDetailSnapshot(threadId, detail, {
-          preserveMissing: options.silent === true,
-          markRead: true,
-          requestedVersion: version,
-          detailEpoch: detailRequest.epoch,
-        })
-      } finally {
-        releaseThreadDetailRequest(threadId, detailRequest)
-      }
+        const version = currentThreadVersion(threadId)
+        const loadedVersion = loadedVersionByThreadId.value[threadId] ?? ''
+        const loadedRecently =
+          Date.now() - (lastMessageLoadAtByThreadId.get(threadId) ?? 0) < RECENT_THREAD_MESSAGE_LOAD_REUSE_MS
+        const canReuseLoadedMessages =
+          options.force !== true &&
+          alreadyLoaded &&
+          (
+            loadedRecently ||
+            (
+              (version.length === 0 || loadedVersion === version) &&
+              inProgressById.value[threadId] !== true
+            )
+          )
+
+        if (canReuseLoadedMessages) {
+          markThreadAsRead(threadId)
+          return
+        }
+
+        const needsResume = resumedThreadById.value[threadId] !== true
+        const detailRequest = acquireThreadDetailRequest(
+          threadId,
+          async () => {
+            if (!needsResume) return getThreadDetail(threadId)
+            return (await resumeThread(threadId)) ?? getThreadDetail(threadId)
+          },
+        )
+        try {
+          const detail = await detailRequest.promise
+
+          if (needsResume && detailRequest.ownsRequest) {
+            resumedThreadById.value = {
+              ...resumedThreadById.value,
+              [threadId]: true,
+            }
+          }
+          reconcileThreadDetailSnapshot(threadId, detail, {
+            preserveMissing: options.silent === true,
+            markRead: true,
+            requestedVersion: version,
+            detailEpoch: detailRequest.epoch,
+          })
+        } finally {
+          releaseThreadDetailRequest(threadId, detailRequest)
+        }
       } catch (unknownError) {
         const message = unknownError instanceof Error ? unknownError.message : 'Unknown application error'
         if (selectedThreadId.value === threadId) {
@@ -5397,9 +5401,9 @@ export function useDesktopState() {
         lastMessageLoadFailureAtByThreadId.set(threadId, Date.now())
         throw unknownError
       } finally {
-      if (shouldShowLoading) {
-        isLoadingMessages.value = false
-      }
+        if (shouldShowLoading) {
+          isLoadingMessages.value = false
+        }
       }
     })().finally(() => {
       loadMessagePromiseByThreadId.delete(threadId)
@@ -6651,7 +6655,11 @@ export function useDesktopState() {
     if (!threadId || isExternallyOwned(threadId) || threadGoalSupportByThreadId.value[threadId] === false) {
       return false
     }
-    isUpdatingThreadGoal.value = true
+    if (updatingThreadGoalByThreadId.value[threadId] === true) return false
+    updatingThreadGoalByThreadId.value = {
+      ...updatingThreadGoalByThreadId.value,
+      [threadId]: true,
+    }
     try {
       const goal = await setThreadGoal({
         threadId,
@@ -6677,7 +6685,7 @@ export function useDesktopState() {
       error.value = goalError instanceof Error ? goalError.message : 'Unable to update thread goal'
       return false
     } finally {
-      isUpdatingThreadGoal.value = false
+      updatingThreadGoalByThreadId.value = omitKey(updatingThreadGoalByThreadId.value, threadId)
     }
   }
 
@@ -6686,7 +6694,11 @@ export function useDesktopState() {
     if (!threadId || isExternallyOwned(threadId) || threadGoalSupportByThreadId.value[threadId] === false) {
       return false
     }
-    isUpdatingThreadGoal.value = true
+    if (updatingThreadGoalByThreadId.value[threadId] === true) return false
+    updatingThreadGoalByThreadId.value = {
+      ...updatingThreadGoalByThreadId.value,
+      [threadId]: true,
+    }
     try {
       await clearThreadGoal(threadId)
       threadGoalByThreadId.value = omitKey(threadGoalByThreadId.value, threadId)
@@ -6705,7 +6717,7 @@ export function useDesktopState() {
       error.value = goalError instanceof Error ? goalError.message : 'Unable to clear thread goal'
       return false
     } finally {
-      isUpdatingThreadGoal.value = false
+      updatingThreadGoalByThreadId.value = omitKey(updatingThreadGoalByThreadId.value, threadId)
     }
   }
 

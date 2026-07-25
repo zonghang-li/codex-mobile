@@ -371,6 +371,31 @@ describe('thread goal state', () => {
     expect(gatewayMocks.clearThreadGoal).toHaveBeenCalledWith('thread-1')
     expect(state.selectedThreadGoal.value).toBeNull()
   })
+
+  it('keeps goal mutation progress scoped to the thread that started it', async () => {
+    installTestWindow()
+    let resolveGoal!: (goal: typeof activeGoal) => void
+    gatewayMocks.setThreadGoal.mockImplementation(() => new Promise((resolve) => {
+      resolveGoal = resolve
+    }))
+
+    const state = useDesktopState()
+    state.primeSelectedThread('thread-1')
+    const updatePromise = state.updateSelectedThreadGoal({
+      objective: activeGoal.objective,
+      status: 'active',
+    })
+
+    expect(state.isUpdatingThreadGoal.value).toBe(true)
+    state.primeSelectedThread('thread-2')
+    expect(state.isUpdatingThreadGoal.value).toBe(false)
+    state.primeSelectedThread('thread-1')
+    expect(state.isUpdatingThreadGoal.value).toBe(true)
+
+    resolveGoal(activeGoal)
+    await updatePromise
+    expect(state.isUpdatingThreadGoal.value).toBe(false)
+  })
 })
 
 afterEach(() => {
