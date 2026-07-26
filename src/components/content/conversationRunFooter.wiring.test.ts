@@ -145,6 +145,15 @@ describe('ConversationRunFooter desktop parity wiring', () => {
     )
   })
 
+  it('renders semantic activity through the shared desktop-style icon component', () => {
+    expect(conversationSource).toContain("import ThreadActivityIcon from './ThreadActivityIcon.vue'")
+    expect(conversationSource).toContain('<ThreadActivityIcon')
+    expect(conversationSource).toContain(':kind="activitySegmentIconKind(')
+    expect(conversationSource).not.toContain(
+      "message.messageType === 'imageView' || message.messageType === 'imageGeneration'",
+    )
+  })
+
   it('uses dark theme surfaces for the Goal creation menu', () => {
     expect(composerSource).not.toContain(':global(.dark) .thread-composer-goal')
     expect(globalStyleSource).toContain(':root.dark .thread-composer-goal-trigger')

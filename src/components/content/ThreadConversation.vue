@@ -55,9 +55,7 @@
               :class="{ 'codex-activity-row-expanded': isActivitySegmentExpanded(message.id) }"
               @click="toggleActivitySegment(message.id)"
             >
-              <IconTablerFilePencil v-if="activitySegmentIconKind(readActivitySegment(message)) === 'edit'" class="icon-svg codex-activity-icon" />
-              <IconTablerSearch v-else-if="activitySegmentIconKind(readActivitySegment(message)) === 'search'" class="icon-svg codex-activity-icon" />
-              <IconTablerTerminal v-else class="icon-svg codex-activity-icon" />
+              <ThreadActivityIcon :kind="activitySegmentIconKind(readActivitySegment(message))" />
               <span class="codex-activity-label">{{ activitySegmentLabel(readActivitySegment(message)) }}</span>
               <span class="cmd-chevron" :class="{ 'cmd-chevron-open': isActivitySegmentExpanded(message.id) }">›</span>
             </button>
@@ -66,12 +64,7 @@
               class="codex-activity-row"
               :data-activity-kind="readActivitySegment(message)?.kind"
             >
-              <IconTablerFilePencil v-if="activitySegmentIconKind(readActivitySegment(message)) === 'edit'" class="icon-svg codex-activity-icon" />
-              <IconTablerSearch v-else-if="activitySegmentIconKind(readActivitySegment(message)) === 'search'" class="icon-svg codex-activity-icon" />
-              <IconTablerTerminal v-else-if="readActivitySegment(message)?.kind === 'summary'" class="icon-svg codex-activity-icon" />
-              <IconTablerSearch v-else-if="message.messageType === 'webSearch'" class="icon-svg codex-activity-icon" />
-              <IconTablerFilePencil v-else-if="message.messageType === 'imageView' || message.messageType === 'imageGeneration' || message.messageType === 'contextCompaction'" class="icon-svg codex-activity-icon" />
-              <IconTablerBolt v-else class="icon-svg codex-activity-icon" />
+              <ThreadActivityIcon :kind="activitySegmentIconKind(readActivitySegment(message))" />
               <span class="codex-activity-label">{{ activitySegmentLabel(readActivitySegment(message)) }}</span>
             </article>
 
@@ -354,9 +347,7 @@
         >
           <div class="message-stack" data-role="system">
             <article class="codex-activity-row" :data-activity-type="message.messageType || ''">
-              <IconTablerSearch v-if="activityIconKind(message) === 'search'" class="icon-svg codex-activity-icon" />
-              <IconTablerFilePencil v-else-if="activityIconKind(message) === 'file'" class="icon-svg codex-activity-icon" />
-              <IconTablerBolt v-else class="icon-svg codex-activity-icon" />
+              <ThreadActivityIcon :kind="activityIconKind(message)" />
               <span class="codex-activity-label">{{ activityMessageLabel(message) }}</span>
             </article>
             <ul
@@ -475,17 +466,12 @@
                         :class="{ 'codex-activity-row-expanded': isActivitySegmentExpanded(segment.id) }"
                         @click="toggleActivitySegment(segment.id)"
                       >
-                        <IconTablerFilePencil v-if="activitySegmentIconKind(segment) === 'edit'" class="icon-svg codex-activity-icon" />
-                        <IconTablerSearch v-else-if="activitySegmentIconKind(segment) === 'search'" class="icon-svg codex-activity-icon" />
-                        <IconTablerTerminal v-else class="icon-svg codex-activity-icon" />
+                        <ThreadActivityIcon :kind="activitySegmentIconKind(segment)" />
                         <span class="codex-activity-label">{{ segment.label }}</span>
                         <span class="cmd-chevron" :class="{ 'cmd-chevron-open': isActivitySegmentExpanded(segment.id) }">›</span>
                       </button>
                       <article v-else class="codex-activity-row" :data-activity-kind="segment.kind">
-                        <IconTablerFilePencil v-if="activitySegmentIconKind(segment) === 'edit'" class="icon-svg codex-activity-icon" />
-                        <IconTablerSearch v-else-if="activitySegmentIconKind(segment) === 'search'" class="icon-svg codex-activity-icon" />
-                        <IconTablerTerminal v-else-if="segment.kind === 'summary'" class="icon-svg codex-activity-icon" />
-                        <IconTablerBolt v-else class="icon-svg codex-activity-icon" />
+                        <ThreadActivityIcon :kind="activitySegmentIconKind(segment)" />
                         <span class="codex-activity-label">{{ segment.label }}</span>
                       </article>
                       <div
@@ -1219,6 +1205,7 @@ import type { ListItem, MessageBlock, TableAlignment, TaskListItem } from './mes
 import CopyableOutputBlock from './CopyableOutputBlock.vue'
 import CodexDirectiveNotices from './CodexDirectiveNotices.vue'
 import MessageBlockRenderer from './MessageBlockRenderer.vue'
+import ThreadActivityIcon from './ThreadActivityIcon.vue'
 import IconTablerArrowBackUp from '../icons/IconTablerArrowBackUp.vue'
 import IconTablerArrowUp from '../icons/IconTablerArrowUp.vue'
 import IconTablerBolt from '../icons/IconTablerBolt.vue'
@@ -1371,11 +1358,10 @@ function commandDisplayLabel(message: UiMessage): string {
   return command ? `Ran ${command}` : 'Ran a command'
 }
 
-function activityIconKind(message: UiMessage): 'search' | 'file' | 'default' {
-  const type = message.messageType ?? ''
-  if (type === 'webSearch') return 'search'
-  if (type === 'reasoning' || type === 'imageView' || type === 'contextCompaction') return 'file'
-  return 'default'
+function activityIconKind(message: UiMessage): ThreadActivityIconKind {
+  const segment = readActivitySegment(message)
+  if (segment && segment.kind !== 'subAgent') return segment.iconKind
+  return 'status'
 }
 
 function activityMessageLabel(message: UiMessage): string {
@@ -1504,7 +1490,8 @@ function activitySegmentLabel(segment: ThreadActivitySegment | null): string {
 }
 
 function activitySegmentIconKind(segment: ThreadActivitySegment | null): ThreadActivityIconKind {
-  return segment?.kind === 'summary' ? segment.iconKind : 'terminal'
+  if (!segment || segment.kind === 'subAgent') return 'status'
+  return segment.iconKind
 }
 
 function activitySegmentAgents(segment: ThreadActivitySegment | null) {

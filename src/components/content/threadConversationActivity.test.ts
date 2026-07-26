@@ -256,12 +256,12 @@ describe('thread conversation completed activity grouping', () => {
       expect.objectContaining({
         id: 'read-3',
         label: 'Read a file',
-        iconKind: 'search',
+        iconKind: 'book',
       }),
     ])
   })
 
-  it('uses search for read-only activity and terminal for command-only activity', () => {
+  it('uses semantic desktop icon kinds for activity', () => {
     const command = (
       id: string,
       category: 'read' | 'unknown',
@@ -278,10 +278,25 @@ describe('thread conversation completed activity grouping', () => {
     })
 
     expect(buildThreadActivitySegments([command('read', 'read')])).toEqual([
-      expect.objectContaining({ iconKind: 'search' }),
+      expect.objectContaining({ iconKind: 'book' }),
     ])
     expect(buildThreadActivitySegments([command('run', 'unknown')])).toEqual([
       expect.objectContaining({ iconKind: 'terminal' }),
+    ])
+    expect(buildThreadActivitySegments([
+      message('codegraph', 'system', 'Used codegraph integration', 'dynamicToolCall'),
+    ])).toEqual([
+      expect.objectContaining({ iconKind: 'integration' }),
+    ])
+    expect(buildThreadActivitySegments([
+      message('image', 'assistant', 'Viewed an image', 'imageView'),
+    ])).toEqual([
+      expect.objectContaining({ iconKind: 'image' }),
+    ])
+    expect(buildThreadActivitySegments([
+      message('compact', 'system', 'Context automatically compacting', 'contextCompaction'),
+    ])).toEqual([
+      expect.objectContaining({ iconKind: 'status' }),
     ])
   })
 

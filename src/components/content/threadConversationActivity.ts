@@ -107,7 +107,8 @@ function actionSummaryLabel(state: ActionSummaryState): string {
 
 function actionSummaryIconKind(state: ActionSummaryState): ThreadActivityIconKind {
   if (state.editedFileCount > 0) return 'edit'
-  if (state.readCount > 0 || state.listCount > 0 || state.searchCount > 0) return 'search'
+  if (state.readCount > 0 || state.listCount > 0) return 'book'
+  if (state.searchCount > 0) return 'search'
   return 'terminal'
 }
 
