@@ -273,6 +273,24 @@ export type ConversationFooterState = {
   deletions: number
 }
 
+export type UiThreadLiveAuthority = 'writer-snapshot' | 'local-stream' | 'persisted' | 'missing'
+
+export type UiThreadLiveFooter = {
+  stepCurrent: number | null
+  stepTotal: number | null
+  completedPercent: number | null
+  fileCount: number | null
+  additions: number | null
+  deletions: number | null
+  label: string
+}
+
+export type UiThreadLiveSnapshot = {
+  revision: number
+  activeTurnId: string | null
+  footer: UiThreadLiveFooter | null
+}
+
 export type UiGenericCodexDirectiveAttribute = {
   key: string
   value: string

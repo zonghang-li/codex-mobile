@@ -729,6 +729,83 @@ describe('getThreadDetail', () => {
     expect(requestSignal).toBe(controller.signal)
   })
 
+  it('normalizes authoritative writer footer snapshots from thread-live-state', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({
+      threadId: 'external-thread',
+      conversationState: { turns: [] },
+      threadTurnStartIndex: 8,
+      hasMoreOlder: true,
+      isInProgress: true,
+      externalRuntime: {
+        state: 'running',
+        turnId: 'turn-external',
+        interruptible: false,
+        source: 'external-session-writer',
+      },
+      liveAuthority: 'writer-snapshot',
+      liveSnapshot: {
+        schemaVersion: 1,
+        threadId: 'external-thread',
+        activeTurnId: 'turn-external',
+        revision: 3,
+        generatedAt: '2026-07-27T00:00:00.000Z',
+        expiresAt: '2026-07-27T00:01:00.000Z',
+        source: 'desktop-writer',
+        state: 'running',
+        footer: {
+          stepCurrent: 2,
+          stepTotal: 6,
+          completedPercent: 33.3333,
+          fileCount: 29,
+          additions: 5485,
+          deletions: 417,
+          label: 'Step 2 / 6 · 29 files changed +5485 -417',
+        },
+        timeline: [],
+        pendingRequest: null,
+        sidebar: { indicator: 'running' },
+      },
+    }), { status: 200, headers: { 'Content-Type': 'application/json' } })))
+
+    await expect(getExternalThreadLiveSnapshot('external-thread')).resolves.toMatchObject({
+      liveAuthority: 'writer-snapshot',
+      liveSnapshot: {
+        revision: 3,
+        activeTurnId: 'turn-external',
+        footer: {
+          stepCurrent: 2,
+          stepTotal: 6,
+          fileCount: 29,
+          additions: 5485,
+          deletions: 417,
+        },
+      },
+    })
+  })
+
+  it('normalizes missing live authority without trusting malformed snapshot payloads', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({
+      threadId: 'external-thread',
+      conversationState: { turns: [] },
+      isInProgress: true,
+      externalRuntime: {
+        state: 'running',
+        turnId: 'turn-external',
+        interruptible: false,
+        source: 'external-session-writer',
+      },
+      liveAuthority: 'writer-snapshot',
+      liveSnapshot: { revision: 'bad', footer: { stepTotal: '6' } },
+    }), { status: 200, headers: { 'Content-Type': 'application/json' } })))
+
+    await expect(getExternalThreadLiveSnapshot('external-thread')).resolves.toMatchObject({
+      liveAuthority: 'missing',
+      liveSnapshot: null,
+      inProgress: true,
+      ownership: 'external',
+    })
+  })
+
   it('returns terminal turn summaries for persisted completion folding', async () => {
     vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({
       result: {
