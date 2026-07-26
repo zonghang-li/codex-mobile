@@ -1228,6 +1228,7 @@ import { useDesktopState } from './composables/useDesktopState'
 import { useMobile } from './composables/useMobile'
 import { useUiLanguage } from './composables/useUiLanguage'
 import { useFeedbackDiagnostics } from './composables/useFeedbackDiagnostics'
+import { createManagedUploadLease } from './composables/managedUploadLease'
 import { deriveConversationFooterState } from './components/content/conversationFooterState'
 import {
   checkoutGitBranch,
@@ -4943,8 +4944,9 @@ async function submitFirstMessageForNewThread(
   text: string,
   imageUrls: string[] = [],
   skills: Array<{ name: string; path: string }> = [],
-  fileAttachments: Array<{ label: string; path: string; fsPath: string }> = [],
+  fileAttachments: Array<{ label: string; path: string; fsPath: string; uploadHandle?: string }> = [],
 ): Promise<void> {
+  const uploadLease = createManagedUploadLease(imageUrls, fileAttachments)
   try {
     worktreeInitStatus.value = { phase: 'idle', title: '', message: '' }
     let targetCwd = newThreadCwd.value
@@ -4972,12 +4974,15 @@ async function submitFirstMessageForNewThread(
       targetCwd = directory.cwd
       newThreadCwd.value = directory.cwd
     }
+    uploadLease.transfer()
     const threadId = await sendMessageToNewThread(text, targetCwd, imageUrls, skills, fileAttachments)
     if (!threadId) return
     await router.replace({ name: 'thread', params: { threadId } })
     scheduleMobileConversationJumpToLatest()
   } catch {
     // Error is already reflected in state.
+  } finally {
+    await uploadLease.release()
   }
 }
 

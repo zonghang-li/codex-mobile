@@ -27,4 +27,10 @@ describe('ThreadComposer ephemeral uploaded-image attachments', () => {
     expect(source).toMatch(/function clearDraftState[\s\S]*cleanupSelectedImages/u)
     expect(source).toMatch(/function invalidatePendingAttachments[\s\S]*cleanupSelectedImages/u)
   })
+
+  it('keeps App ownership through new-thread preflight and transfers it before state submission', async () => {
+    const source = await readFile(new URL('../../App.vue', import.meta.url), 'utf8')
+
+    expect(source).toMatch(/createManagedUploadLease\([\s\S]*createWorktree[\s\S]*createProjectlessThreadDirectory[\s\S]*uploadLease\.transfer\(\)[\s\S]*sendMessageToNewThread[\s\S]*finally[\s\S]*uploadLease\.release\(\)/u)
+  })
 })

@@ -4761,6 +4761,58 @@ describe('provider model selection', () => {
     ])
   })
 
+  it('releases a new-thread upload once after primary and fallback thread/start both fail', async () => {
+    installTestWindow()
+    const state = useDesktopState()
+    state.setSelectedModelId('gpt-5.5')
+    const managedImageUrl = '/codex-local-image?path=%2Ftmp%2Fcodex-web-uploads%2Fupload%2Fphoto.png&uploadHandle=new-thread-fail'
+    gatewayMocks.startThread
+      .mockRejectedValueOnce(new Error('model is not supported'))
+      .mockRejectedValueOnce(new Error('fallback thread start failed'))
+
+    await expect(state.sendMessageToNewThread('hi', '/tmp/project', [managedImageUrl]))
+      .rejects.toThrow('fallback thread start failed')
+
+    expect(gatewayMocks.startThread).toHaveBeenCalledTimes(2)
+    expect(gatewayMocks.cleanupManagedUploads).toHaveBeenCalledTimes(1)
+    expect(gatewayMocks.cleanupManagedUploads).toHaveBeenCalledWith([managedImageUrl], [])
+  })
+
+  it('releases a new-thread upload once when thread/start returns an empty thread id', async () => {
+    installTestWindow()
+    const state = useDesktopState()
+    const managedImageUrl = '/codex-local-image?path=%2Ftmp%2Fcodex-web-uploads%2Fupload%2Fphoto.png&uploadHandle=empty-thread'
+    gatewayMocks.startThread.mockResolvedValue({
+      threadId: '',
+      model: '',
+      modelProvider: '',
+    })
+
+    await expect(state.sendMessageToNewThread('hi', '/tmp/project', [managedImageUrl])).resolves.toBe('')
+
+    expect(gatewayMocks.cleanupManagedUploads).toHaveBeenCalledTimes(1)
+    expect(gatewayMocks.cleanupManagedUploads).toHaveBeenCalledWith([managedImageUrl], [])
+  })
+
+  it('transfers a new-thread upload to pending-turn cleanup without double deletion', async () => {
+    installTestWindow()
+    const state = useDesktopState()
+    const managedImageUrl = '/codex-local-image?path=%2Ftmp%2Fcodex-web-uploads%2Fupload%2Fphoto.png&uploadHandle=pending-owner'
+    gatewayMocks.startThread.mockResolvedValue({
+      threadId: 'new-thread',
+      model: 'gpt-5.4-mini',
+      modelProvider: 'openai',
+    })
+    gatewayMocks.startThreadTurn.mockRejectedValue(new Error('final turn handoff failed'))
+
+    await expect(state.sendMessageToNewThread('hi', '/tmp/project', [managedImageUrl]))
+      .resolves.toBe('new-thread')
+    await vi.waitFor(() => {
+      expect(gatewayMocks.cleanupManagedUploads).toHaveBeenCalledTimes(1)
+    })
+    expect(gatewayMocks.cleanupManagedUploads).toHaveBeenCalledWith([managedImageUrl], [])
+  })
+
   it('refreshes a loaded optimistic thread when completion events arrive', async () => {
     installTestWindow()
     vi.mocked(window.setTimeout).mockImplementation(((callback: TimerHandler) => {

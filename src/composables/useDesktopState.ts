@@ -84,6 +84,7 @@ import {
 } from './externalLiveSnapshot'
 import { resolveTurnCompletionDisposition, type TurnTerminalStatus } from './threadLifecycle'
 import { shouldRefreshMessagesForNotification } from './notificationSyncPolicy'
+import { createManagedUploadLease } from './managedUploadLease'
 
 type ThreadDetailSnapshot = Awaited<ReturnType<typeof getThreadDetail>>
 
@@ -6137,13 +6138,20 @@ export function useDesktopState() {
     skills: Array<{ name: string; path: string }> = [],
     fileAttachments: FileAttachment[] = [],
   ): Promise<string> {
-    if (isUpdatingSpeedMode.value) return ''
+    const uploadLease = createManagedUploadLease(imageUrls, fileAttachments)
+    if (isUpdatingSpeedMode.value) {
+      await uploadLease.release()
+      return ''
+    }
 
     const nextText = text.trim()
     const targetCwd = cwd.trim()
     const selectedModel = readModelIdForThread(NEW_THREAD_COLLABORATION_MODE_CONTEXT).trim()
     const selectedMode = selectedCollaborationMode.value
-    if (!nextText && imageUrls.length === 0 && fileAttachments.length === 0) return ''
+    if (!nextText && imageUrls.length === 0 && fileAttachments.length === 0) {
+      await uploadLease.release()
+      return ''
+    }
 
     isSendingMessage.value = true
     error.value = ''
@@ -6168,7 +6176,10 @@ export function useDesktopState() {
           throw unknownError
         }
       }
-      if (!threadId) return ''
+      if (!threadId) {
+        await uploadLease.release()
+        return ''
+      }
 
       insertOptimisticThread(threadId, targetCwd, nextText || '[Image]')
       appendOptimisticUserMessage(threadId, nextText, imageUrls, skills, fileAttachments)
@@ -6197,7 +6208,15 @@ export function useDesktopState() {
       const capturedThreadId = threadId
       const capturedCwd = targetCwd || null
       const capturedPrompt = nextText
-      void startTurnForThread(threadId, nextText, imageUrls, skills, fileAttachments, selectedMode)
+      void startTurnForThread(
+        threadId,
+        nextText,
+        imageUrls,
+        skills,
+        fileAttachments,
+        selectedMode,
+        uploadLease.transfer,
+      )
         .catch((unknownError) => {
           shouldAutoScrollOnNextAgentEvent = false
           setThreadRuntimeOwnership(threadId, 'idle')
@@ -6210,9 +6229,11 @@ export function useDesktopState() {
         .finally(() => {
           isSendingMessage.value = false
         })
+      await uploadLease.release()
       void requestThreadTitleGeneration(capturedThreadId, capturedPrompt, capturedCwd)
       return threadId
     } catch (unknownError) {
+      await uploadLease.release()
       shouldAutoScrollOnNextAgentEvent = false
       if (threadId) {
         setThreadRuntimeOwnership(threadId, 'idle')
@@ -6236,6 +6257,7 @@ export function useDesktopState() {
     skills: Array<{ name: string; path: string }> = [],
     fileAttachments: FileAttachment[] = [],
     collaborationModeOverride?: CollaborationModeKind,
+    onPendingTurnEstablished?: () => void,
   ): Promise<void> {
     const reasoningEffort = selectedReasoningEffort.value
     const collaborationMode = collaborationModeOverride === 'plan' ? 'plan' : collaborationModeOverride === 'default'
@@ -6264,6 +6286,7 @@ export function useDesktopState() {
       collaborationMode,
       fallbackRetried: false,
     })
+    onPendingTurnEstablished?.()
 
     try {
       if (resumedThreadById.value[threadId] !== true) {
