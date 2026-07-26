@@ -871,6 +871,7 @@ function upsertMessage(previous: UiMessage[], nextMessage: UiMessage): UiMessage
 type TurnSummaryState = {
   turnId: string
   durationMs: number
+  status: TurnTerminalStatus
 }
 
 type TurnActivityState = {
@@ -932,7 +933,9 @@ function formatTurnDuration(durationMs: number): string {
 function areTurnSummariesEqual(first?: TurnSummaryState, second?: TurnSummaryState): boolean {
   if (!first && !second) return true
   if (!first || !second) return false
-  return first.turnId === second.turnId && first.durationMs === second.durationMs
+  return first.turnId === second.turnId
+    && first.durationMs === second.durationMs
+    && first.status === second.status
 }
 
 function areTurnActivitiesEqual(first?: TurnActivityState, second?: TurnActivityState): boolean {
@@ -947,18 +950,21 @@ function areTurnActivitiesEqual(first?: TurnActivityState, second?: TurnActivity
 }
 
 function buildTurnSummaryMessage(summary: TurnSummaryState): UiMessage {
+  const durationLabel = formatTurnDuration(summary.durationMs)
   return {
     id: `turn-summary:${summary.turnId}`,
     role: 'system',
-    text: `Worked for ${formatTurnDuration(summary.durationMs)}`,
+    text: summary.status === 'interrupted'
+      ? `You stopped after ${durationLabel}`
+      : `Worked for ${durationLabel}`,
     messageType: WORKED_MESSAGE_TYPE,
     turnId: summary.turnId,
   }
 }
 
-function findLastAssistantMessageIndex(messages: UiMessage[]): number {
+function findLastAssistantMessageIndex(messages: UiMessage[], turnId: string): number {
   for (let index = messages.length - 1; index >= 0; index -= 1) {
-    if (messages[index].role === 'assistant') {
+    if (messages[index].role === 'assistant' && messages[index].turnId === turnId) {
       return index
     }
   }
@@ -967,14 +973,54 @@ function findLastAssistantMessageIndex(messages: UiMessage[]): number {
 
 function insertTurnSummaryMessage(messages: UiMessage[], summary: TurnSummaryState): UiMessage[] {
   const summaryMessage = buildTurnSummaryMessage(summary)
-  const sanitizedMessages = messages.filter((message) => message.messageType !== WORKED_MESSAGE_TYPE)
-  const insertIndex = findLastAssistantMessageIndex(sanitizedMessages)
-  if (insertIndex < 0) {
+  const sanitizedMessages = messages.filter((message) => (
+    message.id !== summaryMessage.id
+    && !(message.messageType === WORKED_MESSAGE_TYPE && message.turnId === summary.turnId)
+  ))
+  const finalAssistantIndex = findLastAssistantMessageIndex(sanitizedMessages, summary.turnId)
+  if (finalAssistantIndex >= 0) {
+    const next = [...sanitizedMessages]
+    next.splice(finalAssistantIndex, 0, summaryMessage)
+    return next
+  }
+  let lastTurnIndex = -1
+  for (let index = sanitizedMessages.length - 1; index >= 0; index -= 1) {
+    if (sanitizedMessages[index].turnId === summary.turnId) {
+      lastTurnIndex = index
+      break
+    }
+  }
+  if (lastTurnIndex < 0) {
+    const hasTurnMetadata = sanitizedMessages.some((message) => Boolean(message.turnId))
+    if (!hasTurnMetadata) {
+      let legacyAssistantIndex = -1
+      for (let index = sanitizedMessages.length - 1; index >= 0; index -= 1) {
+        if (sanitizedMessages[index].role === 'assistant') {
+          legacyAssistantIndex = index
+          break
+        }
+      }
+      if (legacyAssistantIndex >= 0) {
+        const next = [...sanitizedMessages]
+        next.splice(legacyAssistantIndex, 0, summaryMessage)
+        return next
+      }
+    }
     return [...sanitizedMessages, summaryMessage]
   }
   const next = [...sanitizedMessages]
-  next.splice(insertIndex, 0, summaryMessage)
+  next.splice(lastTurnIndex + 1, 0, summaryMessage)
   return next
+}
+
+function insertTurnSummaryMessages(
+  messages: UiMessage[],
+  summaries: readonly TurnSummaryState[],
+): UiMessage[] {
+  return summaries.reduce(
+    (next, summary) => insertTurnSummaryMessage(next, summary),
+    messages,
+  )
 }
 
 function omitKey<TValue>(record: Record<string, TValue>, key: string): Record<string, TValue> {
@@ -4617,10 +4663,17 @@ export function useDesktopState() {
 
       const durationMs = typeof rawDurationMs === 'number' ? Math.max(0, rawDurationMs) : 0
       if (completionDisposition.ownsActiveLease) {
-        setTurnSummaryForThread(completedTurn.threadId, {
+        const summary: TurnSummaryState = {
           turnId: completedTurn.turnId,
           durationMs,
-        })
+          status: completedTurn.status,
+        }
+        const persistedMessages = persistedMessagesByThreadId.value[completedTurn.threadId] ?? []
+        setPersistedMessagesForThread(
+          completedTurn.threadId,
+          insertTurnSummaryMessage(persistedMessages, summary),
+        )
+        setTurnSummaryForThread(completedTurn.threadId, summary)
         if (activeTurnIdByThreadId.value[completedTurn.threadId]) {
           activeTurnIdByThreadId.value = omitKey(activeTurnIdByThreadId.value, completedTurn.threadId)
         }
@@ -5218,8 +5271,17 @@ export function useDesktopState() {
       setThreadModelId(threadId, resolveThreadModelForProvider(threadId, detail.model, detail.modelProvider))
     }
 
-    const { messages: nextMessages, inProgress: serverInProgress, activeTurnId, turnIndexByTurnId } = detail
-    const localActiveTurnId = activeTurnIdByThreadId.value[threadId] ?? ''
+    const {
+      messages: detailMessages,
+      completionSummaries = [],
+      inProgress: serverInProgress,
+      activeTurnId,
+      turnIndexByTurnId,
+    } = detail
+    const nextMessages = insertTurnSummaryMessages(detailMessages, completionSummaries)
+    const localActiveTurnId = runtimeOwnershipByThreadId.value[threadId] === 'local'
+      ? activeTurnIdByThreadId.value[threadId] ?? ''
+      : ''
     const detailOwnership: ThreadRuntimeOwnership = detail.ownership === 'external'
       ? 'external'
       : detail.ownership === 'local' || serverInProgress
@@ -5255,7 +5317,7 @@ export function useDesktopState() {
     replaceTurnIndexLookupForThread(threadId, turnIndexByTurnId)
     rebindLiveFileChangeTurnIndices(threadId)
     const previousPersisted = persistedMessagesByThreadId.value[threadId] ?? []
-    const mergedMessages = mergeMessages(previousPersisted, detail.messages, {
+    const mergedMessages = mergeMessages(previousPersisted, nextMessages, {
       preserveMissing: options.preserveMissing || hasOptimisticUserMessages(previousPersisted),
     })
     setPersistedMessagesForThread(threadId, mergedMessages)
@@ -5291,7 +5353,7 @@ export function useDesktopState() {
       setThreadRuntimeOwnership(threadId, ownership)
     }
     reconcileExternalReasoningSnapshot(threadId, detail, ownership, inProgress)
-    if (ownership === 'local' && activeTurnId) {
+    if (inProgress && activeTurnId) {
       activeTurnIdByThreadId.value = {
         ...activeTurnIdByThreadId.value,
         [threadId]: activeTurnId,
@@ -5435,7 +5497,8 @@ export function useDesktopState() {
     try {
       const page = await getOlderThreadMessages(threadId, beforeTurnId)
       const previousPersisted = persistedMessagesByThreadId.value[threadId] ?? []
-      const mergedMessages = mergeMessages(page.messages, previousPersisted, { preserveMissing: true })
+      const pageMessages = insertTurnSummaryMessages(page.messages, page.completionSummaries)
+      const mergedMessages = mergeMessages(pageMessages, previousPersisted, { preserveMissing: true })
       setPersistedMessagesForThread(threadId, mergedMessages)
       replaceTurnIndexLookupForThread(threadId, {
         ...(turnIndexByTurnIdByThreadId.value[threadId] ?? {}),
@@ -6595,6 +6658,9 @@ export function useDesktopState() {
     persistQueueState()
     codexRateLimit.value = null
     threadTokenUsageByThreadId.value = {}
+    threadGoalByThreadId.value = {}
+    threadGoalSupportByThreadId.value = {}
+    updatingThreadGoalByThreadId.value = {}
   }
 
   const selectedThreadQueuedMessages = computed<QueuedMessage[]>(() => {

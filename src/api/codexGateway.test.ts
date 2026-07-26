@@ -495,6 +495,45 @@ describe('getThreadDetail', () => {
     expect(requestSignal).toBe(controller.signal)
   })
 
+  it('returns terminal turn summaries for persisted completion folding', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({
+      result: {
+        thread: {
+          id: 'thread-1',
+          turns: [
+            {
+              id: 'turn-completed',
+              status: 'completed',
+              durationMs: 12_000,
+              items: [],
+            },
+            {
+              id: 'turn-stopped',
+              status: 'interrupted',
+              durationMs: 3_000,
+              items: [],
+            },
+            {
+              id: 'turn-running',
+              status: 'inProgress',
+              items: [],
+            },
+          ],
+        },
+      },
+    }), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' },
+    })))
+
+    await expect(getThreadDetail('thread-1')).resolves.toMatchObject({
+      completionSummaries: [
+        { turnId: 'turn-completed', status: 'completed', durationMs: 12_000 },
+        { turnId: 'turn-stopped', status: 'interrupted', durationMs: 3_000 },
+      ],
+    })
+  })
+
   it('reads modelProvider from nested thread payloads returned by thread/read', async () => {
     vi.stubGlobal('fetch', vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
       const body = typeof init?.body === 'string'

@@ -330,6 +330,27 @@ describe('thread goal state', () => {
     expect(state.selectedThreadGoalSupported.value).toBe(true)
   })
 
+  it('refreshes authoritative goal state after polling reconnects', async () => {
+    installTestWindow()
+    gatewayMocks.resumeThread.mockResolvedValue(idleDetail())
+    gatewayMocks.getThreadDetail.mockResolvedValue(idleDetail())
+    gatewayMocks.getThreadGoal.mockResolvedValueOnce(activeGoal).mockResolvedValueOnce(null)
+
+    const state = useDesktopState()
+    state.primeSelectedThread('thread-1')
+    await state.loadMessages('thread-1')
+    await flushMicrotasks()
+    expect(state.selectedThreadGoal.value).toEqual(activeGoal)
+
+    state.stopPolling()
+    state.startPolling()
+    await state.loadMessages('thread-1')
+    await flushMicrotasks()
+
+    expect(gatewayMocks.getThreadGoal).toHaveBeenCalledTimes(2)
+    expect(state.selectedThreadGoal.value).toBeNull()
+  })
+
   it('applies goal update and clear notifications to the matching thread', async () => {
     const { state, emit } = await setupTurnLifecycleNotificationState('thread-1')
 
@@ -1134,6 +1155,61 @@ describe('turn completion lifecycle', () => {
     emit({ method: 'turn/completed', params: { threadId: 'thread-1', turn: { id: 'turn-a', status: 'interrupted' } } })
     expect(state.selectedThreadRuntimeOwnership.value).toBe('idle')
     expect(state.projectGroups.value[0]?.threads[0]?.inProgress).toBe(false)
+  })
+
+  it('keeps completed boundaries when the next turn starts and labels interrupted turns', async () => {
+    const { state, emit } = await setupTurnLifecycleNotificationState('thread-1')
+
+    emit({ method: 'turn/started', params: { threadId: 'thread-1', turn: { id: 'turn-a' } } })
+    emit({
+      method: 'turn/completed',
+      params: {
+        threadId: 'thread-1',
+        durationMs: 3_000,
+        turn: { id: 'turn-a', status: 'interrupted' },
+      },
+    })
+    expect(state.messages.value).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        id: 'turn-summary:turn-a',
+        text: 'You stopped after 3s',
+        messageType: 'worked',
+      }),
+    ]))
+
+    emit({ method: 'turn/started', params: { threadId: 'thread-1', turn: { id: 'turn-b' } } })
+
+    expect(state.messages.value).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: 'turn-summary:turn-a' }),
+    ]))
+  })
+
+  it('restores all persisted completion boundaries on detail reload', async () => {
+    installTestWindow()
+    gatewayMocks.resumeThread.mockResolvedValue({
+      ...idleDetail(),
+      messages: [
+        { id: 'user-a', role: 'user', text: 'first', turnId: 'turn-a', turnIndex: 0 },
+        { id: 'assistant-a', role: 'assistant', text: 'done', turnId: 'turn-a', turnIndex: 0 },
+        { id: 'user-b', role: 'user', text: 'second', turnId: 'turn-b', turnIndex: 1 },
+      ],
+      completionSummaries: [
+        { turnId: 'turn-a', status: 'completed', durationMs: 12_000 },
+        { turnId: 'turn-b', status: 'interrupted', durationMs: 3_000 },
+      ],
+    })
+
+    const state = useDesktopState()
+    state.primeSelectedThread('thread-1')
+    await state.loadMessages('thread-1')
+
+    expect(state.messages.value.map((message) => message.text)).toEqual([
+      'first',
+      'Worked for 12s',
+      'done',
+      'second',
+      'You stopped after 3s',
+    ])
   })
 
   it('retains an event-established turn across a lagging idle detail', async () => {
@@ -2921,6 +2997,16 @@ describe('external runtime ownership', () => {
 
     expect(state.selectedThreadRuntimeOwnership.value).toBe('external')
     expect(state.selectedThread.value?.inProgress).toBe(true)
+  })
+
+  it('retains the authoritative external turn id for the pinned run footer', async () => {
+    const { state } = await setupExternalRuntimeState()
+    gatewayMocks.resumeThread.mockResolvedValue(externalDetail('turn-external-footer'))
+
+    await state.loadMessages('thread-1')
+
+    expect(state.selectedThreadRuntimeOwnership.value).toBe('external')
+    expect(state.selectedActiveTurnId.value).toBe('turn-external-footer')
   })
 
   it('does not let an older running detail overwrite a newer idle detail', async () => {

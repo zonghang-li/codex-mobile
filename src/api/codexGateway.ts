@@ -893,13 +893,37 @@ export type ThreadGroupsPage = {
   nextCursor: string | null
 }
 
+export type ThreadCompletionSummary = {
+  turnId: string
+  status: string
+  durationMs: number
+}
+
 export type ThreadTurnPage = {
   messages: UiMessage[]
+  completionSummaries: ThreadCompletionSummary[]
   inProgress: boolean
   activeTurnId: string
   hasMoreOlder: boolean
   startTurnIndex: number
   turnIndexByTurnId: ThreadTurnIndexById
+}
+
+function readThreadCompletionSummaries(payload: ThreadReadResponse): ThreadCompletionSummary[] {
+  const turns = Array.isArray(payload.thread.turns) ? payload.thread.turns : []
+  return turns.flatMap((turn) => {
+    const rawTurn = asRecord(turn)
+    const turnId = (readString(rawTurn?.id) ?? '').trim()
+    const status = (readString(rawTurn?.status) ?? '').trim()
+    if (!turnId || !status || status === 'inProgress') return []
+    const durationMs = Math.max(
+      0,
+      readNumber(rawTurn?.durationMs)
+        ?? readNumber(rawTurn?.duration_ms)
+        ?? 0,
+    )
+    return [{ turnId, status, durationMs }]
+  })
 }
 
 async function getThreadGroupsPageV2(cursor: string | null, limit: number): Promise<ThreadGroupsPage> {
@@ -941,6 +965,7 @@ async function getThreadDetailV2(
   model: string
   modelProvider: string
   messages: UiMessage[]
+  completionSummaries: ThreadCompletionSummary[]
   inProgress: boolean
   activeTurnId: string
   hasMoreOlder: boolean
@@ -960,6 +985,7 @@ async function getThreadDetailV2(
     model: normalizeThreadModelFromPayload(payload),
     modelProvider: normalizeThreadModelProviderFromPayload(payload),
     messages: normalized,
+    completionSummaries: readThreadCompletionSummaries(payload),
     ...runtime,
     hasMoreOlder: startTurnIndex > 0,
     turnIndexByTurnId: buildTurnIndexByTurnId(payload, startTurnIndex),
@@ -973,6 +999,7 @@ async function getExternalThreadLiveStateSnapshotV2(
   model: string
   modelProvider: string
   messages: UiMessage[]
+  completionSummaries: ThreadCompletionSummary[]
   inProgress: boolean
   activeTurnId: string
   hasMoreOlder: boolean
@@ -1007,6 +1034,7 @@ async function getExternalThreadLiveStateSnapshotV2(
     model: normalizeThreadModelFromPayload(payload),
     modelProvider: normalizeThreadModelProviderFromPayload(payload),
     messages: normalized,
+    completionSummaries: readThreadCompletionSummaries(result),
     ...runtime,
     hasMoreOlder: payload?.hasMoreOlder === true || threadTurnStartIndex > 0,
     turnIndexByTurnId: buildTurnIndexByTurnId(result, threadTurnStartIndex),
@@ -1035,6 +1063,7 @@ async function getOlderThreadMessagesV2(threadId: string, beforeTurnId: string, 
 
   return {
     messages: normalizeThreadMessagesV2(payload.result, startTurnIndex),
+    completionSummaries: readThreadCompletionSummaries(payload.result),
     inProgress: readThreadInProgressFromResponse(payload.result),
     activeTurnId: readActiveTurnIdFromResponse(payload.result),
     hasMoreOlder: payload.hasMoreOlder === true,
@@ -1086,6 +1115,7 @@ export async function getThreadDetail(threadId: string, signal?: AbortSignal): P
   model: string
   modelProvider: string
   messages: UiMessage[]
+  completionSummaries: ThreadCompletionSummary[]
   inProgress: boolean
   activeTurnId: string
   hasMoreOlder: boolean
@@ -1105,6 +1135,7 @@ export async function getExternalThreadLiveSnapshot(threadId: string, signal?: A
   model: string
   modelProvider: string
   messages: UiMessage[]
+  completionSummaries: ThreadCompletionSummary[]
   inProgress: boolean
   activeTurnId: string
   hasMoreOlder: boolean
@@ -1749,6 +1780,7 @@ export type ResumedThread = {
   model: string
   modelProvider: string
   messages: UiMessage[]
+  completionSummaries: ThreadCompletionSummary[]
   inProgress: boolean
   activeTurnId: string
   hasMoreOlder: boolean
@@ -1774,6 +1806,7 @@ export async function resumeThread(threadId: string): Promise<ResumedThread> {
       model: normalizeThreadModelFromPayload(payload),
       modelProvider: normalizeThreadModelProviderFromPayload(payload),
       messages,
+      completionSummaries: readThreadCompletionSummaries(payload),
       ...runtime,
       hasMoreOlder: startTurnIndex > 0,
       turnIndexByTurnId: buildTurnIndexByTurnId(payload, startTurnIndex),
