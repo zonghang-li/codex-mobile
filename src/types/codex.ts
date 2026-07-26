@@ -146,14 +146,17 @@ export type UiCollabAgentActivity = {
   agentsStates: Record<string, UiCollabAgentStatus>
 }
 
+export type UiCollaborationActivityKind = 'sendMessage' | 'waitThreads' | 'listAgents'
+
 export type UiActivityData = {
-  kind: 'command' | 'fileChange' | 'tool' | 'subAgent' | 'image' | 'search' | 'status' | 'plan'
+  kind: 'command' | 'fileChange' | 'tool' | 'subAgent' | 'image' | 'search' | 'status' | 'plan' | 'collaboration'
   label: string
   status?: string
   agentThreadId?: string
   agentPath?: string
   subAgentKind?: UiSubAgentActivityKind
   collabAgent?: UiCollabAgentActivity
+  collaborationKind?: UiCollaborationActivityKind
 }
 
 export type UiFileAttachment = { label: string; path: string }

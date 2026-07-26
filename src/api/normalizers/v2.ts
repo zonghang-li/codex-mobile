@@ -10,6 +10,7 @@ import type {
   CommandExecutionData,
   UiCommandAction,
   UiCollabAgentStatus,
+  UiCollaborationActivityKind,
   UiFileAttachment,
   UiFileChange,
   UiFileChangeStatus,
@@ -163,6 +164,16 @@ function normalizeSubAgentActivity(item: Record<string, unknown>): UiMessage {
       ...(subAgentKind ? { subAgentKind } : {}),
     },
   }
+}
+
+function normalizeRecoveredCollaborationKind(value: string): {
+  kind: UiCollaborationActivityKind
+  label: string
+} | null {
+  if (value === 'sendMessage') return { kind: value, label: 'Sent message to chat' }
+  if (value === 'waitThreads') return { kind: value, label: 'Wait threads' }
+  if (value === 'listAgents') return { kind: value, label: 'Listed agents' }
+  return null
 }
 
 const COLLAB_AGENT_STATUSES = new Set<UiCollabAgentStatus>([
@@ -513,6 +524,22 @@ export function toUiFileChanges(changes: unknown): UiFileChange[] {
 function toUiMessages(item: ThreadItem): UiMessage[] {
   const rawItem = item as unknown as Record<string, unknown>
   const rawType = readString(rawItem.type)
+
+  if (rawType === 'collaborationActivity') {
+    const normalized = normalizeRecoveredCollaborationKind(readString(rawItem.activityKind))
+    if (!normalized) return []
+    return [{
+      id: item.id,
+      role: 'system',
+      text: normalized.label,
+      messageType: 'collaborationActivity',
+      activity: {
+        kind: 'collaboration',
+        label: normalized.label,
+        collaborationKind: normalized.kind,
+      },
+    }]
+  }
 
   if (rawType === 'subAgentActivity') {
     return [normalizeSubAgentActivity(rawItem)]
