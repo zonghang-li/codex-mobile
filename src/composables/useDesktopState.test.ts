@@ -1404,7 +1404,7 @@ describe('turn completion lifecycle', () => {
     expect(state.projectGroups.value[0]?.threads[0]?.inProgress).toBe(false)
   })
 
-  it('keeps completed boundaries when the next turn starts and labels interrupted turns', async () => {
+  it('keeps interrupted completion metadata without adding a visible summary', async () => {
     const { state, emit } = await setupTurnLifecycleNotificationState('thread-1')
 
     emit({ method: 'turn/started', params: { threadId: 'thread-1', turn: { id: 'turn-a' } } })
@@ -1416,22 +1416,30 @@ describe('turn completion lifecycle', () => {
         turn: { id: 'turn-a', status: 'interrupted' },
       },
     })
-    expect(state.messages.value).toEqual(expect.arrayContaining([
-      expect.objectContaining({
-        id: 'turn-summary:turn-a',
-        text: 'You stopped after 3s',
-        messageType: 'worked',
-      }),
-    ]))
+    expect(JSON.parse(window.localStorage.getItem('codex-web-local.turn-completion-summaries.v1') ?? '{}'))
+      .toMatchObject({
+        'thread-1': {
+          'turn-a': {
+            turnId: 'turn-a',
+            durationMs: 3_000,
+            status: 'interrupted',
+          },
+        },
+      })
+    expect(state.messages.value.filter((message) => message.id.startsWith('turn-summary:')))
+      .not.toEqual(expect.arrayContaining([
+        expect.objectContaining({ text: expect.stringContaining('You stopped') }),
+      ]))
 
     emit({ method: 'turn/started', params: { threadId: 'thread-1', turn: { id: 'turn-b' } } })
 
-    expect(state.messages.value).toEqual(expect.arrayContaining([
-      expect.objectContaining({ id: 'turn-summary:turn-a' }),
-    ]))
+    expect(state.messages.value.filter((message) => message.id.startsWith('turn-summary:')))
+      .not.toEqual(expect.arrayContaining([
+        expect.objectContaining({ text: expect.stringContaining('You stopped') }),
+      ]))
   })
 
-  it('restores all persisted completion boundaries on detail reload', async () => {
+  it('restores completed summaries but not interrupted summaries on detail reload', async () => {
     installTestWindow()
     gatewayMocks.getThreadDetail.mockResolvedValue({
       ...idleDetail(),
@@ -1455,8 +1463,11 @@ describe('turn completion lifecycle', () => {
       'Worked for 12s',
       'done',
       'second',
-      'You stopped after 3s',
     ])
+    expect(state.messages.value.filter((message) => message.id.startsWith('turn-summary:')))
+      .not.toEqual(expect.arrayContaining([
+        expect.objectContaining({ text: expect.stringContaining('You stopped') }),
+      ]))
   })
 
   it('keeps an observed completion duration across a browser state reload', async () => {

@@ -1012,11 +1012,15 @@ function findLastAssistantMessageIndex(messages: UiMessage[], turnId: string): n
 }
 
 function insertTurnSummaryMessage(messages: UiMessage[], summary: TurnSummaryState): UiMessage[] {
-  const summaryMessage = buildTurnSummaryMessage(summary)
+  const summaryMessageId = `turn-summary:${summary.turnId}`
   const sanitizedMessages = messages.filter((message) => (
-    message.id !== summaryMessage.id
+    message.id !== summaryMessageId
     && !(message.messageType === WORKED_MESSAGE_TYPE && message.turnId === summary.turnId)
   ))
+  if (summary.status === 'interrupted') {
+    return sanitizedMessages
+  }
+  const summaryMessage = buildTurnSummaryMessage(summary)
   const finalAssistantIndex = findLastAssistantMessageIndex(sanitizedMessages, summary.turnId)
   if (finalAssistantIndex >= 0) {
     const next = [...sanitizedMessages]
