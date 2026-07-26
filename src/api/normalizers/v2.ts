@@ -9,6 +9,7 @@ import type {
 import type {
   CommandExecutionData,
   UiCommandAction,
+  UiCollabAgentStatus,
   UiFileAttachment,
   UiFileChange,
   UiFileChangeStatus,
@@ -132,11 +133,15 @@ function humanizeActivityName(value: string): string {
 }
 
 function normalizeSubAgentActivity(item: Record<string, unknown>): UiMessage {
+  const agentThreadId = readString(item.agentThreadId)
   const agentPath = readString(item.agentPath)
   const rawName = agentPath.split('/').filter(Boolean).at(-1) ?? ''
   const normalizedName = humanizeActivityName(rawName) || 'agent'
   const name = normalizedName.charAt(0).toUpperCase() + normalizedName.slice(1)
   const rawKind = readString(item.kind)
+  const subAgentKind = rawKind === 'started' || rawKind === 'interacted' || rawKind === 'interrupted'
+    ? rawKind
+    : undefined
   const status = rawKind === 'started'
     ? 'started'
     : rawKind === 'interrupted'
@@ -153,9 +158,40 @@ function normalizeSubAgentActivity(item: Record<string, unknown>): UiMessage {
       kind: 'subAgent',
       label,
       status,
+      ...(agentThreadId ? { agentThreadId } : {}),
       agentPath,
+      ...(subAgentKind ? { subAgentKind } : {}),
     },
   }
+}
+
+const COLLAB_AGENT_STATUSES = new Set<UiCollabAgentStatus>([
+  'pendingInit',
+  'running',
+  'interrupted',
+  'completed',
+  'errored',
+  'shutdown',
+  'notFound',
+])
+
+function normalizeCollabAgentStates(value: unknown): Record<string, UiCollabAgentStatus> {
+  const states = asRecord(value)
+  if (!states) return {}
+  const normalized: Record<string, UiCollabAgentStatus> = {}
+  for (const [threadId, rawState] of Object.entries(states)) {
+    const state = asRecord(rawState)
+    const status = readString(state?.status)
+    if (threadId && COLLAB_AGENT_STATUSES.has(status as UiCollabAgentStatus)) {
+      normalized[threadId] = status as UiCollabAgentStatus
+    }
+  }
+  return normalized
+}
+
+function normalizeReceiverThreadIds(value: unknown): string[] {
+  if (!Array.isArray(value)) return []
+  return Array.from(new Set(value.filter((item): item is string => typeof item === 'string' && item.length > 0)))
 }
 
 function decodeHeartbeatXmlText(value: string): string {
@@ -716,16 +752,25 @@ function toUiMessages(item: ThreadItem): UiMessage[] {
 
   if (item.type === 'collabAgentToolCall') {
     const raw = item as unknown as Record<string, unknown>
+    const tool = readString(raw.tool)
+    const status = readString(raw.status)
+    const label = normalizeCollabAgentLabel(tool)
     return [{
       id: item.id,
       role: 'system',
-      text: normalizeCollabAgentLabel(readString(raw.tool)),
+      text: label,
       messageType: 'collabAgentToolCall',
       rawPayload: toRawPayload(item),
       activity: {
-        kind: 'tool',
-        label: normalizeCollabAgentLabel(readString(raw.tool)),
-        status: readString(raw.status) || undefined,
+        kind: 'subAgent',
+        label,
+        status: status || undefined,
+        collabAgent: {
+          tool,
+          ...(status ? { status } : {}),
+          receiverThreadIds: normalizeReceiverThreadIds(raw.receiverThreadIds),
+          agentsStates: normalizeCollabAgentStates(raw.agentsStates),
+        },
       },
     }]
   }

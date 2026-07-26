@@ -77,6 +77,7 @@ import {
   type ExternalReasoningSnapshot,
 } from './externalLiveSnapshot'
 import { resolveTurnCompletionDisposition, type TurnTerminalStatus } from './threadLifecycle'
+import { shouldRefreshMessagesForNotification } from './notificationSyncPolicy'
 
 type ThreadDetailSnapshot = Awaited<ReturnType<typeof getThreadDetail>>
 
@@ -4691,10 +4692,7 @@ export function useDesktopState() {
     if (notification.method === 'thread/tokenUsage/updated') return
 
     const method = notification.method
-    const shouldRefreshMessages =
-      method === 'turn/started' ||
-      method === 'turn/completed' ||
-      method === 'error'
+    const shouldRefreshMessages = shouldRefreshMessagesForNotification(notification)
     const shouldRefreshThreads =
       method.startsWith('thread/') ||
       method === 'turn/completed'

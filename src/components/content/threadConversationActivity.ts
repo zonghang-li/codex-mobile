@@ -1,4 +1,9 @@
 import type { UiMessage } from '../../types/codex'
+import {
+  buildSubAgentActivityGroup,
+  type SubAgentActivityGroup,
+  type SubAgentDisplayItem,
+} from './subAgentActivity'
 
 const TURN_ACTIVITY_MESSAGE_TYPES = new Set([
   'reasoning',
@@ -34,8 +39,8 @@ export type ThreadActivitySegment =
   | {
       kind: 'subAgent'
       id: string
-      label: string
-      status?: string
+      agents: SubAgentDisplayItem[]
+      status: SubAgentActivityGroup['status']
       sourceMessageIds: string[]
     }
   | {
@@ -112,7 +117,14 @@ function activityLabel(message: UiMessage): string {
   return 'Thinking'
 }
 
-export function buildThreadActivitySegments(messages: readonly UiMessage[]): ThreadActivitySegment[] {
+function isSubAgentLifecycleMessage(message: UiMessage): boolean {
+  return message.messageType === 'subAgentActivity' || message.messageType === 'collabAgentToolCall'
+}
+
+export function buildThreadActivitySegments(
+  messages: readonly UiMessage[],
+  options: { parentTurnCompleted?: boolean } = {},
+): ThreadActivitySegment[] {
   const segments: ThreadActivitySegment[] = []
   let actions = emptyActionSummary()
 
@@ -127,9 +139,11 @@ export function buildThreadActivitySegments(messages: readonly UiMessage[]): Thr
     actions = emptyActionSummary()
   }
 
-  for (const message of messages) {
+  for (let index = 0; index < messages.length;) {
+    const message = messages[index]
     if (!isThreadActivityMessage(message)) {
       flushActions()
+      index += 1
       continue
     }
 
@@ -140,10 +154,30 @@ export function buildThreadActivitySegments(messages: readonly UiMessage[]): Thr
       } else {
         appendCommandActivity(actions, message)
       }
+      index += 1
       continue
     }
 
     flushActions()
+    if (isSubAgentLifecycleMessage(message)) {
+      const groupMessages: UiMessage[] = []
+      while (index < messages.length && isSubAgentLifecycleMessage(messages[index])) {
+        groupMessages.push(messages[index])
+        index += 1
+      }
+      const group = buildSubAgentActivityGroup(groupMessages, options)
+      if (group) {
+        segments.push({
+          kind: 'subAgent',
+          id: group.sourceMessageIds.at(-1) ?? '',
+          agents: group.agents,
+          status: group.status,
+          sourceMessageIds: group.sourceMessageIds,
+        })
+      }
+      continue
+    }
+
     const label = activityLabel(message)
     if (message.messageType === 'reasoning') {
       segments.push({
@@ -152,16 +186,7 @@ export function buildThreadActivitySegments(messages: readonly UiMessage[]): Thr
         label,
         sourceMessageIds: [message.id],
       })
-      continue
-    }
-    if (message.messageType === 'subAgentActivity') {
-      segments.push({
-        kind: 'subAgent',
-        id: message.id,
-        label,
-        status: message.activity?.status,
-        sourceMessageIds: [message.id],
-      })
+      index += 1
       continue
     }
     segments.push({
@@ -170,6 +195,7 @@ export function buildThreadActivitySegments(messages: readonly UiMessage[]): Thr
       label,
       sourceMessageIds: [message.id],
     })
+    index += 1
   }
 
   flushActions()
@@ -206,7 +232,17 @@ export function getTurnActivitySegmentsForWorked(
   messages: readonly UiMessage[],
   workedIndex: number,
 ): ThreadActivitySegment[] {
-  return buildThreadActivitySegments(getTurnActivityMessagesForWorked(messages, workedIndex))
+  if (workedIndex < 0 || workedIndex >= messages.length) return []
+  const worked = messages[workedIndex]
+  if (worked?.messageType !== 'worked') return []
+
+  const turnMessages: UiMessage[] = []
+  for (let index = workedIndex - 1; index >= 0; index -= 1) {
+    const candidate = messages[index]
+    if (!candidate || isTurnBoundary(candidate)) break
+    turnMessages.unshift(candidate)
+  }
+  return buildThreadActivitySegments(turnMessages, { parentTurnCompleted: true })
 }
 
 export function getHiddenCompletedActivityMessageIds(messages: readonly UiMessage[]): Set<string> {
