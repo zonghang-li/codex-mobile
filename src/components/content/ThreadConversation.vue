@@ -863,7 +863,7 @@
               </article>
 
               <div
-                v-if="showCopyResponseButton(message) || showEditMessageButton(message)"
+                v-if="showEditMessageButton(message) || showCopyResponseButton(message) || showForkResponseButton(message)"
                 class="message-toolbar"
                 :data-role="message.role"
               >
@@ -879,17 +879,6 @@
                   <span class="message-edit-label">Edit message</span>
                 </button>
                 <button
-                  v-if="showForkResponseButton(message)"
-                  type="button"
-                  class="message-fork-button"
-                  aria-label="Fork thread from this response"
-                  title="Fork thread from this response"
-                  @click="forkResponse(message.id)"
-                >
-                  <IconTablerGitFork class="icon-svg message-fork-icon" />
-                  <span class="message-fork-label">Fork</span>
-                </button>
-                <button
                   v-if="showCopyResponseButton(message)"
                   type="button"
                   class="message-copy-button"
@@ -899,7 +888,16 @@
                   @click="copyResponse(message.id)"
                 >
                   <IconTablerCopy class="icon-svg message-copy-icon" />
-                  <span class="message-copy-label">{{ copiedResponseAnchorId === message.id ? 'Copied' : 'Copy' }}</span>
+                </button>
+                <button
+                  v-if="showForkResponseButton(message)"
+                  type="button"
+                  class="message-fork-button"
+                  aria-label="Fork thread from this response"
+                  title="Fork thread from this response"
+                  @click="forkResponse(message.id)"
+                >
+                  <IconTablerGitFork class="icon-svg message-fork-icon" />
                 </button>
               </div>
 
@@ -1192,7 +1190,10 @@ import {
   type ThreadActivityIconKind,
   type ThreadActivitySegment,
 } from './threadConversationActivity'
-import { projectConversationTurns } from './conversationTurnPresentation'
+import {
+  projectConversationTurns,
+  suppressResponseActions,
+} from './conversationTurnPresentation'
 import { splitDisplayMathSpans } from './displayMath'
 import { splitInlineMathSpans } from './inlineMath'
 import {
@@ -2292,11 +2293,21 @@ const forkableTurnIndexByAnchorId = computed<Record<string, number>>(() => {
 })
 
 function showCopyResponseButton(message: UiMessage): boolean {
-  return typeof copyableResponseContentByAnchorId.value[message.id] === 'string'
+  return !isResponseActionSuppressed(message)
+    && typeof copyableResponseContentByAnchorId.value[message.id] === 'string'
 }
 
 function showForkResponseButton(message: UiMessage): boolean {
-  return typeof forkableTurnIndexByAnchorId.value[message.id] === 'number'
+  return !isResponseActionSuppressed(message)
+    && typeof forkableTurnIndexByAnchorId.value[message.id] === 'number'
+}
+
+function isResponseActionSuppressed(message: UiMessage): boolean {
+  return suppressResponseActions({
+    messageTurnId: message.turnId ?? '',
+    activeTurnId: props.activeTurnId ?? '',
+    runtimeActive: isLiveTurnRuntime.value,
+  })
 }
 
 function mergeFileChangeDiff(first: string, second: string): string {
@@ -5228,38 +5239,35 @@ onBeforeUnmount(() => {
 }
 
 .message-toolbar {
-  @apply mt-1 self-start flex items-center gap-1 opacity-[0.01] transition-opacity duration-200;
+  @apply mt-1 self-start flex items-center gap-0.5 opacity-[0.01] transition-opacity duration-200;
 }
 
 .message-row:hover .message-toolbar {
   @apply opacity-100;
 }
 
-.message-copy-button {
-  @apply inline-flex items-center gap-0.5 rounded-full border border-slate-200 bg-white/90 px-1.25 py-0.5 text-[9px] font-medium leading-none text-slate-500 transition hover:border-slate-300 hover:bg-white hover:text-slate-900;
-}
-
+.message-copy-button,
 .message-fork-button {
-  @apply inline-flex items-center gap-0.5 px-0.5 py-0 text-[9px] font-medium leading-none text-slate-500 transition hover:text-slate-900;
+  @apply inline-flex h-7 w-7 items-center justify-center rounded-md border-0 bg-transparent p-0 text-slate-500 transition hover:bg-slate-200/60 hover:text-slate-900 focus:outline-none focus-visible:ring-2 focus-visible:ring-sky-400/60;
 }
-
 
 .message-copy-button[data-copied='true'] {
-  @apply border-emerald-200 bg-emerald-50 text-emerald-700;
+  @apply bg-transparent text-emerald-500;
 }
 
 .message-edit-button {
   @apply inline-flex items-center gap-0.5 px-0.5 py-0 text-[9px] font-medium leading-none text-amber-600/70 transition hover:text-amber-700;
 }
 
-.message-fork-icon,
 .message-copy-icon,
+.message-fork-icon {
+  @apply h-4 w-4;
+}
+
 .message-edit-icon {
   @apply text-[10px];
 }
 
-.message-fork-label,
-.message-copy-label,
 .message-edit-label {
   @apply leading-none;
 }
@@ -5272,7 +5280,7 @@ onBeforeUnmount(() => {
   .message-fork-button,
   .message-copy-button,
   .message-edit-button {
-    @apply min-h-11 px-2 text-xs;
+    @apply min-h-11 min-w-11;
   }
 }
 
