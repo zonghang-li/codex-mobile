@@ -1103,7 +1103,7 @@ async function inspectThreadWriter(
       includeTurns: true,
     })
   } catch (error) {
-    if (isThreadNotFoundError(error)) {
+    if (isThreadNotFoundError(error) || isThreadMaterializationPendingError(error)) {
       return { state: 'unmaterialized', readResult: null, error }
     }
     throw error

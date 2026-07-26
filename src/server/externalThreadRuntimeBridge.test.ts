@@ -498,6 +498,97 @@ describe('POST /codex-api/rpc guarded user turns', () => {
     expect(inspect).not.toHaveBeenCalled()
   })
 
+  it('allows a locally created first turn when thread/read reports exact pending materialization', async () => {
+    const middleware = createCodexBridgeMiddleware()
+    const shared = sharedBridgeForTest()
+    const inspect = vi.spyOn(shared.runtimeProbe, 'inspect')
+    const rpc = vi.spyOn(shared.appServer as unknown as {
+      rpc(method: string, params: unknown): Promise<unknown>
+    }, 'rpc').mockImplementation(async (method) => {
+      if (method === 'thread/start') return { thread: { id: 'thread-pending-materialization' } }
+      if (method === 'thread/read') {
+        throw new Error(
+          'thread thread-pending-materialization is not materialized yet; includeTurns is unavailable before first user message',
+        )
+      }
+      if (method === 'turn/start') return { turn: { id: 'turn-first-materialized' } }
+      throw new Error(`unexpected method ${method}`)
+    })
+    const port = await listenWithMiddleware(middleware)
+
+    const startResponse = await fetch(`http://127.0.0.1:${port}/codex-api/rpc`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ method: 'thread/start', params: { cwd: '/tmp/project' } }),
+    })
+    expect(startResponse.status).toBe(200)
+
+    const turnResponse = await fetch(`http://127.0.0.1:${port}/codex-api/rpc`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        method: 'turn/start',
+        params: {
+          threadId: 'thread-pending-materialization',
+          input: [{ type: 'text', text: 'first' }],
+        },
+      }),
+    })
+
+    expect(turnResponse.status).toBe(200)
+    await expect(turnResponse.json()).resolves.toMatchObject({
+      result: { turn: { id: 'turn-first-materialized' } },
+    })
+    expect(rpc.mock.calls.map(([method]) => method)).toEqual([
+      'thread/start',
+      'thread/read',
+      'turn/start',
+    ])
+    expect(inspect).not.toHaveBeenCalled()
+  })
+
+  it('fails closed on pending materialization without a local first-turn capability', async () => {
+    const middleware = createCodexBridgeMiddleware()
+    const shared = sharedBridgeForTest()
+    const inspect = vi.spyOn(shared.runtimeProbe, 'inspect')
+    const rpc = vi.spyOn(shared.appServer as unknown as {
+      rpc(method: string, params: unknown): Promise<unknown>
+    }, 'rpc').mockImplementation(async (method) => {
+      if (method === 'thread/read') {
+        throw new Error(
+          'thread thread-existing-pending is not materialized yet; includeTurns is unavailable before first user message',
+        )
+      }
+      if (method === 'turn/start') return { turn: { id: 'turn-competing' } }
+      throw new Error(`unexpected method ${method}`)
+    })
+    const port = await listenWithMiddleware(middleware)
+
+    const turnResponse = await fetch(`http://127.0.0.1:${port}/codex-api/rpc`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        method: 'turn/start',
+        params: {
+          threadId: 'thread-existing-pending',
+          input: [{ type: 'text', text: 'ordinary' }],
+        },
+      }),
+    })
+
+    expect(turnResponse.status).toBe(502)
+    expect(await turnResponse.json()).toMatchObject({
+      error: expect.stringContaining('writer ownership is not idle'),
+    })
+    expect(rpc).toHaveBeenCalledTimes(1)
+    expect(rpc).toHaveBeenCalledWith('thread/read', {
+      threadId: 'thread-existing-pending',
+      includeTurns: true,
+    })
+    expect(rpc).not.toHaveBeenCalledWith('turn/start', expect.anything())
+    expect(inspect).not.toHaveBeenCalled()
+  })
+
   it.each([
     ['running', {
       state: 'running' as const,
