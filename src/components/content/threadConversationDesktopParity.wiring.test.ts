@@ -5,6 +5,10 @@ const source = readFileSync(
   new URL('./ThreadConversation.vue', import.meta.url),
   'utf8',
 )
+const activityIconSource = readFileSync(
+  new URL('./ThreadActivityIcon.vue', import.meta.url),
+  'utf8',
+)
 
 describe('ThreadConversation Codex desktop activity parity wiring', () => {
   it('renders derived activity segments before raw command and file-change rows', () => {
@@ -26,8 +30,12 @@ describe('ThreadConversation Codex desktop activity parity wiring', () => {
 
   it('matches desktop activity icons for edit, read, and command summaries', () => {
     expect(source).toContain('activitySegmentIconKind')
-    expect(source).toContain("activitySegmentIconKind(readActivitySegment(message)) === 'edit'")
-    expect(source).toContain("activitySegmentIconKind(readActivitySegment(message)) === 'search'")
+    expect(source).toContain('<ThreadActivityIcon :kind="activitySegmentIconKind(readActivitySegment(message))" />')
+    expect(activityIconSource).toContain("kind === 'book'")
+    expect(activityIconSource).toContain("kind === 'search'")
+    expect(activityIconSource).toContain("kind === 'edit'")
+    expect(activityIconSource).toContain("kind === 'terminal'")
+    expect(activityIconSource).toContain("kind === 'integration' || kind === 'agent'")
   })
 
   it('uses the same segment model inside completed Worked details', () => {
