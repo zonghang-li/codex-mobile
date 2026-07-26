@@ -6021,20 +6021,34 @@ export function useDesktopState() {
     queueInsertIndex?: number,
     collaborationModeOverride?: CollaborationModeKind,
   ): Promise<void> {
-    if (isUpdatingSpeedMode.value) return
+    const uploadLease = createManagedUploadLease(imageUrls, fileAttachments)
+    if (isUpdatingSpeedMode.value) {
+      await uploadLease.release()
+      return
+    }
 
     const threadId = selectedThreadId.value
     const nextText = text.trim()
-    if (!threadId || isExternallyOwned(threadId)) return
-    if (!nextText && imageUrls.length === 0 && fileAttachments.length === 0) return
+    if (!threadId || isExternallyOwned(threadId)) {
+      await uploadLease.release()
+      return
+    }
+    if (!nextText && imageUrls.length === 0 && fileAttachments.length === 0) {
+      await uploadLease.release()
+      return
+    }
 
     const pendingRollback = rollbackPromiseByThreadId.get(threadId)
     if (pendingRollback) {
       await pendingRollback
-      if (selectedThreadId.value !== threadId || isExternallyOwned(threadId)) return
+      if (selectedThreadId.value !== threadId || isExternallyOwned(threadId)) {
+        await uploadLease.release()
+        return
+      }
     }
 
     if (await maybeReplyToPendingUserInputRequest(threadId, nextText, imageUrls, skills, fileAttachments)) {
+      await uploadLease.release()
       return
     }
 
@@ -6068,6 +6082,7 @@ export function useDesktopState() {
         [threadId]: nextQueue,
       }
       persistQueueState()
+      await uploadLease.release()
       return
     }
 
@@ -6080,11 +6095,13 @@ export function useDesktopState() {
         skills,
         fileAttachments,
         collaborationModeOverride,
+        uploadLease.transfer,
       ).catch((unknownError) => {
         const errorMessage = unknownError instanceof Error ? unknownError.message : 'Unknown application error'
         setTurnErrorForThread(threadId, errorMessage)
         error.value = errorMessage
       })
+      await uploadLease.release()
       return
     }
 
@@ -6118,8 +6135,11 @@ export function useDesktopState() {
         skills,
         fileAttachments,
         collaborationModeOverride,
+        uploadLease.transfer,
       )
+      await uploadLease.release()
     } catch (unknownError) {
+      await uploadLease.release()
       shouldAutoScrollOnNextAgentEvent = false
       setThreadRuntimeOwnership(threadId, 'idle')
       setThreadInProgress(threadId, false)

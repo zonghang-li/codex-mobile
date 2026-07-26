@@ -3785,6 +3785,74 @@ describe('external runtime ownership', () => {
     )
   })
 
+  it('releases a managed image once when selection changes during a pending rollback', async () => {
+    const { state } = await setupExternalRuntimeState()
+    gatewayMocks.getThreadDetail.mockResolvedValue({
+      ...idleDetail(),
+      messages: [{
+        id: 'switch-user-message',
+        role: 'user',
+        text: 'original prompt',
+        turnId: 'turn-switch',
+        turnIndex: 0,
+      }],
+    })
+    const reverted = deferred<{ success: boolean }>()
+    gatewayMocks.revertThreadFileChanges.mockReturnValue(reverted.promise)
+    gatewayMocks.rollbackThread.mockResolvedValue([])
+    await state.loadMessages('thread-1')
+    const managedImageUrl = '/codex-local-image?path=%2Ftmp%2Fcodex-web-uploads%2Fupload%2Fphoto.png&uploadHandle=rollback-switch'
+
+    const rollback = state.rollbackSelectedThread('turn-switch')
+    await flushMicrotasks()
+    const send = state.sendMessageToSelectedThread('edited prompt', [managedImageUrl])
+    await flushMicrotasks()
+    state.primeSelectedThread('thread-2')
+
+    reverted.resolve({ success: true })
+    await rollback
+    await send
+
+    expect(gatewayMocks.startThreadTurn).not.toHaveBeenCalled()
+    expect(gatewayMocks.cleanupManagedUploads).toHaveBeenCalledTimes(1)
+    expect(gatewayMocks.cleanupManagedUploads).toHaveBeenCalledWith([managedImageUrl], [])
+  })
+
+  it('releases a managed image once when external ownership takes over during a pending rollback', async () => {
+    const { state } = await setupExternalRuntimeState()
+    gatewayMocks.getThreadDetail.mockResolvedValue({
+      ...idleDetail(),
+      messages: [{
+        id: 'external-user-message',
+        role: 'user',
+        text: 'original prompt',
+        turnId: 'turn-external-takeover',
+        turnIndex: 0,
+      }],
+    })
+    const reverted = deferred<{ success: boolean }>()
+    gatewayMocks.revertThreadFileChanges.mockReturnValue(reverted.promise)
+    gatewayMocks.rollbackThread.mockResolvedValue([])
+    await state.loadMessages('thread-1')
+    const managedImageUrl = '/codex-local-image?path=%2Ftmp%2Fcodex-web-uploads%2Fupload%2Fphoto.png&uploadHandle=rollback-external'
+
+    const rollback = state.rollbackSelectedThread('turn-external-takeover')
+    await flushMicrotasks()
+    const send = state.sendMessageToSelectedThread('edited prompt', [managedImageUrl])
+    await flushMicrotasks()
+    gatewayMocks.getThreadDetail.mockResolvedValue(externalDetail('turn-external'))
+    await state.loadMessages('thread-1', { force: true })
+
+    reverted.resolve({ success: true })
+    await rollback
+    await send
+
+    expect(state.selectedThreadRuntimeOwnership.value).toBe('external')
+    expect(gatewayMocks.startThreadTurn).not.toHaveBeenCalled()
+    expect(gatewayMocks.cleanupManagedUploads).toHaveBeenCalledTimes(1)
+    expect(gatewayMocks.cleanupManagedUploads).toHaveBeenCalledWith([managedImageUrl], [])
+  })
+
   it('rejects a pending request owned by an external thread after selection changes', async () => {
     const { state, emit } = await setupExternalRuntimeState()
     gatewayMocks.getThreadDetail.mockResolvedValue(externalDetail())
