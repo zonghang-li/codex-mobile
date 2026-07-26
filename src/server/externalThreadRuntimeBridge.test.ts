@@ -785,6 +785,203 @@ describe('GET /codex-api/thread-runtime-state', () => {
 })
 
 describe('GET /codex-api/thread-live-state external runtime parity', () => {
+  it('returns a fresh writer snapshot as authoritative for an externally running task', async () => {
+    const liveStateDir = await mkdtemp(join(tmpdir(), 'codex-mobile-live-state-'))
+    const previousLiveStateDir = process.env.CODEX_MOBILE_LIVE_STATE_DIR
+    process.env.CODEX_MOBILE_LIVE_STATE_DIR = liveStateDir
+    try {
+      await writeFile(join(liveStateDir, 'thread-external.json'), JSON.stringify({
+        schemaVersion: 1,
+        threadId: 'thread-external',
+        activeTurnId: 'turn-external',
+        revision: 3,
+        generatedAt: new Date(Date.now() - 1000).toISOString(),
+        expiresAt: new Date(Date.now() + 30000).toISOString(),
+        source: 'desktop-writer',
+        state: 'running',
+        footer: {
+          stepCurrent: 2,
+          stepTotal: 6,
+          completedPercent: 33.3333,
+          fileCount: 29,
+          additions: 5485,
+          deletions: 417,
+          label: 'Step 2 / 6 · 29 files changed +5485 -417',
+        },
+        timeline: [],
+        pendingRequest: null,
+        sidebar: { indicator: 'running' },
+      }), 'utf8')
+      const middleware = createCodexBridgeMiddleware()
+      const shared = sharedBridgeForTest()
+      vi.spyOn(shared.appServer, 'getPid').mockReturnValue(4242)
+      vi.spyOn(shared.appServer as unknown as {
+        rpc: (method: string, params: unknown) => Promise<unknown>
+      }, 'rpc').mockResolvedValue({
+        thread: {
+          id: 'thread-external',
+          path: join(liveStateDir, 'thread-external.jsonl'),
+          turns: [{
+            id: 'turn-external',
+            status: 'interrupted',
+            items: [{
+              id: 'old-plan',
+              type: 'plan',
+              text: '- [x] old\n- [~] stale\n- [ ] stale\n- [ ] stale\n- [ ] stale',
+            }],
+          }],
+        },
+      })
+      vi.spyOn(shared.runtimeProbe, 'inspect').mockResolvedValue({
+        state: 'running',
+        turnId: 'turn-external',
+        interruptible: false,
+        source: 'external-session-writer',
+      })
+      const port = await listenWithMiddleware(middleware)
+
+      const response = await fetch(`http://127.0.0.1:${port}/codex-api/thread-live-state?threadId=thread-external`)
+
+      expect(response.status).toBe(200)
+      await expect(response.json()).resolves.toMatchObject({
+        isInProgress: true,
+        liveAuthority: 'writer-snapshot',
+        liveSnapshot: {
+          activeTurnId: 'turn-external',
+          footer: {
+            stepCurrent: 2,
+            stepTotal: 6,
+            fileCount: 29,
+            additions: 5485,
+            deletions: 417,
+          },
+        },
+      })
+    } finally {
+      if (previousLiveStateDir === undefined) {
+        delete process.env.CODEX_MOBILE_LIVE_STATE_DIR
+      } else {
+        process.env.CODEX_MOBILE_LIVE_STATE_DIR = previousLiveStateDir
+      }
+      await rm(liveStateDir, { recursive: true, force: true })
+    }
+  })
+
+  it('marks external running live state as missing instead of authorizing stale thread/read footer data', async () => {
+    const liveStateDir = await mkdtemp(join(tmpdir(), 'codex-mobile-live-state-missing-'))
+    const previousLiveStateDir = process.env.CODEX_MOBILE_LIVE_STATE_DIR
+    process.env.CODEX_MOBILE_LIVE_STATE_DIR = liveStateDir
+    try {
+      const middleware = createCodexBridgeMiddleware()
+      const shared = sharedBridgeForTest()
+      vi.spyOn(shared.appServer, 'getPid').mockReturnValue(4242)
+      vi.spyOn(shared.appServer as unknown as {
+        rpc: (method: string, params: unknown) => Promise<unknown>
+      }, 'rpc').mockResolvedValue({
+        thread: {
+          id: 'thread-external',
+          turns: [{
+            id: 'turn-external',
+            status: 'interrupted',
+            items: [{
+              id: 'stale-plan',
+              type: 'plan',
+              text: '- [x] old\n- [~] stale\n- [ ] stale\n- [ ] stale\n- [ ] stale',
+            }],
+          }],
+        },
+      })
+      vi.spyOn(shared.runtimeProbe, 'inspect').mockResolvedValue({
+        state: 'running',
+        turnId: 'turn-external',
+        interruptible: false,
+        source: 'external-session-writer',
+      })
+      const port = await listenWithMiddleware(middleware)
+
+      const response = await fetch(`http://127.0.0.1:${port}/codex-api/thread-live-state?threadId=thread-external`)
+
+      expect(response.status).toBe(200)
+      await expect(response.json()).resolves.toMatchObject({
+        isInProgress: true,
+        liveAuthority: 'missing',
+        liveSnapshot: null,
+      })
+    } finally {
+      if (previousLiveStateDir === undefined) {
+        delete process.env.CODEX_MOBILE_LIVE_STATE_DIR
+      } else {
+        process.env.CODEX_MOBILE_LIVE_STATE_DIR = previousLiveStateDir
+      }
+      await rm(liveStateDir, { recursive: true, force: true })
+    }
+  })
+
+  it('preserves external running state when live thread/read falls back after a read failure', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'codex-mobile-live-state-read-failure-'))
+    const previousLiveStateDir = process.env.CODEX_MOBILE_LIVE_STATE_DIR
+    process.env.CODEX_MOBILE_LIVE_STATE_DIR = dir
+    try {
+      const rolloutPath = join(dir, 'thread-read-failure.jsonl')
+      await writeFile(rolloutPath, '{"type":"session_meta"}\n')
+
+      const middleware = createCodexBridgeMiddleware()
+      const shared = sharedBridgeForTest() as ReturnType<typeof sharedBridgeForTest> & {
+        appServer: ReturnType<typeof sharedBridgeForTest>['appServer'] & {
+          rpc: (method: string, params: unknown) => Promise<unknown>
+          storeThreadReadSnapshot: (threadId: string, snapshot: unknown) => void
+        }
+      }
+      shared.appServer.storeThreadReadSnapshot('thread-read-failure', {
+        threadTurnStartIndex: 4,
+        thread: {
+          id: 'thread-read-failure',
+          path: rolloutPath,
+          turns: [{
+            id: 'turn-external',
+            status: 'interrupted',
+            items: [{ id: 'old-message', type: 'agentMessage', text: 'stale but useful' }],
+          }],
+        },
+      })
+      vi.spyOn(shared.appServer, 'getPid').mockReturnValue(4242)
+      vi.spyOn(shared.appServer, 'rpc').mockRejectedValue(new Error('thread/read failed in test'))
+      vi.spyOn(shared.runtimeProbe, 'inspect').mockResolvedValue({
+        state: 'running',
+        turnId: 'turn-external',
+        interruptible: false,
+        source: 'external-session-writer',
+      })
+      const port = await listenWithMiddleware(middleware)
+
+      const response = await fetch(`http://127.0.0.1:${port}/codex-api/thread-live-state?threadId=thread-read-failure`)
+
+      expect(response.status).toBe(200)
+      await expect(response.json()).resolves.toMatchObject({
+        threadId: 'thread-read-failure',
+        isInProgress: true,
+        externalRuntime: {
+          state: 'running',
+          turnId: 'turn-external',
+          interruptible: false,
+          source: 'external-session-writer',
+        },
+        liveAuthority: 'missing',
+        liveSnapshot: null,
+        liveStateError: {
+          kind: 'readFailed',
+        },
+      })
+    } finally {
+      if (previousLiveStateDir === undefined) {
+        delete process.env.CODEX_MOBILE_LIVE_STATE_DIR
+      } else {
+        process.env.CODEX_MOBILE_LIVE_STATE_DIR = previousLiveStateDir
+      }
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
   it('marks a stale idle thread read as in progress when an external writer is active', async () => {
     const middleware = createCodexBridgeMiddleware()
     const shared = sharedBridgeForTest() as ReturnType<typeof sharedBridgeForTest> & {

@@ -1457,6 +1457,8 @@ const {
   selectedThreadTerminalOpen,
   selectedThreadServerRequests,
   selectedLiveOverlay,
+  selectedLiveAuthority,
+  selectedLiveSnapshot,
   selectedActiveTurnId,
   selectedThreadGoal,
   selectedThreadGoalSupported,
@@ -1849,6 +1851,12 @@ const selectedConversationFooterState = computed(() => deriveConversationFooterS
   messages: filteredMessages.value,
   turnId: selectedActiveTurnId.value,
   isTurnInProgress: isSelectedThreadInProgress.value,
+  externalLiveAuthority: selectedThreadRuntimeOwnership.value === 'external'
+    ? selectedLiveAuthority.value ?? 'missing'
+    : null,
+  authoritativeFooter: selectedThreadRuntimeOwnership.value === 'external'
+    ? selectedLiveSnapshot.value?.footer ?? null
+    : null,
 }))
 const showThreadContextBadge = computed(() => !isHomeRoute.value && !isSkillsRoute.value && !isAutomationsRoute.value && selectedThreadId.value.trim().length > 0)
 const isAccountSwitchBlocked = computed(() =>

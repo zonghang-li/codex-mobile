@@ -80,6 +80,92 @@ describe('selectDesktopPlanStep', () => {
 })
 
 describe('deriveConversationFooterState', () => {
+  it('uses an authoritative writer footer instead of stale message-derived plan data', () => {
+    const result = deriveConversationFooterState({
+      messages: [{
+        id: 'stale-plan',
+        role: 'assistant',
+        text: '',
+        messageType: 'plan',
+        turnId: 'turn-1',
+        plan: {
+          steps: [
+            { step: 'old 1', status: 'completed' },
+            { step: 'old 2', status: 'inProgress' },
+            { step: 'old 3', status: 'pending' },
+            { step: 'old 4', status: 'pending' },
+            { step: 'old 5', status: 'pending' },
+          ],
+        },
+      }],
+      turnId: 'turn-1',
+      isTurnInProgress: true,
+      externalLiveAuthority: 'writer-snapshot',
+      authoritativeFooter: {
+        stepCurrent: 2,
+        stepTotal: 6,
+        completedPercent: 33.3333,
+        fileCount: 29,
+        additions: 5485,
+        deletions: 417,
+        label: 'Step 2 / 6 · 29 files changed +5485 -417',
+      },
+    })
+
+    expect(result).toEqual({
+      turnId: 'turn-1',
+      stepNumber: 2,
+      stepCount: 6,
+      completedPercent: 33.3333,
+      fileCount: 29,
+      additions: 5485,
+      deletions: 417,
+    })
+  })
+
+  it('suppresses stale message-derived footer when external live authority is missing', () => {
+    expect(deriveConversationFooterState({
+      messages: [{
+        id: 'stale-plan',
+        role: 'assistant',
+        text: '',
+        messageType: 'plan',
+        turnId: 'turn-1',
+        plan: {
+          steps: [
+            { step: 'old 1', status: 'completed' },
+            { step: 'old 2', status: 'inProgress' },
+            { step: 'old 3', status: 'pending' },
+            { step: 'old 4', status: 'pending' },
+            { step: 'old 5', status: 'pending' },
+          ],
+        },
+      }],
+      turnId: 'turn-1',
+      isTurnInProgress: true,
+      externalLiveAuthority: 'missing',
+      authoritativeFooter: null,
+    })).toBeNull()
+  })
+
+  it('suppresses stale message-derived footer when a writer snapshot has no footer', () => {
+    expect(deriveConversationFooterState({
+      messages: [
+        planMessage('turn-1', [
+          { step: 'old 1', status: 'completed' },
+          { step: 'old 2', status: 'inProgress' },
+          { step: 'old 3', status: 'pending' },
+          { step: 'old 4', status: 'pending' },
+          { step: 'old 5', status: 'pending' },
+        ]),
+      ],
+      turnId: 'turn-1',
+      isTurnInProgress: true,
+      externalLiveAuthority: 'writer-snapshot',
+      authoritativeFooter: null,
+    })).toBeNull()
+  })
+
   it('combines the current plan and file changes using desktop progress rules', () => {
     const result = deriveConversationFooterState({
       messages: [

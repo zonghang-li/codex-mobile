@@ -42,6 +42,9 @@ import type {
   UiThread,
   UiThreadGoal,
   UiThreadGoalStatus,
+  UiThreadLiveAuthority,
+  UiThreadLiveFooter,
+  UiThreadLiveSnapshot,
   UiReviewAction,
   UiReviewActionLevel,
   UiReviewFile,
@@ -452,6 +455,60 @@ function readBoolean(value: unknown): boolean | null {
 
 function readStringArray(value: unknown): string[] {
   return Array.isArray(value) ? value.filter((item): item is string => typeof item === 'string' && item.length > 0) : []
+}
+
+function readLiveAuthority(value: unknown): UiThreadLiveAuthority {
+  return value === 'writer-snapshot' ||
+    value === 'local-stream' ||
+    value === 'persisted' ||
+    value === 'missing'
+      ? value
+      : 'missing'
+}
+
+function readNullableLiveNumber(value: unknown): number | null | undefined {
+  if (value === null) return null
+  return typeof value === 'number' && Number.isFinite(value) ? value : undefined
+}
+
+function readLiveFooter(value: unknown): UiThreadLiveFooter | null | undefined {
+  if (value === null) return null
+  const record = asRecord(value)
+  if (!record) return undefined
+
+  const stepCurrent = readNullableLiveNumber(record.stepCurrent)
+  const stepTotal = readNullableLiveNumber(record.stepTotal)
+  const completedPercent = readNullableLiveNumber(record.completedPercent)
+  const fileCount = readNullableLiveNumber(record.fileCount)
+  const additions = readNullableLiveNumber(record.additions)
+  const deletions = readNullableLiveNumber(record.deletions)
+  const label = readString(record.label)
+
+  if (
+    stepCurrent === undefined ||
+    stepTotal === undefined ||
+    completedPercent === undefined ||
+    fileCount === undefined ||
+    additions === undefined ||
+    deletions === undefined ||
+    !label
+  ) {
+    return undefined
+  }
+
+  return { stepCurrent, stepTotal, completedPercent, fileCount, additions, deletions, label }
+}
+
+function readLiveSnapshot(value: unknown): UiThreadLiveSnapshot | null {
+  const record = asRecord(value)
+  if (!record) return null
+  const revision = typeof record.revision === 'number' && Number.isSafeInteger(record.revision)
+    ? record.revision
+    : null
+  const activeTurnId = record.activeTurnId === null ? null : readString(record.activeTurnId)
+  const footer = readLiveFooter(record.footer)
+  if (revision === null || footer === undefined) return null
+  return { revision, activeTurnId, footer }
 }
 
 const THREAD_GOAL_STATUSES = new Set<UiThreadGoalStatus>([
@@ -1011,6 +1068,8 @@ async function getExternalThreadLiveStateSnapshotV2(
   ownership: ThreadDetailRuntime['ownership']
   canInterrupt: boolean
   externalRuntimeState: ThreadDetailRuntime['externalRuntimeState']
+  liveAuthority: UiThreadLiveAuthority
+  liveSnapshot: UiThreadLiveSnapshot | null
 }> {
   const params = new URLSearchParams({ threadId })
   const response = await fetch(`/codex-api/thread-live-state?${params.toString()}`, { signal })
@@ -1034,6 +1093,13 @@ async function getExternalThreadLiveStateSnapshotV2(
   } as unknown as ThreadReadResponse
   const normalized = normalizeThreadMessagesV2(result, threadTurnStartIndex)
   const runtime = readThreadDetailRuntime(result)
+  const rawAuthority = readLiveAuthority(payload?.liveAuthority)
+  const rawSnapshot = readLiveSnapshot(payload?.liveSnapshot)
+  const liveAuthority = rawAuthority === 'writer-snapshot' && rawSnapshot
+    ? 'writer-snapshot'
+    : rawAuthority === 'local-stream' || rawAuthority === 'persisted'
+      ? rawAuthority
+      : 'missing'
   return {
     isLiveProjection: true,
     model: normalizeThreadModelFromPayload(payload),
@@ -1043,6 +1109,8 @@ async function getExternalThreadLiveStateSnapshotV2(
     ...runtime,
     hasMoreOlder: payload?.hasMoreOlder === true || threadTurnStartIndex > 0,
     turnIndexByTurnId: buildTurnIndexByTurnId(result, threadTurnStartIndex),
+    liveAuthority,
+    liveSnapshot: liveAuthority === 'writer-snapshot' ? rawSnapshot : null,
   }
 }
 
@@ -1150,6 +1218,8 @@ export async function getExternalThreadLiveSnapshot(threadId: string, signal?: A
   ownership: ThreadDetailRuntime['ownership']
   canInterrupt: boolean
   externalRuntimeState: ThreadDetailRuntime['externalRuntimeState']
+  liveAuthority: UiThreadLiveAuthority
+  liveSnapshot: UiThreadLiveSnapshot | null
 }> {
   try {
     return await getExternalThreadLiveStateSnapshotV2(threadId, signal)
