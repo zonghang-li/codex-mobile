@@ -2587,4 +2587,22 @@ watch(
     @apply max-w-36;
   }
 }
+
+@media (max-width: 360px) {
+  .thread-composer-controls {
+    flex-wrap: wrap;
+    row-gap: 0.25rem;
+  }
+
+  .thread-composer-actions {
+    flex-basis: 100%;
+    width: 100%;
+    justify-content: flex-end;
+  }
+
+  .thread-composer-model-effort {
+    flex: 1 1 auto;
+    max-width: min(12rem, calc(100% - 5rem));
+  }
+}
 </style>

@@ -17,6 +17,10 @@ const conversationSource = readFileSync(
   new URL('./ThreadConversation.vue', import.meta.url),
   'utf8',
 )
+const globalStyleSource = readFileSync(
+  new URL('../../style.css', import.meta.url),
+  'utf8',
+)
 
 describe('ConversationRunFooter desktop parity wiring', () => {
   it('keeps the current plan and diff pill outside the scroll container above the composer', () => {
@@ -48,6 +52,7 @@ describe('ConversationRunFooter desktop parity wiring', () => {
     expect(footerSource).toContain('goal-edit-button')
     expect(footerSource).toContain('goal-clear-button')
     expect(footerSource).toContain('goal-expand-button')
+    expect(globalStyleSource).toContain(':root.dark .conversation-goal-strip')
   })
 
   it('uses an accessible progress primitive', () => {

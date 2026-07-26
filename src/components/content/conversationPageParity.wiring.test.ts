@@ -5,6 +5,7 @@ const appSource = readFileSync(new URL('../../App.vue', import.meta.url), 'utf8'
 const conversationSource = readFileSync(new URL('./ThreadConversation.vue', import.meta.url), 'utf8')
 const footerSource = readFileSync(new URL('./ConversationRunFooter.vue', import.meta.url), 'utf8')
 const composerSource = readFileSync(new URL('./ThreadComposer.vue', import.meta.url), 'utf8')
+const globalStyleSource = readFileSync(new URL('../../style.css', import.meta.url), 'utf8')
 
 describe('current conversation page desktop parity wiring', () => {
   it('keeps the active status footer directly between the conversation and composer', () => {
@@ -41,6 +42,18 @@ describe('current conversation page desktop parity wiring', () => {
   it('keeps the composer input at the iOS-safe focus size', () => {
     expect(composerSource).toMatch(
       /@media \(max-width: 640px\)[\s\S]*\.thread-composer-input\s*\{[^}]*font-size:\s*16px/su,
+    )
+  })
+
+  it('keeps the title and model controls usable at 320px', () => {
+    expect(composerSource).toMatch(
+      /@media \(max-width: 360px\)[\s\S]*\.thread-composer-controls\s*\{[^}]*flex-wrap:\s*wrap/su,
+    )
+    expect(composerSource).toMatch(
+      /@media \(max-width: 360px\)[\s\S]*\.thread-composer-actions\s*\{[^}]*flex-basis:\s*100%/su,
+    )
+    expect(globalStyleSource).toMatch(
+      /@media \(max-width: 360px\)[\s\S]*\.mobile-theme-toggle\s*\{[^}]*display:\s*none/su,
     )
   })
 })

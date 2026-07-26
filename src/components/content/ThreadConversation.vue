@@ -54,7 +54,9 @@
               :class="{ 'codex-activity-row-expanded': isActivitySegmentExpanded(message.id) }"
               @click="toggleActivitySegment(message.id)"
             >
-              <IconTablerTerminal class="icon-svg codex-activity-icon" />
+              <IconTablerFilePencil v-if="activitySegmentIconKind(readActivitySegment(message)) === 'edit'" class="icon-svg codex-activity-icon" />
+              <IconTablerSearch v-else-if="activitySegmentIconKind(readActivitySegment(message)) === 'search'" class="icon-svg codex-activity-icon" />
+              <IconTablerTerminal v-else class="icon-svg codex-activity-icon" />
               <span class="codex-activity-label">{{ activitySegmentLabel(readActivitySegment(message)) }}</span>
               <span class="cmd-chevron" :class="{ 'cmd-chevron-open': isActivitySegmentExpanded(message.id) }">›</span>
             </button>
@@ -63,7 +65,9 @@
               class="codex-activity-row"
               :data-activity-kind="readActivitySegment(message)?.kind"
             >
-              <IconTablerTerminal v-if="readActivitySegment(message)?.kind === 'summary'" class="icon-svg codex-activity-icon" />
+              <IconTablerFilePencil v-if="activitySegmentIconKind(readActivitySegment(message)) === 'edit'" class="icon-svg codex-activity-icon" />
+              <IconTablerSearch v-else-if="activitySegmentIconKind(readActivitySegment(message)) === 'search'" class="icon-svg codex-activity-icon" />
+              <IconTablerTerminal v-else-if="readActivitySegment(message)?.kind === 'summary'" class="icon-svg codex-activity-icon" />
               <IconTablerSearch v-else-if="message.messageType === 'webSearch'" class="icon-svg codex-activity-icon" />
               <IconTablerFilePencil v-else-if="message.messageType === 'imageView' || message.messageType === 'imageGeneration' || message.messageType === 'contextCompaction'" class="icon-svg codex-activity-icon" />
               <IconTablerBolt v-else class="icon-svg codex-activity-icon" />
@@ -469,12 +473,16 @@
                         :class="{ 'codex-activity-row-expanded': isActivitySegmentExpanded(segment.id) }"
                         @click="toggleActivitySegment(segment.id)"
                       >
-                        <IconTablerTerminal class="icon-svg codex-activity-icon" />
+                        <IconTablerFilePencil v-if="activitySegmentIconKind(segment) === 'edit'" class="icon-svg codex-activity-icon" />
+                        <IconTablerSearch v-else-if="activitySegmentIconKind(segment) === 'search'" class="icon-svg codex-activity-icon" />
+                        <IconTablerTerminal v-else class="icon-svg codex-activity-icon" />
                         <span class="codex-activity-label">{{ segment.label }}</span>
                         <span class="cmd-chevron" :class="{ 'cmd-chevron-open': isActivitySegmentExpanded(segment.id) }">›</span>
                       </button>
                       <article v-else class="codex-activity-row" :data-activity-kind="segment.kind">
-                        <IconTablerTerminal v-if="segment.kind === 'summary'" class="icon-svg codex-activity-icon" />
+                        <IconTablerFilePencil v-if="activitySegmentIconKind(segment) === 'edit'" class="icon-svg codex-activity-icon" />
+                        <IconTablerSearch v-else-if="activitySegmentIconKind(segment) === 'search'" class="icon-svg codex-activity-icon" />
+                        <IconTablerTerminal v-else-if="segment.kind === 'summary'" class="icon-svg codex-activity-icon" />
                         <IconTablerBolt v-else class="icon-svg codex-activity-icon" />
                         <span class="codex-activity-label">{{ segment.label }}</span>
                       </article>
@@ -1193,6 +1201,7 @@ import {
   buildThreadActivitySegments,
   getTurnActivitySegmentsForWorked,
   isThreadActivityMessage,
+  type ThreadActivityIconKind,
   type ThreadActivitySegment,
 } from './threadConversationActivity'
 import { projectConversationTurns } from './conversationTurnPresentation'
@@ -1490,6 +1499,10 @@ function activitySegmentAgentStatus(segment: ThreadActivitySegment | null): stri
 
 function activitySegmentLabel(segment: ThreadActivitySegment | null): string {
   return segment && segment.kind !== 'subAgent' ? segment.label : ''
+}
+
+function activitySegmentIconKind(segment: ThreadActivitySegment | null): ThreadActivityIconKind {
+  return segment?.kind === 'summary' ? segment.iconKind : 'terminal'
 }
 
 function activitySegmentAgents(segment: ThreadActivitySegment | null) {

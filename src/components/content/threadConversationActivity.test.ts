@@ -102,6 +102,7 @@ describe('thread conversation completed activity grouping', () => {
         kind: 'summary',
         id: 'run-1',
         label: 'Edited a file, read a file, ran a command',
+        iconKind: 'edit',
         sourceMessageIds: ['file-1', 'read-1', 'run-1'],
       },
       {
@@ -195,11 +196,37 @@ describe('thread conversation completed activity grouping', () => {
       expect.objectContaining({
         id: 'run-2',
         label: 'Edited files, read files, listed files, searched files, ran commands',
+        iconKind: 'edit',
       }),
       expect.objectContaining({
         id: 'read-3',
         label: 'Read a file',
+        iconKind: 'search',
       }),
+    ])
+  })
+
+  it('uses search for read-only activity and terminal for command-only activity', () => {
+    const command = (
+      id: string,
+      category: 'read' | 'unknown',
+    ): UiMessage => ({
+      ...message(id, 'system', id, 'commandExecution'),
+      commandExecution: {
+        command: id,
+        cwd: null,
+        status: 'completed',
+        aggregatedOutput: '',
+        exitCode: 0,
+        activityCategories: [category],
+      },
+    })
+
+    expect(buildThreadActivitySegments([command('read', 'read')])).toEqual([
+      expect.objectContaining({ iconKind: 'search' }),
+    ])
+    expect(buildThreadActivitySegments([command('run', 'unknown')])).toEqual([
+      expect.objectContaining({ iconKind: 'terminal' }),
     ])
   })
 

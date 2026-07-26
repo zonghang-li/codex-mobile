@@ -24,6 +24,12 @@ describe('ThreadConversation Codex desktop activity parity wiring', () => {
     expect(source).not.toContain('activitySegmentStatus(')
   })
 
+  it('matches desktop activity icons for edit, read, and command summaries', () => {
+    expect(source).toContain('activitySegmentIconKind')
+    expect(source).toContain("activitySegmentIconKind(readActivitySegment(message)) === 'edit'")
+    expect(source).toContain("activitySegmentIconKind(readActivitySegment(message)) === 'search'")
+  })
+
   it('uses the same segment model inside completed Worked details', () => {
     expect(source).toContain('getTurnActivitySegmentsForWorked(messages, messages.indexOf(message))')
     expect(source).not.toContain('v-for="activity in getTurnActivityMessagesForWorked(')

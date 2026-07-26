@@ -294,37 +294,6 @@ function saveGoalEdit(): void {
   @apply rounded-full border border-zinc-300 bg-white px-3 py-1.5 text-xs font-medium text-zinc-700 hover:bg-zinc-50 disabled:cursor-default disabled:opacity-40;
 }
 
-:global(.dark) .conversation-run-footer-pill,
-:global(.dark) .conversation-goal-strip {
-  @apply border-zinc-700 bg-zinc-800/95 text-zinc-300 shadow-lg shadow-black/20;
-}
-
-:global(.dark) .conversation-goal-summary,
-:global(.dark) .conversation-goal-objective,
-:global(.dark) .conversation-goal-duration {
-  @apply text-zinc-400;
-}
-
-:global(.dark) .conversation-goal-status {
-  @apply text-zinc-100;
-}
-
-:global(.dark) .conversation-goal-action {
-  @apply text-zinc-400 hover:bg-zinc-700 hover:text-zinc-100;
-}
-
-:global(.dark) .conversation-goal-details {
-  @apply border-zinc-700 text-zinc-400;
-}
-
-:global(.dark) .conversation-goal-editor {
-  @apply border-zinc-600 bg-zinc-900 text-zinc-100 focus:border-zinc-400;
-}
-
-:global(.dark) .conversation-goal-editor-actions button {
-  @apply border-zinc-600 bg-zinc-800 text-zinc-200 hover:bg-zinc-700;
-}
-
 .conversation-run-footer-step,
 .conversation-run-footer-files {
   @apply min-w-0 truncate tabular-nums;
