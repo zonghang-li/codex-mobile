@@ -1104,6 +1104,200 @@ describe('GET /codex-api/thread-live-state external runtime parity', () => {
     })
   })
 
+  it('recovers allowlisted parent coordination activity without leaking payloads', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'codex-mobile-rpc-collaboration-'))
+    disposers.push(() => {
+      void rm(dir, { recursive: true, force: true })
+    })
+    const rolloutPath = join(dir, 'thread-collaboration.jsonl')
+    await writeFile(rolloutPath, [
+      JSON.stringify({ type: 'turn_context', payload: { turn_id: 'turn-collaboration' } }),
+      JSON.stringify({ type: 'response_item', payload: { type: 'message', role: 'assistant' } }),
+      JSON.stringify({
+        type: 'response_item',
+        payload: {
+          type: 'function_call',
+          name: 'send_message',
+          call_id: 'call-send',
+          arguments: JSON.stringify({ target: '/root/reviewer', message: 'secret child prompt' }),
+        },
+      }),
+      JSON.stringify({
+        type: 'response_item',
+        payload: {
+          type: 'function_call',
+          name: 'wait_agent',
+          call_id: 'call-wait',
+          arguments: JSON.stringify({ timeout_ms: 30_000 }),
+        },
+      }),
+      JSON.stringify({
+        type: 'response_item',
+        payload: {
+          type: 'function_call',
+          name: 'list_agents',
+          call_id: 'call-list',
+          arguments: '{}',
+        },
+      }),
+      JSON.stringify({
+        type: 'response_item',
+        payload: {
+          type: 'function_call',
+          name: 'send_message_to_thread',
+          call_id: 'call-send-thread',
+          arguments: JSON.stringify({ threadId: 'thread-child', message: 'private thread message' }),
+        },
+      }),
+      JSON.stringify({
+        type: 'response_item',
+        payload: {
+          type: 'function_call',
+          name: 'followup_task',
+          call_id: 'call-followup',
+          arguments: JSON.stringify({ target: '/root/reviewer', message: 'private follow-up' }),
+        },
+      }),
+      JSON.stringify({
+        type: 'response_item',
+        payload: {
+          type: 'function_call',
+          name: 'wait_threads',
+          call_id: 'call-wait-threads',
+          arguments: JSON.stringify({ targets: [{ threadId: 'thread-child' }] }),
+        },
+      }),
+      JSON.stringify({
+        type: 'response_item',
+        payload: {
+          type: 'function_call',
+          name: 'send_message',
+          arguments: JSON.stringify({ message: 'missing call id' }),
+        },
+      }),
+      JSON.stringify({
+        type: 'response_item',
+        payload: {
+          type: 'function_call',
+          name: 'untrusted_private_tool',
+          call_id: 'call-private',
+          arguments: JSON.stringify({ token: 'must-not-appear' }),
+        },
+      }),
+      JSON.stringify({ type: 'response_item', payload: { type: 'message', role: 'assistant' } }),
+      '',
+    ].join('\n'))
+
+    const middleware = createCodexBridgeMiddleware()
+    const shared = sharedBridgeForTest() as ReturnType<typeof sharedBridgeForTest> & {
+      appServer: ReturnType<typeof sharedBridgeForTest>['appServer'] & {
+        rpc: (method: string, params: unknown) => Promise<unknown>
+      }
+    }
+    vi.spyOn(shared.appServer, 'getPid').mockReturnValue(4242)
+    vi.spyOn(shared.appServer, 'rpc').mockResolvedValue({
+      thread: {
+        id: 'thread-collaboration',
+        path: rolloutPath,
+        turns: [{
+          id: 'turn-collaboration',
+          status: 'completed',
+          items: [
+            { id: 'agent-1', type: 'agentMessage', text: 'first' },
+            {
+              id: 'call-send',
+              type: 'subAgentActivity',
+              agentThreadId: 'thread-reviewer',
+              agentPath: '/root/reviewer',
+              kind: 'interacted',
+            },
+            {
+              id: 'call-spawn',
+              type: 'subAgentActivity',
+              agentThreadId: 'thread-started',
+              agentPath: '/root/started',
+              kind: 'started',
+            },
+            { id: 'agent-2', type: 'agentMessage', text: 'second' },
+          ],
+        }],
+      },
+    })
+    vi.spyOn(shared.runtimeProbe, 'inspect').mockResolvedValue({ state: 'idle' })
+    const port = await listenWithMiddleware(middleware)
+
+    const response = await fetch(`http://127.0.0.1:${port}/codex-api/rpc`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        method: 'thread/read',
+        params: { threadId: 'thread-collaboration', includeTurns: true },
+      }),
+    })
+    const payload = await response.json() as {
+      result?: { thread?: { turns?: Array<{ items?: Array<Record<string, unknown>> }> } }
+    }
+    const items = payload.result?.thread?.turns?.[0]?.items ?? []
+    const serialized = JSON.stringify(items)
+
+    expect(items.map((item) => item.id)).toEqual([
+      'agent-1',
+      'session-collab-call-send',
+      'session-collab-call-wait',
+      'session-collab-call-list',
+      'session-collab-call-send-thread',
+      'session-collab-call-followup',
+      'session-collab-call-wait-threads',
+      'call-spawn',
+      'agent-2',
+    ])
+    expect(items.slice(1, 7)).toEqual([
+      {
+        id: 'session-collab-call-send',
+        type: 'collaborationActivity',
+        activityKind: 'sendMessage',
+        sourceCallId: 'call-send',
+      },
+      {
+        id: 'session-collab-call-wait',
+        type: 'collaborationActivity',
+        activityKind: 'waitThreads',
+        sourceCallId: 'call-wait',
+      },
+      {
+        id: 'session-collab-call-list',
+        type: 'collaborationActivity',
+        activityKind: 'listAgents',
+        sourceCallId: 'call-list',
+      },
+      {
+        id: 'session-collab-call-send-thread',
+        type: 'collaborationActivity',
+        activityKind: 'sendMessage',
+        sourceCallId: 'call-send-thread',
+      },
+      {
+        id: 'session-collab-call-followup',
+        type: 'collaborationActivity',
+        activityKind: 'sendMessage',
+        sourceCallId: 'call-followup',
+      },
+      {
+        id: 'session-collab-call-wait-threads',
+        type: 'collaborationActivity',
+        activityKind: 'waitThreads',
+        sourceCallId: 'call-wait-threads',
+      },
+    ])
+    expect(serialized).not.toContain('secret child prompt')
+    expect(serialized).not.toContain('private thread message')
+    expect(serialized).not.toContain('private follow-up')
+    expect(serialized).not.toContain('thread-child')
+    expect(serialized).not.toContain('missing call id')
+    expect(serialized).not.toContain('must-not-appear')
+    expect(serialized).not.toContain('thread-reviewer')
+  })
+
   it('caps recovered session command output in normal thread/read RPC responses', async () => {
     const dir = await mkdtemp(join(tmpdir(), 'codex-mobile-rpc-session-command-large-output-'))
     disposers.push(() => {

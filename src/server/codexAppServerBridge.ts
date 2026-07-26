@@ -3682,11 +3682,29 @@ type SessionRecoveredFileChangeItem = {
   changes: Record<string, unknown>[]
 }
 
-type SessionItemSlot = {
-  type: 'agentMessage' | 'commandExecution' | 'fileChange'
-  command?: SessionRecoveredCommand
-  fileChange?: SessionRecoveredFileChangeItem
+type SessionRecoveredCollaborationKind = 'sendMessage' | 'waitThreads' | 'listAgents'
+
+type SessionRecoveredCollaborationActivity = {
+  id: string
+  type: 'collaborationActivity'
+  activityKind: SessionRecoveredCollaborationKind
+  sourceCallId: string
 }
+
+const SESSION_COLLABORATION_KIND_BY_FUNCTION = new Map<string, SessionRecoveredCollaborationKind>([
+  ['send_message', 'sendMessage'],
+  ['send_message_to_thread', 'sendMessage'],
+  ['followup_task', 'sendMessage'],
+  ['wait_agent', 'waitThreads'],
+  ['wait_threads', 'waitThreads'],
+  ['list_agents', 'listAgents'],
+])
+
+type SessionItemSlot =
+  | { type: 'agentMessage' }
+  | { type: 'commandExecution'; command: SessionRecoveredCommand }
+  | { type: 'fileChange'; fileChange: SessionRecoveredFileChangeItem }
+  | { type: 'collaborationActivity'; collaborationActivity: SessionRecoveredCollaborationActivity }
 
 type SessionRecoveredItemsCacheEntry = {
   size: number
@@ -3737,6 +3755,25 @@ function buildSessionItemOrder(sessionLogRaw: string, turnIds: Set<string> | nul
     if (payload.type === 'message' && payload.role === 'assistant') {
       slots.push({ type: 'agentMessage' })
       continue
+    }
+
+    if (payload.type === 'function_call') {
+      const functionName = readNonEmptyString(payload.name)
+      const activityKind = SESSION_COLLABORATION_KIND_BY_FUNCTION.get(functionName)
+      if (activityKind) {
+        const callId = readNonEmptyString(payload.call_id)
+        if (!callId) continue
+        slots.push({
+          type: 'collaborationActivity',
+          collaborationActivity: {
+            id: `session-collab-${callId}`,
+            type: 'collaborationActivity',
+            activityKind,
+            sourceCallId: callId,
+          },
+        })
+        continue
+      }
     }
 
     if (payload.type === 'function_call' && payload.name === 'exec_command') {
@@ -4317,10 +4354,19 @@ function mergeSessionCommandsIntoTurns(
     const existingItems = Array.isArray(turnRecord.items) ? (turnRecord.items as Record<string, unknown>[]) : []
     const alreadyHasRecoveredItems = existingItems.some((it) => {
       const id = readNonEmptyString(it.id)
-      return id.startsWith('session-cmd-') || id.startsWith('session-fc-')
+      return id.startsWith('session-cmd-')
+        || id.startsWith('session-fc-')
+        || id.startsWith('session-collab-')
     })
     if (alreadyHasRecoveredItems) return turn
 
+    const recoveredCollaborationByCallId = new Map(
+      slots
+        .filter((slot): slot is Extract<SessionItemSlot, { type: 'collaborationActivity' }> =>
+          slot.type === 'collaborationActivity',
+        )
+        .map((slot) => [slot.collaborationActivity.sourceCallId, slot.collaborationActivity]),
+    )
     const existingIds = new Set(
       existingItems
         .map((it) => readNonEmptyString(it.id))
@@ -4329,13 +4375,16 @@ function mergeSessionCommandsIntoTurns(
 
     const nextItems: Record<string, unknown>[] = []
     let slotIndex = 0
+    let didRecoverItem = false
 
     const appendRecoveredSlot = (slot: SessionItemSlot): void => {
       let recovered: Record<string, unknown> | null = null
-      if (slot.type === 'commandExecution' && slot.command) {
+      if (slot.type === 'commandExecution') {
         recovered = slot.command as unknown as Record<string, unknown>
-      } else if (slot.type === 'fileChange' && slot.fileChange) {
+      } else if (slot.type === 'fileChange') {
         recovered = slot.fileChange as unknown as Record<string, unknown>
+      } else if (slot.type === 'collaborationActivity') {
+        recovered = slot.collaborationActivity as unknown as Record<string, unknown>
       }
 
       if (!recovered) return
@@ -4343,6 +4392,7 @@ function mergeSessionCommandsIntoTurns(
       if (recoveredId && existingIds.has(recoveredId)) return
       if (recoveredId) existingIds.add(recoveredId)
       nextItems.push(recovered)
+      didRecoverItem = true
     }
 
     const flushRecoveredUntilNextAgentMessage = (): void => {
@@ -4353,6 +4403,15 @@ function mergeSessionCommandsIntoTurns(
     }
 
     for (const item of existingItems) {
+      const itemId = readNonEmptyString(item.id)
+      if (
+        item.type === 'subAgentActivity'
+        && item.kind === 'interacted'
+        && recoveredCollaborationByCallId.has(itemId)
+      ) {
+        didRecoverItem = true
+        continue
+      }
       if (item.type === 'agentMessage') {
         flushRecoveredUntilNextAgentMessage()
         nextItems.push(item)
@@ -4371,7 +4430,7 @@ function mergeSessionCommandsIntoTurns(
       slotIndex += 1
     }
 
-    if (nextItems.length === existingItems.length) return turn
+    if (!didRecoverItem) return turn
 
     return {
       ...turnRecord,
