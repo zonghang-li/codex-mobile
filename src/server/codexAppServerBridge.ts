@@ -1171,6 +1171,12 @@ export function buildThreadLiveStateReadFailureFallback(
   snapshot: unknown,
   error: unknown,
   mergeItemsIntoTurns: (threadId: string, turns: unknown[]) => unknown[],
+  options: {
+    externalRuntime?: unknown
+    isInProgress?: boolean
+    liveAuthority?: 'writer-snapshot' | 'local-stream' | 'persisted' | 'missing'
+    liveSnapshot?: unknown | null
+  } = {},
 ): unknown {
   const liveSnapshot = trimLiveThreadTurnsInRpcResult(snapshot)
   const record = asRecord(liveSnapshot)
@@ -1180,7 +1186,7 @@ export function buildThreadLiveStateReadFailureFallback(
   const threadTurnStartIndex = Math.max(0, Math.floor(
     typeof record?.threadTurnStartIndex === 'number' ? record.threadTurnStartIndex : 0,
   ))
-  return {
+  const responseData: Record<string, unknown> = {
     threadId,
     threadTurnStartIndex,
     hasMoreOlder: threadTurnStartIndex > 0,
@@ -1190,10 +1196,14 @@ export function buildThreadLiveStateReadFailureFallback(
       kind: 'readFailed',
       message: getErrorMessage(error, 'thread/read failed'),
     },
-    isInProgress: false,
-    liveAuthority: 'missing',
-    liveSnapshot: null,
+    isInProgress: options.isInProgress ?? false,
+    liveAuthority: options.liveAuthority ?? 'missing',
+    liveSnapshot: options.liveSnapshot ?? null,
   }
+  if (options.externalRuntime !== undefined) {
+    responseData.externalRuntime = options.externalRuntime
+  }
+  return responseData
 }
 
 function getErrorMessage(payload: unknown, fallback: string): string {
@@ -9028,8 +9038,8 @@ export function createCodexBridgeMiddleware(options: {
           return
         }
 
+        let precheckedExternalRuntime: unknown | null = null
         try {
-          let precheckedExternalRuntime: unknown | null = null
           const lastSnapshot = appServer.getLastThreadReadSnapshot(threadId)
           if (lastSnapshot) {
             const snapshotRecord = asRecord(lastSnapshot)
@@ -9180,11 +9190,28 @@ export function createCodexBridgeMiddleware(options: {
 
           const snapshot = appServer.getLastThreadReadSnapshot(threadId)
           if (snapshot) {
+            const fallbackExternalRuntime = precheckedExternalRuntime
+            const fallbackExternalInProgress = asRecord(fallbackExternalRuntime)?.state === 'running'
+            const activeExternalTurnId = fallbackExternalInProgress
+              ? readNonEmptyString(asRecord(fallbackExternalRuntime)?.turnId)
+              : ''
+            const liveSnapshot = activeExternalTurnId
+              ? await readThreadLiveSnapshotFile(getThreadLiveStateDir(), threadId, {
+                  activeTurnId: activeExternalTurnId,
+                  nowMs: Date.now(),
+                })
+              : null
             setJson(res, 200, buildThreadLiveStateReadFailureFallback(
               threadId,
               snapshot,
               error,
               (snapshotThreadId, turns) => appServer.mergeItemsIntoTurns(snapshotThreadId, turns),
+              {
+                externalRuntime: fallbackExternalRuntime ?? undefined,
+                isInProgress: fallbackExternalInProgress,
+                liveAuthority: liveSnapshot ? 'writer-snapshot' : 'missing',
+                liveSnapshot,
+              },
             ))
           } else {
             setJson(res, 200, {

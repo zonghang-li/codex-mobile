@@ -917,6 +917,71 @@ describe('GET /codex-api/thread-live-state external runtime parity', () => {
     }
   })
 
+  it('preserves external running state when live thread/read falls back after a read failure', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'codex-mobile-live-state-read-failure-'))
+    const previousLiveStateDir = process.env.CODEX_MOBILE_LIVE_STATE_DIR
+    process.env.CODEX_MOBILE_LIVE_STATE_DIR = dir
+    try {
+      const rolloutPath = join(dir, 'thread-read-failure.jsonl')
+      await writeFile(rolloutPath, '{"type":"session_meta"}\n')
+
+      const middleware = createCodexBridgeMiddleware()
+      const shared = sharedBridgeForTest() as ReturnType<typeof sharedBridgeForTest> & {
+        appServer: ReturnType<typeof sharedBridgeForTest>['appServer'] & {
+          rpc: (method: string, params: unknown) => Promise<unknown>
+          storeThreadReadSnapshot: (threadId: string, snapshot: unknown) => void
+        }
+      }
+      shared.appServer.storeThreadReadSnapshot('thread-read-failure', {
+        threadTurnStartIndex: 4,
+        thread: {
+          id: 'thread-read-failure',
+          path: rolloutPath,
+          turns: [{
+            id: 'turn-external',
+            status: 'interrupted',
+            items: [{ id: 'old-message', type: 'agentMessage', text: 'stale but useful' }],
+          }],
+        },
+      })
+      vi.spyOn(shared.appServer, 'getPid').mockReturnValue(4242)
+      vi.spyOn(shared.appServer, 'rpc').mockRejectedValue(new Error('thread/read failed in test'))
+      vi.spyOn(shared.runtimeProbe, 'inspect').mockResolvedValue({
+        state: 'running',
+        turnId: 'turn-external',
+        interruptible: false,
+        source: 'external-session-writer',
+      })
+      const port = await listenWithMiddleware(middleware)
+
+      const response = await fetch(`http://127.0.0.1:${port}/codex-api/thread-live-state?threadId=thread-read-failure`)
+
+      expect(response.status).toBe(200)
+      await expect(response.json()).resolves.toMatchObject({
+        threadId: 'thread-read-failure',
+        isInProgress: true,
+        externalRuntime: {
+          state: 'running',
+          turnId: 'turn-external',
+          interruptible: false,
+          source: 'external-session-writer',
+        },
+        liveAuthority: 'missing',
+        liveSnapshot: null,
+        liveStateError: {
+          kind: 'readFailed',
+        },
+      })
+    } finally {
+      if (previousLiveStateDir === undefined) {
+        delete process.env.CODEX_MOBILE_LIVE_STATE_DIR
+      } else {
+        process.env.CODEX_MOBILE_LIVE_STATE_DIR = previousLiveStateDir
+      }
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
   it('marks a stale idle thread read as in progress when an external writer is active', async () => {
     const middleware = createCodexBridgeMiddleware()
     const shared = sharedBridgeForTest() as ReturnType<typeof sharedBridgeForTest> & {
