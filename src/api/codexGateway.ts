@@ -896,7 +896,7 @@ export type ThreadGroupsPage = {
 export type ThreadCompletionSummary = {
   turnId: string
   status: string
-  durationMs: number
+  durationMs: number | null
 }
 
 export type ThreadTurnPage = {
@@ -916,12 +916,10 @@ function readThreadCompletionSummaries(payload: ThreadReadResponse): ThreadCompl
     const turnId = (readString(rawTurn?.id) ?? '').trim()
     const status = (readString(rawTurn?.status) ?? '').trim()
     if (!turnId || !status || status === 'inProgress') return []
-    const durationMs = Math.max(
-      0,
+    const rawDurationMs =
       readNumber(rawTurn?.durationMs)
-        ?? readNumber(rawTurn?.duration_ms)
-        ?? 0,
-    )
+      ?? readNumber(rawTurn?.duration_ms)
+    const durationMs = rawDurationMs === null ? null : Math.max(0, rawDurationMs)
     return [{ turnId, status, durationMs }]
   })
 }

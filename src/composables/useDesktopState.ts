@@ -106,6 +106,7 @@ const READ_STATE_STORAGE_KEY = 'codex-web-local.thread-read-state.v1'
 const UNREAD_CUTOFF_STORAGE_KEY = 'codex-web-local.thread-unread-cutoff.v1'
 const THREAD_TOKEN_USAGE_STORAGE_KEY = 'codex-web-local.thread-token-usage.v1'
 const THREAD_TERMINAL_OPEN_STORAGE_KEY = 'codex-web-local.thread-terminal-open.v1'
+const TURN_COMPLETION_SUMMARY_STORAGE_KEY = 'codex-web-local.turn-completion-summaries.v1'
 const SELECTED_THREAD_STORAGE_KEY = 'codex-web-local.selected-thread-id.v1'
 const SELECTED_MODEL_BY_CONTEXT_STORAGE_KEY = 'codex-web-local.selected-model-by-context.v1'
 const LEGACY_SELECTED_MODEL_STORAGE_KEY = 'codex-web-local.selected-model-id.v1'
@@ -870,7 +871,7 @@ function upsertMessage(previous: UiMessage[], nextMessage: UiMessage): UiMessage
 
 type TurnSummaryState = {
   turnId: string
-  durationMs: number
+  durationMs: number | null
   status: TurnTerminalStatus
 }
 
@@ -906,8 +907,11 @@ function parseIsoTimestamp(value: string): number | null {
   return Number.isNaN(ms) ? null : ms
 }
 
-function formatTurnDuration(durationMs: number): string {
-  if (!Number.isFinite(durationMs) || durationMs <= 0) {
+function formatTurnDuration(durationMs: number | null): string {
+  if (durationMs === null || !Number.isFinite(durationMs)) {
+    return ''
+  }
+  if (durationMs <= 0) {
     return '<1s'
   }
 
@@ -951,12 +955,14 @@ function areTurnActivitiesEqual(first?: TurnActivityState, second?: TurnActivity
 
 function buildTurnSummaryMessage(summary: TurnSummaryState): UiMessage {
   const durationLabel = formatTurnDuration(summary.durationMs)
+  const durationSuffix = durationLabel ? ` after ${durationLabel}` : ''
+  const workedSuffix = durationLabel ? ` for ${durationLabel}` : ''
   return {
     id: `turn-summary:${summary.turnId}`,
     role: 'system',
     text: summary.status === 'interrupted'
-      ? `You stopped after ${durationLabel}`
-      : `Worked for ${durationLabel}`,
+      ? `You stopped${durationSuffix}`
+      : `Worked${workedSuffix}`,
     messageType: WORKED_MESSAGE_TYPE,
     turnId: summary.turnId,
   }
@@ -1021,6 +1027,52 @@ function insertTurnSummaryMessages(
     (next, summary) => insertTurnSummaryMessage(next, summary),
     messages,
   )
+}
+
+function loadPersistedTurnSummaryMap(): Record<string, Record<string, TurnSummaryState>> {
+  if (typeof window === 'undefined') return {}
+
+  try {
+    const raw = window.localStorage.getItem(TURN_COMPLETION_SUMMARY_STORAGE_KEY)
+    if (!raw) return {}
+    const parsed = JSON.parse(raw) as unknown
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return {}
+
+    const result: Record<string, Record<string, TurnSummaryState>> = {}
+    for (const [threadId, threadValue] of Object.entries(parsed as Record<string, unknown>)) {
+      if (!threadId || !threadValue || typeof threadValue !== 'object' || Array.isArray(threadValue)) continue
+      const summaries: Record<string, TurnSummaryState> = {}
+      for (const [turnId, summaryValue] of Object.entries(threadValue as Record<string, unknown>)) {
+        if (!turnId || !summaryValue || typeof summaryValue !== 'object' || Array.isArray(summaryValue)) continue
+        const summary = summaryValue as Record<string, unknown>
+        const status = typeof summary.status === 'string' ? summary.status.trim() : ''
+        const durationMs = summary.durationMs === null
+          ? null
+          : typeof summary.durationMs === 'number' && Number.isFinite(summary.durationMs)
+            ? Math.max(0, summary.durationMs)
+            : null
+        if (!status) continue
+        summaries[turnId] = { turnId, status, durationMs }
+      }
+      if (Object.keys(summaries).length > 0) {
+        result[threadId] = summaries
+      }
+    }
+    return result
+  } catch {
+    return {}
+  }
+}
+
+function savePersistedTurnSummaryMap(
+  state: Record<string, Record<string, TurnSummaryState>>,
+): void {
+  if (typeof window === 'undefined') return
+  try {
+    window.localStorage.setItem(TURN_COMPLETION_SUMMARY_STORAGE_KEY, JSON.stringify(state))
+  } catch {
+    // Keep live completion boundaries usable when storage is unavailable.
+  }
 }
 
 function omitKey<TValue>(record: Record<string, TValue>, key: string): Record<string, TValue> {
@@ -1561,6 +1613,9 @@ export function useDesktopState() {
   const resumedThreadById = ref<Record<string, boolean>>({})
   const turnIndexByTurnIdByThreadId = ref<Record<string, Record<string, number>>>({})
   const turnSummaryByThreadId = ref<Record<string, TurnSummaryState>>({})
+  const persistedTurnSummaryByThreadId = ref<Record<string, Record<string, TurnSummaryState>>>(
+    loadPersistedTurnSummaryMap(),
+  )
   const turnActivityByThreadId = ref<Record<string, TurnActivityState>>({})
   const turnErrorByThreadId = ref<Record<string, TurnErrorState>>({})
   const activeTurnIdByThreadId = ref<Record<string, string>>({})
@@ -1656,6 +1711,8 @@ export function useDesktopState() {
   const loadMessagePromiseByThreadId = new Map<string, Promise<void>>()
   const rollbackPromiseByThreadId = new Map<string, Promise<void>>()
   const detailRequestEpochByThreadId = new Map<string, number>()
+  const threadGoalRequestEpochByThreadId = new Map<string, number>()
+  let threadGoalRequestGeneration = 0
   const detailRequestByThreadId = new Map<string, {
     epoch: number
     promise: Promise<ThreadDetailSnapshot>
@@ -2628,6 +2685,42 @@ export function useDesktopState() {
     }
   }
 
+  function persistTurnSummaryForThread(threadId: string, summary: TurnSummaryState): void {
+    if (!threadId || !summary.turnId) return
+    const previousThreadSummaries = persistedTurnSummaryByThreadId.value[threadId] ?? {}
+    const nextThreadEntries = Object.entries({
+      ...previousThreadSummaries,
+      [summary.turnId]: summary,
+    }).slice(-50)
+    const nextThreadSummaries = Object.fromEntries(nextThreadEntries) as Record<string, TurnSummaryState>
+    const nextEntries = Object.entries({
+      ...persistedTurnSummaryByThreadId.value,
+      [threadId]: nextThreadSummaries,
+    }).slice(-100)
+    persistedTurnSummaryByThreadId.value = Object.fromEntries(nextEntries) as Record<
+      string,
+      Record<string, TurnSummaryState>
+    >
+    savePersistedTurnSummaryMap(persistedTurnSummaryByThreadId.value)
+  }
+
+  function mergeTurnSummariesWithPersistedDurations(
+    threadId: string,
+    summaries: readonly TurnSummaryState[],
+  ): TurnSummaryState[] {
+    const persisted = persistedTurnSummaryByThreadId.value[threadId] ?? {}
+    return summaries.map((summary) => {
+      const persistedSummary = persisted[summary.turnId]
+      if (summary.durationMs !== null || persistedSummary?.durationMs === null || !persistedSummary) {
+        return summary
+      }
+      return {
+        ...summary,
+        durationMs: persistedSummary.durationMs,
+      }
+    })
+  }
+
   function isCurrentThreadDetailEpoch(threadId: string, epoch: number): boolean {
     return (detailRequestEpochByThreadId.get(threadId) ?? 0) === epoch
   }
@@ -3492,9 +3585,24 @@ export function useDesktopState() {
       || /(?:method|rpc).*(?:not found|unknown|unsupported)|-32601|thread\/goal.*(?:not found|unsupported)/iu.test(message)
   }
 
+  function invalidateThreadGoalRequest(threadId: string): void {
+    threadGoalRequestEpochByThreadId.set(
+      threadId,
+      (threadGoalRequestEpochByThreadId.get(threadId) ?? 0) + 1,
+    )
+  }
+
   async function refreshThreadGoal(threadId: string): Promise<void> {
+    const generation = threadGoalRequestGeneration
+    const requestEpoch = (threadGoalRequestEpochByThreadId.get(threadId) ?? 0) + 1
+    threadGoalRequestEpochByThreadId.set(threadId, requestEpoch)
+    const isCurrentRequest = () => (
+      generation === threadGoalRequestGeneration
+      && threadGoalRequestEpochByThreadId.get(threadId) === requestEpoch
+    )
     try {
       const goal = await getThreadGoal(threadId)
+      if (!isCurrentRequest()) return
       threadGoalSupportByThreadId.value = {
         ...threadGoalSupportByThreadId.value,
         [threadId]: true,
@@ -3508,6 +3616,7 @@ export function useDesktopState() {
         threadGoalByThreadId.value = omitKey(threadGoalByThreadId.value, threadId)
       }
     } catch (goalError) {
+      if (!isCurrentRequest()) return
       if (isThreadGoalUnsupportedError(goalError)) {
         threadGoalSupportByThreadId.value = {
           ...threadGoalSupportByThreadId.value,
@@ -4557,6 +4666,7 @@ export function useDesktopState() {
       const threadId = extractThreadIdFromNotification(notification)
       const goal = readThreadGoal(params?.goal ?? notification.params)
       if (threadId && goal) {
+        invalidateThreadGoalRequest(threadId)
         threadGoalByThreadId.value = {
           ...threadGoalByThreadId.value,
           [threadId]: goal,
@@ -4572,6 +4682,7 @@ export function useDesktopState() {
     if (notification.method === 'thread/goal/cleared') {
       const threadId = extractThreadIdFromNotification(notification)
       if (threadId) {
+        invalidateThreadGoalRequest(threadId)
         threadGoalByThreadId.value = omitKey(threadGoalByThreadId.value, threadId)
         threadGoalSupportByThreadId.value = {
           ...threadGoalSupportByThreadId.value,
@@ -4661,13 +4772,14 @@ export function useDesktopState() {
           : null) ??
         (startedTurnState ? completedTurn.completedAtMs - startedTurnState.startedAtMs : null)
 
-      const durationMs = typeof rawDurationMs === 'number' ? Math.max(0, rawDurationMs) : 0
+      const durationMs = typeof rawDurationMs === 'number' ? Math.max(0, rawDurationMs) : null
+      const summary: TurnSummaryState = {
+        turnId: completedTurn.turnId,
+        durationMs,
+        status: completedTurn.status,
+      }
+      persistTurnSummaryForThread(completedTurn.threadId, summary)
       if (completionDisposition.ownsActiveLease) {
-        const summary: TurnSummaryState = {
-          turnId: completedTurn.turnId,
-          durationMs,
-          status: completedTurn.status,
-        }
         const persistedMessages = persistedMessagesByThreadId.value[completedTurn.threadId] ?? []
         setPersistedMessagesForThread(
           completedTurn.threadId,
@@ -5278,7 +5390,10 @@ export function useDesktopState() {
       activeTurnId,
       turnIndexByTurnId,
     } = detail
-    const nextMessages = insertTurnSummaryMessages(detailMessages, completionSummaries)
+    const nextMessages = insertTurnSummaryMessages(
+      detailMessages,
+      mergeTurnSummariesWithPersistedDurations(threadId, completionSummaries),
+    )
     const localActiveTurnId = runtimeOwnershipByThreadId.value[threadId] === 'local'
       ? activeTurnIdByThreadId.value[threadId] ?? ''
       : ''
@@ -5497,7 +5612,10 @@ export function useDesktopState() {
     try {
       const page = await getOlderThreadMessages(threadId, beforeTurnId)
       const previousPersisted = persistedMessagesByThreadId.value[threadId] ?? []
-      const pageMessages = insertTurnSummaryMessages(page.messages, page.completionSummaries)
+      const pageMessages = insertTurnSummaryMessages(
+        page.messages,
+        mergeTurnSummariesWithPersistedDurations(threadId, page.completionSummaries),
+      )
       const mergedMessages = mergeMessages(pageMessages, previousPersisted, { preserveMissing: true })
       setPersistedMessagesForThread(threadId, mergedMessages)
       replaceTurnIndexLookupForThread(threadId, {
@@ -6595,6 +6713,8 @@ export function useDesktopState() {
   }
 
   function stopPolling(): void {
+    threadGoalRequestGeneration += 1
+    threadGoalRequestEpochByThreadId.clear()
     externalRuntimePollingEnabled = false
     cancelExternalRuntimePolling()
     backgroundRuntimePollingEnabled = false
@@ -6721,6 +6841,7 @@ export function useDesktopState() {
     if (!threadId || isExternallyOwned(threadId) || threadGoalSupportByThreadId.value[threadId] === false) {
       return false
     }
+    invalidateThreadGoalRequest(threadId)
     if (updatingThreadGoalByThreadId.value[threadId] === true) return false
     updatingThreadGoalByThreadId.value = {
       ...updatingThreadGoalByThreadId.value,
@@ -6760,6 +6881,7 @@ export function useDesktopState() {
     if (!threadId || isExternallyOwned(threadId) || threadGoalSupportByThreadId.value[threadId] === false) {
       return false
     }
+    invalidateThreadGoalRequest(threadId)
     if (updatingThreadGoalByThreadId.value[threadId] === true) return false
     updatingThreadGoalByThreadId.value = {
       ...updatingThreadGoalByThreadId.value,

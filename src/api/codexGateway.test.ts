@@ -504,13 +504,11 @@ describe('getThreadDetail', () => {
             {
               id: 'turn-completed',
               status: 'completed',
-              durationMs: 12_000,
               items: [],
             },
             {
               id: 'turn-stopped',
               status: 'interrupted',
-              durationMs: 3_000,
               items: [],
             },
             {
@@ -528,8 +526,8 @@ describe('getThreadDetail', () => {
 
     await expect(getThreadDetail('thread-1')).resolves.toMatchObject({
       completionSummaries: [
-        { turnId: 'turn-completed', status: 'completed', durationMs: 12_000 },
-        { turnId: 'turn-stopped', status: 'interrupted', durationMs: 3_000 },
+        { turnId: 'turn-completed', status: 'completed', durationMs: null },
+        { turnId: 'turn-stopped', status: 'interrupted', durationMs: null },
       ],
     })
   })
