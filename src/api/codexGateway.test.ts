@@ -15,7 +15,9 @@ import {
   setThreadGoal,
   startThread,
   startThreadTurn,
+  cleanupUploadedFile,
   clearThreadGoal,
+  uploadFile,
 } from './codexGateway'
 
 function runtimePayload(thread: Record<string, unknown>): ThreadReadResponse {
@@ -126,6 +128,110 @@ describe('startThreadTurn collaboration mode payloads', () => {
     expect(requests[0].params).toMatchObject({
       approvalPolicy: 'never',
       sandboxPolicy: { type: 'dangerFullAccess' },
+    })
+  })
+
+  it('keeps a managed image available through accepted turn handoff, then cleans it up', async () => {
+    const requests: Array<{ url: string; method: string; body: unknown }> = []
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input)
+      const body = typeof init?.body === 'string' ? JSON.parse(init.body) as unknown : null
+      requests.push({ url, method: init?.method ?? 'GET', body })
+      if (url === '/codex-api/rpc') {
+        return new Response(JSON.stringify({ result: { turn: { id: 'turn-managed' } } }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        })
+      }
+      return new Response(JSON.stringify({ ok: true }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      })
+    }))
+
+    const imageUrl = '/codex-local-image?path=%2Ftmp%2Fcodex-web-uploads%2Fupload%2Fphoto.png&uploadHandle=upload-handle'
+    await expect(startThreadTurn('thread-1', 'inspect this', [imageUrl])).resolves.toBe('turn-managed')
+
+    expect(requests).toHaveLength(2)
+    expect(requests[0]).toMatchObject({
+      url: '/codex-api/rpc',
+      method: 'POST',
+      body: {
+        method: 'turn/start',
+        params: {
+          input: [
+            { type: 'text', text: '@photo.png\n\ninspect this' },
+            { type: 'localImage', path: '/tmp/codex-web-uploads/upload/photo.png' },
+          ],
+        },
+      },
+    })
+    expect(requests[1]).toEqual({
+      url: '/codex-api/upload-file',
+      method: 'DELETE',
+      body: { uploadHandle: 'upload-handle' },
+    })
+  })
+
+  it('cleans a managed image after a failed turn handoff', async () => {
+    const requests: string[] = []
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input)
+      requests.push(url)
+      if (url === '/codex-api/rpc') {
+        return new Response(JSON.stringify({ error: 'handoff failed' }), {
+          status: 500,
+          headers: { 'Content-Type': 'application/json' },
+        })
+      }
+      return new Response(JSON.stringify({ ok: true }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      })
+    }))
+
+    const imageUrl = '/codex-local-image?path=%2Ftmp%2Fcodex-web-uploads%2Fupload%2Fphoto.png&uploadHandle=upload-handle'
+    await expect(startThreadTurn('thread-1', 'inspect this', [imageUrl])).rejects.toThrow()
+    expect(requests).toEqual(['/codex-api/rpc', '/codex-api/upload-file'])
+  })
+})
+
+describe('managed uploads', () => {
+  afterEach(() => {
+    vi.unstubAllGlobals()
+  })
+
+  it('returns only the server-issued managed identity and temporary send path', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({
+      uploadHandle: 'managed-upload',
+      path: '/tmp/codex-web-uploads/managed-upload/photo.png',
+    }), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' },
+    })))
+
+    await expect(uploadFile(new File(['image'], 'photo.png', { type: 'image/png' }))).resolves.toEqual({
+      uploadHandle: 'managed-upload',
+      path: '/tmp/codex-web-uploads/managed-upload/photo.png',
+    })
+  })
+
+  it('cleans by opaque upload handle without accepting a client path', async () => {
+    const requests: Array<{ input: RequestInfo | URL; init?: RequestInit }> = []
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      requests.push({ input, init })
+      return new Response(JSON.stringify({ ok: true }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      })
+    }))
+
+    await expect(cleanupUploadedFile('managed-upload')).resolves.toBe(true)
+    expect(requests).toHaveLength(1)
+    expect(String(requests[0].input)).toBe('/codex-api/upload-file')
+    expect(requests[0].init).toMatchObject({
+      method: 'DELETE',
+      body: JSON.stringify({ uploadHandle: 'managed-upload' }),
     })
   })
 })
@@ -433,6 +539,46 @@ describe('getThreadDetail', () => {
       activeTurnId: 'turn-external',
     })
     expect(requestSignal).toBe(controller.signal)
+  })
+
+  it('hides managed user-upload previews while preserving assistant-generated images', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({
+      result: {
+        thread: {
+          id: 'thread-images',
+          turns: [{
+            id: 'turn-images',
+            status: 'completed',
+            items: [
+              {
+                type: 'userMessage',
+                id: 'user-image',
+                content: [
+                  { type: 'text', text: '@photo.png\n\ninspect this' },
+                  { type: 'localImage', path: '/tmp/codex-web-uploads/upload-123/photo.png' },
+                ],
+              },
+              {
+                type: 'imageGeneration',
+                id: 'assistant-image',
+                result: 'aGVsbG8=',
+              },
+            ],
+          }],
+        },
+      },
+    }), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' },
+    })))
+
+    const detail = await getThreadDetail('thread-images')
+    expect(detail.messages.find((message) => message.id === 'user-image')).toMatchObject({
+      text: '@photo.png\n\ninspect this',
+    })
+    expect(detail.messages.find((message) => message.id === 'user-image')?.images).toBeUndefined()
+    expect(detail.messages.find((message) => message.id === 'assistant-image')?.images)
+      .toEqual(['data:image/png;base64,aGVsbG8='])
   })
 
   it('normalizes an aborted thread/read through the existing API error model', async () => {

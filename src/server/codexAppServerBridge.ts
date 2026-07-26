@@ -258,6 +258,8 @@ const DEFAULT_API_PERF_MS_THRESHOLD = 300
 const DEFAULT_API_PERF_BODY_MB_THRESHOLD = 1
 const MB_DIVISOR = 1024 * 1024
 const COMPOSIO_USER_DATA_PATH = join(homedir(), '.composio', 'user_data.json')
+const MANAGED_UPLOAD_ROOT = join(tmpdir(), 'codex-web-uploads')
+const managedUploads = new Map<string, { root: string; directory: string }>()
 
 type SessionRecoveredFileChange = {
   path: string
@@ -6507,6 +6509,71 @@ function bufferIndexOf(buf: Buffer, needle: Buffer, start = 0): number {
   return -1
 }
 
+function isPathInsideRoot(root: string, candidate: string): boolean {
+  const relativePath = relative(root, candidate)
+  return relativePath.length > 0
+    && relativePath !== '..'
+    && !relativePath.startsWith(`..${sep}`)
+    && !isAbsolute(relativePath)
+}
+
+export async function createManagedUpload(
+  fileName: string,
+  fileData: Uint8Array,
+  uploadRoot = MANAGED_UPLOAD_ROOT,
+): Promise<{ uploadHandle: string; path: string }> {
+  const root = resolve(uploadRoot)
+  await mkdir(root, { recursive: true })
+  const rootInfo = await lstat(root)
+  if (!rootInfo.isDirectory() || rootInfo.isSymbolicLink()) {
+    throw new Error('Managed upload root is not a real directory')
+  }
+
+  const uploadHandle = randomUUID()
+  const directory = join(root, `upload-${uploadHandle}`)
+  await mkdir(directory, { recursive: false, mode: 0o700 })
+  const safeFileName = basename(fileName.trim().replace(/[/\\]/gu, '_')) || 'uploaded-file'
+  const path = join(directory, safeFileName)
+  await writeFile(path, fileData, { mode: 0o600 })
+  managedUploads.set(uploadHandle, { root, directory })
+  return { uploadHandle, path }
+}
+
+export async function deleteManagedUpload(uploadHandle: string): Promise<boolean> {
+  const normalizedHandle = uploadHandle.trim()
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu.test(normalizedHandle)) {
+    return false
+  }
+  const upload = managedUploads.get(normalizedHandle)
+  if (!upload) return false
+
+  try {
+    const [rootInfo, directoryInfo] = await Promise.all([
+      lstat(upload.root),
+      lstat(upload.directory),
+    ])
+    if (
+      !rootInfo.isDirectory()
+      || rootInfo.isSymbolicLink()
+      || !directoryInfo.isDirectory()
+      || directoryInfo.isSymbolicLink()
+    ) {
+      return false
+    }
+    const [canonicalRoot, canonicalDirectory] = await Promise.all([
+      realpath(upload.root),
+      realpath(upload.directory),
+    ])
+    if (!isPathInsideRoot(canonicalRoot, canonicalDirectory)) return false
+    await rm(canonicalDirectory, { recursive: true, force: false })
+    return true
+  } catch {
+    return false
+  } finally {
+    managedUploads.delete(normalizedHandle)
+  }
+}
+
 function handleFileUpload(req: IncomingMessage, res: ServerResponse): void {
   const chunks: Buffer[] = []
   req.on('data', (chunk: Buffer) => chunks.push(chunk))
@@ -6543,12 +6610,7 @@ function handleFileUpload(req: IncomingMessage, res: ServerResponse): void {
         break
       }
       if (!fileData) { setJson(res, 400, { error: 'No file in request' }); return }
-      const uploadDir = join(tmpdir(), 'codex-web-uploads')
-      await mkdir(uploadDir, { recursive: true })
-      const destDir = await mkdtemp(join(uploadDir, 'f-'))
-      const destPath = join(destDir, fileName)
-      await writeFile(destPath, fileData)
-      setJson(res, 200, { path: destPath })
+      setJson(res, 200, await createManagedUpload(fileName, fileData))
     } catch (err) {
       setJson(res, 500, { error: getErrorMessage(err, 'Upload failed') })
     }
@@ -8363,6 +8425,21 @@ export function createCodexBridgeMiddleware(options: {
 
       if (req.method === 'POST' && url.pathname === '/codex-api/upload-file') {
         handleFileUpload(req, res)
+        return
+      }
+
+      if (req.method === 'DELETE' && url.pathname === '/codex-api/upload-file') {
+        const body = asRecord(await readJsonBody(req))
+        const uploadHandle = readNonEmptyString(body?.uploadHandle)
+        if (!uploadHandle) {
+          setJson(res, 400, { error: 'Missing uploadHandle' })
+          return
+        }
+        if (!(await deleteManagedUpload(uploadHandle))) {
+          setJson(res, 404, { error: 'Managed upload not found' })
+          return
+        }
+        setJson(res, 200, { ok: true })
         return
       }
 

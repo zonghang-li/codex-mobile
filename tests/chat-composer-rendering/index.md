@@ -35,6 +35,7 @@ Return to the [manual test index](../../tests.md).
 | [Codex desktop activity parity and mobile typography](codex-desktop-activity-parity-and-mobile-typography.md) |
 | [Feature: Mobile output block copy controls](mobile-output-block-copy-controls.md) |
 | [Assistant generated image rendering](assistant-generated-image-rendering.md) |
+| [Ephemeral user image attachment tokens](ephemeral-user-image-attachment-tokens.md) |
 | [Stop button activates promptly for new threads](stop-button-activates-promptly-for-new-threads.md) |
 | [New-thread plan mode persists and toggles correctly](new-thread-plan-mode-persists-and-toggles-correctly.md) |
 | [Completed plan cards expose implement action](completed-plan-cards-expose-implement-action.md) |

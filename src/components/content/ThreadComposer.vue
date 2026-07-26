@@ -12,8 +12,8 @@
       }"
     >
       <div v-if="selectedImages.length > 0" class="thread-composer-attachments">
-        <div v-for="image in selectedImages" :key="image.id" class="thread-composer-attachment">
-          <img class="thread-composer-attachment-image" :src="image.url" :alt="image.name || 'Selected image'" />
+        <span v-for="image in selectedImages" :key="image.id" class="thread-composer-attachment">
+          <span class="thread-composer-attachment-name">@{{ image.name }}</span>
           <button
             class="thread-composer-attachment-remove"
             type="button"
@@ -21,9 +21,9 @@
             :disabled="isInteractionDisabled"
             @click="removeImage(image.id)"
           >
-            x
+            ×
           </button>
-        </div>
+        </span>
       </div>
 
       <div v-if="folderUploadGroups.length > 0" class="thread-composer-folder-chips">
@@ -451,6 +451,7 @@ import { useUiLanguage } from '../../composables/useUiLanguage'
 import { getSupportedReasoningEfforts } from '../../utils/modelReasoningEfforts'
 import {
   createComposerPrompt,
+  cleanupUploadedFile,
   getComposerPrompts,
   removeComposerPrompt,
   searchComposerFiles,
@@ -512,7 +513,7 @@ const props = defineProps<{
   isUpdatingGoal?: boolean
 }>()
 
-export type FileAttachment = { label: string; path: string; fsPath: string }
+export type FileAttachment = { label: string; path: string; fsPath: string; uploadHandle?: string }
 
 export type ComposerDraftPayload = {
   text: string
@@ -549,7 +550,8 @@ const { t } = useUiLanguage()
 type SelectedImage = {
   id: string
   name: string
-  url: string
+  uploadHandle: string
+  sendPath: string
 }
 
 type FolderUploadGroup = {
@@ -1044,13 +1046,13 @@ function onSubmit(mode: 'steer' | 'queue' = 'steer'): void {
   if (!canSubmit.value) return
   emit('submit', {
     text,
-    imageUrls: selectedImages.value.map((image) => image.url),
+    imageUrls: selectedImages.value.map(toSelectedImageUrl),
     fileAttachments: [...fileAttachments.value],
     skills: selectedSkills.value.map((s) => ({ name: s.name, path: s.path })),
     mode,
   })
   clearPersistedDraftForThread(props.activeThreadId)
-  clearDraftState()
+  clearDraftState(false)
   isComposerExpanded.value = false
   folderUploadGroups.value = []
   isAttachMenuOpen.value = false
@@ -1071,11 +1073,10 @@ function setActiveInProgressMode(mode: 'steer' | 'queue'): void {
 function replaceDraftState(payload: ComposerDraftPayload): void {
   draftGeneration.value += 1
   draft.value = payload.text
-  selectedImages.value = payload.imageUrls.map((url, index) => ({
-    id: `queued-${Date.now()}-${index}-${Math.random().toString(36).slice(2, 8)}`,
-    name: `Image ${index + 1}`,
-    url,
-  }))
+  selectedImages.value = payload.imageUrls.flatMap((url, index) => {
+    const image = selectedImageFromUrl(url, index)
+    return image ? [image] : []
+  })
   selectedSkills.value = payload.skills.map((skill) => (
     (props.skills ?? []).find((item) => item.path === skill.path)
     ?? { name: skill.name, displayName: undefined, description: '', path: skill.path }
@@ -1091,7 +1092,25 @@ function replaceDraftState(payload: ComposerDraftPayload): void {
   attachmentSessionToken += 1
 }
 
-function clearDraftState(): void {
+function cleanupSelectedImages(): void {
+  const images = selectedImages.value
+  selectedImages.value = []
+  for (const image of images) {
+    void cleanupUploadedFile(image.uploadHandle)
+  }
+}
+
+function cleanupManagedFileAttachments(): void {
+  for (const attachment of fileAttachments.value) {
+    if (attachment.uploadHandle) void cleanupUploadedFile(attachment.uploadHandle)
+  }
+}
+
+function clearDraftState(cleanupImages = true): void {
+  if (cleanupImages) {
+    cleanupSelectedImages()
+    cleanupManagedFileAttachments()
+  }
   replaceDraftState({
     text: '',
     imageUrls: [],
@@ -1123,9 +1142,7 @@ function loadPersistedDraftForThread(threadId: string): ComposerDraftPayload | n
     }
     return {
       text: typeof parsed.text === 'string' ? parsed.text : '',
-      imageUrls: Array.isArray(parsed.imageUrls)
-        ? parsed.imageUrls.filter((url): url is string => typeof url === 'string')
-        : [],
+      imageUrls: [],
       fileAttachments: Array.isArray(parsed.fileAttachments)
         ? parsed.fileAttachments.filter((attachment): attachment is FileAttachment => (
           Boolean(attachment)
@@ -1178,8 +1195,10 @@ function clearPersistedDraftForThread(threadId: string): void {
 function getCurrentDraftPayload(): ComposerDraftPayload {
   return {
     text: draft.value,
-    imageUrls: selectedImages.value.map((image) => image.url),
-    fileAttachments: fileAttachments.value.map((attachment) => ({ ...attachment })),
+    imageUrls: [],
+    fileAttachments: fileAttachments.value
+      .filter((attachment) => !attachment.uploadHandle)
+      .map((attachment) => ({ ...attachment })),
     skills: selectedSkills.value.map((skill) => ({ name: skill.name, path: skill.path })),
   }
 }
@@ -1323,8 +1342,38 @@ function triggerFolderPicker(): void {
   folderPickerInputRef.value?.click()
 }
 
+function toSelectedImageUrl(image: SelectedImage): string {
+  const params = new URLSearchParams({
+    path: image.sendPath,
+    uploadHandle: image.uploadHandle,
+  })
+  return `/codex-local-image?${params.toString()}`
+}
+
+function selectedImageFromUrl(url: string, index: number): SelectedImage | null {
+  try {
+    const parsed = new URL(url, 'http://localhost')
+    if (parsed.pathname !== '/codex-local-image') return null
+    const sendPath = parsed.searchParams.get('path')?.trim() ?? ''
+    const uploadHandle = parsed.searchParams.get('uploadHandle')?.trim() ?? ''
+    if (!sendPath || !uploadHandle) return null
+    const normalizedPath = sendPath.replace(/\\/gu, '/')
+    const name = normalizedPath.split('/').filter(Boolean).at(-1) || `Image ${index + 1}`
+    return {
+      id: `queued-${Date.now()}-${index}-${Math.random().toString(36).slice(2, 8)}`,
+      name,
+      uploadHandle,
+      sendPath,
+    }
+  } catch {
+    return null
+  }
+}
+
 function removeImage(id: string): void {
-  selectedImages.value = selectedImages.value.filter((image) => image.id !== id)
+  const image = selectedImages.value.find((item) => item.id === id)
+  selectedImages.value = selectedImages.value.filter((item) => item.id !== id)
+  if (image) void cleanupUploadedFile(image.uploadHandle)
 }
 
 function removeSkill(path: string): void {
@@ -1344,15 +1393,21 @@ function openSkillMarkdown(skill: SkillItem): void {
 }
 
 function removeFileAttachment(fsPath: string): void {
+  const attachment = fileAttachments.value.find((item) => item.fsPath === fsPath)
   fileAttachments.value = fileAttachments.value.filter((a) => a.fsPath !== fsPath)
+  if (attachment?.uploadHandle) void cleanupUploadedFile(attachment.uploadHandle)
 }
 
 function removeFolderAttachment(groupId: string): void {
   const group = folderUploadGroups.value.find((item) => item.id === groupId)
   if (!group) return
   const toRemove = new Set(group.filePaths)
+  const removed = fileAttachments.value.filter((attachment) => toRemove.has(attachment.fsPath))
   fileAttachments.value = fileAttachments.value.filter((a) => !toRemove.has(a.fsPath))
   folderUploadGroups.value = folderUploadGroups.value.filter((item) => item.id !== groupId)
+  for (const attachment of removed) {
+    if (attachment.uploadHandle) void cleanupUploadedFile(attachment.uploadHandle)
+  }
 }
 
 function getFolderUploadPercent(group: FolderUploadGroup): number {
@@ -1360,12 +1415,17 @@ function getFolderUploadPercent(group: FolderUploadGroup): number {
   return Math.round((group.processed / group.total) * 100)
 }
 
-function addFileAttachment(filePath: string, customLabel?: string): void {
+function addFileAttachment(filePath: string, customLabel?: string, uploadHandle?: string): void {
   const normalized = filePath.replace(/\\/g, '/')
   if (fileAttachments.value.some((a) => a.fsPath === normalized)) return
   const parts = normalized.split('/').filter(Boolean)
   const label = customLabel?.trim() || parts[parts.length - 1] || normalized
-  fileAttachments.value = [...fileAttachments.value, { label, path: normalized, fsPath: normalized }]
+  fileAttachments.value = [...fileAttachments.value, {
+    label,
+    path: normalized,
+    fsPath: normalized,
+    ...(uploadHandle ? { uploadHandle } : {}),
+  }]
 }
 
 function isImageFile(file: File): boolean {
@@ -1462,10 +1522,13 @@ async function attachImageFile(file: File, sessionToken: number): Promise<void> 
   if (!beginAttachmentWork(sessionToken)) return
   try {
     const normalizedFile = ensureFileName(file)
-    const serverPath = await uploadFile(normalizedFile)
-    if (!canApplyAttachmentMutation(props.runtimeOwnership, sessionToken, attachmentSessionToken)) return
-    if (!serverPath) {
+    const upload = await uploadFile(normalizedFile)
+    if (!upload) {
       recordAttachmentBatchResult('failure')
+      return
+    }
+    if (!canApplyAttachmentMutation(props.runtimeOwnership, sessionToken, attachmentSessionToken)) {
+      void cleanupUploadedFile(upload.uploadHandle)
       return
     }
     selectedImages.value = [
@@ -1473,7 +1536,8 @@ async function attachImageFile(file: File, sessionToken: number): Promise<void> 
       {
         id: createAttachmentId(),
         name: normalizedFile.name,
-        url: `/codex-local-image?path=${encodeURIComponent(serverPath)}`,
+        uploadHandle: upload.uploadHandle,
+        sendPath: upload.path,
       },
     ]
     recordAttachmentBatchResult('success')
@@ -1489,13 +1553,16 @@ async function attachImageFile(file: File, sessionToken: number): Promise<void> 
 async function attachUploadedFile(file: File, sessionToken: number): Promise<void> {
   if (!beginAttachmentWork(sessionToken)) return
   try {
-    const serverPath = await uploadFile(file)
-    if (!canApplyAttachmentMutation(props.runtimeOwnership, sessionToken, attachmentSessionToken)) return
-    if (!serverPath) {
+    const upload = await uploadFile(file)
+    if (!upload) {
       recordAttachmentBatchResult('failure')
       return
     }
-    addFileAttachment(serverPath)
+    if (!canApplyAttachmentMutation(props.runtimeOwnership, sessionToken, attachmentSessionToken)) {
+      void cleanupUploadedFile(upload.uploadHandle)
+      return
+    }
+    addFileAttachment(upload.path, undefined, upload.uploadHandle)
     recordAttachmentBatchResult('success')
   } catch {
     if (canApplyAttachmentMutation(props.runtimeOwnership, sessionToken, attachmentSessionToken)) {
@@ -1564,16 +1631,21 @@ async function addFolderFiles(files: FileList | null): Promise<void> {
 
   for (const file of rows) {
     try {
-      const serverPath = await uploadFile(file)
-      if (generation !== draftGeneration.value) return
-      if (!canApplyAttachmentMutation(props.runtimeOwnership, sessionToken, attachmentSessionToken)) return
-      if (serverPath) {
+      const upload = await uploadFile(file)
+      if (
+        generation !== draftGeneration.value
+        || !canApplyAttachmentMutation(props.runtimeOwnership, sessionToken, attachmentSessionToken)
+      ) {
+        if (upload) void cleanupUploadedFile(upload.uploadHandle)
+        return
+      }
+      if (upload) {
         const relativePath = (file as File & { webkitRelativePath?: string }).webkitRelativePath || file.name
-        addFileAttachment(serverPath, relativePath)
+        addFileAttachment(upload.path, relativePath, upload.uploadHandle)
         updateGroup((group) => ({
           ...group,
           processed: group.processed + 1,
-          filePaths: [...group.filePaths, serverPath],
+          filePaths: [...group.filePaths, upload.path],
         }))
         continue
       }
@@ -1946,6 +2018,9 @@ function onDocumentClick(event: MouseEvent): void {
 }
 
 function invalidatePendingAttachments(): void {
+  cleanupSelectedImages()
+  cleanupManagedFileAttachments()
+  fileAttachments.value = fileAttachments.value.filter((attachment) => !attachment.uploadHandle)
   attachmentSessionToken += 1
   pendingAttachmentCount.value = 0
   attachmentBatchStats.value = null
@@ -1974,6 +2049,8 @@ defineExpose<ThreadComposerExposed>({
 })
 
 onBeforeUnmount(() => {
+  cleanupSelectedImages()
+  cleanupManagedFileAttachments()
   document.removeEventListener('click', onDocumentClick)
   window.removeEventListener('drop', onWindowDragCleanup)
   window.removeEventListener('dragend', onWindowDragCleanup)
@@ -2084,15 +2161,23 @@ watch(
 }
 
 .thread-composer-attachment {
-  @apply relative h-14 w-14 overflow-hidden rounded-lg border border-zinc-200 bg-zinc-50;
+  @apply inline-flex min-w-0 items-center gap-1 rounded-md border border-zinc-200 bg-zinc-50 px-2 py-0.5 text-xs text-zinc-700;
 }
 
-.thread-composer-attachment-image {
-  @apply h-full w-full object-cover;
+.thread-composer-attachment-name {
+  @apply max-w-48 truncate font-mono;
 }
 
 .thread-composer-attachment-remove {
-  @apply absolute right-0.5 top-0.5 inline-flex h-4 w-4 items-center justify-center rounded-full border-0 bg-black/70 text-xs leading-none text-white;
+  @apply inline-flex h-3.5 w-3.5 items-center justify-center rounded-full border-0 bg-transparent p-0 text-xs leading-none text-zinc-400 transition hover:bg-zinc-200 hover:text-zinc-700;
+}
+
+:global(.dark) .thread-composer-attachment {
+  @apply border-zinc-700 bg-zinc-800 text-zinc-200;
+}
+
+:global(.dark) .thread-composer-attachment-remove {
+  @apply text-zinc-400 hover:bg-zinc-700 hover:text-zinc-100;
 }
 
 .thread-composer-file-chips {

@@ -23,7 +23,7 @@ import { extractErrorMessage, normalizeCodexApiError } from './codexErrors'
 import {
   readActiveTurnIdFromResponse,
   normalizeThreadGroupsV2,
-  normalizeThreadMessagesV2,
+  normalizeThreadMessagesV2 as normalizeThreadMessagesV2Base,
   normalizeThreadSummaryV2,
   readThreadInProgressFromResponse,
 } from './normalizers/v2'
@@ -309,6 +309,30 @@ const DEFAULT_COLLABORATION_MODE_OPTIONS: CollaborationModeOption[] = [
   { value: 'default', label: 'Default' },
   { value: 'plan', label: 'Plan' },
 ]
+
+function isManagedUserUploadImageUrl(value: string): boolean {
+  try {
+    const parsed = new URL(value, 'http://localhost')
+    if (parsed.pathname !== '/codex-local-image') return false
+    const path = parsed.searchParams.get('path')?.replace(/\\/gu, '/') ?? ''
+    return path.includes('/codex-web-uploads/upload-')
+  } catch {
+    return false
+  }
+}
+
+function normalizeThreadMessagesV2(payload: ThreadReadResponse, baseTurnIndex = 0): UiMessage[] {
+  return normalizeThreadMessagesV2Base(payload, baseTurnIndex).map((message) => {
+    if (message.role !== 'user' || !message.images?.some(isManagedUserUploadImageUrl)) {
+      return message
+    }
+    const images = message.images.filter((image) => !isManagedUserUploadImageUrl(image))
+    return {
+      ...message,
+      images: images.length > 0 ? images : undefined,
+    }
+  })
+}
 
 export type WorktreeCreateResult = {
   cwd: string
@@ -2072,7 +2096,23 @@ export async function forkThread(
   }
 }
 
-export type FileAttachmentParam = { label: string; path: string; fsPath: string }
+export type FileAttachmentParam = { label: string; path: string; fsPath: string; uploadHandle?: string }
+
+type ManagedLocalImage = { path: string; uploadHandle: string; label: string }
+
+function extractManagedLocalImageFromUrl(value: string): ManagedLocalImage | null {
+  if (!value) return null
+  try {
+    const parsed = new URL(value, 'http://localhost')
+    if (parsed.pathname !== '/codex-local-image') return null
+    const path = parsed.searchParams.get('path')?.trim() ?? ''
+    const uploadHandle = parsed.searchParams.get('uploadHandle')?.trim() ?? ''
+    if (!path || !uploadHandle) return null
+    return { path, uploadHandle, label: fileNameFromPath(path) }
+  } catch {
+    return null
+  }
+}
 
 function extractLocalImagePathFromUrl(value: string): string | null {
   if (!value) return null
@@ -2102,6 +2142,12 @@ function fileNameFromPath(pathValue: string): string {
   const normalized = pathValue.replace(/\\/g, '/')
   const segments = normalized.split('/').filter(Boolean)
   return segments.at(-1) ?? normalized
+}
+
+function buildTextWithImageTokens(prompt: string, images: ManagedLocalImage[]): string {
+  if (images.length === 0) return prompt
+  const tokens = images.map((image) => `@${image.label}`).join(' ')
+  return prompt.trim().length > 0 ? `${tokens}\n\n${prompt}` : tokens
 }
 
 async function resolveCollaborationModeSettings(
@@ -2166,22 +2212,22 @@ export async function startThreadTurn(
   fileAttachments: FileAttachmentParam[] = [],
   collaborationMode?: CollaborationModeKind,
 ): Promise<string> {
+  const managedImages = imageUrls.flatMap((imageUrl) => {
+    const image = extractManagedLocalImageFromUrl(imageUrl.trim())
+    return image ? [image] : []
+  })
+  const uploadHandles = Array.from(new Set([
+    ...managedImages.map((image) => image.uploadHandle),
+    ...fileAttachments.flatMap((attachment) => attachment.uploadHandle ? [attachment.uploadHandle] : []),
+  ]))
   try {
     const normalizedModel = model?.trim() ?? ''
-    const localImageAttachments: FileAttachmentParam[] = []
-    for (const imageUrl of imageUrls) {
-      const localImagePath = extractLocalImagePathFromUrl(imageUrl.trim())
-      if (!localImagePath) continue
-      localImageAttachments.push({
-        label: fileNameFromPath(localImagePath),
-        path: localImagePath,
-        fsPath: localImagePath,
-      })
-    }
-    const allFileAttachments = [...fileAttachments, ...localImageAttachments]
-    const dedupedFileAttachments = allFileAttachments.filter((entry, index) =>
-      allFileAttachments.findIndex((candidate) => candidate.fsPath === entry.fsPath) === index)
-    const finalText = buildTextWithAttachments(text, dedupedFileAttachments)
+    const dedupedFileAttachments = fileAttachments.filter((entry, index) =>
+      fileAttachments.findIndex((candidate) => candidate.fsPath === entry.fsPath) === index)
+    const finalText = buildTextWithAttachments(
+      buildTextWithImageTokens(text, managedImages),
+      dedupedFileAttachments,
+    )
     const input: Array<Record<string, unknown>> = [{ type: 'text', text: finalText }]
     for (const imageUrl of imageUrls) {
       const normalizedUrl = imageUrl.trim()
@@ -2234,6 +2280,8 @@ export async function startThreadTurn(
     return typeof payload?.turn?.id === 'string' ? payload.turn.id.trim() : ''
   } catch (error) {
     throw normalizeCodexApiError(error, `Failed to start turn for thread ${threadId}`, 'turn/start')
+  } finally {
+    await Promise.all(uploadHandles.map((uploadHandle) => cleanupUploadedFile(uploadHandle)))
   }
 }
 
@@ -3964,7 +4012,12 @@ export async function removeComposerPrompt(path: string): Promise<boolean> {
 
 const FILE_UPLOAD_TIMEOUT_MS = 60_000
 
-export async function uploadFile(file: File): Promise<string | null> {
+export type ManagedUpload = {
+  uploadHandle: string
+  path: string
+}
+
+export async function uploadFile(file: File): Promise<ManagedUpload | null> {
   const controller = new AbortController()
   const timeoutId = setTimeout(() => controller.abort(), FILE_UPLOAD_TIMEOUT_MS)
   try {
@@ -3976,11 +4029,28 @@ export async function uploadFile(file: File): Promise<string | null> {
       signal: controller.signal,
     })
     if (!resp.ok) return null
-    const data = (await resp.json()) as { path?: string }
-    return data.path ?? null
+    const data = (await resp.json()) as Partial<ManagedUpload>
+    const uploadHandle = data.uploadHandle?.trim() ?? ''
+    const path = data.path?.trim() ?? ''
+    return uploadHandle && path ? { uploadHandle, path } : null
   } catch {
     return null
   } finally {
     clearTimeout(timeoutId)
+  }
+}
+
+export async function cleanupUploadedFile(uploadHandle: string): Promise<boolean> {
+  const normalizedHandle = uploadHandle.trim()
+  if (!normalizedHandle) return false
+  try {
+    const response = await fetch('/codex-api/upload-file', {
+      method: 'DELETE',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ uploadHandle: normalizedHandle }),
+    })
+    return response.ok
+  } catch {
+    return false
   }
 }
