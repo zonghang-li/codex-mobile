@@ -260,6 +260,9 @@ const MB_DIVISOR = 1024 * 1024
 const COMPOSIO_USER_DATA_PATH = join(homedir(), '.composio', 'user_data.json')
 const MANAGED_UPLOAD_ROOT = join(tmpdir(), 'codex-web-uploads')
 const managedUploads = new Map<string, { root: string; directory: string }>()
+const managedUploadDeletions = new Map<string, Promise<boolean>>()
+const MANAGED_UPLOAD_TTL_MS = 60 * 60 * 1000
+const MANAGED_UPLOAD_REAPER_MAX_ENTRIES = 512
 
 type SessionRecoveredFileChange = {
   path: string
@@ -6546,31 +6549,92 @@ export async function deleteManagedUpload(uploadHandle: string): Promise<boolean
   }
   const upload = managedUploads.get(normalizedHandle)
   if (!upload) return false
+  const existingDeletion = managedUploadDeletions.get(normalizedHandle)
+  if (existingDeletion) return existingDeletion
 
-  try {
-    const [rootInfo, directoryInfo] = await Promise.all([
-      lstat(upload.root),
-      lstat(upload.directory),
-    ])
-    if (
-      !rootInfo.isDirectory()
-      || rootInfo.isSymbolicLink()
-      || !directoryInfo.isDirectory()
-      || directoryInfo.isSymbolicLink()
-    ) {
+  const deletion = (async () => {
+    try {
+      const [rootInfo, directoryInfo] = await Promise.all([
+        lstat(upload.root),
+        lstat(upload.directory),
+      ])
+      if (
+        !rootInfo.isDirectory()
+        || rootInfo.isSymbolicLink()
+        || !directoryInfo.isDirectory()
+        || directoryInfo.isSymbolicLink()
+      ) {
+        return false
+      }
+      const [canonicalRoot, canonicalDirectory] = await Promise.all([
+        realpath(upload.root),
+        realpath(upload.directory),
+      ])
+      if (!isPathInsideRoot(canonicalRoot, canonicalDirectory)) return false
+      await rm(canonicalDirectory, { recursive: true, force: false })
+      managedUploads.delete(normalizedHandle)
+      return true
+    } catch {
       return false
     }
-    const [canonicalRoot, canonicalDirectory] = await Promise.all([
-      realpath(upload.root),
-      realpath(upload.directory),
-    ])
-    if (!isPathInsideRoot(canonicalRoot, canonicalDirectory)) return false
-    await rm(canonicalDirectory, { recursive: true, force: false })
-    return true
-  } catch {
-    return false
+  })()
+  managedUploadDeletions.set(normalizedHandle, deletion)
+  try {
+    return await deletion
   } finally {
-    managedUploads.delete(normalizedHandle)
+    managedUploadDeletions.delete(normalizedHandle)
+  }
+}
+
+export async function reapExpiredManagedUploads(options: {
+  uploadRoot?: string
+  nowMs?: number
+  ttlMs?: number
+  maxEntries?: number
+} = {}): Promise<number> {
+  const root = resolve(options.uploadRoot ?? MANAGED_UPLOAD_ROOT)
+  const nowMs = options.nowMs ?? Date.now()
+  const ttlMs = Math.max(0, options.ttlMs ?? MANAGED_UPLOAD_TTL_MS)
+  const maxEntries = Math.max(0, Math.floor(options.maxEntries ?? MANAGED_UPLOAD_REAPER_MAX_ENTRIES))
+  if (maxEntries === 0) return 0
+
+  try {
+    const rootInfo = await lstat(root)
+    if (!rootInfo.isDirectory() || rootInfo.isSymbolicLink()) return 0
+    const canonicalRoot = await realpath(root)
+    const entries = (await readdir(root, { withFileTypes: true })).slice(0, maxEntries)
+    let removed = 0
+    for (const entry of entries) {
+      if (
+        !entry.isDirectory()
+        || entry.isSymbolicLink()
+        || (
+          !/^upload-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu.test(entry.name)
+          && !/^f-[A-Za-z0-9_-]+$/u.test(entry.name)
+        )
+      ) continue
+      const directory = join(root, entry.name)
+      try {
+        const directoryInfo = await lstat(directory)
+        if (
+          !directoryInfo.isDirectory()
+          || directoryInfo.isSymbolicLink()
+          || directoryInfo.mtimeMs > nowMs - ttlMs
+        ) continue
+        const canonicalDirectory = await realpath(directory)
+        if (!isPathInsideRoot(canonicalRoot, canonicalDirectory)) continue
+        await rm(canonicalDirectory, { recursive: true, force: false })
+        for (const [handle, upload] of managedUploads) {
+          if (resolve(upload.directory) === resolve(directory)) managedUploads.delete(handle)
+        }
+        removed += 1
+      } catch {
+        // An orphan can disappear or become unsafe while the bounded sweep runs.
+      }
+    }
+    return removed
+  } catch {
+    return 0
   }
 }
 
@@ -7895,6 +7959,7 @@ async function buildThreadSearchIndex(appServer: AppServerProcess): Promise<Thre
 export function createCodexBridgeMiddleware(options: {
   securityPolicy?: ServerSecurityPolicy
 } = {}): CodexBridgeMiddleware {
+  void reapExpiredManagedUploads().catch(() => {})
   const securityPolicy = options.securityPolicy ?? PERMISSIVE_SECURITY_POLICY
   const {
     appServer,

@@ -310,28 +310,8 @@ const DEFAULT_COLLABORATION_MODE_OPTIONS: CollaborationModeOption[] = [
   { value: 'plan', label: 'Plan' },
 ]
 
-function isManagedUserUploadImageUrl(value: string): boolean {
-  try {
-    const parsed = new URL(value, 'http://localhost')
-    if (parsed.pathname !== '/codex-local-image') return false
-    const path = parsed.searchParams.get('path')?.replace(/\\/gu, '/') ?? ''
-    return path.includes('/codex-web-uploads/upload-')
-  } catch {
-    return false
-  }
-}
-
 function normalizeThreadMessagesV2(payload: ThreadReadResponse, baseTurnIndex = 0): UiMessage[] {
-  return normalizeThreadMessagesV2Base(payload, baseTurnIndex).map((message) => {
-    if (message.role !== 'user' || !message.images?.some(isManagedUserUploadImageUrl)) {
-      return message
-    }
-    const images = message.images.filter((image) => !isManagedUserUploadImageUrl(image))
-    return {
-      ...message,
-      images: images.length > 0 ? images : undefined,
-    }
-  })
+  return normalizeThreadMessagesV2Base(payload, baseTurnIndex)
 }
 
 export type WorktreeCreateResult = {
@@ -2126,6 +2106,11 @@ function extractLocalImagePathFromUrl(value: string): string | null {
   }
 }
 
+function isManagedUploadImageUrl(value: string): boolean {
+  const path = extractLocalImagePathFromUrl(value)?.replace(/\\/gu, '/') ?? ''
+  return extractManagedLocalImageFromUrl(value) !== null || path.includes('/codex-web-uploads/')
+}
+
 function buildTextWithAttachments(
   prompt: string,
   files: FileAttachmentParam[],
@@ -2216,10 +2201,6 @@ export async function startThreadTurn(
     const image = extractManagedLocalImageFromUrl(imageUrl.trim())
     return image ? [image] : []
   })
-  const uploadHandles = Array.from(new Set([
-    ...managedImages.map((image) => image.uploadHandle),
-    ...fileAttachments.flatMap((attachment) => attachment.uploadHandle ? [attachment.uploadHandle] : []),
-  ]))
   try {
     const normalizedModel = model?.trim() ?? ''
     const dedupedFileAttachments = fileAttachments.filter((entry, index) =>
@@ -2280,8 +2261,6 @@ export async function startThreadTurn(
     return typeof payload?.turn?.id === 'string' ? payload.turn.id.trim() : ''
   } catch (error) {
     throw normalizeCodexApiError(error, `Failed to start turn for thread ${threadId}`, 'turn/start')
-  } finally {
-    await Promise.all(uploadHandles.map((uploadHandle) => cleanupUploadedFile(uploadHandle)))
   }
 }
 
@@ -2902,7 +2881,10 @@ function normalizeStoredQueuedMessage(value: unknown): StoredQueuedMessage | nul
   if (!id) return null
 
   const imageUrls = Array.isArray(record.imageUrls)
-    ? record.imageUrls.filter((item): item is string => typeof item === 'string' && item.trim().length > 0)
+    ? record.imageUrls.filter((item): item is string =>
+      typeof item === 'string'
+      && item.trim().length > 0
+      && !isManagedUploadImageUrl(item.trim()))
     : []
   const skills = Array.isArray(record.skills)
     ? record.skills.flatMap((item) => {
@@ -2920,7 +2902,12 @@ function normalizeStoredQueuedMessage(value: unknown): StoredQueuedMessage | nul
       const label = typeof itemRecord.label === 'string' ? itemRecord.label.trim() : ''
       const path = typeof itemRecord.path === 'string' ? itemRecord.path.trim() : ''
       const fsPath = typeof itemRecord.fsPath === 'string' ? itemRecord.fsPath.trim() : ''
-      return label && path && fsPath ? [{ label, path, fsPath }] : []
+      const normalizedFsPath = fsPath.replace(/\\/gu, '/')
+      const normalizedPath = path.replace(/\\/gu, '/')
+      const isManagedUpload = Boolean(
+        typeof itemRecord.uploadHandle === 'string' && itemRecord.uploadHandle.trim(),
+      ) || normalizedFsPath.includes('/codex-web-uploads/') || normalizedPath.includes('/codex-web-uploads/')
+      return label && path && fsPath && !isManagedUpload ? [{ label, path, fsPath }] : []
     })
     : []
 
@@ -4043,14 +4030,35 @@ export async function uploadFile(file: File): Promise<ManagedUpload | null> {
 export async function cleanupUploadedFile(uploadHandle: string): Promise<boolean> {
   const normalizedHandle = uploadHandle.trim()
   if (!normalizedHandle) return false
-  try {
-    const response = await fetch('/codex-api/upload-file', {
-      method: 'DELETE',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ uploadHandle: normalizedHandle }),
-    })
-    return response.ok
-  } catch {
-    return false
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    try {
+      const response = await fetch('/codex-api/upload-file', {
+        method: 'DELETE',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ uploadHandle: normalizedHandle }),
+      })
+      if (response.ok) return true
+    } catch {
+      // Retry bounded transient transport failures below.
+    }
   }
+  console.warn('Managed upload cleanup failed after retries')
+  return false
+}
+
+export async function cleanupManagedUploads(
+  imageUrls: string[],
+  fileAttachments: FileAttachmentParam[],
+): Promise<boolean> {
+  const uploadHandles = Array.from(new Set([
+    ...imageUrls.flatMap((imageUrl) => {
+      const image = extractManagedLocalImageFromUrl(imageUrl.trim())
+      return image ? [image.uploadHandle] : []
+    }),
+    ...fileAttachments.flatMap((attachment) => attachment.uploadHandle?.trim()
+      ? [attachment.uploadHandle.trim()]
+      : []),
+  ]))
+  const results = await Promise.all(uploadHandles.map((uploadHandle) => cleanupUploadedFile(uploadHandle)))
+  return results.every(Boolean)
 }

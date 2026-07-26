@@ -26,6 +26,23 @@ function threadReadResponseWithContent(content: unknown[]): ThreadReadResponse {
 }
 
 describe('normalizeThreadMessagesV2', () => {
+  it.each([
+    '/tmp/codex-web-uploads/f-legacy/photo.png',
+    '/private/var/folders/arbitrary/camera.jpg',
+  ])('hides persisted user localImage previews and keeps only an attachment token for %s', (path) => {
+    const messages = normalizeThreadMessagesV2(threadReadResponseWithContent([{
+      type: 'userMessage',
+      id: 'user-local-image',
+      content: [{ type: 'localImage', path }],
+    }]))
+
+    expect(messages[0]).toMatchObject({
+      role: 'user',
+      text: `@${path.split('/').at(-1)}`,
+    })
+    expect(messages[0]?.images).toBeUndefined()
+  })
+
   it('extracts persisted Codex directives from assistant messages only', () => {
     const response = threadReadResponseWithContent([
       {

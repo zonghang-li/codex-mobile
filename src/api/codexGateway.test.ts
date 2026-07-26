@@ -9,12 +9,14 @@ import {
   getThreadGoal,
   getThreadRuntimeState,
   getThreadRuntimeStates,
+  getThreadQueueState,
   listDirectoryComposioConnectors,
   readThreadDetailRuntime,
   resumeThread,
   setThreadGoal,
   startThread,
   startThreadTurn,
+  cleanupManagedUploads,
   cleanupUploadedFile,
   clearThreadGoal,
   uploadFile,
@@ -131,7 +133,7 @@ describe('startThreadTurn collaboration mode payloads', () => {
     })
   })
 
-  it('keeps a managed image available through accepted turn handoff, then cleans it up', async () => {
+  it('keeps a managed image available after accepted turn handoff for lifecycle-owned cleanup', async () => {
     const requests: Array<{ url: string; method: string; body: unknown }> = []
     vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       const url = String(input)
@@ -152,7 +154,7 @@ describe('startThreadTurn collaboration mode payloads', () => {
     const imageUrl = '/codex-local-image?path=%2Ftmp%2Fcodex-web-uploads%2Fupload%2Fphoto.png&uploadHandle=upload-handle'
     await expect(startThreadTurn('thread-1', 'inspect this', [imageUrl])).resolves.toBe('turn-managed')
 
-    expect(requests).toHaveLength(2)
+    expect(requests).toHaveLength(1)
     expect(requests[0]).toMatchObject({
       url: '/codex-api/rpc',
       method: 'POST',
@@ -166,14 +168,9 @@ describe('startThreadTurn collaboration mode payloads', () => {
         },
       },
     })
-    expect(requests[1]).toEqual({
-      url: '/codex-api/upload-file',
-      method: 'DELETE',
-      body: { uploadHandle: 'upload-handle' },
-    })
   })
 
-  it('cleans a managed image after a failed turn handoff', async () => {
+  it('does not consume a managed image when a turn handoff fails before fallback policy runs', async () => {
     const requests: string[] = []
     vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
       const url = String(input)
@@ -192,7 +189,7 @@ describe('startThreadTurn collaboration mode payloads', () => {
 
     const imageUrl = '/codex-local-image?path=%2Ftmp%2Fcodex-web-uploads%2Fupload%2Fphoto.png&uploadHandle=upload-handle'
     await expect(startThreadTurn('thread-1', 'inspect this', [imageUrl])).rejects.toThrow()
-    expect(requests).toEqual(['/codex-api/rpc', '/codex-api/upload-file'])
+    expect(requests).toEqual(['/codex-api/rpc'])
   })
 })
 
@@ -232,6 +229,91 @@ describe('managed uploads', () => {
     expect(requests[0].init).toMatchObject({
       method: 'DELETE',
       body: JSON.stringify({ uploadHandle: 'managed-upload' }),
+    })
+  })
+
+  it('retries a failed cleanup response before reporting success', async () => {
+    const requests: RequestInfo[] = []
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
+      requests.push(input as RequestInfo)
+      const status = requests.length < 3 ? 503 : 200
+      return new Response(JSON.stringify({ ok: status === 200 }), {
+        status,
+        headers: { 'Content-Type': 'application/json' },
+      })
+    }))
+
+    await expect(cleanupUploadedFile('managed-upload')).resolves.toBe(true)
+    expect(requests).toHaveLength(3)
+  })
+
+  it('reports cleanup failure after the bounded retry budget without exposing the handle', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({ ok: false }), {
+      status: 503,
+      headers: { 'Content-Type': 'application/json' },
+    })))
+    const warning = vi.spyOn(console, 'warn').mockImplementation(() => {})
+
+    await expect(cleanupUploadedFile('sensitive-handle')).resolves.toBe(false)
+    expect(fetch).toHaveBeenCalledTimes(3)
+    expect(warning).toHaveBeenCalledWith('Managed upload cleanup failed after retries')
+    expect(warning.mock.calls.flat().join(' ')).not.toContain('sensitive-handle')
+    warning.mockRestore()
+  })
+
+  it('deduplicates managed image and file capabilities during lifecycle cleanup', async () => {
+    const requests: Array<{ body: string }> = []
+    vi.stubGlobal('fetch', vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+      requests.push({ body: String(init?.body ?? '') })
+      return new Response(JSON.stringify({ ok: true }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      })
+    }))
+    const imageUrl = '/codex-local-image?path=%2Ftmp%2Fcodex-web-uploads%2Fupload%2Fphoto.png&uploadHandle=shared-handle'
+
+    await expect(cleanupManagedUploads([imageUrl], [{
+      label: 'photo.png',
+      path: '/tmp/codex-web-uploads/upload/photo.png',
+      fsPath: '/tmp/codex-web-uploads/upload/photo.png',
+      uploadHandle: 'shared-handle',
+    }])).resolves.toBe(true)
+    expect(requests).toEqual([{ body: JSON.stringify({ uploadHandle: 'shared-handle' }) }])
+  })
+
+  it('drops legacy managed capabilities when loading persisted queue state', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({
+      data: {
+        'thread-1': [{
+          id: 'legacy-queue',
+          text: 'queued text survives',
+          imageUrls: [
+            '/codex-local-image?path=%2Ftmp%2Fcodex-web-uploads%2Ff-old%2Fphoto.png&uploadHandle=old-handle',
+            '/codex-local-image?path=%2Ftmp%2Fcodex-web-uploads%2Ff-older%2Fcamera.png',
+          ],
+          skills: [],
+          fileAttachments: [{
+            label: 'notes.txt',
+            path: '/tmp/codex-web-uploads/f-old/notes.txt',
+            fsPath: '/tmp/codex-web-uploads/f-old/notes.txt',
+          }],
+          collaborationMode: 'default',
+        }],
+      },
+    }), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' },
+    })))
+
+    await expect(getThreadQueueState()).resolves.toEqual({
+      'thread-1': [{
+        id: 'legacy-queue',
+        text: 'queued text survives',
+        imageUrls: [],
+        skills: [],
+        fileAttachments: [],
+        collaborationMode: 'default',
+      }],
     })
   })
 })

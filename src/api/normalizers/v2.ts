@@ -237,6 +237,7 @@ function parseUserMessageContent(
 
   const textChunks: string[] = []
   const images: string[] = []
+  const localImageLabels: string[] = []
   const skills: Array<{ name: string; path: string }> = []
   const rawBlocks: UiMessage[] = []
 
@@ -248,7 +249,9 @@ function parseUserMessageContent(
       images.push(block.url.trim())
     }
     if (block.type === 'localImage' && typeof block.path === 'string' && block.path.trim().length > 0) {
-      images.push(toLocalImageUrl(block.path.trim()))
+      const normalizedPath = block.path.trim().replace(/\\/gu, '/')
+      const label = normalizedPath.split('/').at(-1)?.trim() ?? ''
+      if (label && !localImageLabels.includes(label)) localImageLabels.push(label)
     }
     if (block.type === 'skill') {
       const name = typeof block.name === 'string' ? block.name.trim() : ''
@@ -273,9 +276,16 @@ function parseUserMessageContent(
   const fullText = textChunks.join('\n')
   const fileAttachments = extractFileAttachments(fullText)
   const heartbeat = parseHeartbeatEnvelope(fullText)
+  const requestText = heartbeat?.instructions ?? extractCodexUserRequestText(fullText)
+  const missingImageTokens = localImageLabels
+    .map((label) => `@${label}`)
+    .filter((token) => !requestText.includes(token))
+  const text = missingImageTokens.length > 0
+    ? [missingImageTokens.join(' '), requestText].filter(Boolean).join('\n\n')
+    : requestText
 
   return {
-    text: heartbeat?.instructions ?? extractCodexUserRequestText(fullText),
+    text,
     images,
     skills,
     fileAttachments,
@@ -564,7 +574,7 @@ function toUiMessages(item: ThreadItem): UiMessage[] {
         id: item.id,
         role: 'user',
         text: parsed.text,
-        images: parsed.images,
+        images: parsed.images.length > 0 ? parsed.images : undefined,
         skills: parsed.skills.length > 0 ? parsed.skills : undefined,
         fileAttachments: parsed.fileAttachments.length > 0 ? parsed.fileAttachments : undefined,
         messageType: item.type,

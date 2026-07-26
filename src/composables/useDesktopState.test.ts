@@ -45,6 +45,7 @@ const gatewayMocks = vi.hoisted(() => ({
   setThreadGoal: vi.fn(),
   setWorkspaceRootsState: vi.fn(),
   clearThreadGoal: vi.fn(),
+  cleanupManagedUploads: vi.fn(),
   startThread: vi.fn(),
   startThreadTurn: vi.fn(),
   subscribeCodexNotifications: vi.fn(),
@@ -303,6 +304,7 @@ beforeEach(() => {
   gatewayMocks.getThreadGoal.mockResolvedValue(null)
   gatewayMocks.getThreadRuntimeStates.mockResolvedValue({})
   gatewayMocks.setThreadQueueState.mockResolvedValue(undefined)
+  gatewayMocks.cleanupManagedUploads.mockResolvedValue(true)
   gatewayMocks.getThreadTitleCache.mockResolvedValue({ titles: {} })
   gatewayMocks.getWorkspaceRootsState.mockRejectedValue(new Error('no workspace roots state'))
 })
@@ -1487,7 +1489,8 @@ describe('turn completion lifecycle', () => {
         return turnId
       })
 
-    await state.sendMessageToSelectedThread('retry this request')
+    const managedImageUrl = '/codex-local-image?path=%2Ftmp%2Fcodex-web-uploads%2Fupload%2Fphoto.png&uploadHandle=upload-handle'
+    await state.sendMessageToSelectedThread('retry this request', [managedImageUrl])
     emit({
       method: 'turn/started',
       params: {
@@ -1514,6 +1517,7 @@ describe('turn completion lifecycle', () => {
     await vi.waitFor(() => {
       expect(gatewayMocks.startThreadTurn).toHaveBeenCalledTimes(2)
     })
+    expect(gatewayMocks.cleanupManagedUploads).not.toHaveBeenCalled()
 
     gatewayMocks.getThreadDetail.mockResolvedValue({
       model: 'gpt-5.5',
@@ -1536,7 +1540,7 @@ describe('turn completion lifecycle', () => {
     expect(gatewayMocks.startThreadTurn).toHaveBeenLastCalledWith(
       'thread-1',
       'retry this request',
-      [],
+      [managedImageUrl],
       'gpt-5.4-mini',
       'medium',
       undefined,
@@ -1564,9 +1568,66 @@ describe('turn completion lifecycle', () => {
       inProgress: false,
       unread: false,
     })
+    await vi.waitFor(() => {
+      expect(gatewayMocks.cleanupManagedUploads).toHaveBeenCalledWith([managedImageUrl], [])
+    })
+    expect(gatewayMocks.cleanupManagedUploads).toHaveBeenCalledTimes(1)
     await state.interruptSelectedThreadTurn()
     expect(gatewayMocks.interruptThreadTurn).toHaveBeenCalledTimes(1)
     expect(gatewayMocks.startThreadTurn).toHaveBeenCalledTimes(2)
+  })
+
+  it('releases managed attachments after the fallback handoff finally fails', async () => {
+    const { state, emit } = await setupTurnLifecycleNotificationState('thread-1')
+    const managedImageUrl = '/codex-local-image?path=%2Ftmp%2Fcodex-web-uploads%2Fupload%2Fphoto.png&uploadHandle=upload-final-fail'
+    gatewayMocks.getThreadDetail.mockResolvedValue({
+      ...idleDetail(),
+      model: 'gpt-5.5',
+      modelProvider: 'openai',
+    })
+    gatewayMocks.rollbackThread.mockResolvedValue([])
+    gatewayMocks.startThreadTurn
+      .mockResolvedValueOnce('turn-primary')
+      .mockRejectedValueOnce(new Error('fallback handoff failed'))
+
+    await state.sendMessageToSelectedThread('retry then fail', [managedImageUrl])
+    emit({ method: 'turn/started', params: { threadId: 'thread-1', turn: { id: 'turn-primary' } } })
+    emit({
+      method: 'turn/completed',
+      params: {
+        threadId: 'thread-1',
+        turn: { id: 'turn-primary', status: 'failed', error: { message: 'model is not supported' } },
+      },
+    })
+
+    await vi.waitFor(() => {
+      expect(gatewayMocks.startThreadTurn).toHaveBeenCalledTimes(2)
+      expect(gatewayMocks.cleanupManagedUploads).toHaveBeenCalledWith([managedImageUrl], [])
+    })
+  })
+
+  it('sends managed queue attachments immediately instead of persisting capabilities', async () => {
+    const { state, emit } = await setupTurnLifecycleNotificationState('thread-1')
+    gatewayMocks.startThreadTurn.mockResolvedValue('turn-steer')
+    emit({ method: 'turn/started', params: { threadId: 'thread-1', turn: { id: 'turn-active' } } })
+    const persistenceCalls = gatewayMocks.setThreadQueueState.mock.calls.length
+    const managedImageUrl = '/codex-local-image?path=%2Ftmp%2Fcodex-web-uploads%2Fupload%2Fphoto.png&uploadHandle=queue-handle'
+
+    await state.sendMessageToSelectedThread('send now', [managedImageUrl], [], 'queue')
+    await vi.waitFor(() => {
+      expect(gatewayMocks.startThreadTurn).toHaveBeenCalledWith(
+        'thread-1',
+        'send now',
+        [managedImageUrl],
+        undefined,
+        'medium',
+        undefined,
+        [],
+        'default',
+      )
+    })
+    expect(gatewayMocks.setThreadQueueState).toHaveBeenCalledTimes(persistenceCalls)
+    expect(state.selectedThreadQueuedMessages.value).toEqual([])
   })
 
   it('marks a successful background completion unread', async () => {

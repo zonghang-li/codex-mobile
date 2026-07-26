@@ -36,6 +36,7 @@ import {
   startThread,
   subscribeCodexNotifications,
   startThreadTurn,
+  cleanupManagedUploads,
   clearThreadGoal,
   type RpcNotification,
   type SkillInfo,
@@ -1595,7 +1596,7 @@ export function useDesktopState() {
   const liveCommandsByThreadId = ref<Record<string, UiMessage[]>>({})
   const liveFileChangeMessagesByThreadId = ref<Record<string, UiMessage[]>>({})
   const inProgressById = ref<Record<string, boolean>>({})
-  type FileAttachment = { label: string; path: string; fsPath: string }
+  type FileAttachment = { label: string; path: string; fsPath: string; uploadHandle?: string }
   type QueuedMessage = {
     id: string
     text: string
@@ -2140,7 +2141,37 @@ export function useDesktopState() {
     pendingTurnRequestByThreadId.value = omitKey(pendingTurnRequestByThreadId.value, threadId)
   }
 
+  function isManagedUploadImageUrl(value: string): boolean {
+    try {
+      const parsed = new URL(value, 'http://localhost')
+      const path = parsed.searchParams.get('path')?.replace(/\\/gu, '/') ?? ''
+      return parsed.pathname === '/codex-local-image' && (
+        Boolean(parsed.searchParams.get('uploadHandle')?.trim())
+        || path.includes('/codex-web-uploads/')
+      )
+    } catch {
+      return false
+    }
+  }
 
+  function hasManagedUploadCapabilities(
+    imageUrls: string[],
+    fileAttachments: FileAttachment[],
+  ): boolean {
+    return imageUrls.some(isManagedUploadImageUrl)
+      || fileAttachments.some((attachment) => Boolean(attachment.uploadHandle?.trim())
+        || attachment.fsPath.replace(/\\/gu, '/').includes('/codex-web-uploads/')
+        || attachment.path.replace(/\\/gu, '/').includes('/codex-web-uploads/'))
+  }
+
+  function releasePendingTurnRequest(
+    threadId: string,
+    request: PendingTurnRequest | undefined = pendingTurnRequestByThreadId.value[threadId],
+  ): void {
+    clearPendingTurnRequest(threadId)
+    if (!request || !hasManagedUploadCapabilities(request.imageUrls, request.fileAttachments)) return
+    void cleanupManagedUploads(request.imageUrls, request.fileAttachments)
+  }
 
   async function retryPendingTurnWithFallback(threadId: string): Promise<void> {
     if (fallbackRetryInFlightThreadIds.has(threadId)) return
@@ -2215,6 +2246,7 @@ export function useDesktopState() {
       pendingThreadMessageRefresh.add(threadId)
       await syncFromNotifications()
     } catch (unknownError) {
+      releasePendingTurnRequest(threadId)
       const errorMessage = unknownError instanceof Error ? unknownError.message : 'Unknown application error'
       setTurnErrorForThread(threadId, errorMessage)
       error.value = errorMessage
@@ -3489,7 +3521,7 @@ export function useDesktopState() {
     if (activeTurnIdByThreadId.value[threadId]) {
       activeTurnIdByThreadId.value = omitKey(activeTurnIdByThreadId.value, threadId)
     }
-    clearPendingTurnRequest(threadId)
+    releasePendingTurnRequest(threadId)
   }
 
   function normalizePlanStepStatus(value: unknown): UiPlanStep['status'] {
@@ -4830,6 +4862,7 @@ export function useDesktopState() {
           suppressUnreadForNonSuccessCompletion(completedTurn.threadId)
         }
         if (!completionDisposition.keepRunning) {
+          releasePendingTurnRequest(completedTurn.threadId, pendingTurnRequest)
           setThreadInProgress(completedTurn.threadId, false)
           setTurnActivityForThread(completedTurn.threadId, null)
         }
@@ -4837,7 +4870,6 @@ export function useDesktopState() {
           markThreadUnreadByEvent(completedTurn.threadId)
         }
         if (!shouldRetryWithFallback) {
-          clearPendingTurnRequest(completedTurn.threadId)
           scheduleQueueStateRefresh(completedTurn.threadId)
         }
       }
@@ -5196,13 +5228,15 @@ export function useDesktopState() {
       next[normalizedThreadId] = queue.map((message) => ({
         id: message.id,
         text: message.text,
-        imageUrls: [...message.imageUrls],
+        imageUrls: message.imageUrls.filter((imageUrl) => !isManagedUploadImageUrl(imageUrl)),
         skills: message.skills.map((skill) => ({ name: skill.name, path: skill.path })),
-        fileAttachments: message.fileAttachments.map((attachment) => ({
-          label: attachment.label,
-          path: attachment.path,
-          fsPath: attachment.fsPath,
-        })),
+        fileAttachments: message.fileAttachments
+          .filter((attachment) => !hasManagedUploadCapabilities([], [attachment]))
+          .map((attachment) => ({
+            label: attachment.label,
+            path: attachment.path,
+            fsPath: attachment.fsPath,
+          })),
         collaborationMode: message.collaborationMode,
       }))
     }
@@ -6005,7 +6039,11 @@ export function useDesktopState() {
 
     const isInProgress = inProgressById.value[threadId] === true
 
-    if (isInProgress && mode === 'queue') {
+    if (
+      isInProgress
+      && mode === 'queue'
+      && !hasManagedUploadCapabilities(imageUrls, fileAttachments)
+    ) {
       const queue = queuedMessagesByThreadId.value[threadId] ?? []
       const id = `q-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
       const nextQueue = [...queue]
@@ -6295,6 +6333,7 @@ export function useDesktopState() {
       await syncFromNotifications()
       scheduleDelayedTurnSync(threadId)
     } catch (unknownError) {
+      releasePendingTurnRequest(threadId)
       throw unknownError
     }
   }
