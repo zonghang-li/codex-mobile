@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from 'vitest'
 import {
   applySessionSkillEnrichmentForRpc,
+  buildThreadLiveStateReadFailureFallback,
   prepareRpcProxyRequest,
   shouldStoreThreadReadSnapshotForRpc,
   trimLiveThreadTurnsInRpcResult,
@@ -104,5 +105,32 @@ describe('external live snapshot RPC preparation', () => {
 
     expect(result.threadTurnStartIndex).toBe(11)
     expect(result.thread.turns.map((turn) => turn.id)).toEqual(['turn-11'])
+  })
+
+  it('preserves absolute pagination metadata when a later read falls back to a successful snapshot', () => {
+    const successfulSnapshot = trimLiveThreadTurnsInRpcResult({
+      thread: {
+        id: 'thread-live',
+        turns: Array.from({ length: 12 }, (_unused, index) => ({
+          id: `turn-${index}`,
+          status: index === 11 ? 'inProgress' : 'completed',
+          items: [],
+        })),
+      },
+    })
+    const fallback = buildThreadLiveStateReadFailureFallback(
+      'thread-live',
+      successfulSnapshot,
+      new Error('next read failed'),
+      (_threadId, turns) => turns,
+    ) as {
+      threadTurnStartIndex: number
+      hasMoreOlder: boolean
+      conversationState: { turns: Array<{ id: string }> }
+    }
+
+    expect(fallback.threadTurnStartIndex).toBe(11)
+    expect(fallback.hasMoreOlder).toBe(true)
+    expect(fallback.conversationState.turns.map((turn) => turn.id)).toEqual(['turn-11'])
   })
 })

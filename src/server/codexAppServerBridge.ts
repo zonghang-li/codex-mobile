@@ -1129,6 +1129,33 @@ export function trimLiveThreadTurnsInRpcResult(result: unknown): unknown {
   return trimThreadTurnsInRpcResult('thread/read', result, 1)
 }
 
+export function buildThreadLiveStateReadFailureFallback(
+  threadId: string,
+  snapshot: unknown,
+  error: unknown,
+  mergeItemsIntoTurns: (threadId: string, turns: unknown[]) => unknown[],
+): unknown {
+  const record = asRecord(snapshot)
+  const thread = asRecord(record?.thread)
+  const rawTurns = Array.isArray(thread?.turns) ? thread.turns : []
+  const turns = mergeItemsIntoTurns(threadId, rawTurns)
+  const threadTurnStartIndex = Math.max(0, Math.floor(
+    typeof record?.threadTurnStartIndex === 'number' ? record.threadTurnStartIndex : 0,
+  ))
+  return {
+    threadId,
+    threadTurnStartIndex,
+    hasMoreOlder: threadTurnStartIndex > 0,
+    conversationState: { turns },
+    ownerClientId: null,
+    liveStateError: {
+      kind: 'readFailed',
+      message: getErrorMessage(error, 'thread/read failed'),
+    },
+    isInProgress: false,
+  }
+}
+
 function getErrorMessage(payload: unknown, fallback: string): string {
   if (payload instanceof Error && payload.message.trim().length > 0) {
     return payload.message
@@ -8675,20 +8702,12 @@ export function createCodexBridgeMiddleware(options: {
 
           const snapshot = appServer.getLastThreadReadSnapshot(threadId)
           if (snapshot) {
-            const record = asRecord(snapshot)
-            const thread = asRecord(record?.thread)
-            const rawTurns = Array.isArray(thread?.turns) ? thread.turns : []
-            const turns = appServer.mergeItemsIntoTurns(threadId, rawTurns)
-            setJson(res, 200, {
+            setJson(res, 200, buildThreadLiveStateReadFailureFallback(
               threadId,
-              conversationState: { turns },
-              ownerClientId: null,
-              liveStateError: {
-                kind: 'readFailed',
-                message: getErrorMessage(error, 'thread/read failed'),
-              },
-              isInProgress: false,
-            })
+              snapshot,
+              error,
+              (snapshotThreadId, turns) => appServer.mergeItemsIntoTurns(snapshotThreadId, turns),
+            ))
           } else {
             setJson(res, 200, {
               threadId,
