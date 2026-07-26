@@ -1102,6 +1102,83 @@ describe('GET /codex-api/thread-live-state external runtime parity', () => {
     expect(rpc).toHaveBeenCalledTimes(1)
   })
 
+  it('does not reuse cached writer authority after the external runtime becomes idle', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'codex-mobile-live-state-cache-authority-'))
+    const previousLiveStateDir = process.env.CODEX_MOBILE_LIVE_STATE_DIR
+    process.env.CODEX_MOBILE_LIVE_STATE_DIR = dir
+    disposers.push(() => {
+      if (previousLiveStateDir === undefined) {
+        delete process.env.CODEX_MOBILE_LIVE_STATE_DIR
+      } else {
+        process.env.CODEX_MOBILE_LIVE_STATE_DIR = previousLiveStateDir
+      }
+      void rm(dir, { recursive: true, force: true })
+    })
+    const rolloutPath = join(dir, 'thread-cache-authority.jsonl')
+    await writeFile(rolloutPath, '{"type":"session_meta"}\n')
+    await writeFile(join(dir, 'thread-cache-authority.json'), JSON.stringify({
+      schemaVersion: 1,
+      threadId: 'thread-cache-authority',
+      activeTurnId: 'turn-external',
+      revision: 7,
+      generatedAt: new Date(Date.now() - 1000).toISOString(),
+      expiresAt: new Date(Date.now() + 30000).toISOString(),
+      source: 'desktop-writer',
+      state: 'running',
+      footer: {
+        stepCurrent: 2,
+        stepTotal: 6,
+        completedPercent: 33.3333,
+        fileCount: 29,
+        additions: 5485,
+        deletions: 417,
+        label: 'Step 2 / 6 · 29 files changed +5485 -417',
+      },
+      timeline: [],
+      pendingRequest: null,
+      sidebar: { indicator: 'running' },
+    }), 'utf8')
+
+    const middleware = createCodexBridgeMiddleware()
+    const shared = sharedBridgeForTest() as ReturnType<typeof sharedBridgeForTest> & {
+      appServer: ReturnType<typeof sharedBridgeForTest>['appServer'] & {
+        rpc: (method: string, params: unknown) => Promise<unknown>
+      }
+    }
+    vi.spyOn(shared.appServer, 'getPid').mockReturnValue(4242)
+    vi.spyOn(shared.appServer, 'rpc').mockResolvedValue({
+      thread: {
+        id: 'thread-cache-authority',
+        path: rolloutPath,
+        turns: [{ id: 'turn-complete', status: 'completed', items: [] }],
+      },
+    })
+    const inspect = vi.spyOn(shared.runtimeProbe, 'inspect')
+    inspect.mockResolvedValueOnce({
+      state: 'running',
+      turnId: 'turn-external',
+      interruptible: false,
+      source: 'external-session-writer',
+    })
+    inspect.mockResolvedValueOnce({ state: 'idle' })
+    const port = await listenWithMiddleware(middleware)
+
+    const first = await fetch(`http://127.0.0.1:${port}/codex-api/thread-live-state?threadId=thread-cache-authority`)
+    await expect(first.json()).resolves.toMatchObject({
+      isInProgress: true,
+      liveAuthority: 'writer-snapshot',
+      liveSnapshot: { activeTurnId: 'turn-external' },
+    })
+
+    const second = await fetch(`http://127.0.0.1:${port}/codex-api/thread-live-state?threadId=thread-cache-authority`)
+    await expect(second.json()).resolves.toMatchObject({
+      isInProgress: false,
+      externalRuntime: { state: 'idle' },
+      liveAuthority: 'persisted',
+      liveSnapshot: null,
+    })
+  })
+
   it('projects live state to the newest absolute turn', async () => {
     const middleware = createCodexBridgeMiddleware()
     const shared = sharedBridgeForTest() as ReturnType<typeof sharedBridgeForTest> & {
