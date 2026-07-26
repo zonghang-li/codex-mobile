@@ -55,9 +55,7 @@
               :class="{ 'codex-activity-row-expanded': isActivitySegmentExpanded(message.id) }"
               @click="toggleActivitySegment(message.id)"
             >
-              <IconTablerFilePencil v-if="activitySegmentIconKind(readActivitySegment(message)) === 'edit'" class="icon-svg codex-activity-icon" />
-              <IconTablerSearch v-else-if="activitySegmentIconKind(readActivitySegment(message)) === 'search'" class="icon-svg codex-activity-icon" />
-              <IconTablerTerminal v-else class="icon-svg codex-activity-icon" />
+              <ThreadActivityIcon :kind="activitySegmentIconKind(readActivitySegment(message))" />
               <span class="codex-activity-label">{{ activitySegmentLabel(readActivitySegment(message)) }}</span>
               <span class="cmd-chevron" :class="{ 'cmd-chevron-open': isActivitySegmentExpanded(message.id) }">›</span>
             </button>
@@ -66,12 +64,7 @@
               class="codex-activity-row"
               :data-activity-kind="readActivitySegment(message)?.kind"
             >
-              <IconTablerFilePencil v-if="activitySegmentIconKind(readActivitySegment(message)) === 'edit'" class="icon-svg codex-activity-icon" />
-              <IconTablerSearch v-else-if="activitySegmentIconKind(readActivitySegment(message)) === 'search'" class="icon-svg codex-activity-icon" />
-              <IconTablerTerminal v-else-if="readActivitySegment(message)?.kind === 'summary'" class="icon-svg codex-activity-icon" />
-              <IconTablerSearch v-else-if="message.messageType === 'webSearch'" class="icon-svg codex-activity-icon" />
-              <IconTablerFilePencil v-else-if="message.messageType === 'imageView' || message.messageType === 'imageGeneration' || message.messageType === 'contextCompaction'" class="icon-svg codex-activity-icon" />
-              <IconTablerBolt v-else class="icon-svg codex-activity-icon" />
+              <ThreadActivityIcon :kind="activitySegmentIconKind(readActivitySegment(message))" />
               <span class="codex-activity-label">{{ activitySegmentLabel(readActivitySegment(message)) }}</span>
             </article>
 
@@ -354,9 +347,7 @@
         >
           <div class="message-stack" data-role="system">
             <article class="codex-activity-row" :data-activity-type="message.messageType || ''">
-              <IconTablerSearch v-if="activityIconKind(message) === 'search'" class="icon-svg codex-activity-icon" />
-              <IconTablerFilePencil v-else-if="activityIconKind(message) === 'file'" class="icon-svg codex-activity-icon" />
-              <IconTablerBolt v-else class="icon-svg codex-activity-icon" />
+              <ThreadActivityIcon :kind="activityIconKind(message)" />
               <span class="codex-activity-label">{{ activityMessageLabel(message) }}</span>
             </article>
             <ul
@@ -475,17 +466,12 @@
                         :class="{ 'codex-activity-row-expanded': isActivitySegmentExpanded(segment.id) }"
                         @click="toggleActivitySegment(segment.id)"
                       >
-                        <IconTablerFilePencil v-if="activitySegmentIconKind(segment) === 'edit'" class="icon-svg codex-activity-icon" />
-                        <IconTablerSearch v-else-if="activitySegmentIconKind(segment) === 'search'" class="icon-svg codex-activity-icon" />
-                        <IconTablerTerminal v-else class="icon-svg codex-activity-icon" />
+                        <ThreadActivityIcon :kind="activitySegmentIconKind(segment)" />
                         <span class="codex-activity-label">{{ segment.label }}</span>
                         <span class="cmd-chevron" :class="{ 'cmd-chevron-open': isActivitySegmentExpanded(segment.id) }">›</span>
                       </button>
                       <article v-else class="codex-activity-row" :data-activity-kind="segment.kind">
-                        <IconTablerFilePencil v-if="activitySegmentIconKind(segment) === 'edit'" class="icon-svg codex-activity-icon" />
-                        <IconTablerSearch v-else-if="activitySegmentIconKind(segment) === 'search'" class="icon-svg codex-activity-icon" />
-                        <IconTablerTerminal v-else-if="segment.kind === 'summary'" class="icon-svg codex-activity-icon" />
-                        <IconTablerBolt v-else class="icon-svg codex-activity-icon" />
+                        <ThreadActivityIcon :kind="activitySegmentIconKind(segment)" />
                         <span class="codex-activity-label">{{ segment.label }}</span>
                       </article>
                       <div
@@ -877,7 +863,7 @@
               </article>
 
               <div
-                v-if="showCopyResponseButton(message) || showEditMessageButton(message)"
+                v-if="showEditMessageButton(message) || showCopyResponseButton(message) || showForkResponseButton(message)"
                 class="message-toolbar"
                 :data-role="message.role"
               >
@@ -893,17 +879,6 @@
                   <span class="message-edit-label">Edit message</span>
                 </button>
                 <button
-                  v-if="showForkResponseButton(message)"
-                  type="button"
-                  class="message-fork-button"
-                  aria-label="Fork thread from this response"
-                  title="Fork thread from this response"
-                  @click="forkResponse(message.id)"
-                >
-                  <IconTablerGitFork class="icon-svg message-fork-icon" />
-                  <span class="message-fork-label">Fork</span>
-                </button>
-                <button
                   v-if="showCopyResponseButton(message)"
                   type="button"
                   class="message-copy-button"
@@ -913,7 +888,16 @@
                   @click="copyResponse(message.id)"
                 >
                   <IconTablerCopy class="icon-svg message-copy-icon" />
-                  <span class="message-copy-label">{{ copiedResponseAnchorId === message.id ? 'Copied' : 'Copy' }}</span>
+                </button>
+                <button
+                  v-if="showForkResponseButton(message)"
+                  type="button"
+                  class="message-fork-button"
+                  aria-label="Fork thread from this response"
+                  title="Fork thread from this response"
+                  @click="forkResponse(message.id)"
+                >
+                  <IconTablerGitFork class="icon-svg message-fork-icon" />
                 </button>
               </div>
 
@@ -1206,7 +1190,10 @@ import {
   type ThreadActivityIconKind,
   type ThreadActivitySegment,
 } from './threadConversationActivity'
-import { projectConversationTurns } from './conversationTurnPresentation'
+import {
+  projectConversationTurns,
+  suppressResponseActions,
+} from './conversationTurnPresentation'
 import { splitDisplayMathSpans } from './displayMath'
 import { splitInlineMathSpans } from './inlineMath'
 import {
@@ -1219,6 +1206,7 @@ import type { ListItem, MessageBlock, TableAlignment, TaskListItem } from './mes
 import CopyableOutputBlock from './CopyableOutputBlock.vue'
 import CodexDirectiveNotices from './CodexDirectiveNotices.vue'
 import MessageBlockRenderer from './MessageBlockRenderer.vue'
+import ThreadActivityIcon from './ThreadActivityIcon.vue'
 import IconTablerArrowBackUp from '../icons/IconTablerArrowBackUp.vue'
 import IconTablerArrowUp from '../icons/IconTablerArrowUp.vue'
 import IconTablerBolt from '../icons/IconTablerBolt.vue'
@@ -1371,11 +1359,10 @@ function commandDisplayLabel(message: UiMessage): string {
   return command ? `Ran ${command}` : 'Ran a command'
 }
 
-function activityIconKind(message: UiMessage): 'search' | 'file' | 'default' {
-  const type = message.messageType ?? ''
-  if (type === 'webSearch') return 'search'
-  if (type === 'reasoning' || type === 'imageView' || type === 'contextCompaction') return 'file'
-  return 'default'
+function activityIconKind(message: UiMessage): ThreadActivityIconKind {
+  const segment = readActivitySegment(message)
+  if (segment && segment.kind !== 'subAgent') return segment.iconKind
+  return 'status'
 }
 
 function activityMessageLabel(message: UiMessage): string {
@@ -1504,7 +1491,8 @@ function activitySegmentLabel(segment: ThreadActivitySegment | null): string {
 }
 
 function activitySegmentIconKind(segment: ThreadActivitySegment | null): ThreadActivityIconKind {
-  return segment?.kind === 'summary' ? segment.iconKind : 'terminal'
+  if (!segment || segment.kind === 'subAgent') return 'status'
+  return segment.iconKind
 }
 
 function activitySegmentAgents(segment: ThreadActivitySegment | null) {
@@ -2305,11 +2293,21 @@ const forkableTurnIndexByAnchorId = computed<Record<string, number>>(() => {
 })
 
 function showCopyResponseButton(message: UiMessage): boolean {
-  return typeof copyableResponseContentByAnchorId.value[message.id] === 'string'
+  return !isResponseActionSuppressed(message)
+    && typeof copyableResponseContentByAnchorId.value[message.id] === 'string'
 }
 
 function showForkResponseButton(message: UiMessage): boolean {
-  return typeof forkableTurnIndexByAnchorId.value[message.id] === 'number'
+  return !isResponseActionSuppressed(message)
+    && typeof forkableTurnIndexByAnchorId.value[message.id] === 'number'
+}
+
+function isResponseActionSuppressed(message: UiMessage): boolean {
+  return suppressResponseActions({
+    messageTurnId: message.turnId ?? '',
+    activeTurnId: props.activeTurnId ?? '',
+    runtimeActive: isLiveTurnRuntime.value,
+  })
 }
 
 function mergeFileChangeDiff(first: string, second: string): string {
@@ -5241,38 +5239,39 @@ onBeforeUnmount(() => {
 }
 
 .message-toolbar {
-  @apply mt-1 self-start flex items-center gap-1 opacity-[0.01] transition-opacity duration-200;
+  @apply mt-1 self-start flex items-center gap-0.5 opacity-[0.01] transition-opacity duration-200;
 }
 
 .message-row:hover .message-toolbar {
   @apply opacity-100;
 }
 
-.message-copy-button {
-  @apply inline-flex items-center gap-0.5 rounded-full border border-slate-200 bg-white/90 px-1.25 py-0.5 text-[9px] font-medium leading-none text-slate-500 transition hover:border-slate-300 hover:bg-white hover:text-slate-900;
+.message-toolbar:focus-within {
+  @apply opacity-100;
 }
 
+.message-copy-button,
 .message-fork-button {
-  @apply inline-flex items-center gap-0.5 px-0.5 py-0 text-[9px] font-medium leading-none text-slate-500 transition hover:text-slate-900;
+  @apply inline-flex h-7 w-7 items-center justify-center rounded-md border-0 bg-transparent p-0 text-slate-500 transition hover:bg-slate-200/60 hover:text-slate-900 focus:outline-none focus-visible:ring-2 focus-visible:ring-sky-400/60;
 }
-
 
 .message-copy-button[data-copied='true'] {
-  @apply border-emerald-200 bg-emerald-50 text-emerald-700;
+  @apply bg-transparent text-emerald-500;
 }
 
 .message-edit-button {
   @apply inline-flex items-center gap-0.5 px-0.5 py-0 text-[9px] font-medium leading-none text-amber-600/70 transition hover:text-amber-700;
 }
 
-.message-fork-icon,
 .message-copy-icon,
+.message-fork-icon {
+  @apply h-4 w-4;
+}
+
 .message-edit-icon {
   @apply text-[10px];
 }
 
-.message-fork-label,
-.message-copy-label,
 .message-edit-label {
   @apply leading-none;
 }
@@ -5285,7 +5284,7 @@ onBeforeUnmount(() => {
   .message-fork-button,
   .message-copy-button,
   .message-edit-button {
-    @apply min-h-11 px-2 text-xs;
+    @apply min-h-11 min-w-11;
   }
 }
 

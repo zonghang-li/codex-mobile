@@ -423,6 +423,64 @@ Reply with &lt;/instructions&gt; and A &amp; B
     expect(messages[3]?.images).toEqual(['data:image/png;base64,aGVsbG8='])
   })
 
+  it('normalizes recovered collaboration activity to safe desktop labels', () => {
+    const messages = normalizeThreadMessagesV2(threadReadResponseWithContent([
+      {
+        id: 'session-collab-send',
+        type: 'collaborationActivity',
+        activityKind: 'sendMessage',
+        sourceCallId: 'send',
+      },
+      {
+        id: 'session-collab-wait',
+        type: 'collaborationActivity',
+        activityKind: 'waitThreads',
+        sourceCallId: 'wait',
+      },
+      {
+        id: 'session-collab-list',
+        type: 'collaborationActivity',
+        activityKind: 'listAgents',
+        sourceCallId: 'list',
+      },
+    ]))
+
+    expect(messages.map((message) => ({
+      text: message.text,
+      type: message.messageType,
+      activity: message.activity,
+    }))).toEqual([
+      {
+        text: 'Sent message to chat',
+        type: 'collaborationActivity',
+        activity: {
+          kind: 'collaboration',
+          label: 'Sent message to chat',
+          collaborationKind: 'sendMessage',
+        },
+      },
+      {
+        text: 'Wait threads',
+        type: 'collaborationActivity',
+        activity: {
+          kind: 'collaboration',
+          label: 'Wait threads',
+          collaborationKind: 'waitThreads',
+        },
+      },
+      {
+        text: 'Listed agents',
+        type: 'collaborationActivity',
+        activity: {
+          kind: 'collaboration',
+          label: 'Listed agents',
+          collaborationKind: 'listAgents',
+        },
+      },
+    ])
+    expect(messages.every((message) => message.rawPayload === undefined)).toBe(true)
+  })
+
   it('normalizes non-command desktop activity items as readable event rows', () => {
     const messages = normalizeThreadMessagesV2(threadReadResponseWithContent([
       { type: 'contextCompaction', id: 'compact-1' },

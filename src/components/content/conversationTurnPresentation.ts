@@ -16,8 +16,24 @@ export type ConversationTurnPresentationInput = {
   activeTurnId: string | null
 }
 
+export type ResponseActionVisibilityInput = {
+  messageTurnId: string
+  activeTurnId: string
+  runtimeActive: boolean
+}
+
 type MutableTurnSection = ConversationTurnSection & {
   seenMessageIds: Set<string>
+}
+
+export function suppressResponseActions(input: ResponseActionVisibilityInput): boolean {
+  const activeTurnId = input.activeTurnId.trim()
+  const messageTurnId = input.messageTurnId.trim()
+  if (activeTurnId) {
+    if (!messageTurnId) return input.runtimeActive
+    return messageTurnId === activeTurnId
+  }
+  return input.runtimeActive
 }
 
 function explicitTurnKey(message: UiMessage): string {

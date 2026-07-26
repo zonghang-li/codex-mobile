@@ -123,15 +123,21 @@ describe('ConversationRunFooter desktop parity wiring', () => {
     const goalIndex = footerSource.indexOf('class="conversation-goal-strip"', activeFooterIndex)
 
     expect(toolbarIndex).toBeGreaterThan(responseIndex)
-    expect(forkIndex).toBeGreaterThan(toolbarIndex)
-    expect(copyIndex).toBeGreaterThan(forkIndex)
-    expect(historicalSummaryIndex).toBeGreaterThan(copyIndex)
+    expect(copyIndex).toBeGreaterThan(toolbarIndex)
+    expect(forkIndex).toBeGreaterThan(copyIndex)
+    expect(historicalSummaryIndex).toBeGreaterThan(forkIndex)
+    expect(conversationSource).not.toContain('class="message-copy-label"')
+    expect(conversationSource).not.toContain('class="message-fork-label"')
+    expect(conversationSource).toContain('aria-label="Fork thread from this response"')
+    expect(conversationSource).toContain(
+      "copiedResponseAnchorId === message.id ? 'Response copied' : 'Copy response'",
+    )
     expect(footerIndex).toBeGreaterThan(conversationIndex)
     expect(footerIndex).toBeLessThan(composerIndex)
     expect(goalIndex).toBeGreaterThan(activeFooterIndex)
   })
 
-  it('keeps Fork and Copy visible with touch-sized targets on coarse pointers', () => {
+  it('uses transparent icon actions with touch-sized targets on coarse pointers', () => {
     const forkStylesIndex = conversationSource.indexOf('.message-fork-button {')
     const copyStylesIndex = conversationSource.indexOf('.message-copy-button {')
     const coarsePointerStylesIndex = conversationSource.indexOf(
@@ -141,7 +147,22 @@ describe('ConversationRunFooter desktop parity wiring', () => {
     expect(coarsePointerStylesIndex).toBeGreaterThan(forkStylesIndex)
     expect(coarsePointerStylesIndex).toBeGreaterThan(copyStylesIndex)
     expect(conversationSource).toMatch(
-      /@media \(hover: none\), \(pointer: coarse\) \{[\s\S]*\.message-toolbar \{[\s\S]*@apply opacity-100;[\s\S]*\.message-fork-button,[\s\S]*\.message-copy-button,[\s\S]*\.message-edit-button \{[\s\S]*@apply [^;]*min-h-11[^;]*text-xs/u,
+      /\.message-copy-button,[\s\S]*\.message-fork-button\s*\{[\s\S]*@apply [^;]*border-0[^;]*bg-transparent/u,
+    )
+    expect(conversationSource).toMatch(
+      /@media \(hover: none\), \(pointer: coarse\) \{[\s\S]*\.message-toolbar \{[\s\S]*@apply opacity-100;[\s\S]*\.message-fork-button,[\s\S]*\.message-copy-button,[\s\S]*\.message-edit-button \{[\s\S]*@apply [^;]*min-h-11[^;]*min-w-11/u,
+    )
+    expect(conversationSource).toMatch(
+      /\.message-toolbar:focus-within\s*\{\s*@apply opacity-100;\s*\}/u,
+    )
+  })
+
+  it('renders semantic activity through the shared desktop-style icon component', () => {
+    expect(conversationSource).toContain("import ThreadActivityIcon from './ThreadActivityIcon.vue'")
+    expect(conversationSource).toContain('<ThreadActivityIcon')
+    expect(conversationSource).toContain(':kind="activitySegmentIconKind(')
+    expect(conversationSource).not.toContain(
+      "message.messageType === 'imageView' || message.messageType === 'imageGeneration'",
     )
   })
 

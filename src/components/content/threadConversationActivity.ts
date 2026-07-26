@@ -21,6 +21,7 @@ const TURN_ACTIVITY_MESSAGE_TYPES = new Set([
   'imageGeneration',
   'enteredReviewMode',
   'exitedReviewMode',
+  'collaborationActivity',
 ])
 
 export type ThreadActivitySegment =
@@ -28,6 +29,7 @@ export type ThreadActivitySegment =
       kind: 'reasoning'
       id: string
       label: string
+      iconKind: ThreadActivityIconKind
       sourceMessageIds: string[]
     }
   | {
@@ -48,10 +50,19 @@ export type ThreadActivitySegment =
       kind: 'event'
       id: string
       label: string
+      iconKind: ThreadActivityIconKind
       sourceMessageIds: string[]
     }
 
-export type ThreadActivityIconKind = 'edit' | 'search' | 'terminal'
+export type ThreadActivityIconKind =
+  | 'book'
+  | 'search'
+  | 'edit'
+  | 'terminal'
+  | 'integration'
+  | 'image'
+  | 'agent'
+  | 'status'
 
 type ActionSummaryState = {
   sourceMessageIds: string[]
@@ -96,7 +107,8 @@ function actionSummaryLabel(state: ActionSummaryState): string {
 
 function actionSummaryIconKind(state: ActionSummaryState): ThreadActivityIconKind {
   if (state.editedFileCount > 0) return 'edit'
-  if (state.readCount > 0 || state.listCount > 0 || state.searchCount > 0) return 'search'
+  if (state.readCount > 0 || state.listCount > 0) return 'book'
+  if (state.searchCount > 0) return 'search'
   return 'terminal'
 }
 
@@ -128,6 +140,33 @@ function activityLabel(message: UiMessage): string {
 
 function isSubAgentLifecycleMessage(message: UiMessage): boolean {
   return message.messageType === 'subAgentActivity' || message.messageType === 'collabAgentToolCall'
+}
+
+function isCollaborationActivity(message: UiMessage): boolean {
+  return message.messageType === 'collaborationActivity'
+    && message.activity?.kind === 'collaboration'
+}
+
+function collaborationLabelPart(message: UiMessage): string {
+  if (message.activity?.collaborationKind === 'sendMessage') return 'sent message to chat'
+  if (message.activity?.collaborationKind === 'waitThreads') return 'wait threads'
+  if (message.activity?.collaborationKind === 'listAgents') return 'listed agents'
+  return ''
+}
+
+function capitalizeFirst(value: string): string {
+  return value ? value.charAt(0).toUpperCase() + value.slice(1) : value
+}
+
+function activityMessageIconKind(message: UiMessage): ThreadActivityIconKind {
+  const type = message.messageType ?? ''
+  if (type === 'webSearch') return 'search'
+  if (type === 'imageView' || type === 'imageGeneration') return 'image'
+  if (type === 'mcpToolCall' || type === 'dynamicToolCall' || type === 'collaborationActivity') {
+    return 'integration'
+  }
+  if (type === 'subAgentActivity' || type === 'collabAgentToolCall') return 'agent'
+  return 'status'
 }
 
 export function buildThreadActivitySegments(
@@ -169,6 +208,32 @@ export function buildThreadActivitySegments(
     }
 
     flushActions()
+    if (isCollaborationActivity(message)) {
+      const sourceMessageIds: string[] = []
+      const parts: string[] = []
+      const seenParts = new Set<string>()
+      while (index < messages.length && isCollaborationActivity(messages[index])) {
+        const collaborationMessage = messages[index]
+        sourceMessageIds.push(collaborationMessage.id)
+        const part = collaborationLabelPart(collaborationMessage)
+        if (part && !seenParts.has(part)) {
+          seenParts.add(part)
+          parts.push(part)
+        }
+        index += 1
+      }
+      if (parts.length > 0) {
+        segments.push({
+          kind: 'event',
+          id: sourceMessageIds.at(-1) ?? '',
+          label: capitalizeFirst(parts.join(', ')),
+          iconKind: 'integration',
+          sourceMessageIds,
+        })
+      }
+      continue
+    }
+
     if (isSubAgentLifecycleMessage(message)) {
       const groupMessages: UiMessage[] = []
       while (index < messages.length && isSubAgentLifecycleMessage(messages[index])) {
@@ -194,6 +259,7 @@ export function buildThreadActivitySegments(
         kind: 'reasoning',
         id: message.id,
         label,
+        iconKind: activityMessageIconKind(message),
         sourceMessageIds: [message.id],
       })
       index += 1
@@ -203,6 +269,7 @@ export function buildThreadActivitySegments(
       kind: 'event',
       id: message.id,
       label,
+      iconKind: activityMessageIconKind(message),
       sourceMessageIds: [message.id],
     })
     index += 1

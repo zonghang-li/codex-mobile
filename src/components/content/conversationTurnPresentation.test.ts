@@ -1,6 +1,9 @@
 import { describe, expect, it } from 'vitest'
 import type { UiMessage } from '../../types/codex'
-import { projectConversationTurns } from './conversationTurnPresentation'
+import {
+  projectConversationTurns,
+  suppressResponseActions,
+} from './conversationTurnPresentation'
 
 function message(
   id: string,
@@ -135,5 +138,38 @@ describe('projectConversationTurns', () => {
     expect(sections).toHaveLength(1)
     expect(sections[0]?.turnId).toBe('turn-index:3')
     expect(sections[0]?.finalMessageId).toBe('final')
+  })
+})
+
+describe('response action visibility', () => {
+  it('suppresses the authoritative active turn', () => {
+    expect(suppressResponseActions({
+      messageTurnId: 'turn-active',
+      activeTurnId: 'turn-active',
+      runtimeActive: true,
+    })).toBe(true)
+    expect(suppressResponseActions({
+      messageTurnId: 'turn-complete',
+      activeTurnId: 'turn-active',
+      runtimeActive: true,
+    })).toBe(false)
+  })
+
+  it('fails closed while runtime is active and active turn identity is unknown', () => {
+    expect(suppressResponseActions({
+      messageTurnId: 'turn-unknown',
+      activeTurnId: '',
+      runtimeActive: true,
+    })).toBe(true)
+    expect(suppressResponseActions({
+      messageTurnId: 'turn-complete',
+      activeTurnId: '',
+      runtimeActive: false,
+    })).toBe(false)
+    expect(suppressResponseActions({
+      messageTurnId: '',
+      activeTurnId: 'turn-active',
+      runtimeActive: true,
+    })).toBe(true)
   })
 })

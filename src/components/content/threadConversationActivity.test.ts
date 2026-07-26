@@ -4,6 +4,7 @@ import {
   buildThreadActivitySegments,
   getHiddenCompletedActivityMessageIds,
   getTurnActivityMessagesForWorked,
+  getTurnActivitySegmentsForWorked,
   isThreadActivityMessage,
 } from './threadConversationActivity'
 
@@ -32,6 +33,7 @@ describe('thread conversation completed activity grouping', () => {
       'dynamicToolCall',
       'sleep',
       'imageGeneration',
+      'collaborationActivity',
     ]
 
     for (const messageType of activityTypes) {
@@ -96,6 +98,7 @@ describe('thread conversation completed activity grouping', () => {
         kind: 'reasoning',
         id: 'reasoning-1',
         label: 'Closing the final review',
+        iconKind: 'status',
         sourceMessageIds: ['reasoning-1'],
       },
       {
@@ -156,6 +159,57 @@ describe('thread conversation completed activity grouping', () => {
     ])
   })
 
+  it('aggregates adjacent unique parent collaboration actions in desktop order', () => {
+    const collaboration = (
+      id: string,
+      text: string,
+      collaborationKind: 'sendMessage' | 'waitThreads' | 'listAgents',
+    ): UiMessage => ({
+      ...message(id, 'system', text, 'collaborationActivity'),
+      activity: {
+        kind: 'collaboration',
+        label: text,
+        collaborationKind,
+      },
+    })
+    const messages = [
+      collaboration('send-1', 'Sent message to chat', 'sendMessage'),
+      collaboration('wait-1', 'Wait threads', 'waitThreads'),
+      collaboration('wait-2', 'Wait threads', 'waitThreads'),
+    ]
+
+    expect(buildThreadActivitySegments(messages)).toEqual([{
+      kind: 'event',
+      id: 'wait-2',
+      label: 'Sent message to chat, wait threads',
+      iconKind: 'integration',
+      sourceMessageIds: ['send-1', 'wait-1', 'wait-2'],
+    }])
+  })
+
+  it('keeps collaboration activity in the completed Worked for fold', () => {
+    const messages: UiMessage[] = [
+      {
+        ...message('send', 'system', 'Sent message to chat', 'collaborationActivity'),
+        activity: {
+          kind: 'collaboration',
+          label: 'Sent message to chat',
+          collaborationKind: 'sendMessage',
+        },
+      },
+      message('worked', 'system', 'Worked for 1m 25s', 'worked'),
+    ]
+
+    expect(getHiddenCompletedActivityMessageIds(messages)).toEqual(new Set(['send']))
+    expect(getTurnActivitySegmentsForWorked(messages, 1)).toEqual([
+      expect.objectContaining({
+        kind: 'event',
+        label: 'Sent message to chat',
+        iconKind: 'integration',
+      }),
+    ])
+  })
+
   it('uses stable plural grammar and does not combine activity across turn boundaries', () => {
     const command = (
       id: string,
@@ -202,12 +256,12 @@ describe('thread conversation completed activity grouping', () => {
       expect.objectContaining({
         id: 'read-3',
         label: 'Read a file',
-        iconKind: 'search',
+        iconKind: 'book',
       }),
     ])
   })
 
-  it('uses search for read-only activity and terminal for command-only activity', () => {
+  it('uses semantic desktop icon kinds for activity', () => {
     const command = (
       id: string,
       category: 'read' | 'unknown',
@@ -224,10 +278,25 @@ describe('thread conversation completed activity grouping', () => {
     })
 
     expect(buildThreadActivitySegments([command('read', 'read')])).toEqual([
-      expect.objectContaining({ iconKind: 'search' }),
+      expect.objectContaining({ iconKind: 'book' }),
     ])
     expect(buildThreadActivitySegments([command('run', 'unknown')])).toEqual([
       expect.objectContaining({ iconKind: 'terminal' }),
+    ])
+    expect(buildThreadActivitySegments([
+      message('codegraph', 'system', 'Used codegraph integration', 'dynamicToolCall'),
+    ])).toEqual([
+      expect.objectContaining({ iconKind: 'integration' }),
+    ])
+    expect(buildThreadActivitySegments([
+      message('image', 'assistant', 'Viewed an image', 'imageView'),
+    ])).toEqual([
+      expect.objectContaining({ iconKind: 'image' }),
+    ])
+    expect(buildThreadActivitySegments([
+      message('compact', 'system', 'Context automatically compacting', 'contextCompaction'),
+    ])).toEqual([
+      expect.objectContaining({ iconKind: 'status' }),
     ])
   })
 
@@ -243,6 +312,7 @@ describe('thread conversation completed activity grouping', () => {
       kind: 'reasoning',
       id: 'reasoning-markdown',
       label: 'Planning diagnostic instrumentation Assessing socket failure causes',
+      iconKind: 'status',
       sourceMessageIds: ['reasoning-markdown'],
     }])
   })
