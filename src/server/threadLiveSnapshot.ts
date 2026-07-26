@@ -46,6 +46,10 @@ function readNullableNumber(value: unknown): number | null | undefined {
   return typeof value === 'number' && Number.isFinite(value) ? value : undefined
 }
 
+function isSnapshotFileThreadId(value: string): boolean {
+  return value.length > 0 && !value.includes('/') && !value.includes('\\')
+}
+
 function readFooter(value: unknown): ThreadLiveFooter | null | undefined {
   if (value === null) return null
   const record = asRecord(value)
@@ -144,6 +148,8 @@ export async function readThreadLiveSnapshotFile(
   threadId: string,
   options: { activeTurnId: string; nowMs: number; minRevision?: number },
 ): Promise<ThreadLiveSnapshot | null> {
+  if (!isSnapshotFileThreadId(threadId)) return null
+
   try {
     const raw = await readFile(join(liveStateDir, `${threadId}.json`), 'utf8')
     return parseThreadLiveSnapshot(JSON.parse(raw), {

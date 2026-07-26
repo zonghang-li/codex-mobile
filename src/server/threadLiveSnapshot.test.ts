@@ -1,4 +1,4 @@
-import { mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { describe, expect, it } from 'vitest'
@@ -114,6 +114,24 @@ describe('thread live snapshots', () => {
       })).resolves.toBeNull()
     } finally {
       await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('does not allow thread ids to escape the configured live-state directory', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'codex-mobile-live-state-root-'))
+    const dir = join(root, 'live-state')
+    try {
+      await mkdir(dir)
+      await writeFile(join(root, 'outside.json'), JSON.stringify(validSnapshot({
+        threadId: '../outside',
+      })), 'utf8')
+
+      await expect(readThreadLiveSnapshotFile(dir, '../outside', {
+        activeTurnId: 'turn-1',
+        nowMs,
+      })).resolves.toBeNull()
+    } finally {
+      await rm(root, { recursive: true, force: true })
     }
   })
 })
