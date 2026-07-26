@@ -2163,14 +2163,6 @@ watch(
   @apply inline-flex h-3.5 w-3.5 items-center justify-center rounded-full border-0 bg-transparent p-0 text-xs leading-none text-zinc-400 transition hover:bg-zinc-200 hover:text-zinc-700;
 }
 
-:global(.dark) .thread-composer-attachment {
-  @apply border-zinc-700 bg-zinc-800 text-zinc-200;
-}
-
-:global(.dark) .thread-composer-attachment-remove {
-  @apply text-zinc-400 hover:bg-zinc-700 hover:text-zinc-100;
-}
-
 .thread-composer-file-chips {
   @apply mb-2 flex flex-wrap gap-1.5;
 }
@@ -2540,27 +2532,6 @@ watch(
 
 :global(.dark) .thread-composer-mic {
   @apply bg-zinc-800 text-zinc-300 hover:bg-zinc-700 hover:text-zinc-50 disabled:bg-zinc-800/60 disabled:text-zinc-600;
-}
-
-:global(.dark) .thread-composer-goal-trigger {
-  @apply text-zinc-400;
-}
-
-:global(.dark) .thread-composer-goal-trigger {
-  @apply hover:bg-zinc-800 hover:text-zinc-100;
-}
-
-:global(.dark) .thread-composer-goal-menu {
-  @apply border-zinc-700 bg-zinc-900 text-zinc-100;
-}
-
-:global(.dark) .thread-composer-goal-menu-copy,
-:global(.dark) .thread-composer-goal-menu-label {
-  @apply text-zinc-400;
-}
-
-:global(.dark) .thread-composer-goal-menu-input {
-  @apply border-zinc-600 bg-zinc-950 text-zinc-100 focus:border-zinc-400;
 }
 
 :global(.dark) .thread-composer-model-effort :deep(.composer-dropdown-trigger) {

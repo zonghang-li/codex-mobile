@@ -23,7 +23,9 @@ for viewport density, wrapping, and overflow checks.
 
 ## Capture method
 
-- Route: the real Task 8 thread, not a mocked page.
+- Route type: authenticated real-thread hash route, not a mocked page. The
+  concrete thread identifier is intentionally omitted from this document and
+  the committed image.
 - Browser: authorized Chromium via Playwright.
 - Viewport: `393×852` CSS pixels.
 - Device scale factor: `3` (`1179×2556` screenshot pixels).
@@ -35,8 +37,38 @@ for viewport density, wrapping, and overflow checks.
   pixels before side-by-side comparison. Full-view and focused subagent,
   actions, Goal, and attachment comparisons were inspected together.
 
-Temporary comparison captures were written under `/tmp/task8-*` during QA and
-removed after inspection as part of the Task 8 cleanup.
+## Persisted review evidence
+
+- Sanitized montage:
+  `docs/superpowers/qa/mobile-reliability-pass3.png`
+- Montage dimensions: `2200×1875` pixels.
+- SHA-256:
+  `f8b7f44215f8f21a973aaee5f5acf6767262a2981f3d514a8557bfc5d74770af`
+- Current capture dimensions before component cropping: `1179×2556` pixels for
+  a `393×852` CSS viewport at DPR 3.
+- Current focused crops at DPR 3: subagent row `1131×120`, toolbar `405×132`,
+  run footer `597×102`, composer `1131×405`, Goal menu `960×552`, and
+  attachment token `456×66`.
+- Reference focused crops: subagent/status `652×118` from the supplied 2×
+  strip, run footer `780×115` from the supplied 2× client capture, and composer
+  `1131×460` from the supplied 3× mobile capture.
+- Density normalization: the source and current composer are both 3×. The 2×
+  subagent and footer references were assessed at CSS size against the 3×
+  implementation measurements; the committed montage retains native crop
+  pixels for legibility and centers each crop in an equal-width panel.
+- Compared items: subagent chip/status hierarchy, run-footer shape and
+  centering, mobile composer composition, coarse-pointer Fork/Copy actions,
+  Goal-open dark state, dark attachment token, and dark/light composer states.
+- Redaction: only component crops are retained. Task labels, response content,
+  file/path text, attachment filename, and footer counts were removed with
+  opaque solid fills rather than blur. No full conversation screenshot,
+  concrete route identifier, browser address, or local path is embedded.
+- Manual inspection: the exact committed PNG was opened at original detail
+  after assembly. It contains only the UI crops and generic control/status text
+  shown above; no private conversation body, task name, or path remains.
+
+Temporary raw captures and intermediate montage files were written only under
+`/tmp/task8-review-evidence` and removed after inspection.
 
 ## Findings and fixes
 
@@ -50,6 +82,7 @@ removed after inspection as part of the Task 8 cleanup.
 | 3 | — | No remaining P0, P1, or P2 visual defects. | Passed. |
 
 Each correction was first covered by a failing wiring test, then re-run green.
+The persisted Pass 3 montage confirms `P0 = 0`, `P1 = 0`, and `P2 = 0`.
 
 ## Final measurements
 
@@ -88,15 +121,15 @@ Each correction was first covered by a failing wiring test, then re-run green.
 - Goal opens by button activation, remains within the viewport, and closes with
   Escape.
 - Attachment selection used the real file chooser; removal used the accessible
-  `Remove qa-attachment.png` button and was verified by DOM detachment.
+  `Remove qa-evidence.png` button and was verified by DOM detachment.
 - Fork/Copy are visible on coarse pointers and meet the 44px touch-target
   dimension.
 - Light and dark theme captures showed readable foreground/background
   separation and no theme flash in the validated surfaces.
 - Three `403` resource console messages came from historical file/attachment
   resources outside the isolated safe preview's allowed root. They did not
-  affect any Task 8 target surface. A live-state request was aborted only when
-  the script deliberately navigated away from the thread.
+  affect any Task 8 target surface. The final capture reported no failed
+  network requests.
 - Screenshot review does not replace a screen-reader audit or instrumented
   contrast measurement; no blocking keyboard, label, clipping, or visible
   contrast issue was found in this scope.

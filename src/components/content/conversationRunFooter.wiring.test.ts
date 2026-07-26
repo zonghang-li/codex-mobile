@@ -146,6 +146,7 @@ describe('ConversationRunFooter desktop parity wiring', () => {
   })
 
   it('uses dark theme surfaces for the Goal creation menu', () => {
+    expect(composerSource).not.toContain(':global(.dark) .thread-composer-goal')
     expect(globalStyleSource).toContain(':root.dark .thread-composer-goal-trigger')
     expect(globalStyleSource).toContain(':root.dark .thread-composer-goal-menu')
     expect(globalStyleSource).toContain(':root.dark .thread-composer-goal-menu-input')

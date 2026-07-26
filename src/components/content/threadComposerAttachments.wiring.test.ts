@@ -10,6 +10,7 @@ describe('ThreadComposer ephemeral uploaded-image attachments', () => {
     expect(source).not.toMatch(/<img[^>]+selectedImages/u)
     expect(source).toContain('@{{ image.name }}')
     expect(source).toContain('@click="removeImage(image.id)"')
+    expect(source).not.toContain(':global(.dark) .thread-composer-attachment')
     expect(globalStyleSource).toContain(':root.dark .thread-composer-attachment')
     expect(globalStyleSource).toContain(':root.dark .thread-composer-attachment-remove')
   })
