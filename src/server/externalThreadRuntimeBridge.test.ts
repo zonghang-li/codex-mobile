@@ -1021,6 +1021,95 @@ describe('GET /codex-api/thread-live-state external runtime parity', () => {
     ])
   })
 
+  it('recovers redacted parent coordination activity in live-state responses', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'codex-mobile-live-state-collaboration-'))
+    disposers.push(() => {
+      void rm(dir, { recursive: true, force: true })
+    })
+    const rolloutPath = join(dir, 'thread-live-collaboration.jsonl')
+    await writeFile(rolloutPath, [
+      JSON.stringify({ type: 'turn_context', payload: { turn_id: 'turn-live-collaboration' } }),
+      JSON.stringify({ type: 'response_item', payload: { type: 'message', role: 'assistant' } }),
+      JSON.stringify({
+        type: 'response_item',
+        payload: {
+          type: 'function_call',
+          name: 'send_message',
+          call_id: 'call-live-send',
+          arguments: JSON.stringify({
+            target: '/root/private-reviewer',
+            message: 'live-state secret prompt',
+          }),
+        },
+      }),
+      JSON.stringify({
+        type: 'response_item',
+        payload: {
+          type: 'function_call',
+          name: 'wait_threads',
+          call_id: 'call-live-wait',
+          arguments: JSON.stringify({ targets: [{ threadId: 'private-child-thread' }] }),
+        },
+      }),
+      JSON.stringify({ type: 'response_item', payload: { type: 'message', role: 'assistant' } }),
+      '',
+    ].join('\n'))
+
+    const middleware = createCodexBridgeMiddleware()
+    const shared = sharedBridgeForTest() as ReturnType<typeof sharedBridgeForTest> & {
+      appServer: ReturnType<typeof sharedBridgeForTest>['appServer'] & {
+        rpc: (method: string, params: unknown) => Promise<unknown>
+      }
+    }
+    vi.spyOn(shared.appServer, 'getPid').mockReturnValue(4242)
+    vi.spyOn(shared.appServer, 'rpc').mockResolvedValue({
+      thread: {
+        id: 'thread-live-collaboration',
+        path: rolloutPath,
+        turns: [{
+          id: 'turn-live-collaboration',
+          status: 'completed',
+          items: [
+            { id: 'agent-live-1', type: 'agentMessage', text: 'first' },
+            { id: 'agent-live-2', type: 'agentMessage', text: 'second' },
+          ],
+        }],
+      },
+    })
+    vi.spyOn(shared.runtimeProbe, 'inspect').mockResolvedValue({ state: 'idle' })
+    const port = await listenWithMiddleware(middleware)
+
+    const response = await fetch(
+      `http://127.0.0.1:${port}/codex-api/thread-live-state?threadId=thread-live-collaboration`,
+    )
+    const payload = await response.json() as {
+      conversationState?: { turns?: Array<{ items?: Array<Record<string, unknown>> }> }
+    }
+    const items = payload.conversationState?.turns?.[0]?.items ?? []
+    const serialized = JSON.stringify(items)
+
+    expect(response.status).toBe(200)
+    expect(items).toEqual([
+      { id: 'agent-live-1', type: 'agentMessage', text: 'first' },
+      {
+        id: 'session-collab-call-live-send',
+        type: 'collaborationActivity',
+        activityKind: 'sendMessage',
+        sourceCallId: 'call-live-send',
+      },
+      {
+        id: 'session-collab-call-live-wait',
+        type: 'collaborationActivity',
+        activityKind: 'waitThreads',
+        sourceCallId: 'call-live-wait',
+      },
+      { id: 'agent-live-2', type: 'agentMessage', text: 'second' },
+    ])
+    expect(serialized).not.toContain('live-state secret prompt')
+    expect(serialized).not.toContain('/root/private-reviewer')
+    expect(serialized).not.toContain('private-child-thread')
+  })
+
   it('recovers session command rows for normal thread/read RPC responses', async () => {
     const dir = await mkdtemp(join(tmpdir(), 'codex-mobile-rpc-session-command-'))
     disposers.push(() => {
