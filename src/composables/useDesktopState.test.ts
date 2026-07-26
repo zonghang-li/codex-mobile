@@ -485,6 +485,92 @@ describe('thread goal state', () => {
     expect(gatewayMocks.resumeThread).not.toHaveBeenCalled()
   })
 
+  it('keeps a newer Goal notification when an older set response settles', async () => {
+    const pendingSet = deferred<typeof activeGoal>()
+    const staleSetGoal = {
+      ...activeGoal,
+      objective: 'Stale set response',
+      updatedAt: activeGoal.updatedAt + 1,
+    }
+    const notifiedGoal = {
+      ...activeGoal,
+      objective: 'Newer notification',
+      status: 'blocked' as const,
+      updatedAt: activeGoal.updatedAt + 2,
+    }
+    gatewayMocks.setThreadGoal.mockReturnValue(pendingSet.promise)
+    const { state, emit } = await setupTurnLifecycleNotificationState('thread-1')
+
+    const mutation = state.updateSelectedThreadGoal({
+      objective: staleSetGoal.objective,
+      status: 'active',
+    })
+    emit({
+      method: 'thread/goal/updated',
+      params: { threadId: 'thread-1', goal: notifiedGoal },
+    })
+    pendingSet.resolve(staleSetGoal)
+    await mutation
+
+    expect(state.selectedThreadGoal.value).toEqual(notifiedGoal)
+  })
+
+  it('keeps a Goal created by notification when an older clear response settles', async () => {
+    const pendingClear = deferred<void>()
+    const notifiedGoal = {
+      ...activeGoal,
+      objective: 'Created while clear was pending',
+      updatedAt: activeGoal.updatedAt + 1,
+    }
+    gatewayMocks.clearThreadGoal.mockReturnValue(pendingClear.promise)
+    const { state, emit } = await setupTurnLifecycleNotificationState('thread-1')
+
+    const mutation = state.clearSelectedThreadGoal()
+    emit({
+      method: 'thread/goal/updated',
+      params: { threadId: 'thread-1', goal: notifiedGoal },
+    })
+    pendingClear.resolve()
+    await mutation
+
+    expect(state.selectedThreadGoal.value).toEqual(notifiedGoal)
+  })
+
+  it('does not reuse a pending mutation epoch after Goal polling reconnects', async () => {
+    installTestWindow()
+    const pendingSet = deferred<typeof activeGoal>()
+    const staleSetGoal = {
+      ...activeGoal,
+      objective: 'Response from the previous polling generation',
+    }
+    const refreshedGoal = {
+      ...activeGoal,
+      objective: 'Goal loaded after reconnect',
+      updatedAt: activeGoal.updatedAt + 1,
+    }
+    gatewayMocks.setThreadGoal.mockReturnValue(pendingSet.promise)
+    gatewayMocks.getThreadGoal.mockResolvedValue(refreshedGoal)
+
+    const state = useDesktopState()
+    state.primeSelectedThread('thread-1')
+    const mutation = state.updateSelectedThreadGoal({
+      objective: staleSetGoal.objective,
+      status: 'active',
+    })
+
+    state.stopPolling()
+    state.startPolling()
+    pollingCleanups.push(() => state.stopPolling())
+    await state.loadMessages('thread-1')
+    await flushMicrotasks()
+    expect(state.selectedThreadGoal.value).toEqual(refreshedGoal)
+
+    pendingSet.resolve(staleSetGoal)
+    await mutation
+
+    expect(state.selectedThreadGoal.value).toEqual(refreshedGoal)
+  })
+
   it('keeps goal mutation progress scoped to the thread that started it', async () => {
     installTestWindow()
     let resolveGoal!: (goal: typeof activeGoal) => void

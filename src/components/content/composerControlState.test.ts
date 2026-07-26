@@ -1,6 +1,10 @@
 import { readFileSync } from 'node:fs'
 import { describe, expect, it } from 'vitest'
-import { deriveComposerControlState } from './composerControlState'
+import { effectScope, nextTick, ref } from 'vue'
+import {
+  deriveComposerControlState,
+  useConversationGoalEditorState,
+} from './composerControlState'
 
 const composerSource = readFileSync(
   new URL('./ThreadComposer.vue', import.meta.url),
@@ -88,6 +92,38 @@ describe('deriveComposerControlState', () => {
       canEditConfiguration: false,
       canToggleGoal: true,
     })
+  })
+
+  it('discards an editing draft when its Goal is cleared or its thread identity changes', async () => {
+    const threadId = ref('thread-1')
+    const objective = ref<string | null>('First goal')
+    const scope = effectScope()
+    const editor = scope.run(() => useConversationGoalEditorState({
+      threadId: () => threadId.value,
+      objective: () => objective.value,
+    }))
+    expect(editor).toBeDefined()
+    if (!editor) throw new Error('Expected Goal editor state')
+
+    editor.begin('First goal')
+    editor.editingObjective.value = 'Stale draft'
+    objective.value = null
+    await nextTick()
+
+    expect(editor.isEditingGoal.value).toBe(false)
+    expect(editor.editingObjective.value).toBe('')
+
+    objective.value = 'Second goal'
+    await nextTick()
+    editor.begin('Second goal')
+    editor.editingObjective.value = 'Another stale draft'
+    threadId.value = 'thread-2'
+    objective.value = 'Other thread goal'
+    await nextTick()
+
+    expect(editor.isEditingGoal.value).toBe(false)
+    expect(editor.editingObjective.value).toBe('Other thread goal')
+    scope.stop()
   })
 
   it('hides the composer while an approval or input request owns the response surface', () => {

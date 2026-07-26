@@ -3650,21 +3650,25 @@ export function useDesktopState() {
       || /(?:method|rpc).*(?:not found|unknown|unsupported)|-32601|thread\/goal.*(?:not found|unsupported)/iu.test(message)
   }
 
-  function invalidateThreadGoalRequest(threadId: string): void {
-    threadGoalRequestEpochByThreadId.set(
-      threadId,
-      (threadGoalRequestEpochByThreadId.get(threadId) ?? 0) + 1,
-    )
+  function invalidateThreadGoalRequest(threadId: string): number {
+    const requestEpoch = (threadGoalRequestEpochByThreadId.get(threadId) ?? 0) + 1
+    threadGoalRequestEpochByThreadId.set(threadId, requestEpoch)
+    return requestEpoch
+  }
+
+  function isCurrentThreadGoalRequest(
+    threadId: string,
+    requestEpoch: number,
+    requestGeneration: number,
+  ): boolean {
+    return requestGeneration === threadGoalRequestGeneration
+      && threadGoalRequestEpochByThreadId.get(threadId) === requestEpoch
   }
 
   async function refreshThreadGoal(threadId: string): Promise<void> {
     const generation = threadGoalRequestGeneration
-    const requestEpoch = (threadGoalRequestEpochByThreadId.get(threadId) ?? 0) + 1
-    threadGoalRequestEpochByThreadId.set(threadId, requestEpoch)
-    const isCurrentRequest = () => (
-      generation === threadGoalRequestGeneration
-      && threadGoalRequestEpochByThreadId.get(threadId) === requestEpoch
-    )
+    const requestEpoch = invalidateThreadGoalRequest(threadId)
+    const isCurrentRequest = () => isCurrentThreadGoalRequest(threadId, requestEpoch, generation)
     try {
       const goal = await getThreadGoal(threadId)
       if (!isCurrentRequest()) return
@@ -6956,8 +6960,9 @@ export function useDesktopState() {
     if (!threadId || threadGoalSupportByThreadId.value[threadId] === false) {
       return false
     }
-    invalidateThreadGoalRequest(threadId)
     if (updatingThreadGoalByThreadId.value[threadId] === true) return false
+    const requestGeneration = threadGoalRequestGeneration
+    const requestEpoch = invalidateThreadGoalRequest(threadId)
     updatingThreadGoalByThreadId.value = {
       ...updatingThreadGoalByThreadId.value,
       [threadId]: true,
@@ -6968,6 +6973,7 @@ export function useDesktopState() {
         objective: input.objective,
         status: input.status,
       })
+      if (!isCurrentThreadGoalRequest(threadId, requestEpoch, requestGeneration)) return true
       threadGoalByThreadId.value = {
         ...threadGoalByThreadId.value,
         [threadId]: goal,
@@ -6978,6 +6984,7 @@ export function useDesktopState() {
       }
       return true
     } catch (goalError) {
+      if (!isCurrentThreadGoalRequest(threadId, requestEpoch, requestGeneration)) return false
       if (isThreadGoalUnsupportedError(goalError)) {
         threadGoalSupportByThreadId.value = {
           ...threadGoalSupportByThreadId.value,
@@ -6996,14 +7003,16 @@ export function useDesktopState() {
     if (!threadId || threadGoalSupportByThreadId.value[threadId] === false) {
       return false
     }
-    invalidateThreadGoalRequest(threadId)
     if (updatingThreadGoalByThreadId.value[threadId] === true) return false
+    const requestGeneration = threadGoalRequestGeneration
+    const requestEpoch = invalidateThreadGoalRequest(threadId)
     updatingThreadGoalByThreadId.value = {
       ...updatingThreadGoalByThreadId.value,
       [threadId]: true,
     }
     try {
       await clearThreadGoal(threadId)
+      if (!isCurrentThreadGoalRequest(threadId, requestEpoch, requestGeneration)) return true
       threadGoalByThreadId.value = omitKey(threadGoalByThreadId.value, threadId)
       threadGoalSupportByThreadId.value = {
         ...threadGoalSupportByThreadId.value,
@@ -7011,6 +7020,7 @@ export function useDesktopState() {
       }
       return true
     } catch (goalError) {
+      if (!isCurrentThreadGoalRequest(threadId, requestEpoch, requestGeneration)) return false
       if (isThreadGoalUnsupportedError(goalError)) {
         threadGoalSupportByThreadId.value = {
           ...threadGoalSupportByThreadId.value,

@@ -1,3 +1,4 @@
+import { ref, watch, type Ref } from 'vue'
 import type { ReasoningEffort, SpeedMode } from '../../types/codex'
 import type { ThreadRuntimeOwnership } from '../../types/threadRuntime'
 import {
@@ -17,6 +18,52 @@ export type ComposerControlStateInput = {
   selectedModel: string
   selectedReasoningEffort: ReasoningEffort | ''
   selectedSpeedMode: SpeedMode
+}
+
+export type ConversationGoalEditorState = {
+  isEditingGoal: Ref<boolean>
+  editingObjective: Ref<string>
+  begin: (objective: string) => void
+  cancel: () => void
+  finish: () => void
+}
+
+export function useConversationGoalEditorState(source: {
+  threadId: () => string
+  objective: () => string | null
+}): ConversationGoalEditorState {
+  const isEditingGoal = ref(false)
+  const editingObjective = ref('')
+
+  watch(
+    () => [source.threadId(), source.objective()] as const,
+    ([threadId, objective], previous) => {
+      const threadChanged = previous !== undefined && previous[0] !== threadId
+      if (threadChanged || objective === null) {
+        isEditingGoal.value = false
+        editingObjective.value = objective ?? ''
+        return
+      }
+      if (!isEditingGoal.value) editingObjective.value = objective
+    },
+    { immediate: true },
+  )
+
+  return {
+    isEditingGoal,
+    editingObjective,
+    begin(objective: string) {
+      editingObjective.value = objective
+      isEditingGoal.value = true
+    },
+    cancel() {
+      editingObjective.value = source.objective() ?? ''
+      isEditingGoal.value = false
+    },
+    finish() {
+      isEditingGoal.value = false
+    },
+  }
 }
 
 const EFFORT_LABELS: Record<ReasoningEffort, string> = {

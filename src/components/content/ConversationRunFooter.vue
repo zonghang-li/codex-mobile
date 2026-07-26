@@ -198,9 +198,11 @@ import IconTablerTargetArrow from '../icons/IconTablerTargetArrow.vue'
 import IconTablerTrash from '../icons/IconTablerTrash.vue'
 import IconTablerX from '../icons/IconTablerX.vue'
 import ConversationProgressDonut from './ConversationProgressDonut.vue'
+import { useConversationGoalEditorState } from './composerControlState'
 import { deriveThreadGoalPresentation } from './threadGoalPresentation'
 
 const props = defineProps<{
+  threadId: string
   footerState: ConversationFooterState | null
   goal: UiThreadGoal | null
   goalSupported: boolean
@@ -215,9 +217,7 @@ const emit = defineEmits<{
 const { t } = useUiLanguage()
 const nowMs = ref(Date.now())
 const isGoalExpanded = ref(false)
-const isEditingGoal = ref(false)
 const isClearGoalConfirming = ref(false)
-const editingObjective = ref('')
 const clearGoalButtonRef = ref<HTMLButtonElement | null>(null)
 const confirmGoalClearButtonRef = ref<HTMLButtonElement | null>(null)
 const CLEAR_GOAL_CONFIRMATION_TIMEOUT_MS = 5000
@@ -227,10 +227,19 @@ let clearGoalConfirmationTimer: ReturnType<typeof setTimeout> | null = null
 const goalPresentation = computed(() => (
   props.goal ? deriveThreadGoalPresentation(props.goal, nowMs.value) : null
 ))
+const {
+  isEditingGoal,
+  editingObjective,
+  begin: beginEditingGoal,
+  cancel: cancelEditingGoal,
+  finish: finishEditingGoal,
+} = useConversationGoalEditorState({
+  threadId: () => props.threadId,
+  objective: () => props.goal?.objective ?? null,
+})
 
-watch(() => props.goal?.objective, (objective) => {
+watch(() => [props.threadId, props.goal?.objective] as const, () => {
   cancelGoalClear(false)
-  if (!isEditingGoal.value) editingObjective.value = objective ?? ''
 }, { immediate: true })
 
 onMounted(() => {
@@ -250,14 +259,12 @@ function formatFileCount(count: number): string {
 
 function beginGoalEdit(): void {
   cancelGoalClear(false)
-  editingObjective.value = props.goal?.objective ?? ''
-  isEditingGoal.value = true
+  beginEditingGoal(props.goal?.objective ?? '')
   isGoalExpanded.value = true
 }
 
 function cancelGoalEdit(): void {
-  editingObjective.value = props.goal?.objective ?? ''
-  isEditingGoal.value = false
+  cancelEditingGoal()
 }
 
 function saveGoalEdit(): void {
@@ -267,7 +274,7 @@ function saveGoalEdit(): void {
     objective,
     status: props.goal.status,
   })
-  isEditingGoal.value = false
+  finishEditingGoal()
 }
 
 function clearGoalConfirmationTimerIfNeeded(): void {

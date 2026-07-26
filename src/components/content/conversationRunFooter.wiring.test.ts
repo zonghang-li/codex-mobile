@@ -48,10 +48,12 @@ describe('ConversationRunFooter desktop parity wiring', () => {
 
   it('renders create, edit, pause, resume, complete, blocked, clear, and expansion Goal controls', () => {
     expect(appSource).toContain(':goal="selectedThreadGoal"')
+    expect(appSource).toContain(':thread-id="selectedThreadId"')
     expect(appSource).toContain('@set-goal="updateSelectedThreadGoal"')
     expect(appSource).toContain('@clear-goal="clearSelectedThreadGoal"')
     expect(composerSource).toContain("emit('set-goal', { objective, status: 'active' })")
     expect(footerSource).toContain('deriveThreadGoalPresentation')
+    expect(footerSource).toContain('useConversationGoalEditorState')
     expect(footerSource).toContain('goal-pause-button')
     expect(footerSource).toContain('goal-resume-button')
     expect(footerSource).toContain('goal-edit-button')

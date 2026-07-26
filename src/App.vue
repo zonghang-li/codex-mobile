@@ -1034,6 +1034,7 @@
                     @terminal-focus-change="onTerminalFocusChange"
                   />
                   <ConversationRunFooter
+                    :thread-id="selectedThreadId"
                     :footer-state="selectedConversationFooterState"
                     :goal="selectedThreadGoal"
                     :goal-supported="selectedThreadGoalSupported"
