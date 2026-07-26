@@ -152,6 +152,9 @@ describe('ConversationRunFooter desktop parity wiring', () => {
     expect(conversationSource).toMatch(
       /@media \(hover: none\), \(pointer: coarse\) \{[\s\S]*\.message-toolbar \{[\s\S]*@apply opacity-100;[\s\S]*\.message-fork-button,[\s\S]*\.message-copy-button,[\s\S]*\.message-edit-button \{[\s\S]*@apply [^;]*min-h-11[^;]*min-w-11/u,
     )
+    expect(conversationSource).toMatch(
+      /\.message-toolbar:focus-within\s*\{\s*@apply opacity-100;\s*\}/u,
+    )
   })
 
   it('renders semantic activity through the shared desktop-style icon component', () => {

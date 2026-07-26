@@ -5246,6 +5246,10 @@ onBeforeUnmount(() => {
   @apply opacity-100;
 }
 
+.message-toolbar:focus-within {
+  @apply opacity-100;
+}
+
 .message-copy-button,
 .message-fork-button {
   @apply inline-flex h-7 w-7 items-center justify-center rounded-md border-0 bg-transparent p-0 text-slate-500 transition hover:bg-slate-200/60 hover:text-slate-900 focus:outline-none focus-visible:ring-2 focus-visible:ring-sky-400/60;
