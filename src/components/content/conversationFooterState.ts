@@ -46,6 +46,7 @@ export function deriveConversationFooterState(
     }
   }
 
+  if (input.externalLiveAuthority === 'writer-snapshot') return null
   if (input.externalLiveAuthority === 'missing') return null
 
   let latestPlan: readonly UiPlanStep[] = []
