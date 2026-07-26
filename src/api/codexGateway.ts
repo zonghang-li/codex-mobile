@@ -1033,8 +1033,6 @@ async function getThreadDetailV2(
   ownership: ThreadDetailRuntime['ownership']
   canInterrupt: boolean
   externalRuntimeState: ThreadDetailRuntime['externalRuntimeState']
-  liveAuthority: UiThreadLiveAuthority
-  liveSnapshot: UiThreadLiveSnapshot | null
 }> {
   const payload = await callRpc<ThreadReadResponse>('thread/read', {
     threadId,
@@ -1070,6 +1068,8 @@ async function getExternalThreadLiveStateSnapshotV2(
   ownership: ThreadDetailRuntime['ownership']
   canInterrupt: boolean
   externalRuntimeState: ThreadDetailRuntime['externalRuntimeState']
+  liveAuthority: UiThreadLiveAuthority
+  liveSnapshot: UiThreadLiveSnapshot | null
 }> {
   const params = new URLSearchParams({ threadId })
   const response = await fetch(`/codex-api/thread-live-state?${params.toString()}`, { signal })
@@ -1197,8 +1197,6 @@ export async function getThreadDetail(threadId: string, signal?: AbortSignal): P
   ownership: ThreadDetailRuntime['ownership']
   canInterrupt: boolean
   externalRuntimeState: ThreadDetailRuntime['externalRuntimeState']
-  liveAuthority: UiThreadLiveAuthority
-  liveSnapshot: UiThreadLiveSnapshot | null
 }> {
   try {
     return await getThreadDetailV2(threadId, signal)
@@ -1220,6 +1218,8 @@ export async function getExternalThreadLiveSnapshot(threadId: string, signal?: A
   ownership: ThreadDetailRuntime['ownership']
   canInterrupt: boolean
   externalRuntimeState: ThreadDetailRuntime['externalRuntimeState']
+  liveAuthority: UiThreadLiveAuthority
+  liveSnapshot: UiThreadLiveSnapshot | null
 }> {
   try {
     return await getExternalThreadLiveStateSnapshotV2(threadId, signal)
