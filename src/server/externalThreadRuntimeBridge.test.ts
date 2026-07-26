@@ -180,6 +180,83 @@ async function listenWithMiddleware(middleware: ReturnType<typeof createCodexBri
   return (server.address() as AddressInfo).port
 }
 
+describe('POST /codex-api/rpc guarded resume', () => {
+  it('degrades thread/resume to thread/read while another process owns the task', async () => {
+    const middleware = createCodexBridgeMiddleware()
+    const shared = sharedBridgeForTest()
+    vi.spyOn(shared.appServer, 'getPid').mockReturnValue(4242)
+    vi.spyOn(shared.runtimeProbe, 'inspect').mockResolvedValue({
+      state: 'running',
+      turnId: 'turn-external',
+      interruptible: false,
+      source: 'external-session-writer',
+    })
+    const rpc = vi.spyOn(shared.appServer as unknown as {
+      rpc(method: string, params: unknown): Promise<unknown>
+    }, 'rpc').mockResolvedValue({
+      thread: {
+        id: 'thread-external',
+        path: '/home/user/.codex/sessions/rollout-thread-external.jsonl',
+        status: { type: 'idle' },
+        turns: [],
+      },
+    })
+    const port = await listenWithMiddleware(middleware)
+
+    const response = await fetch(`http://127.0.0.1:${port}/codex-api/rpc`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        method: 'thread/resume',
+        params: { threadId: 'thread-external' },
+      }),
+    })
+
+    expect(response.status).toBe(200)
+    expect(rpc).toHaveBeenCalledTimes(1)
+    expect(rpc).toHaveBeenCalledWith('thread/read', {
+      threadId: 'thread-external',
+      includeTurns: true,
+    })
+    await expect(response.json()).resolves.toMatchObject({
+      result: {
+        thread: {
+          id: 'thread-external',
+          externalRuntime: { state: 'running', source: 'external-session-writer' },
+        },
+      },
+    })
+  })
+})
+
+describe('dynamic tool server requests', () => {
+  it('fails an unsupported request owned by the current app-server without listing it as pending', () => {
+    const middleware = createCodexBridgeMiddleware()
+    const shared = sharedBridgeForTest()
+    const appServer = shared.appServer as unknown as {
+      handleServerRequest(requestId: number, method: string, params: unknown): void
+      listPendingServerRequests(): unknown[]
+      sendServerRequestReply(requestId: number, reply: unknown): void
+    }
+    const reply = vi.spyOn(appServer, 'sendServerRequestReply').mockImplementation(() => undefined)
+    disposers.push(() => middleware.dispose())
+
+    appServer.handleServerRequest(77, 'item/tool/call', {
+      threadId: 'thread-local',
+      toolName: 'codex_app/list_threads',
+      arguments: [],
+    })
+
+    expect(appServer.listPendingServerRequests()).toEqual([])
+    expect(reply).toHaveBeenCalledWith(77, {
+      error: {
+        code: -32601,
+        message: 'Dynamic tool calls are not supported by codex-mobile.',
+      },
+    })
+  })
+})
+
 describe('GET /codex-api/thread-runtime-state', () => {
 
   it('returns a successful runtime payload and excludes the mobile child PID', async () => {

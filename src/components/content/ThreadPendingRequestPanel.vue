@@ -212,15 +212,6 @@
           </footer>
         </section>
 
-        <section v-else-if="request.method === 'item/tool/call'" class="thread-pending-request-actions">
-          <button type="button" class="thread-pending-request-primary" @click="onRespondToolCallFailure(request)">
-            {{ t('Fail Tool Call') }}
-          </button>
-          <button type="button" class="thread-pending-request-secondary" @click="onRespondToolCallSuccess(request)">
-            {{ t('Success (Empty)') }}
-          </button>
-        </section>
-
         <section v-else class="thread-pending-request-actions">
           <button type="button" class="thread-pending-request-primary" @click="onRespondEmptyResult(request)">
             {{ t('Return Empty Result') }}
@@ -388,7 +379,6 @@ function requestPanelTitle(request: UiServerRequest): string {
   if (isApprovalRequest(request)) return 'Awaiting approval'
   if (isMcpElicitationRequest(request)) return 'MCP server input required'
   if (request.method === 'item/tool/requestUserInput') return 'Awaiting response'
-  if (request.method === 'item/tool/call') return 'Tool response needed'
   return request.method
 }
 
@@ -976,31 +966,6 @@ function onRespondToolRequestUserInput(request: UiServerRequest): void {
   emit('respondServerRequest', {
     id: request.id,
     result: { answers },
-  })
-}
-
-function onRespondToolCallFailure(request: UiServerRequest): void {
-  emit('respondServerRequest', {
-    id: request.id,
-    result: {
-      success: false,
-      contentItems: [
-        {
-          type: 'inputText',
-          text: 'Tool call rejected from CodexUI.',
-        },
-      ],
-    },
-  })
-}
-
-function onRespondToolCallSuccess(request: UiServerRequest): void {
-  emit('respondServerRequest', {
-    id: request.id,
-    result: {
-      success: true,
-      contentItems: [],
-    },
   })
 }
 

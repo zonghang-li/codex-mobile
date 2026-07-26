@@ -113,6 +113,11 @@ type PendingServerRequest = {
   receivedAtIso: string
 }
 
+const UNSUPPORTED_DYNAMIC_TOOL_ERROR = {
+  code: -32601,
+  message: 'Dynamic tool calls are not supported by codex-mobile.',
+} as const
+
 type ChatgptAuthTokensRefreshParams = {
   reason?: string
   previousAccountId?: string | null
@@ -1067,6 +1072,30 @@ export async function augmentThreadResultWithExternalRuntime(
       externalRuntime: await runtimeProbe.inspect(threadId, excludedPid),
     },
   }
+}
+
+async function guardThreadResumeAgainstExternalWriter(
+  appServer: RpcExecutor,
+  runtimeProbe: Pick<ThreadRuntimeProbe, 'registerThread' | 'inspect'>,
+  excludedPid: number | null,
+  threadId: string,
+): Promise<{ blocked: false } | { blocked: true; readResult: unknown }> {
+  const readResult = await appServer.rpc('thread/read', {
+    threadId,
+    includeTurns: true,
+  })
+  const record = asRecord(readResult)
+  const thread = asRecord(record?.thread)
+  const rolloutPath = readNonEmptyString(thread?.path)
+  if (!thread || !rolloutPath || readThreadResultInProgress(thread)) {
+    return { blocked: false }
+  }
+
+  runtimeProbe.registerThread(threadId, rolloutPath)
+  const runtime = await runtimeProbe.inspect(threadId, excludedPid)
+  return runtime.state === 'running'
+    ? { blocked: true, readResult }
+    : { blocked: false }
 }
 
 function trimThreadTurnsInRpcResult(method: string, result: unknown): unknown {
@@ -2686,17 +2715,39 @@ export async function callRpcWithArchiveRecovery(
   appServer: RpcExecutor,
   method: string,
   params: unknown,
+  runtimeProbe?: Pick<ThreadRuntimeProbe, 'registerThread' | 'inspect'>,
+  excludedPid: number | null = null,
 ): Promise<unknown> {
+  const paramsRecord = asRecord(params)
+  const threadId = readNonEmptyString(paramsRecord?.threadId)
+  if (method === 'thread/resume' && threadId && runtimeProbe) {
+    const guard = await guardThreadResumeAgainstExternalWriter(
+      appServer,
+      runtimeProbe,
+      excludedPid,
+      threadId,
+    )
+    if (guard.blocked) return guard.readResult
+  }
+
   try {
     const result = await callRpcWithRateLimitDecodeRecovery(appServer, method, params)
     return method === 'thread/list'
       ? await canonicalizeThreadListResponseForRead(result)
       : result
   } catch (error) {
-    const paramsRecord = asRecord(params)
-    const threadId = readNonEmptyString(paramsRecord?.threadId)
-
     if (method === 'turn/start' && threadId && isThreadNotFoundError(error)) {
+      if (runtimeProbe) {
+        const guard = await guardThreadResumeAgainstExternalWriter(
+          appServer,
+          runtimeProbe,
+          excludedPid,
+          threadId,
+        )
+        if (guard.blocked) {
+          throw new Error('Cannot resume a task owned by another app-server process.')
+        }
+      }
       await appServer.rpc('thread/resume', { threadId })
       return appServer.rpc(method, params ?? null)
     }
@@ -7065,6 +7116,13 @@ class AppServerProcess {
       return
     }
 
+    if (method === 'item/tool/call' || method === 'dynamic_tool_call_request') {
+      this.sendServerRequestReply(requestId, {
+        error: UNSUPPORTED_DYNAMIC_TOOL_ERROR,
+      })
+      return
+    }
+
     const pendingRequest: PendingServerRequest = {
       id: requestId,
       method,
@@ -7464,6 +7522,17 @@ export class BackendQueueProcessor {
   }
 
   private async startQueuedTurn(turn: BackendQueuedTurn): Promise<void> {
+    if (this.runtimeProbe) {
+      const guard = await guardThreadResumeAgainstExternalWriter(
+        this.appServer,
+        this.runtimeProbe,
+        this.appServer.getPid(),
+        turn.threadId,
+      )
+      if (guard.blocked) {
+        throw new Error('Cannot resume a task owned by another app-server process.')
+      }
+    }
     await this.appServer.rpc('thread/resume', { threadId: turn.threadId })
     await this.appServer.rpc('turn/start', await this.buildQueuedTurnParams(turn))
   }
@@ -8289,7 +8358,13 @@ export function createCodexBridgeMiddleware(options: {
 
         let rpcResult: unknown
         try {
-          rpcResult = await callRpcWithArchiveRecovery(appServer, body.method, preparedRpcRequest.params)
+          rpcResult = await callRpcWithArchiveRecovery(
+            appServer,
+            body.method,
+            preparedRpcRequest.params,
+            runtimeProbe,
+            appServer.getPid(),
+          )
         } catch (error) {
 	          if (body.method === 'account/rateLimits/read' && isUnauthenticatedRateLimitError(error)) {
 	            setJson(res, 200, { result: null })

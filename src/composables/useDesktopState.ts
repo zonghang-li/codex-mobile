@@ -3819,6 +3819,9 @@ export function useDesktopState() {
 
     const requestParamRecord = asRecord(requestParams)
     const method = normalizePendingServerRequestMethod(rawMethod, requestParamRecord)
+    if (method === 'item/tool/call') {
+      return null
+    }
     const threadId = (
       readString(requestParamRecord?.threadId) ||
       readString(requestParamRecord?.thread_id) ||
@@ -5544,23 +5547,13 @@ export function useDesktopState() {
           return
         }
 
-        const needsResume = resumedThreadById.value[threadId] !== true
         const detailRequest = acquireThreadDetailRequest(
           threadId,
-          async () => {
-            if (!needsResume) return getThreadDetail(threadId)
-            return (await resumeThread(threadId)) ?? getThreadDetail(threadId)
-          },
+          () => getThreadDetail(threadId),
         )
         try {
           const detail = await detailRequest.promise
 
-          if (needsResume && detailRequest.ownsRequest) {
-            resumedThreadById.value = {
-              ...resumedThreadById.value,
-              [threadId]: true,
-            }
-          }
           reconcileThreadDetailSnapshot(threadId, detail, {
             preserveMissing: options.silent === true,
             markRead: true,
