@@ -874,6 +874,47 @@
                 </a>
               </article>
 
+              <div
+                v-if="showCopyResponseButton(message) || showEditMessageButton(message)"
+                class="message-toolbar"
+                :data-role="message.role"
+              >
+                <button
+                  v-if="showEditMessageButton(message)"
+                  type="button"
+                  class="message-edit-button"
+                  aria-label="Edit this message"
+                  title="Edit this message"
+                  @click="editMessage(message.id)"
+                >
+                  <IconTablerFilePencil class="icon-svg message-edit-icon" />
+                  <span class="message-edit-label">Edit message</span>
+                </button>
+                <button
+                  v-if="showForkResponseButton(message)"
+                  type="button"
+                  class="message-fork-button"
+                  aria-label="Fork thread from this response"
+                  title="Fork thread from this response"
+                  @click="forkResponse(message.id)"
+                >
+                  <IconTablerGitFork class="icon-svg message-fork-icon" />
+                  <span class="message-fork-label">Fork</span>
+                </button>
+                <button
+                  v-if="showCopyResponseButton(message)"
+                  type="button"
+                  class="message-copy-button"
+                  :data-copied="copiedResponseAnchorId === message.id"
+                  :aria-label="copiedResponseAnchorId === message.id ? 'Response copied' : 'Copy response'"
+                  :title="copiedResponseAnchorId === message.id ? 'Response copied' : 'Copy response'"
+                  @click="copyResponse(message.id)"
+                >
+                  <IconTablerCopy class="icon-svg message-copy-icon" />
+                  <span class="message-copy-label">{{ copiedResponseAnchorId === message.id ? 'Copied' : 'Copy' }}</span>
+                </button>
+              </div>
+
               <section v-if="readAnchoredFileChangeSummary(message)" class="file-change-summary-block file-change-summary-block-inline">
                 <button
                   type="button"
@@ -959,47 +1000,6 @@
                   </div>
                 </div>
               </section>
-
-              <div
-                v-if="showCopyResponseButton(message) || showEditMessageButton(message)"
-                class="message-toolbar"
-                :data-role="message.role"
-              >
-                <button
-                  v-if="showEditMessageButton(message)"
-                  type="button"
-                  class="message-edit-button"
-                  aria-label="Edit this message"
-                  title="Edit this message"
-                  @click="editMessage(message.id)"
-                >
-                  <IconTablerFilePencil class="icon-svg message-edit-icon" />
-                  <span class="message-edit-label">Edit message</span>
-                </button>
-                <button
-                  v-if="showForkResponseButton(message)"
-                  type="button"
-                  class="message-fork-button"
-                  aria-label="Fork thread from this response"
-                  title="Fork thread from this response"
-                  @click="forkResponse(message.id)"
-                >
-                  <IconTablerGitFork class="icon-svg message-fork-icon" />
-                  <span class="message-fork-label">Fork</span>
-                </button>
-                <button
-                  v-if="showCopyResponseButton(message)"
-                  type="button"
-                  class="message-copy-button"
-                  :data-copied="copiedResponseAnchorId === message.id"
-                  :aria-label="copiedResponseAnchorId === message.id ? 'Response copied' : 'Copy response'"
-                  :title="copiedResponseAnchorId === message.id ? 'Response copied' : 'Copy response'"
-                  @click="copyResponse(message.id)"
-                >
-                  <IconTablerCopy class="icon-svg message-copy-icon" />
-                  <span class="message-copy-label">{{ copiedResponseAnchorId === message.id ? 'Copied' : 'Copy' }}</span>
-                </button>
-              </div>
             </article>
           </div>
         </div>
@@ -2489,7 +2489,10 @@ const visibleMessages = computed(() => renderableMessages.value.slice(effectiveR
 const hasMoreAbove = computed(() => effectiveRenderWindowStart.value > 0 || props.hasMorePersistedAbove === true)
 
 function readAnchoredFileChangeSummary(message: UiMessage): TurnFileChangeSummary | null {
-  return anchoredFileChangeSummaryByAnchorId.value[message.id] ?? null
+  const summary = anchoredFileChangeSummaryByAnchorId.value[message.id] ?? null
+  const activeTurnId = props.activeTurnId?.trim() ?? ''
+  if (activeTurnId && summary?.turnId === activeTurnId) return null
+  return summary
 }
 
 function readStandaloneFileChangeSummary(message: UiMessage): TurnFileChangeSummary | null {

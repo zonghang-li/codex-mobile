@@ -79,4 +79,37 @@ describe('ConversationRunFooter desktop parity wiring', () => {
     expect(conversationSource).toContain("message.messageType === 'fileChange'")
     expect(conversationSource).toContain("message.messageType === 'plan.live'")
   })
+
+  it('renders anchored file changes only for historical turns', () => {
+    expect(conversationSource).toMatch(
+      /function readAnchoredFileChangeSummary\(message: UiMessage\): TurnFileChangeSummary \| null \{[\s\S]*const summary = anchoredFileChangeSummaryByAnchorId\.value\[message\.id\] \?\? null[\s\S]*const activeTurnId = props\.activeTurnId\?\.trim\(\) \?\? ''[\s\S]*if \(activeTurnId && summary\?\.turnId === activeTurnId\) return null[\s\S]*return summary[\s\S]*\}/u,
+    )
+    expect(conversationSource).toContain(
+      '<section v-if="readAnchoredFileChangeSummary(message)" class="file-change-summary-block file-change-summary-block-inline">',
+    )
+  })
+
+  it('keeps response actions before historical summaries and the active footer before Goal and the composer', () => {
+    const responseIndex = conversationSource.indexOf('<CodexDirectiveNotices')
+    const toolbarIndex = conversationSource.indexOf('class="message-toolbar"', responseIndex)
+    const forkIndex = conversationSource.indexOf('class="message-fork-button"', toolbarIndex)
+    const copyIndex = conversationSource.indexOf('class="message-copy-button"', toolbarIndex)
+    const historicalSummaryIndex = conversationSource.indexOf(
+      '<section v-if="readAnchoredFileChangeSummary(message)"',
+      toolbarIndex,
+    )
+    const conversationIndex = appSource.indexOf('<ThreadConversation')
+    const footerIndex = appSource.indexOf('<ConversationRunFooter', conversationIndex)
+    const composerIndex = appSource.indexOf('<ThreadComposer', footerIndex)
+    const activeFooterIndex = footerSource.indexOf('class="conversation-run-footer-pill"')
+    const goalIndex = footerSource.indexOf('class="conversation-goal-strip"', activeFooterIndex)
+
+    expect(toolbarIndex).toBeGreaterThan(responseIndex)
+    expect(forkIndex).toBeGreaterThan(toolbarIndex)
+    expect(copyIndex).toBeGreaterThan(forkIndex)
+    expect(historicalSummaryIndex).toBeGreaterThan(copyIndex)
+    expect(footerIndex).toBeGreaterThan(conversationIndex)
+    expect(footerIndex).toBeLessThan(composerIndex)
+    expect(goalIndex).toBeGreaterThan(activeFooterIndex)
+  })
 })
