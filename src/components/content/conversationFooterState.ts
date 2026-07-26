@@ -3,12 +3,16 @@ import type {
   UiFileChange,
   UiMessage,
   UiPlanStep,
+  UiThreadLiveAuthority,
+  UiThreadLiveFooter,
 } from '../../types/codex'
 
 export type ConversationFooterInput = {
   messages: readonly UiMessage[]
   turnId: string
   isTurnInProgress: boolean
+  authoritativeFooter?: UiThreadLiveFooter | null
+  externalLiveAuthority?: UiThreadLiveAuthority | null
 }
 
 export function selectDesktopPlanStep(steps: readonly UiPlanStep[]): number | null {
@@ -28,6 +32,21 @@ export function deriveConversationFooterState(
 ): ConversationFooterState | null {
   const turnId = input.turnId.trim()
   if (!input.isTurnInProgress || !turnId) return null
+
+  if (input.authoritativeFooter) {
+    const footer = input.authoritativeFooter
+    return {
+      turnId,
+      stepNumber: footer.stepCurrent,
+      stepCount: footer.stepTotal ?? 0,
+      completedPercent: footer.completedPercent ?? 0,
+      fileCount: footer.fileCount ?? 0,
+      additions: footer.additions ?? 0,
+      deletions: footer.deletions ?? 0,
+    }
+  }
+
+  if (input.externalLiveAuthority === 'missing') return null
 
   let latestPlan: readonly UiPlanStep[] = []
   const fileChangesByPath = new Map<string, UiFileChange>()

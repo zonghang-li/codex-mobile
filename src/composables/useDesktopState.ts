@@ -67,6 +67,8 @@ import type {
   UiThread,
   UiThreadGoal,
   UiThreadGoalStatus,
+  UiThreadLiveAuthority,
+  UiThreadLiveSnapshot,
 } from '../types/codex'
 import type { ThreadRuntimeOwnership } from '../types/threadRuntime'
 import { getPathParent, isProjectlessChatPath, normalizePathForUi, toProjectName } from '../pathUtils.js'
@@ -86,7 +88,10 @@ import { resolveTurnCompletionDisposition, type TurnTerminalStatus } from './thr
 import { shouldRefreshMessagesForNotification } from './notificationSyncPolicy'
 import { createManagedUploadLease } from './managedUploadLease'
 
-type ThreadDetailSnapshot = Awaited<ReturnType<typeof getThreadDetail>>
+type ThreadDetailSnapshot = Awaited<ReturnType<typeof getThreadDetail>> & {
+  liveAuthority?: UiThreadLiveAuthority
+  liveSnapshot?: UiThreadLiveSnapshot | null
+}
 
 type ThreadDetailRequestLease = {
   epoch: number
@@ -1659,6 +1664,8 @@ export function useDesktopState() {
   const activeTurnIdByThreadId = ref<Record<string, string>>({})
   const runtimeOwnershipByThreadId = ref<Record<string, ThreadRuntimeOwnership>>({})
   const externalReasoningSnapshotByThreadId = ref<Record<string, ExternalReasoningSnapshot>>({})
+  const liveAuthorityByThreadId = ref<Record<string, UiThreadLiveAuthority>>({})
+  const liveSnapshotByThreadId = ref<Record<string, UiThreadLiveSnapshot | null>>({})
   const interruptBlockedUntilPersistedByThreadId = ref<Record<string, boolean>>({})
   const threadListedByServerById = ref<Record<string, boolean>>({})
   const persistedUserMessageByThreadId = ref<Record<string, boolean>>({})
@@ -1846,6 +1853,14 @@ export function useDesktopState() {
       reasoningText,
       errorText,
     }
+  })
+  const selectedLiveAuthority = computed<UiThreadLiveAuthority | null>(() => {
+    const threadId = selectedThreadId.value
+    return threadId ? liveAuthorityByThreadId.value[threadId] ?? null : null
+  })
+  const selectedLiveSnapshot = computed<UiThreadLiveSnapshot | null>(() => {
+    const threadId = selectedThreadId.value
+    return threadId ? liveSnapshotByThreadId.value[threadId] ?? null : null
   })
   const selectedActiveTurnId = computed(() => {
     const threadId = selectedThreadId.value
@@ -2671,6 +2686,8 @@ export function useDesktopState() {
     turnErrorByThreadId.value = pruneThreadStateMap(turnErrorByThreadId.value, activeThreadIds)
     activeTurnIdByThreadId.value = pruneThreadStateMap(activeTurnIdByThreadId.value, activeThreadIds)
     runtimeOwnershipByThreadId.value = pruneThreadStateMap(runtimeOwnershipByThreadId.value, activeThreadIds)
+    liveAuthorityByThreadId.value = pruneThreadStateMap(liveAuthorityByThreadId.value, activeThreadIds)
+    liveSnapshotByThreadId.value = pruneThreadStateMap(liveSnapshotByThreadId.value, activeThreadIds)
     externalReasoningSnapshotByThreadId.value = pruneThreadStateMap(
       externalReasoningSnapshotByThreadId.value,
       activeThreadIds,
@@ -3152,6 +3169,9 @@ export function useDesktopState() {
     if (ownership !== 'external' && externalReasoningSnapshotByThreadId.value[threadId]) {
       externalReasoningSnapshotByThreadId.value = omitKey(externalReasoningSnapshotByThreadId.value, threadId)
     }
+    if (ownership !== 'external') {
+      clearThreadLiveAuthority(threadId)
+    }
     if (ownership === 'local' && currentOwnership !== 'local') {
       localRuntimeAuthorityVersionByThreadId.set(
         threadId,
@@ -3188,6 +3208,7 @@ export function useDesktopState() {
       }
     } else {
       inProgressById.value = omitKey(inProgressById.value, threadId)
+      clearThreadLiveAuthority(threadId)
       if (externalReasoningSnapshotByThreadId.value[threadId]) {
         externalReasoningSnapshotByThreadId.value = omitKey(externalReasoningSnapshotByThreadId.value, threadId)
       }
@@ -5503,6 +5524,16 @@ export function useDesktopState() {
     }
   }
 
+  function clearThreadLiveAuthority(threadId: string): void {
+    if (!threadId) return
+    if (liveAuthorityByThreadId.value[threadId]) {
+      liveAuthorityByThreadId.value = omitKey(liveAuthorityByThreadId.value, threadId)
+    }
+    if (threadId in liveSnapshotByThreadId.value) {
+      liveSnapshotByThreadId.value = omitKey(liveSnapshotByThreadId.value, threadId)
+    }
+  }
+
   function reconcileThreadDetailSnapshot(
     threadId: string,
     detail: ThreadDetailSnapshot,
@@ -5564,6 +5595,18 @@ export function useDesktopState() {
         ? 'external'
         : detailOwnership
     const inProgress = retainLocal || retainEstablishedExternal || detail.inProgress
+    if (isLiveProjection) {
+      liveAuthorityByThreadId.value = {
+        ...liveAuthorityByThreadId.value,
+        [threadId]: detail.liveAuthority ?? 'persisted',
+      }
+      liveSnapshotByThreadId.value = {
+        ...liveSnapshotByThreadId.value,
+        [threadId]: detail.liveSnapshot ?? null,
+      }
+    } else if (ownership !== 'external' || !inProgress) {
+      clearThreadLiveAuthority(threadId)
+    }
     hasMoreOlderMessagesByThreadId.value = {
       ...hasMoreOlderMessagesByThreadId.value,
       [threadId]: detail.hasMoreOlder === true,
@@ -6956,6 +6999,8 @@ export function useDesktopState() {
     turnSummaryByThreadId.value = {}
     turnErrorByThreadId.value = {}
     activeTurnIdByThreadId.value = {}
+    liveAuthorityByThreadId.value = {}
+    liveSnapshotByThreadId.value = {}
     externalReasoningSnapshotByThreadId.value = {}
     interruptBlockedUntilPersistedByThreadId.value = {}
     threadListedByServerById.value = {}
@@ -7110,6 +7155,8 @@ export function useDesktopState() {
     isSelectedThreadInterruptPending,
     selectedThreadServerRequests,
     selectedLiveOverlay,
+    selectedLiveAuthority,
+    selectedLiveSnapshot,
     selectedActiveTurnId,
     selectedThreadGoal,
     selectedThreadGoalSupported,
