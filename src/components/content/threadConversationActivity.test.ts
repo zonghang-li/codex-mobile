@@ -112,6 +112,7 @@ describe('thread conversation completed activity grouping', () => {
           id: 'thread-docs',
           label: 'Updated docs coverage review',
           state: 'updated',
+          tone: 'purple',
         }],
         status: 'updated',
         sourceMessageIds: ['agent-1'],

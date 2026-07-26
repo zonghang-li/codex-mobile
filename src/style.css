@@ -307,6 +307,35 @@ body {
   @apply text-zinc-400 hover:text-zinc-200;
 }
 
+:root.dark .thread-composer-attachment {
+  @apply border-zinc-700 bg-zinc-800 text-zinc-200;
+}
+
+:root.dark .thread-composer-attachment-remove {
+  @apply text-zinc-400 hover:bg-zinc-700 hover:text-zinc-100;
+}
+
+:root.dark .thread-composer-goal-trigger {
+  @apply text-zinc-400 hover:bg-zinc-800 hover:text-zinc-100;
+}
+
+:root.dark .thread-composer-goal-menu {
+  @apply border-zinc-700 bg-zinc-900 text-zinc-100;
+}
+
+:root.dark .thread-composer-goal-menu-copy,
+:root.dark .thread-composer-goal-menu-label {
+  @apply text-zinc-400;
+}
+
+:root.dark .thread-composer-goal-menu-input {
+  @apply border-zinc-600 bg-zinc-950 text-zinc-100 focus:border-zinc-400;
+}
+
+:root.dark .thread-composer-goal-menu-submit {
+  @apply border-zinc-100 bg-zinc-100 text-zinc-950 hover:bg-white disabled:border-zinc-700 disabled:bg-zinc-800 disabled:text-zinc-500;
+}
+
 :root.dark .thread-composer-submit {
   @apply bg-zinc-200 text-zinc-900 hover:bg-white;
 }

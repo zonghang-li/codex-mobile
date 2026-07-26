@@ -5,22 +5,21 @@ const source = readFileSync(new URL('./ThreadComposer.vue', import.meta.url), 'u
 const appSource = readFileSync(new URL('../../App.vue', import.meta.url), 'utf8')
 
 describe('ThreadComposer desktop parity wiring', () => {
-  it('renders desktop-order permission, goal, combined model/effort, mic, and primary action controls', () => {
+  it('renders desktop-order goal, combined model/effort, mic, and primary action controls without a fixed permission status', () => {
     const controls = source.indexOf('class="thread-composer-controls"')
     const attach = source.indexOf('thread-composer-attach-trigger', controls)
-    const permission = source.indexOf('thread-composer-permission-trigger', controls)
     const goal = source.indexOf('thread-composer-goal-trigger', controls)
     const combined = source.indexOf('thread-composer-model-effort', controls)
     const mic = source.indexOf('thread-composer-mic', controls)
     const primary = source.indexOf('thread-composer-stop', controls)
 
     expect(attach).toBeGreaterThan(controls)
-    expect(permission).toBeGreaterThan(attach)
-    expect(goal).toBeGreaterThan(permission)
+    expect(goal).toBeGreaterThan(attach)
     expect(combined).toBeGreaterThan(goal)
     expect(mic).toBeGreaterThan(combined)
     expect(primary).toBeGreaterThan(mic)
-    expect(source).toContain('composerControlState.permissionLabel')
+    expect(source).not.toContain('thread-composer-permission-trigger')
+    expect(source).not.toContain('composerControlState.permissionLabel')
     expect(source).toContain('composerControlState.modelEffortLabel')
   })
 

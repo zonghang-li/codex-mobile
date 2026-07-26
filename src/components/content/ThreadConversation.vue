@@ -5277,6 +5277,18 @@ onBeforeUnmount(() => {
   @apply leading-none;
 }
 
+@media (hover: none), (pointer: coarse) {
+  .message-toolbar {
+    @apply opacity-100;
+  }
+
+  .message-fork-button,
+  .message-copy-button,
+  .message-edit-button {
+    @apply min-h-11 px-2 text-xs;
+  }
+}
+
 .message-image-list {
   @apply list-none m-0 mb-2 p-0 flex flex-wrap gap-2;
 }

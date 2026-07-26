@@ -4,12 +4,14 @@ import { describe, expect, it } from 'vitest'
 describe('ThreadComposer ephemeral uploaded-image attachments', () => {
   it('renders uploaded images as removable @filename tokens without an image preview', async () => {
     const source = await readFile(new URL('./ThreadComposer.vue', import.meta.url), 'utf8')
+    const globalStyleSource = await readFile(new URL('../../style.css', import.meta.url), 'utf8')
 
     expect(source).not.toContain('thread-composer-attachment-image')
     expect(source).not.toMatch(/<img[^>]+selectedImages/u)
     expect(source).toContain('@{{ image.name }}')
     expect(source).toContain('@click="removeImage(image.id)"')
-    expect(source).toContain(':global(.dark) .thread-composer-attachment')
+    expect(globalStyleSource).toContain(':root.dark .thread-composer-attachment')
+    expect(globalStyleSource).toContain(':root.dark .thread-composer-attachment-remove')
   })
 
   it('keeps managed identity and send path only in memory and excludes them from draft persistence', async () => {

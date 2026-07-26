@@ -130,4 +130,27 @@ describe('ConversationRunFooter desktop parity wiring', () => {
     expect(footerIndex).toBeLessThan(composerIndex)
     expect(goalIndex).toBeGreaterThan(activeFooterIndex)
   })
+
+  it('keeps Fork and Copy visible with touch-sized targets on coarse pointers', () => {
+    const forkStylesIndex = conversationSource.indexOf('.message-fork-button {')
+    const copyStylesIndex = conversationSource.indexOf('.message-copy-button {')
+    const coarsePointerStylesIndex = conversationSource.indexOf(
+      '@media (hover: none), (pointer: coarse)',
+    )
+
+    expect(coarsePointerStylesIndex).toBeGreaterThan(forkStylesIndex)
+    expect(coarsePointerStylesIndex).toBeGreaterThan(copyStylesIndex)
+    expect(conversationSource).toMatch(
+      /@media \(hover: none\), \(pointer: coarse\) \{[\s\S]*\.message-toolbar \{[\s\S]*@apply opacity-100;[\s\S]*\.message-fork-button,[\s\S]*\.message-copy-button,[\s\S]*\.message-edit-button \{[\s\S]*@apply [^;]*min-h-11[^;]*text-xs/u,
+    )
+  })
+
+  it('uses dark theme surfaces for the Goal creation menu', () => {
+    expect(globalStyleSource).toContain(':root.dark .thread-composer-goal-trigger')
+    expect(globalStyleSource).toContain(':root.dark .thread-composer-goal-menu')
+    expect(globalStyleSource).toContain(':root.dark .thread-composer-goal-menu-input')
+    expect(globalStyleSource).toMatch(
+      /:root\.dark \.thread-composer-goal-menu\s*\{\s*@apply [^;]*border-zinc-700 [^;]*bg-zinc-900 [^;]*text-zinc-100/u,
+    )
+  })
 })

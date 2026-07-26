@@ -2486,11 +2486,7 @@ watch(
 }
 
 .thread-composer-goal-trigger {
-  @apply inline-flex h-8 min-w-0 shrink-0 items-center rounded-full border-0 bg-transparent px-2 text-sm text-zinc-500 transition;
-}
-
-.thread-composer-goal-trigger {
-  @apply hover:bg-zinc-100 hover:text-zinc-800 disabled:cursor-default disabled:opacity-40;
+  @apply inline-flex h-8 min-w-0 shrink-0 items-center rounded-full border-0 bg-transparent px-2 text-sm text-zinc-500 transition hover:bg-zinc-100 hover:text-zinc-800 disabled:cursor-default disabled:opacity-40;
 }
 
 .thread-composer-goal-control {
