@@ -1135,7 +1135,8 @@ export function buildThreadLiveStateReadFailureFallback(
   error: unknown,
   mergeItemsIntoTurns: (threadId: string, turns: unknown[]) => unknown[],
 ): unknown {
-  const record = asRecord(snapshot)
+  const liveSnapshot = trimLiveThreadTurnsInRpcResult(snapshot)
+  const record = asRecord(liveSnapshot)
   const thread = asRecord(record?.thread)
   const rawTurns = Array.isArray(thread?.turns) ? thread.turns : []
   const turns = mergeItemsIntoTurns(threadId, rawTurns)

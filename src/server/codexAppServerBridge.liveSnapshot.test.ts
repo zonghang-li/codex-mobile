@@ -133,4 +133,34 @@ describe('external live snapshot RPC preparation', () => {
     expect(fallback.hasMoreOlder).toBe(true)
     expect(fallback.conversationState.turns.map((turn) => turn.id)).toEqual(['turn-11'])
   })
+
+  it('narrows a five-turn cached detail when the first live read fails', () => {
+    const cachedDetail = trimThreadTurnsInRpcResult('thread/read', {
+      thread: {
+        id: 'thread-live',
+        turns: Array.from({ length: 12 }, (_unused, index) => ({
+          id: `turn-${index}`,
+          status: index === 11 ? 'inProgress' : 'completed',
+          items: [],
+        })),
+      },
+    }) as { threadTurnStartIndex: number; thread: { turns: Array<{ id: string }> } }
+    expect(cachedDetail.threadTurnStartIndex).toBe(7)
+    expect(cachedDetail.thread.turns).toHaveLength(5)
+
+    const fallback = buildThreadLiveStateReadFailureFallback(
+      'thread-live',
+      cachedDetail,
+      new Error('first live read failed'),
+      (_threadId, turns) => turns,
+    ) as {
+      threadTurnStartIndex: number
+      hasMoreOlder: boolean
+      conversationState: { turns: Array<{ id: string }> }
+    }
+
+    expect(fallback.threadTurnStartIndex).toBe(11)
+    expect(fallback.hasMoreOlder).toBe(true)
+    expect(fallback.conversationState.turns.map((turn) => turn.id)).toEqual(['turn-11'])
+  })
 })
