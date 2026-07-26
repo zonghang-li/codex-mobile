@@ -1,3 +1,4 @@
+import { readFileSync } from 'node:fs'
 import { describe, expect, it } from 'vitest'
 import type {
   UiCollabAgentStatus,
@@ -5,6 +6,11 @@ import type {
   UiSubAgentActivityKind,
 } from '../../types/codex'
 import { buildSubAgentActivityGroup } from './subAgentActivity'
+
+const conversationSource = readFileSync(
+  new URL('./ThreadConversation.vue', import.meta.url),
+  'utf8',
+)
 
 function subAgent(
   id: string,
@@ -60,7 +66,12 @@ describe('buildSubAgentActivityGroup', () => {
     expect(buildSubAgentActivityGroup([
       subAgent('start', 'thread-docs', 'Docs reviewer', 'started'),
     ])).toEqual({
-      agents: [{ id: 'thread-docs', label: 'Docs reviewer', state: 'waiting' }],
+      agents: [{
+        id: 'thread-docs',
+        label: 'Docs reviewer',
+        state: 'waiting',
+        tone: 'purple',
+      }],
       status: 'started working',
       sourceMessageIds: ['start'],
     })
@@ -69,7 +80,12 @@ describe('buildSubAgentActivityGroup', () => {
       subAgent('start', 'thread-docs', 'Docs reviewer', 'started'),
       collab('running', 'wait', 'inProgress', ['thread-docs'], { 'thread-docs': 'running' }),
     ])?.agents).toEqual([
-      { id: 'thread-docs', label: 'Docs reviewer', state: 'working' },
+      {
+        id: 'thread-docs',
+        label: 'Docs reviewer',
+        state: 'working',
+        tone: 'purple',
+      },
     ])
 
     expect(buildSubAgentActivityGroup([
@@ -77,7 +93,12 @@ describe('buildSubAgentActivityGroup', () => {
       subAgent('update', 'thread-docs', 'Docs reviewer', 'interacted'),
       collab('running', 'sendInput', 'completed', ['thread-docs'], { 'thread-docs': 'running' }),
     ])).toEqual({
-      agents: [{ id: 'thread-docs', label: 'Docs reviewer', state: 'updated' }],
+      agents: [{
+        id: 'thread-docs',
+        label: 'Docs reviewer',
+        state: 'updated',
+        tone: 'purple',
+      }],
       status: 'updated',
       sourceMessageIds: ['start', 'update', 'running'],
     })
@@ -86,7 +107,12 @@ describe('buildSubAgentActivityGroup', () => {
       subAgent('start', 'thread-docs', 'Docs reviewer', 'started'),
       collab('done', 'wait', 'completed', ['thread-docs'], { 'thread-docs': 'completed' }),
     ])).toEqual({
-      agents: [{ id: 'thread-docs', label: 'Docs reviewer', state: 'done' }],
+      agents: [{
+        id: 'thread-docs',
+        label: 'Docs reviewer',
+        state: 'done',
+        tone: 'purple',
+      }],
       status: 'finished',
       sourceMessageIds: ['start', 'done'],
     })
@@ -105,8 +131,18 @@ describe('buildSubAgentActivityGroup', () => {
 
     expect(group).toEqual({
       agents: [
-        { id: 'thread-docs', label: 'Docs reviewer', state: 'failed' },
-        { id: 'thread-shell', label: 'Shell reviewer', state: 'interrupted' },
+        {
+          id: 'thread-docs',
+          label: 'Docs reviewer',
+          state: 'failed',
+          tone: 'purple',
+        },
+        {
+          id: 'thread-shell',
+          label: 'Shell reviewer',
+          state: 'interrupted',
+          tone: 'purple',
+        },
       ],
       status: 'failed',
       sourceMessageIds: ['docs-start', 'shell-start', 'docs-update', 'states'],
@@ -119,13 +155,23 @@ describe('buildSubAgentActivityGroup', () => {
       subAgent('start', 'thread-docs', 'Docs reviewer', 'started'),
       collab('wait', 'wait', 'completed', ['thread-docs'], {}),
     ])?.agents).toEqual([
-      { id: 'thread-docs', label: 'Docs reviewer', state: 'done' },
+      {
+        id: 'thread-docs',
+        label: 'Docs reviewer',
+        state: 'done',
+        tone: 'purple',
+      },
     ])
 
     expect(buildSubAgentActivityGroup([
       subAgent('start', 'thread-docs', 'Docs reviewer', 'started'),
     ], { parentTurnCompleted: true })).toEqual({
-      agents: [{ id: 'thread-docs', label: 'Docs reviewer', state: 'done' }],
+      agents: [{
+        id: 'thread-docs',
+        label: 'Docs reviewer',
+        state: 'done',
+        tone: 'purple',
+      }],
       status: 'finished',
       sourceMessageIds: ['start'],
     })
@@ -134,7 +180,61 @@ describe('buildSubAgentActivityGroup', () => {
   it('uses a deterministic path fallback when a child thread id is absent', () => {
     const row = subAgent('start', '', 'Docs reviewer', 'started', '/root/docs_reviewer')
     expect(buildSubAgentActivityGroup([row])?.agents).toEqual([
-      { id: 'path:/root/docs_reviewer', label: 'Docs reviewer', state: 'waiting' },
+      {
+        id: 'path:/root/docs_reviewer',
+        label: 'Docs reviewer',
+        state: 'waiting',
+        tone: 'pink',
+      },
     ])
+  })
+
+  it('maps agent identities to deterministic green, purple, and pink tones', () => {
+    const messages = [
+      subAgent('green-start', 'agent-a', 'Green reviewer', 'started'),
+      subAgent('purple-start', 'agent-b', 'Purple reviewer', 'started'),
+      subAgent('pink-start', 'agent-c', 'Pink reviewer', 'started'),
+    ]
+
+    expect(buildSubAgentActivityGroup(messages)?.agents.map(({ id, tone }) => ({
+      id,
+      tone,
+    }))).toEqual([
+      { id: 'agent-a', tone: 'green' },
+      { id: 'agent-b', tone: 'purple' },
+      { id: 'agent-c', tone: 'pink' },
+    ])
+    expect(buildSubAgentActivityGroup([...messages].reverse())?.agents
+      .map(({ id, tone }) => ({ id, tone }))
+      .sort((left, right) => left.id.localeCompare(right.id))).toEqual([
+      { id: 'agent-a', tone: 'green' },
+      { id: 'agent-b', tone: 'purple' },
+      { id: 'agent-c', tone: 'pink' },
+    ])
+  })
+
+  it('renders non-button agent chips with transparent neutral bordered styling', () => {
+    expect(conversationSource.match(
+      /<span\s+v-for="agent in [^"]+"[\s\S]*?class="codex-agent-activity-chip"/gu,
+    )).toHaveLength(2)
+    expect(conversationSource).not.toMatch(
+      /<button[^>]*class="codex-agent-activity-chip"/u,
+    )
+    expect(conversationSource).toContain(':data-agent-tone="agent.tone"')
+    expect(conversationSource).toMatch(
+      /\.codex-agent-activity-chip\s*\{\s*@apply [^;]*border [^;]*border-zinc-200\/80 [^;]*bg-transparent/u,
+    )
+    expect(conversationSource).toMatch(
+      /:global\(\.dark\) \.codex-agent-activity-chip\s*\{\s*@apply [^;]*border-zinc-800\/80 [^;]*bg-transparent/u,
+    )
+    expect(conversationSource).toContain(
+      ".codex-agent-activity-chip[data-agent-tone='green'] .codex-agent-activity-icon",
+    )
+    expect(conversationSource).toContain(
+      ".codex-agent-activity-chip[data-agent-tone='purple'] .codex-agent-activity-icon",
+    )
+    expect(conversationSource).toContain(
+      ".codex-agent-activity-chip[data-agent-tone='pink'] .codex-agent-activity-icon",
+    )
   })
 })

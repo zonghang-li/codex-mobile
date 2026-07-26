@@ -74,7 +74,6 @@ export function deriveComposerControlState(
     canStop,
     canEditConfiguration,
     canToggleGoal: canEditConfiguration && input.goalSupported,
-    permissionLabel: 'Approve for me',
     modelEffortLabel,
     showFastIcon: input.selectedSpeedMode === 'fast'
       && /^gpt-5\.(?:4|5|6)(?:$|-)/iu.test(input.selectedModel.trim()),

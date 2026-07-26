@@ -1,5 +1,11 @@
+import { readFileSync } from 'node:fs'
 import { describe, expect, it } from 'vitest'
 import { deriveComposerControlState } from './composerControlState'
+
+const composerSource = readFileSync(
+  new URL('./ThreadComposer.vue', import.meta.url),
+  'utf8',
+)
 
 const localIdle = {
   runtimeOwnership: 'idle' as const,
@@ -14,17 +20,21 @@ const localIdle = {
 }
 
 describe('deriveComposerControlState', () => {
-  it('exposes the fixed safe runtime permission label and editable idle controls', () => {
-    expect(deriveComposerControlState(localIdle)).toMatchObject({
+  it('exposes editable idle controls without a fixed permission status', () => {
+    const state = deriveComposerControlState(localIdle)
+
+    expect(state).toMatchObject({
       composerVisible: true,
       primaryAction: 'send',
       canSubmit: true,
       canEditConfiguration: true,
       canToggleGoal: true,
-      permissionLabel: 'Approve for me',
       modelEffortLabel: 'GPT-5.6-sol Max',
       showFastIcon: true,
     })
+    expect(state).not.toHaveProperty('permissionLabel')
+    expect(composerSource).not.toContain('Approve for me')
+    expect(composerSource).not.toContain('thread-composer-permission-trigger')
   })
 
   it('turns an empty local running composer into a stop control', () => {

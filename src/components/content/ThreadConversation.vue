@@ -39,6 +39,7 @@
                 :key="agent.id"
                 class="codex-agent-activity-chip"
                 :data-agent-state="agent.state"
+                :data-agent-tone="agent.tone"
               >
                 <IconTablerBolt class="icon-svg codex-agent-activity-icon" aria-hidden="true" />
                 <span class="codex-agent-activity-label">{{ agent.label }}</span>
@@ -460,6 +461,7 @@
                           :key="agent.id"
                           class="codex-agent-activity-chip"
                           :data-agent-state="agent.state"
+                          :data-agent-tone="agent.tone"
                         >
                           <IconTablerBolt class="icon-svg codex-agent-activity-icon" aria-hidden="true" />
                           <span class="codex-agent-activity-label">{{ agent.label }}</span>
@@ -5795,11 +5797,23 @@ onBeforeUnmount(() => {
 }
 
 .codex-agent-activity-chip {
-  @apply inline-flex max-w-full min-w-0 items-center gap-2 rounded-full border border-zinc-200/80 bg-zinc-100/60 px-3 py-1 text-zinc-500;
+  @apply inline-flex max-w-full min-w-0 items-center gap-2 rounded-full border border-zinc-200/80 bg-transparent px-3 py-1 text-zinc-500;
 }
 
 .codex-agent-activity-icon {
   @apply h-4 w-4 shrink-0 text-zinc-400;
+}
+
+.codex-agent-activity-chip[data-agent-tone='green'] .codex-agent-activity-icon {
+  @apply text-green-500;
+}
+
+.codex-agent-activity-chip[data-agent-tone='purple'] .codex-agent-activity-icon {
+  @apply text-purple-500;
+}
+
+.codex-agent-activity-chip[data-agent-tone='pink'] .codex-agent-activity-icon {
+  @apply text-pink-500;
 }
 
 .codex-agent-activity-label {
@@ -6097,11 +6111,19 @@ onBeforeUnmount(() => {
 }
 
 :global(.dark) .codex-agent-activity-chip {
-  @apply border-zinc-800/80 bg-zinc-900/60 text-zinc-400;
+  @apply border-zinc-800/80 bg-transparent text-zinc-400;
 }
 
-:global(.dark) .codex-agent-activity-icon {
-  @apply text-zinc-600;
+:global(.dark) .codex-agent-activity-chip[data-agent-tone='green'] .codex-agent-activity-icon {
+  @apply text-green-400;
+}
+
+:global(.dark) .codex-agent-activity-chip[data-agent-tone='purple'] .codex-agent-activity-icon {
+  @apply text-purple-400;
+}
+
+:global(.dark) .codex-agent-activity-chip[data-agent-tone='pink'] .codex-agent-activity-icon {
+  @apply text-pink-400;
 }
 
 :global(.dark) .worked-separator-line {

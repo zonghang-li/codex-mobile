@@ -11,10 +11,13 @@ export type SubAgentDisplayState =
   | 'interrupted'
   | 'failed'
 
+export type SubAgentTone = 'green' | 'purple' | 'pink'
+
 export type SubAgentDisplayItem = {
   id: string
   label: string
   state: SubAgentDisplayState
+  tone: SubAgentTone
 }
 
 export type SubAgentActivityGroup = {
@@ -24,6 +27,16 @@ export type SubAgentActivityGroup = {
 }
 
 type MutableSubAgent = SubAgentDisplayItem
+
+const SUB_AGENT_TONES = ['green', 'purple', 'pink'] as const
+
+function toneFromAgentIdentity(identity: string): SubAgentTone {
+  let hash = 0
+  for (const character of identity) {
+    hash += character.codePointAt(0) ?? 0
+  }
+  return SUB_AGENT_TONES[hash % SUB_AGENT_TONES.length] ?? 'green'
+}
 
 function isTerminal(state: SubAgentDisplayState): boolean {
   return state === 'done' || state === 'interrupted' || state === 'failed'
@@ -72,6 +85,7 @@ export function buildSubAgentActivityGroup(
       id,
       label: label || defaultAgentLabel(id),
       state: 'waiting',
+      tone: toneFromAgentIdentity(id),
     }
     agents.set(id, created)
     return created

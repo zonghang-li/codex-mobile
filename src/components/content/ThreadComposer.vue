@@ -275,15 +275,6 @@
         </div>
 
         <template v-if="!isDictationRecording">
-          <button
-            class="thread-composer-permission-trigger"
-            type="button"
-            :title="t('Codex handles routine approvals automatically')"
-            disabled
-          >
-            {{ composerControlState.permissionLabel }}
-          </button>
-
           <div v-if="goalSupported" ref="goalMenuRootRef" class="thread-composer-goal-control">
             <button
               class="thread-composer-goal-trigger"
@@ -2494,13 +2485,8 @@ watch(
   @apply truncate;
 }
 
-.thread-composer-permission-trigger,
 .thread-composer-goal-trigger {
   @apply inline-flex h-8 min-w-0 shrink-0 items-center rounded-full border-0 bg-transparent px-2 text-sm text-zinc-500 transition;
-}
-
-.thread-composer-permission-trigger:disabled {
-  @apply cursor-default opacity-100;
 }
 
 .thread-composer-goal-trigger {
@@ -2560,8 +2546,7 @@ watch(
   @apply bg-zinc-800 text-zinc-300 hover:bg-zinc-700 hover:text-zinc-50 disabled:bg-zinc-800/60 disabled:text-zinc-600;
 }
 
-:global(.dark) .thread-composer-goal-trigger,
-:global(.dark) .thread-composer-permission-trigger {
+:global(.dark) .thread-composer-goal-trigger {
   @apply text-zinc-400;
 }
 
@@ -2654,10 +2639,6 @@ watch(
 
   .thread-composer-controls {
     @apply gap-0.5;
-  }
-
-  .thread-composer-permission-trigger {
-    @apply max-w-28 truncate px-1.5 text-xs;
   }
 
   .thread-composer-goal-trigger {
