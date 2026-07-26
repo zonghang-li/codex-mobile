@@ -1085,28 +1085,53 @@ export async function augmentThreadResultWithExternalRuntime(
   }
 }
 
+type ThreadWriterInspection =
+  | { state: 'idle'; readResult: unknown }
+  | { state: 'blocked'; readResult: unknown }
+  | { state: 'unmaterialized'; readResult: unknown; error?: unknown }
+
+async function inspectThreadWriter(
+  appServer: RpcExecutor,
+  runtimeProbe: Pick<ThreadRuntimeProbe, 'registerThread' | 'inspect'>,
+  excludedPid: number | null,
+  threadId: string,
+): Promise<ThreadWriterInspection> {
+  let readResult: unknown
+  try {
+    readResult = await appServer.rpc('thread/read', {
+      threadId,
+      includeTurns: true,
+    })
+  } catch (error) {
+    if (isThreadNotFoundError(error)) {
+      return { state: 'unmaterialized', readResult: null, error }
+    }
+    throw error
+  }
+  const record = asRecord(readResult)
+  const thread = asRecord(record?.thread)
+  const rolloutPath = readNonEmptyString(thread?.path)
+  if (!thread || !rolloutPath) {
+    return { state: 'unmaterialized', readResult }
+  }
+
+  runtimeProbe.registerThread(threadId, rolloutPath)
+  const runtime = await runtimeProbe.inspect(threadId, excludedPid)
+  return runtime.state === 'idle'
+    ? { state: 'idle', readResult }
+    : { state: 'blocked', readResult }
+}
+
 async function guardThreadResumeAgainstExternalWriter(
   appServer: RpcExecutor,
   runtimeProbe: Pick<ThreadRuntimeProbe, 'registerThread' | 'inspect'>,
   excludedPid: number | null,
   threadId: string,
 ): Promise<{ blocked: false } | { blocked: true; readResult: unknown }> {
-  const readResult = await appServer.rpc('thread/read', {
-    threadId,
-    includeTurns: true,
-  })
-  const record = asRecord(readResult)
-  const thread = asRecord(record?.thread)
-  const rolloutPath = readNonEmptyString(thread?.path)
-  if (!thread || !rolloutPath) {
-    return { blocked: true, readResult }
-  }
-
-  runtimeProbe.registerThread(threadId, rolloutPath)
-  const runtime = await runtimeProbe.inspect(threadId, excludedPid)
-  return runtime.state === 'idle'
-    ? { blocked: false }
-    : { blocked: true, readResult }
+  const inspection = await inspectThreadWriter(appServer, runtimeProbe, excludedPid, threadId)
+  if (inspection.state === 'idle') return { blocked: false }
+  if (inspection.state === 'unmaterialized' && inspection.error) throw inspection.error
+  return { blocked: true, readResult: inspection.readResult }
 }
 
 export function trimThreadTurnsInRpcResult(
@@ -2789,14 +2814,17 @@ export async function callRpcWithArchiveRecovery(
       : result
   } catch (error) {
     if (method === 'turn/start' && threadId && isThreadNotFoundError(error)) {
-      if (runtimeProbe && options.locallyCreatedFirstTurn !== true) {
-        const guard = await guardThreadResumeAgainstExternalWriter(
+      if (runtimeProbe) {
+        const inspection = await inspectThreadWriter(
           appServer,
           runtimeProbe,
           excludedPid,
           threadId,
         )
-        if (guard.blocked) {
+        if (
+          inspection.state !== 'idle'
+          && !(inspection.state === 'unmaterialized' && options.locallyCreatedFirstTurn === true)
+        ) {
           throw new Error('Cannot resume a task owned by another app-server process.')
         }
       }
@@ -8726,14 +8754,17 @@ export function createCodexBridgeMiddleware(options: {
           const isPendingFirstTurn = body.method === 'turn/start'
             && requestThreadId.length > 0
             && hasPendingFirstTurn(requestThreadId)
-          if (body.method === 'turn/start' && requestThreadId && !isPendingFirstTurn) {
-            const guard = await guardThreadResumeAgainstExternalWriter(
+          if (body.method === 'turn/start' && requestThreadId) {
+            const inspection = await inspectThreadWriter(
               appServer,
               runtimeProbe,
               appServer.getPid(),
               requestThreadId,
             )
-            if (guard.blocked) {
+            if (
+              inspection.state !== 'idle'
+              && !(inspection.state === 'unmaterialized' && isPendingFirstTurn)
+            ) {
               throw new Error('Cannot start a turn because task writer ownership is not idle.')
             }
           }
