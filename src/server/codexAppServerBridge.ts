@@ -9132,7 +9132,7 @@ export function createCodexBridgeMiddleware(options: {
           const cached = isExternalInProgress
             ? null
             : appServer.getCachedLiveState(threadId, rawTurns.length, sessionSize)
-          if (cached) {
+          if (cached && asRecord(cached)?.isInProgress === false) {
             setJson(res, 200, cached)
             return
           }

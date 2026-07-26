@@ -46,8 +46,7 @@ export function deriveConversationFooterState(
     }
   }
 
-  if (input.externalLiveAuthority === 'writer-snapshot') return null
-  if (input.externalLiveAuthority === 'missing') return null
+  if (input.externalLiveAuthority) return null
 
   let latestPlan: readonly UiPlanStep[] = []
   const fileChangesByPath = new Map<string, UiFileChange>()

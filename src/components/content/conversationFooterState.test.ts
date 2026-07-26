@@ -166,6 +166,26 @@ describe('deriveConversationFooterState', () => {
     })).toBeNull()
   })
 
+  it('suppresses stale message-derived footer for any external non-authoritative authority', () => {
+    for (const authority of ['local-stream', 'persisted'] as const) {
+      expect(deriveConversationFooterState({
+        messages: [
+          planMessage('turn-1', [
+            { step: 'old 1', status: 'completed' },
+            { step: 'old 2', status: 'inProgress' },
+            { step: 'old 3', status: 'pending' },
+            { step: 'old 4', status: 'pending' },
+            { step: 'old 5', status: 'pending' },
+          ]),
+        ],
+        turnId: 'turn-1',
+        isTurnInProgress: true,
+        externalLiveAuthority: authority,
+        authoritativeFooter: null,
+      })).toBeNull()
+    }
+  })
+
   it('combines the current plan and file changes using desktop progress rules', () => {
     const result = deriveConversationFooterState({
       messages: [
