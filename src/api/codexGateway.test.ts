@@ -484,12 +484,18 @@ describe('getThreadDetail', () => {
     }))
 
     await expect(getExternalThreadLiveSnapshot('external-thread', controller.signal)).resolves.toMatchObject({
+      isLiveProjection: true,
       ownership: 'external',
       activeTurnId: 'turn-external',
       inProgress: true,
       hasMoreOlder: true,
       turnIndexByTurnId: { 'turn-external': 8 },
-      messages: [expect.objectContaining({ id: 'agent-live', text: 'live output' })],
+      messages: [expect.objectContaining({
+        id: 'agent-live',
+        text: 'live output',
+        turnId: 'turn-external',
+        turnIndex: 8,
+      })],
     })
     expect(requestUrl).toBe('/codex-api/thread-live-state?threadId=external-thread')
     expect(requestSignal).toBe(controller.signal)

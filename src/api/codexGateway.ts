@@ -960,6 +960,7 @@ async function getThreadDetailV2(
   threadId: string,
   signal?: AbortSignal,
 ): Promise<{
+  isLiveProjection?: boolean
   model: string
   modelProvider: string
   messages: UiMessage[]
@@ -994,6 +995,7 @@ async function getExternalThreadLiveStateSnapshotV2(
   threadId: string,
   signal?: AbortSignal,
 ): Promise<{
+  isLiveProjection: true
   model: string
   modelProvider: string
   messages: UiMessage[]
@@ -1029,6 +1031,7 @@ async function getExternalThreadLiveStateSnapshotV2(
   const normalized = normalizeThreadMessagesV2(result, threadTurnStartIndex)
   const runtime = readThreadDetailRuntime(result)
   return {
+    isLiveProjection: true,
     model: normalizeThreadModelFromPayload(payload),
     modelProvider: normalizeThreadModelProviderFromPayload(payload),
     messages: normalized,
@@ -1110,6 +1113,7 @@ export async function getThreadSummary(threadId: string): Promise<UiThread> {
 }
 
 export async function getThreadDetail(threadId: string, signal?: AbortSignal): Promise<{
+  isLiveProjection?: boolean
   model: string
   modelProvider: string
   messages: UiMessage[]
@@ -1130,6 +1134,7 @@ export async function getThreadDetail(threadId: string, signal?: AbortSignal): P
 }
 
 export async function getExternalThreadLiveSnapshot(threadId: string, signal?: AbortSignal): Promise<{
+  isLiveProjection: true
   model: string
   modelProvider: string
   messages: UiMessage[]

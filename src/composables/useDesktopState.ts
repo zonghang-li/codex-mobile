@@ -772,6 +772,38 @@ function mergeMessages(
   return areMessageArraysEqual(previous, merged) ? previous : merged
 }
 
+function mergeLiveProjectionMessages(
+  previous: UiMessage[],
+  incoming: UiMessage[],
+): UiMessage[] {
+  const incomingTurnIndexes = new Set(
+    incoming
+      .map((message) => message.turnIndex)
+      .filter((turnIndex): turnIndex is number => (
+        typeof turnIndex === 'number' && Number.isFinite(turnIndex)
+      )),
+  )
+  const incomingTurnIds = new Set(
+    incoming
+      .map((message) => message.turnId)
+      .filter((turnId): turnId is string => typeof turnId === 'string' && turnId.length > 0),
+  )
+  if (incomingTurnIndexes.size === 0 && incomingTurnIds.size === 0) {
+    return mergeMessages(previous, incoming, { preserveMissing: true })
+  }
+
+  const preserved = previous.filter((message) => {
+    if (
+      typeof message.turnIndex === 'number'
+      && incomingTurnIndexes.has(message.turnIndex)
+    ) {
+      return false
+    }
+    return !message.turnId || !incomingTurnIds.has(message.turnId)
+  })
+  return mergeMessages(preserved, incoming, { preserveMissing: true })
+}
+
 function areUiFileChangesEqual(first?: UiFileChange[], second?: UiFileChange[]): boolean {
   if (!first && !second) return true
   if (!first || !second) return false
@@ -5393,6 +5425,7 @@ export function useDesktopState() {
       activeTurnId,
       turnIndexByTurnId,
     } = detail
+    const isLiveProjection = detail.isLiveProjection === true
     const nextMessages = insertTurnSummaryMessages(
       detailMessages,
       mergeTurnSummariesWithPersistedDurations(threadId, completionSummaries),
@@ -5432,12 +5465,19 @@ export function useDesktopState() {
       [threadId]: detail.hasMoreOlder === true,
     }
     markThreadMessagesPersisted(threadId, nextMessages)
-    replaceTurnIndexLookupForThread(threadId, turnIndexByTurnId)
+    replaceTurnIndexLookupForThread(threadId, isLiveProjection
+      ? {
+          ...(turnIndexByTurnIdByThreadId.value[threadId] ?? {}),
+          ...turnIndexByTurnId,
+        }
+      : turnIndexByTurnId)
     rebindLiveFileChangeTurnIndices(threadId)
     const previousPersisted = persistedMessagesByThreadId.value[threadId] ?? []
-    const mergedMessages = mergeMessages(previousPersisted, nextMessages, {
-      preserveMissing: options.preserveMissing || hasOptimisticUserMessages(previousPersisted),
-    })
+    const mergedMessages = isLiveProjection
+      ? mergeLiveProjectionMessages(previousPersisted, nextMessages)
+      : mergeMessages(previousPersisted, nextMessages, {
+          preserveMissing: options.preserveMissing || hasOptimisticUserMessages(previousPersisted),
+        })
     setPersistedMessagesForThread(threadId, mergedMessages)
 
     const previousLiveAgent = liveAgentMessagesByThreadId.value[threadId] ?? []

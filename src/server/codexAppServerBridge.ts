@@ -241,7 +241,7 @@ const COMPOSIO_CONNECTORS_PAGE_LIMIT_MAX = 1000
 
 const PROVIDER_MODELS_FETCH_TIMEOUT_MS = 5_000
 
-const THREAD_RESPONSE_TURN_LIMIT = 10
+const THREAD_RESPONSE_TURN_LIMIT = 5
 const THREAD_TURN_PAGE_READ_CACHE_TTL_MS = 30_000
 const THREAD_METHODS_WITH_TURNS = new Set(['thread/read', 'thread/resume', 'thread/fork', 'thread/rollback'])
 const THREAD_METHODS_WITH_THREAD_SNAPSHOT = new Set([...THREAD_METHODS_WITH_TURNS, 'thread/start'])
@@ -1098,23 +1098,35 @@ async function guardThreadResumeAgainstExternalWriter(
     : { blocked: true, readResult }
 }
 
-function trimThreadTurnsInRpcResult(method: string, result: unknown): unknown {
+export function trimThreadTurnsInRpcResult(
+  method: string,
+  result: unknown,
+  limit = THREAD_RESPONSE_TURN_LIMIT,
+): unknown {
   if (!THREAD_METHODS_WITH_TURNS.has(method)) return result
 
   const record = asRecord(result)
   const thread = asRecord(record?.thread)
   const turns = Array.isArray(thread?.turns) ? thread.turns : null
-  if (!record || !thread || !turns || turns.length <= THREAD_RESPONSE_TURN_LIMIT) return result
-  const startTurnIndex = Math.max(0, turns.length - THREAD_RESPONSE_TURN_LIMIT)
+  if (!record || !thread || !turns || turns.length <= limit) return result
+  const existingStartTurnIndex = Math.max(0, Math.floor(
+    typeof record.threadTurnStartIndex === 'number' ? record.threadTurnStartIndex : 0,
+  ))
+  const relativeStartTurnIndex = Math.max(0, turns.length - limit)
+  const startTurnIndex = existingStartTurnIndex + relativeStartTurnIndex
 
   return {
     ...record,
     threadTurnStartIndex: startTurnIndex,
     thread: {
       ...thread,
-      turns: turns.slice(startTurnIndex),
+      turns: turns.slice(relativeStartTurnIndex),
     },
   }
+}
+
+export function trimLiveThreadTurnsInRpcResult(result: unknown): unknown {
+  return trimThreadTurnsInRpcResult('thread/read', result, 1)
 }
 
 function getErrorMessage(payload: unknown, fallback: string): string {
@@ -8582,7 +8594,7 @@ export function createCodexBridgeMiddleware(options: {
             threadId,
             includeTurns: true,
           })
-          const trimmedThreadReadResult = trimThreadTurnsInRpcResult('thread/read', rawThreadReadResult)
+          const trimmedThreadReadResult = trimLiveThreadTurnsInRpcResult(rawThreadReadResult)
           const threadReadResult = mergeStreamTurnErrorsIntoThreadResult(appServer, trimmedThreadReadResult)
           const sanitized = await sanitizeThreadTurnsInlinePayloads('thread/read', threadReadResult)
           appServer.storeThreadReadSnapshot(threadId, sanitized)

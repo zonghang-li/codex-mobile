@@ -3,6 +3,8 @@ import {
   applySessionSkillEnrichmentForRpc,
   prepareRpcProxyRequest,
   shouldStoreThreadReadSnapshotForRpc,
+  trimLiveThreadTurnsInRpcResult,
+  trimThreadTurnsInRpcResult,
 } from './codexAppServerBridge'
 
 describe('external live snapshot RPC preparation', () => {
@@ -58,5 +60,49 @@ describe('external live snapshot RPC preparation', () => {
     expect(shouldStoreThreadReadSnapshotForRpc('thread/read', true)).toBe(false)
     expect(shouldStoreThreadReadSnapshotForRpc('thread/read', false)).toBe(true)
     expect(shouldStoreThreadReadSnapshotForRpc('thread/start', false)).toBe(true)
+  })
+
+  it('limits an initial thread detail response to the newest five turns', () => {
+    const turns = Array.from({ length: 12 }, (_unused, index) => ({
+      id: `turn-${index}`,
+      status: 'completed',
+      items: [],
+    }))
+    const result = trimThreadTurnsInRpcResult('thread/read', {
+      thread: {
+        id: 'thread-windowed',
+        turns,
+      },
+    }) as { threadTurnStartIndex: number; thread: { turns: Array<{ id: string }> } }
+
+    expect(result.threadTurnStartIndex).toBe(7)
+    expect(result.thread.turns.map((turn) => turn.id)).toEqual([
+      'turn-7',
+      'turn-8',
+      'turn-9',
+      'turn-10',
+      'turn-11',
+    ])
+  })
+
+  it('projects a live snapshot to only the newest absolute turn', () => {
+    const turns = Array.from({ length: 12 }, (_unused, index) => ({
+      id: `turn-${index}`,
+      status: index === 11 ? 'inProgress' : 'completed',
+      items: [{
+        id: `item-${index}`,
+        type: 'agentMessage',
+        text: `message ${index}`,
+      }],
+    }))
+    const result = trimLiveThreadTurnsInRpcResult({
+      thread: {
+        id: 'thread-live',
+        turns,
+      },
+    }) as { threadTurnStartIndex: number; thread: { turns: Array<{ id: string }> } }
+
+    expect(result.threadTurnStartIndex).toBe(11)
+    expect(result.thread.turns.map((turn) => turn.id)).toEqual(['turn-11'])
   })
 })

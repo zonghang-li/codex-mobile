@@ -3173,6 +3173,95 @@ describe('external runtime ownership', () => {
     ]))
   })
 
+  it('replaces only the matching absolute turn from a one-turn live projection', async () => {
+    const state = await setupBackgroundRuntimeState()
+    gatewayMocks.getThreadDetail.mockResolvedValue({
+      ...externalDetail('turn-2'),
+      hasMoreOlder: true,
+      turnIndexByTurnId: {
+        'turn-0': 0,
+        'turn-1': 1,
+        'turn-2': 2,
+      },
+      messages: [
+        {
+          id: 'older-user',
+          role: 'user',
+          text: 'older prompt',
+          messageType: 'userMessage',
+          turnId: 'turn-0',
+          turnIndex: 0,
+        },
+        {
+          id: 'older-agent',
+          role: 'assistant',
+          text: 'older answer',
+          messageType: 'agentMessage',
+          turnId: 'turn-1',
+          turnIndex: 1,
+        },
+        {
+          id: 'stale-current-agent',
+          role: 'assistant',
+          text: 'stale current answer',
+          messageType: 'agentMessage',
+          turnId: 'turn-2',
+          turnIndex: 2,
+        },
+      ],
+    })
+    gatewayMocks.getExternalThreadLiveSnapshot.mockResolvedValue({
+      ...externalDetail('turn-2'),
+      isLiveProjection: true,
+      hasMoreOlder: true,
+      turnIndexByTurnId: { 'turn-2': 2 },
+      messages: [{
+        id: 'fresh-current-agent',
+        role: 'assistant',
+        text: 'fresh current answer',
+        messageType: 'agentMessage',
+        turnId: 'turn-2',
+        turnIndex: 2,
+      }],
+    })
+
+    await state.loadMessages('thread-selected')
+    state.startPolling()
+    pollingCleanups.push(() => state.stopPolling())
+    await vi.advanceTimersByTimeAsync(1_000)
+    await flushMicrotasks()
+
+    expect(state.messages.value.map((message) => message.id)).toEqual([
+      'older-user',
+      'older-agent',
+      'fresh-current-agent',
+    ])
+  })
+
+  it('pauses selected live projection polling while hidden and resumes immediately when visible', async () => {
+    const state = await setupBackgroundRuntimeState()
+    Object.assign(document, { visibilityState: 'hidden' })
+    gatewayMocks.getThreadDetail.mockResolvedValue(externalDetail('turn-external'))
+    gatewayMocks.getExternalThreadLiveSnapshot.mockResolvedValue(externalDetail('turn-external'))
+
+    await state.loadMessages('thread-selected')
+    state.startPolling()
+    pollingCleanups.push(() => state.stopPolling())
+    await vi.advanceTimersByTimeAsync(10_000)
+    expect(gatewayMocks.getExternalThreadLiveSnapshot).not.toHaveBeenCalled()
+
+    const visibilityHandler = vi.mocked(document.addEventListener).mock.calls.find(
+      ([eventName]) => eventName === 'visibilitychange',
+    )?.[1] as EventListener
+    expect(visibilityHandler).toBeDefined()
+    Object.assign(document, { visibilityState: 'visible' })
+    visibilityHandler(new Event('visibilitychange'))
+    await vi.advanceTimersByTimeAsync(0)
+    await flushMicrotasks()
+
+    expect(gatewayMocks.getExternalThreadLiveSnapshot).toHaveBeenCalledTimes(1)
+  })
+
   it('does not establish external ownership from inconclusive detail while idle', async () => {
     const { state } = await setupExternalRuntimeState()
     gatewayMocks.getThreadDetail.mockResolvedValue({

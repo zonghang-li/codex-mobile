@@ -508,7 +508,7 @@ describe('GET /codex-api/thread-live-state external runtime parity', () => {
     expect(rpc).toHaveBeenCalledTimes(1)
   })
 
-  it('keeps live-state turn windows aligned with normal thread/read trimming', async () => {
+  it('projects live state to the newest absolute turn', async () => {
     const middleware = createCodexBridgeMiddleware()
     const shared = sharedBridgeForTest() as ReturnType<typeof sharedBridgeForTest> & {
       appServer: ReturnType<typeof sharedBridgeForTest>['appServer'] & {
@@ -540,19 +540,10 @@ describe('GET /codex-api/thread-live-state external runtime parity', () => {
     expect(response.status).toBe(200)
     await expect(response.json()).resolves.toMatchObject({
       threadId: 'thread-windowed',
-      threadTurnStartIndex: 2,
+      threadTurnStartIndex: 11,
       hasMoreOlder: true,
       conversationState: {
         turns: [
-          expect.objectContaining({ id: 'turn-2' }),
-          expect.objectContaining({ id: 'turn-3' }),
-          expect.objectContaining({ id: 'turn-4' }),
-          expect.objectContaining({ id: 'turn-5' }),
-          expect.objectContaining({ id: 'turn-6' }),
-          expect.objectContaining({ id: 'turn-7' }),
-          expect.objectContaining({ id: 'turn-8' }),
-          expect.objectContaining({ id: 'turn-9' }),
-          expect.objectContaining({ id: 'turn-10' }),
           expect.objectContaining({ id: 'turn-11' }),
         ],
       },
