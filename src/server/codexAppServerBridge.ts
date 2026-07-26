@@ -1087,15 +1087,15 @@ async function guardThreadResumeAgainstExternalWriter(
   const record = asRecord(readResult)
   const thread = asRecord(record?.thread)
   const rolloutPath = readNonEmptyString(thread?.path)
-  if (!thread || !rolloutPath || readThreadResultInProgress(thread)) {
-    return { blocked: false }
+  if (!thread || !rolloutPath) {
+    return { blocked: true, readResult }
   }
 
   runtimeProbe.registerThread(threadId, rolloutPath)
   const runtime = await runtimeProbe.inspect(threadId, excludedPid)
-  return runtime.state === 'running'
-    ? { blocked: true, readResult }
-    : { blocked: false }
+  return runtime.state === 'idle'
+    ? { blocked: false }
+    : { blocked: true, readResult }
 }
 
 function trimThreadTurnsInRpcResult(method: string, result: unknown): unknown {

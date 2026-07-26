@@ -227,6 +227,83 @@ describe('POST /codex-api/rpc guarded resume', () => {
       },
     })
   })
+
+  it('degrades an active thread/resume to thread/read when another process owns the writer', async () => {
+    const middleware = createCodexBridgeMiddleware()
+    const shared = sharedBridgeForTest()
+    vi.spyOn(shared.appServer, 'getPid').mockReturnValue(4242)
+    const inspect = vi.spyOn(shared.runtimeProbe, 'inspect').mockResolvedValue({
+      state: 'running',
+      turnId: 'turn-external',
+      interruptible: false,
+      source: 'external-session-writer',
+    })
+    const rpc = vi.spyOn(shared.appServer as unknown as {
+      rpc(method: string, params: unknown): Promise<unknown>
+    }, 'rpc').mockResolvedValue({
+      thread: {
+        id: 'thread-active-external',
+        path: '/home/user/.codex/sessions/rollout-thread-active-external.jsonl',
+        status: { type: 'active' },
+        turns: [{ id: 'turn-external', status: 'inProgress' }],
+      },
+    })
+    const port = await listenWithMiddleware(middleware)
+
+    const response = await fetch(`http://127.0.0.1:${port}/codex-api/rpc`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        method: 'thread/resume',
+        params: { threadId: 'thread-active-external' },
+      }),
+    })
+
+    expect(response.status).toBe(200)
+    expect(rpc).toHaveBeenCalledTimes(1)
+    expect(rpc).toHaveBeenCalledWith('thread/read', {
+      threadId: 'thread-active-external',
+      includeTurns: true,
+    })
+    expect(inspect).toHaveBeenCalledWith('thread-active-external', 4242)
+  })
+
+  it('does not resume when writer ownership is unknown', async () => {
+    const middleware = createCodexBridgeMiddleware()
+    const shared = sharedBridgeForTest()
+    vi.spyOn(shared.appServer, 'getPid').mockReturnValue(4242)
+    const inspect = vi.spyOn(shared.runtimeProbe, 'inspect').mockResolvedValue({
+      state: 'unknown',
+    })
+    const rpc = vi.spyOn(shared.appServer as unknown as {
+      rpc(method: string, params: unknown): Promise<unknown>
+    }, 'rpc').mockResolvedValue({
+      thread: {
+        id: 'thread-unknown-writer',
+        path: '/home/user/.codex/sessions/rollout-thread-unknown-writer.jsonl',
+        status: { type: 'idle' },
+        turns: [],
+      },
+    })
+    const port = await listenWithMiddleware(middleware)
+
+    const response = await fetch(`http://127.0.0.1:${port}/codex-api/rpc`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        method: 'thread/resume',
+        params: { threadId: 'thread-unknown-writer' },
+      }),
+    })
+
+    expect(response.status).toBe(200)
+    expect(rpc).toHaveBeenCalledTimes(1)
+    expect(rpc).toHaveBeenCalledWith('thread/read', {
+      threadId: 'thread-unknown-writer',
+      includeTurns: true,
+    })
+    expect(inspect).toHaveBeenCalledWith('thread-unknown-writer', 4242)
+  })
 })
 
 describe('dynamic tool server requests', () => {
