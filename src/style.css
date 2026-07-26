@@ -2095,6 +2095,37 @@ a.codex-directive-title {
   @apply text-zinc-300 hover:bg-zinc-800;
 }
 
+:root.dark .conversation-run-footer-pill,
+:root.dark .conversation-goal-strip {
+  @apply border-zinc-700 bg-zinc-800/95 text-zinc-300 shadow-lg shadow-black/20;
+}
+
+:root.dark .conversation-goal-summary,
+:root.dark .conversation-goal-objective,
+:root.dark .conversation-goal-duration {
+  @apply text-zinc-400;
+}
+
+:root.dark .conversation-goal-status {
+  @apply text-zinc-100;
+}
+
+:root.dark .conversation-goal-action {
+  @apply text-zinc-400 hover:bg-zinc-700 hover:text-zinc-100;
+}
+
+:root.dark .conversation-goal-details {
+  @apply border-zinc-700 text-zinc-400;
+}
+
+:root.dark .conversation-goal-editor {
+  @apply border-zinc-600 bg-zinc-900 text-zinc-100 focus:border-zinc-400;
+}
+
+:root.dark .conversation-goal-editor-actions button {
+  @apply border-zinc-600 bg-zinc-800 text-zinc-200 hover:bg-zinc-700;
+}
+
 @media (max-width: 768px) {
   .mobile-theme-toggle {
     display: inline-flex;
@@ -2116,5 +2147,11 @@ a.codex-directive-title {
   .rename-thread-input,
   .request-input {
     font-size: 16px !important;
+  }
+}
+
+@media (max-width: 360px) {
+  .mobile-theme-toggle {
+    display: none;
   }
 }

@@ -6,13 +6,16 @@ import {
   getExternalThreadLiveSnapshot,
   getThreadDetail,
   getThreadGroupsPage,
+  getThreadGoal,
   getThreadRuntimeState,
   getThreadRuntimeStates,
   listDirectoryComposioConnectors,
   readThreadDetailRuntime,
   resumeThread,
+  setThreadGoal,
   startThread,
   startThreadTurn,
+  clearThreadGoal,
 } from './codexGateway'
 
 function runtimePayload(thread: Record<string, unknown>): ThreadReadResponse {
@@ -158,6 +161,92 @@ describe('startThread runtime policy payloads', () => {
         sandbox: 'danger-full-access',
       },
     })
+  })
+})
+
+describe('thread goal RPCs', () => {
+  afterEach(() => {
+    vi.unstubAllGlobals()
+  })
+
+  it('gets, sets, and clears the authoritative Codex thread goal', async () => {
+    const requests: Array<{ method: string, params: Record<string, unknown> }> = []
+    const goal = {
+      objective: 'Finish desktop parity',
+      status: 'active',
+      updatedAt: 1_753_500_000,
+      timeUsedSeconds: 45,
+      tokensUsed: 1_200,
+      tokenBudget: 10_000,
+    }
+    vi.stubGlobal('fetch', vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+      const body = typeof init?.body === 'string'
+        ? JSON.parse(init.body) as { method: string, params: Record<string, unknown> }
+        : { method: '', params: {} }
+      requests.push(body)
+      return new Response(JSON.stringify({
+        result: body.method === 'thread/goal/clear' ? {} : { goal },
+      }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      })
+    }))
+
+    await expect(getThreadGoal('thread-1')).resolves.toEqual(goal)
+    await expect(setThreadGoal({
+      threadId: 'thread-1',
+      objective: 'Finish desktop parity',
+      status: 'active',
+    })).resolves.toEqual(goal)
+    await expect(clearThreadGoal('thread-1')).resolves.toBeUndefined()
+
+    expect(requests).toEqual([
+      { method: 'thread/goal/get', params: { threadId: 'thread-1' } },
+      {
+        method: 'thread/goal/set',
+        params: {
+          threadId: 'thread-1',
+          objective: 'Finish desktop parity',
+          status: 'active',
+        },
+      },
+      { method: 'thread/goal/clear', params: { threadId: 'thread-1' } },
+    ])
+  })
+
+  it('rejects malformed set responses and accepts every desktop goal status', async () => {
+    const statuses = [
+      'active',
+      'paused',
+      'blocked',
+      'usageLimited',
+      'budgetLimited',
+      'complete',
+    ]
+    let responseGoal: Record<string, unknown> | null = null
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({
+      result: { goal: responseGoal },
+    }), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' },
+    })))
+
+    for (const status of statuses) {
+      responseGoal = {
+        objective: 'Goal',
+        status,
+        updatedAt: 100,
+        timeUsedSeconds: 2,
+        tokensUsed: 3,
+        tokenBudget: null,
+      }
+      await expect(setThreadGoal({ threadId: 'thread-1', status: status as never }))
+        .resolves.toMatchObject({ status })
+    }
+
+    responseGoal = { objective: 'Goal', status: 'unknown' }
+    await expect(setThreadGoal({ threadId: 'thread-1', status: 'active' }))
+      .rejects.toThrow('Invalid thread goal response')
   })
 })
 
@@ -404,6 +493,43 @@ describe('getThreadDetail', () => {
     })
     expect(requestUrl).toBe('/codex-api/thread-live-state?threadId=external-thread')
     expect(requestSignal).toBe(controller.signal)
+  })
+
+  it('returns terminal turn summaries for persisted completion folding', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({
+      result: {
+        thread: {
+          id: 'thread-1',
+          turns: [
+            {
+              id: 'turn-completed',
+              status: 'completed',
+              items: [],
+            },
+            {
+              id: 'turn-stopped',
+              status: 'interrupted',
+              items: [],
+            },
+            {
+              id: 'turn-running',
+              status: 'inProgress',
+              items: [],
+            },
+          ],
+        },
+      },
+    }), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' },
+    })))
+
+    await expect(getThreadDetail('thread-1')).resolves.toMatchObject({
+      completionSummaries: [
+        { turnId: 'turn-completed', status: 'completed', durationMs: null },
+        { turnId: 'turn-stopped', status: 'interrupted', durationMs: null },
+      ],
+    })
   })
 
   it('reads modelProvider from nested thread payloads returned by thread/read', async () => {

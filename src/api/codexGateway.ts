@@ -40,6 +40,8 @@ import type {
   UiMessage,
   UiProjectGroup,
   UiThread,
+  UiThreadGoal,
+  UiThreadGoalStatus,
   UiReviewAction,
   UiReviewActionLevel,
   UiReviewFile,
@@ -448,6 +450,44 @@ function readStringArray(value: unknown): string[] {
   return Array.isArray(value) ? value.filter((item): item is string => typeof item === 'string' && item.length > 0) : []
 }
 
+const THREAD_GOAL_STATUSES = new Set<UiThreadGoalStatus>([
+  'active',
+  'paused',
+  'blocked',
+  'usageLimited',
+  'budgetLimited',
+  'complete',
+])
+
+function normalizeThreadGoal(value: unknown): UiThreadGoal | null {
+  const record = asRecord(value)
+  if (!record) return null
+  const objective = typeof record.objective === 'string' ? record.objective : ''
+  const status = readString(record.status)
+  const updatedAt = readNumber(record.updatedAt)
+  const timeUsedSeconds = readNumber(record.timeUsedSeconds)
+  const tokensUsed = readNumber(record.tokensUsed)
+  const tokenBudget = record.tokenBudget === null ? null : readNumber(record.tokenBudget)
+  if (
+    !status
+    || !THREAD_GOAL_STATUSES.has(status as UiThreadGoalStatus)
+    || updatedAt === null
+    || timeUsedSeconds === null
+    || tokensUsed === null
+    || (record.tokenBudget !== null && tokenBudget === null)
+  ) {
+    return null
+  }
+  return {
+    objective,
+    status: status as UiThreadGoalStatus,
+    updatedAt,
+    timeUsedSeconds,
+    tokensUsed,
+    tokenBudget,
+  }
+}
+
 function hasOnlyKeys(record: Record<string, unknown>, keys: string[]): boolean {
   const recordKeys = Object.keys(record)
   return recordKeys.length === keys.length && keys.every((key) => recordKeys.includes(key))
@@ -853,13 +893,35 @@ export type ThreadGroupsPage = {
   nextCursor: string | null
 }
 
+export type ThreadCompletionSummary = {
+  turnId: string
+  status: string
+  durationMs: number | null
+}
+
 export type ThreadTurnPage = {
   messages: UiMessage[]
+  completionSummaries: ThreadCompletionSummary[]
   inProgress: boolean
   activeTurnId: string
   hasMoreOlder: boolean
   startTurnIndex: number
   turnIndexByTurnId: ThreadTurnIndexById
+}
+
+function readThreadCompletionSummaries(payload: ThreadReadResponse): ThreadCompletionSummary[] {
+  const turns = Array.isArray(payload.thread.turns) ? payload.thread.turns : []
+  return turns.flatMap((turn) => {
+    const rawTurn = asRecord(turn)
+    const turnId = (readString(rawTurn?.id) ?? '').trim()
+    const status = (readString(rawTurn?.status) ?? '').trim()
+    if (!turnId || !status || status === 'inProgress') return []
+    const rawDurationMs =
+      readNumber(rawTurn?.durationMs)
+      ?? readNumber(rawTurn?.duration_ms)
+    const durationMs = rawDurationMs === null ? null : Math.max(0, rawDurationMs)
+    return [{ turnId, status, durationMs }]
+  })
 }
 
 async function getThreadGroupsPageV2(cursor: string | null, limit: number): Promise<ThreadGroupsPage> {
@@ -901,6 +963,7 @@ async function getThreadDetailV2(
   model: string
   modelProvider: string
   messages: UiMessage[]
+  completionSummaries: ThreadCompletionSummary[]
   inProgress: boolean
   activeTurnId: string
   hasMoreOlder: boolean
@@ -920,6 +983,7 @@ async function getThreadDetailV2(
     model: normalizeThreadModelFromPayload(payload),
     modelProvider: normalizeThreadModelProviderFromPayload(payload),
     messages: normalized,
+    completionSummaries: readThreadCompletionSummaries(payload),
     ...runtime,
     hasMoreOlder: startTurnIndex > 0,
     turnIndexByTurnId: buildTurnIndexByTurnId(payload, startTurnIndex),
@@ -933,6 +997,7 @@ async function getExternalThreadLiveStateSnapshotV2(
   model: string
   modelProvider: string
   messages: UiMessage[]
+  completionSummaries: ThreadCompletionSummary[]
   inProgress: boolean
   activeTurnId: string
   hasMoreOlder: boolean
@@ -967,6 +1032,7 @@ async function getExternalThreadLiveStateSnapshotV2(
     model: normalizeThreadModelFromPayload(payload),
     modelProvider: normalizeThreadModelProviderFromPayload(payload),
     messages: normalized,
+    completionSummaries: readThreadCompletionSummaries(result),
     ...runtime,
     hasMoreOlder: payload?.hasMoreOlder === true || threadTurnStartIndex > 0,
     turnIndexByTurnId: buildTurnIndexByTurnId(result, threadTurnStartIndex),
@@ -995,6 +1061,7 @@ async function getOlderThreadMessagesV2(threadId: string, beforeTurnId: string, 
 
   return {
     messages: normalizeThreadMessagesV2(payload.result, startTurnIndex),
+    completionSummaries: readThreadCompletionSummaries(payload.result),
     inProgress: readThreadInProgressFromResponse(payload.result),
     activeTurnId: readActiveTurnIdFromResponse(payload.result),
     hasMoreOlder: payload.hasMoreOlder === true,
@@ -1046,6 +1113,7 @@ export async function getThreadDetail(threadId: string, signal?: AbortSignal): P
   model: string
   modelProvider: string
   messages: UiMessage[]
+  completionSummaries: ThreadCompletionSummary[]
   inProgress: boolean
   activeTurnId: string
   hasMoreOlder: boolean
@@ -1065,6 +1133,7 @@ export async function getExternalThreadLiveSnapshot(threadId: string, signal?: A
   model: string
   modelProvider: string
   messages: UiMessage[]
+  completionSummaries: ThreadCompletionSummary[]
   inProgress: boolean
   activeTurnId: string
   hasMoreOlder: boolean
@@ -1709,6 +1778,7 @@ export type ResumedThread = {
   model: string
   modelProvider: string
   messages: UiMessage[]
+  completionSummaries: ThreadCompletionSummary[]
   inProgress: boolean
   activeTurnId: string
   hasMoreOlder: boolean
@@ -1734,6 +1804,7 @@ export async function resumeThread(threadId: string): Promise<ResumedThread> {
       model: normalizeThreadModelFromPayload(payload),
       modelProvider: normalizeThreadModelProviderFromPayload(payload),
       messages,
+      completionSummaries: readThreadCompletionSummaries(payload),
       ...runtime,
       hasMoreOlder: startTurnIndex > 0,
       turnIndexByTurnId: buildTurnIndexByTurnId(payload, startTurnIndex),
@@ -1763,6 +1834,35 @@ export async function archiveThread(threadId: string): Promise<void> {
 
 export async function renameThread(threadId: string, threadName: string): Promise<void> {
   await callRpc('thread/name/set', { threadId, name: threadName })
+}
+
+export async function getThreadGoal(threadId: string): Promise<UiThreadGoal | null> {
+  const payload = await callRpc<unknown>('thread/goal/get', { threadId })
+  const record = asRecord(payload)
+  if (record?.goal === null || record?.goal === undefined) return null
+  const goal = normalizeThreadGoal(record.goal)
+  if (!goal) throw new Error('Invalid thread goal response')
+  return goal
+}
+
+export async function setThreadGoal(input: {
+  threadId: string
+  objective?: string
+  status: UiThreadGoalStatus
+}): Promise<UiThreadGoal> {
+  const params: Record<string, unknown> = {
+    threadId: input.threadId,
+    status: input.status,
+  }
+  if (input.objective !== undefined) params.objective = input.objective
+  const payload = await callRpc<unknown>('thread/goal/set', params)
+  const goal = normalizeThreadGoal(asRecord(payload)?.goal)
+  if (!goal) throw new Error('Invalid thread goal response')
+  return goal
+}
+
+export async function clearThreadGoal(threadId: string): Promise<void> {
+  await callRpc('thread/goal/clear', { threadId })
 }
 
 export async function rollbackThread(threadId: string, numTurns: number): Promise<UiMessage[]> {

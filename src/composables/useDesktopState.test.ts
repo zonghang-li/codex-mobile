@@ -26,6 +26,7 @@ const gatewayMocks = vi.hoisted(() => ({
   getExternalThreadLiveSnapshot: vi.fn(),
   getThreadDetail: vi.fn(),
   getThreadGroupsPage: vi.fn(),
+  getThreadGoal: vi.fn(),
   getThreadRuntimeState: vi.fn(),
   getThreadRuntimeStates: vi.fn(),
   getThreadQueueState: vi.fn(),
@@ -41,7 +42,9 @@ const gatewayMocks = vi.hoisted(() => ({
   rollbackThread: vi.fn(),
   setCodexSpeedMode: vi.fn(),
   setThreadQueueState: vi.fn(),
+  setThreadGoal: vi.fn(),
   setWorkspaceRootsState: vi.fn(),
+  clearThreadGoal: vi.fn(),
   startThread: vi.fn(),
   startThreadTurn: vi.fn(),
   subscribeCodexNotifications: vi.fn(),
@@ -295,10 +298,153 @@ beforeEach(() => {
     (threadId: string, signal?: AbortSignal) => gatewayMocks.getThreadDetail(threadId, signal),
   )
   gatewayMocks.getThreadQueueState.mockResolvedValue({})
+  gatewayMocks.getThreadGoal.mockResolvedValue(null)
   gatewayMocks.getThreadRuntimeStates.mockResolvedValue({})
   gatewayMocks.setThreadQueueState.mockResolvedValue(undefined)
   gatewayMocks.getThreadTitleCache.mockResolvedValue({ titles: {} })
   gatewayMocks.getWorkspaceRootsState.mockRejectedValue(new Error('no workspace roots state'))
+})
+
+describe('thread goal state', () => {
+  const activeGoal = {
+    objective: 'Match the Codex conversation page',
+    status: 'active' as const,
+    updatedAt: 1_785_000_000,
+    timeUsedSeconds: 75,
+    tokensUsed: 1200,
+    tokenBudget: 8000,
+  }
+
+  it('loads the selected thread goal without coupling it to thread detail errors', async () => {
+    installTestWindow()
+    gatewayMocks.resumeThread.mockResolvedValue(idleDetail())
+    gatewayMocks.getThreadGoal.mockResolvedValue(activeGoal)
+
+    const state = useDesktopState()
+    state.primeSelectedThread('thread-1')
+    await state.loadMessages('thread-1')
+    await flushMicrotasks()
+
+    expect(gatewayMocks.getThreadGoal).toHaveBeenCalledWith('thread-1')
+    expect(state.selectedThreadGoal.value).toEqual(activeGoal)
+    expect(state.selectedThreadGoalSupported.value).toBe(true)
+  })
+
+  it('refreshes authoritative goal state after polling reconnects', async () => {
+    installTestWindow()
+    gatewayMocks.resumeThread.mockResolvedValue(idleDetail())
+    gatewayMocks.getThreadDetail.mockResolvedValue(idleDetail())
+    gatewayMocks.getThreadGoal.mockResolvedValueOnce(activeGoal).mockResolvedValueOnce(null)
+
+    const state = useDesktopState()
+    state.primeSelectedThread('thread-1')
+    await state.loadMessages('thread-1')
+    await flushMicrotasks()
+    expect(state.selectedThreadGoal.value).toEqual(activeGoal)
+
+    state.stopPolling()
+    state.startPolling()
+    await state.loadMessages('thread-1')
+    await flushMicrotasks()
+
+    expect(gatewayMocks.getThreadGoal).toHaveBeenCalledTimes(2)
+    expect(state.selectedThreadGoal.value).toBeNull()
+  })
+
+  it('ignores a stale goal response from the connection that stopped polling', async () => {
+    installTestWindow()
+    gatewayMocks.resumeThread.mockResolvedValue(idleDetail())
+    gatewayMocks.getThreadDetail.mockResolvedValue(idleDetail())
+    const staleGoal = deferred<typeof activeGoal | null>()
+    gatewayMocks.getThreadGoal
+      .mockReturnValueOnce(staleGoal.promise)
+      .mockResolvedValueOnce(null)
+
+    const state = useDesktopState()
+    state.primeSelectedThread('thread-1')
+    await state.loadMessages('thread-1')
+    await flushMicrotasks()
+    expect(gatewayMocks.getThreadGoal).toHaveBeenCalledTimes(1)
+
+    state.stopPolling()
+    state.startPolling()
+    await state.loadMessages('thread-1', { force: true })
+    await flushMicrotasks()
+    expect(gatewayMocks.getThreadGoal).toHaveBeenCalledTimes(2)
+    expect(state.selectedThreadGoal.value).toBeNull()
+
+    staleGoal.resolve(activeGoal)
+    await flushMicrotasks()
+
+    expect(state.selectedThreadGoal.value).toBeNull()
+  })
+
+  it('applies goal update and clear notifications to the matching thread', async () => {
+    const { state, emit } = await setupTurnLifecycleNotificationState('thread-1')
+
+    emit({
+      method: 'thread/goal/updated',
+      params: { threadId: 'thread-1', goal: activeGoal },
+    })
+    expect(state.selectedThreadGoal.value).toEqual(activeGoal)
+    expect(state.selectedThreadGoalSupported.value).toBe(true)
+
+    emit({
+      method: 'thread/goal/cleared',
+      params: { threadId: 'thread-1' },
+    })
+    expect(state.selectedThreadGoal.value).toBeNull()
+    expect(state.selectedThreadGoalSupported.value).toBe(true)
+  })
+
+  it('updates, pauses, resumes, and clears the selected goal through Codex RPCs', async () => {
+    installTestWindow()
+    gatewayMocks.setThreadGoal.mockResolvedValue(activeGoal)
+    gatewayMocks.clearThreadGoal.mockResolvedValue(undefined)
+
+    const state = useDesktopState()
+    state.primeSelectedThread('thread-1')
+
+    await state.updateSelectedThreadGoal({
+      objective: activeGoal.objective,
+      status: 'active',
+    })
+    expect(gatewayMocks.setThreadGoal).toHaveBeenCalledWith({
+      threadId: 'thread-1',
+      objective: activeGoal.objective,
+      status: 'active',
+    })
+    expect(state.selectedThreadGoal.value).toEqual(activeGoal)
+
+    await state.clearSelectedThreadGoal()
+    expect(gatewayMocks.clearThreadGoal).toHaveBeenCalledWith('thread-1')
+    expect(state.selectedThreadGoal.value).toBeNull()
+  })
+
+  it('keeps goal mutation progress scoped to the thread that started it', async () => {
+    installTestWindow()
+    let resolveGoal!: (goal: typeof activeGoal) => void
+    gatewayMocks.setThreadGoal.mockImplementation(() => new Promise((resolve) => {
+      resolveGoal = resolve
+    }))
+
+    const state = useDesktopState()
+    state.primeSelectedThread('thread-1')
+    const updatePromise = state.updateSelectedThreadGoal({
+      objective: activeGoal.objective,
+      status: 'active',
+    })
+
+    expect(state.isUpdatingThreadGoal.value).toBe(true)
+    state.primeSelectedThread('thread-2')
+    expect(state.isUpdatingThreadGoal.value).toBe(false)
+    state.primeSelectedThread('thread-1')
+    expect(state.isUpdatingThreadGoal.value).toBe(true)
+
+    resolveGoal(activeGoal)
+    await updatePromise
+    expect(state.isUpdatingThreadGoal.value).toBe(false)
+  })
 })
 
 afterEach(() => {
@@ -1037,6 +1183,121 @@ describe('turn completion lifecycle', () => {
     emit({ method: 'turn/completed', params: { threadId: 'thread-1', turn: { id: 'turn-a', status: 'interrupted' } } })
     expect(state.selectedThreadRuntimeOwnership.value).toBe('idle')
     expect(state.projectGroups.value[0]?.threads[0]?.inProgress).toBe(false)
+  })
+
+  it('keeps completed boundaries when the next turn starts and labels interrupted turns', async () => {
+    const { state, emit } = await setupTurnLifecycleNotificationState('thread-1')
+
+    emit({ method: 'turn/started', params: { threadId: 'thread-1', turn: { id: 'turn-a' } } })
+    emit({
+      method: 'turn/completed',
+      params: {
+        threadId: 'thread-1',
+        durationMs: 3_000,
+        turn: { id: 'turn-a', status: 'interrupted' },
+      },
+    })
+    expect(state.messages.value).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        id: 'turn-summary:turn-a',
+        text: 'You stopped after 3s',
+        messageType: 'worked',
+      }),
+    ]))
+
+    emit({ method: 'turn/started', params: { threadId: 'thread-1', turn: { id: 'turn-b' } } })
+
+    expect(state.messages.value).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: 'turn-summary:turn-a' }),
+    ]))
+  })
+
+  it('restores all persisted completion boundaries on detail reload', async () => {
+    installTestWindow()
+    gatewayMocks.resumeThread.mockResolvedValue({
+      ...idleDetail(),
+      messages: [
+        { id: 'user-a', role: 'user', text: 'first', turnId: 'turn-a', turnIndex: 0 },
+        { id: 'assistant-a', role: 'assistant', text: 'done', turnId: 'turn-a', turnIndex: 0 },
+        { id: 'user-b', role: 'user', text: 'second', turnId: 'turn-b', turnIndex: 1 },
+      ],
+      completionSummaries: [
+        { turnId: 'turn-a', status: 'completed', durationMs: 12_000 },
+        { turnId: 'turn-b', status: 'interrupted', durationMs: 3_000 },
+      ],
+    })
+
+    const state = useDesktopState()
+    state.primeSelectedThread('thread-1')
+    await state.loadMessages('thread-1')
+
+    expect(state.messages.value.map((message) => message.text)).toEqual([
+      'first',
+      'Worked for 12s',
+      'done',
+      'second',
+      'You stopped after 3s',
+    ])
+  })
+
+  it('keeps an observed completion duration across a browser state reload', async () => {
+    const { state, emit } = await setupTurnLifecycleNotificationState('thread-1')
+
+    emit({ method: 'turn/started', params: { threadId: 'thread-1', turn: { id: 'turn-a' } } })
+    emit({
+      method: 'turn/completed',
+      params: {
+        threadId: 'thread-1',
+        durationMs: 3_000,
+        turn: { id: 'turn-a', status: 'completed' },
+      },
+    })
+    state.stopPolling()
+
+    gatewayMocks.resumeThread.mockResolvedValue({
+      ...idleDetail(),
+      messages: [
+        { id: 'user-a', role: 'user', text: 'first', turnId: 'turn-a', turnIndex: 0 },
+        { id: 'assistant-a', role: 'assistant', text: 'done', turnId: 'turn-a', turnIndex: 0 },
+      ],
+      completionSummaries: [
+        { turnId: 'turn-a', status: 'completed', durationMs: null },
+      ],
+    })
+
+    const restoredState = useDesktopState()
+    restoredState.primeSelectedThread('thread-1')
+    await restoredState.loadMessages('thread-1')
+
+    expect(restoredState.messages.value.map((message) => message.text)).toEqual([
+      'first',
+      'Worked for 3s',
+      'done',
+    ])
+  })
+
+  it('does not invent a sub-second duration when persisted history has no timing metadata', async () => {
+    installTestWindow()
+    gatewayMocks.resumeThread.mockResolvedValue({
+      ...idleDetail(),
+      messages: [
+        { id: 'user-a', role: 'user', text: 'first', turnId: 'turn-a', turnIndex: 0 },
+        { id: 'assistant-a', role: 'assistant', text: 'done', turnId: 'turn-a', turnIndex: 0 },
+      ],
+      completionSummaries: [
+        { turnId: 'turn-a', status: 'completed', durationMs: null },
+      ],
+    })
+
+    const state = useDesktopState()
+    state.primeSelectedThread('thread-1')
+    await state.loadMessages('thread-1')
+
+    expect(state.messages.value.map((message) => message.text)).toEqual([
+      'first',
+      'Worked',
+      'done',
+    ])
   })
 
   it('retains an event-established turn across a lagging idle detail', async () => {
@@ -2826,6 +3087,16 @@ describe('external runtime ownership', () => {
     expect(state.selectedThread.value?.inProgress).toBe(true)
   })
 
+  it('retains the authoritative external turn id for the pinned run footer', async () => {
+    const { state } = await setupExternalRuntimeState()
+    gatewayMocks.resumeThread.mockResolvedValue(externalDetail('turn-external-footer'))
+
+    await state.loadMessages('thread-1')
+
+    expect(state.selectedThreadRuntimeOwnership.value).toBe('external')
+    expect(state.selectedActiveTurnId.value).toBe('turn-external-footer')
+  })
+
   it('does not let an older running detail overwrite a newer idle detail', async () => {
     vi.stubGlobal('document', {
       visibilityState: 'visible',
@@ -3259,6 +3530,30 @@ describe('external runtime ownership', () => {
     expect(gatewayMocks.rollbackThread).toHaveBeenCalledWith('thread-1', 1)
     expect(gatewayMocks.replyToServerRequest).toHaveBeenCalledWith(101, { result: {}, error: undefined })
     expect(replied).toBe(true)
+  })
+
+  it('issues only one RPC when the same pending request is resolved twice concurrently', async () => {
+    const { state, emit } = await setupExternalRuntimeState()
+    const reply = deferred<void>()
+    gatewayMocks.replyToServerRequest.mockReturnValue(reply.promise)
+    emit({
+      method: 'server/request',
+      params: {
+        id: 102,
+        method: 'item/tool/requestUserInput',
+        params: { threadId: 'thread-2', questions: [] },
+      },
+    })
+
+    const first = state.respondToPendingServerRequest({ id: 102, result: {} })
+    const second = state.respondToPendingServerRequest({ id: 102, result: {} })
+    await flushMicrotasks()
+
+    expect(gatewayMocks.replyToServerRequest).toHaveBeenCalledTimes(1)
+    expect(await second).toBe(false)
+
+    reply.resolve()
+    expect(await first).toBe(true)
   })
 
   it('waits for an edited-message rollback before starting the replacement turn', async () => {
@@ -4333,7 +4628,7 @@ describe('provider model selection', () => {
     expect(gatewayMocks.getThreadDetail).toHaveBeenCalledWith('mini-thread')
     expect(state.messages.value.map((message) => `${message.role}:${message.text}`)).toEqual([
       'user:hi',
-      'system:Worked for <1s',
+      'system:Worked',
       'assistant:Hi.',
     ])
   })

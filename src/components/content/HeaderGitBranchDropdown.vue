@@ -6,6 +6,8 @@
       :disabled="disabled"
       :title="triggerLabel"
       :aria-label="triggerLabel"
+      aria-haspopup="dialog"
+      :aria-expanded="isOpen"
       @click="toggleOpen"
     >
       <IconTablerGitFork class="header-git-trigger-icon" />
@@ -15,7 +17,12 @@
     </button>
 
     <div v-if="isOpen" class="header-git-menu-wrap">
-      <div class="header-git-menu" :class="{ 'has-commit-files': Boolean(selectedCommit) }">
+      <div
+        class="header-git-menu"
+        role="dialog"
+        aria-label="Git branch and commit controls"
+        :class="{ 'has-commit-files': Boolean(selectedCommit) }"
+      >
         <button v-if="showReview" class="header-git-review-row" type="button" @click="toggleReview">
           <IconTablerFilePencil class="header-git-row-icon" />
           <span class="header-git-review-label">{{ reviewOpen ? 'Review Worktree Changes (Open)' : 'Review Worktree Changes' }}</span>
@@ -172,7 +179,7 @@
                     class="header-git-branch-checkout"
                     type="button"
                     :disabled="busy"
-                    @click="emit('checkoutBranch', branch.value)"
+                    @click="checkoutSelectedBranch(branch.value)"
                   >
                     Checkout
                   </button>
@@ -304,14 +311,36 @@ function toggleOpen(): void {
   isOpen.value = !isOpen.value
 }
 
+function closeMenu(): void {
+  isOpen.value = false
+  searchQuery.value = ''
+  commitSearchQuery.value = ''
+  selectedCommitSha.value = ''
+  copiedCommitSha.value = ''
+}
+
 function toggleReview(): void {
   emit('toggleReview')
 }
 
 function selectBranch(branch: string): void {
+  const option = props.branches.find((candidate) => candidate.value === branch)
+  if (branch === props.currentBranch) {
+    closeMenu()
+    return
+  }
+  if (option && option.isRemote !== true) {
+    checkoutSelectedBranch(branch)
+    return
+  }
   selectedBranch.value = branch
   selectedCommitSha.value = ''
   emit('loadCommits', { branch, includeResetHistory: showResetHistoryRefs.value })
+}
+
+function checkoutSelectedBranch(branch: string): void {
+  emit('checkoutBranch', branch)
+  closeMenu()
 }
 
 function reloadSelectedBranchCommits(): void {
@@ -355,11 +384,7 @@ function formatFileLineCount(value: number | null): string {
 function openCommitFile(filePath: string): void {
   if (!selectedCommit.value) return
   emit('openCommitFile', { sha: selectedCommit.value.sha, path: filePath })
-  isOpen.value = false
-  searchQuery.value = ''
-  commitSearchQuery.value = ''
-  selectedCommitSha.value = ''
-  copiedCommitSha.value = ''
+  closeMenu()
 }
 
 function onEscapeSearch(): void {
@@ -367,9 +392,7 @@ function onEscapeSearch(): void {
     searchQuery.value = ''
     return
   }
-  isOpen.value = false
-  selectedCommitSha.value = ''
-  copiedCommitSha.value = ''
+  closeMenu()
 }
 
 function onEscapeCommitSearch(): void {
@@ -377,9 +400,7 @@ function onEscapeCommitSearch(): void {
     commitSearchQuery.value = ''
     return
   }
-  isOpen.value = false
-  selectedCommitSha.value = ''
-  copiedCommitSha.value = ''
+  closeMenu()
 }
 
 function onDocumentPointerDown(event: PointerEvent): void {
@@ -387,10 +408,13 @@ function onDocumentPointerDown(event: PointerEvent): void {
   const root = rootRef.value
   const target = event.target
   if (!root || !(target instanceof Node) || root.contains(target)) return
-  isOpen.value = false
-  searchQuery.value = ''
-  commitSearchQuery.value = ''
-  selectedCommitSha.value = ''
+  closeMenu()
+}
+
+function onDocumentKeyDown(event: KeyboardEvent): void {
+  if (!isOpen.value || event.key !== 'Escape') return
+  event.preventDefault()
+  closeMenu()
 }
 
 function preferredBranch(): string {
@@ -441,8 +465,14 @@ watch(selectedBranchCommits, (commits) => {
   }
 })
 
-onMounted(() => window.addEventListener('pointerdown', onDocumentPointerDown))
-onBeforeUnmount(() => window.removeEventListener('pointerdown', onDocumentPointerDown))
+onMounted(() => {
+  window.addEventListener('pointerdown', onDocumentPointerDown)
+  window.addEventListener('keydown', onDocumentKeyDown)
+})
+onBeforeUnmount(() => {
+  window.removeEventListener('pointerdown', onDocumentPointerDown)
+  window.removeEventListener('keydown', onDocumentKeyDown)
+})
 </script>
 
 <style scoped>

@@ -76,6 +76,23 @@ export type UiThread = {
 
 export type UiPendingRequestState = 'approval' | 'response'
 
+export type UiThreadGoalStatus =
+  | 'active'
+  | 'paused'
+  | 'blocked'
+  | 'usageLimited'
+  | 'budgetLimited'
+  | 'complete'
+
+export type UiThreadGoal = {
+  objective: string
+  status: UiThreadGoalStatus
+  updatedAt: number
+  timeUsedSeconds: number
+  tokensUsed: number
+  tokenBudget: number | null
+}
+
 export type UiThreadAutomationStatus = 'ACTIVE' | 'PAUSED'
 
 export type UiThreadAutomation = {
@@ -241,6 +258,16 @@ export type UiPlanData = {
   explanation?: string
   steps: UiPlanStep[]
   isStreaming?: boolean
+}
+
+export type ConversationFooterState = {
+  turnId: string
+  stepNumber: number | null
+  stepCount: number
+  completedPercent: number
+  fileCount: number
+  additions: number
+  deletions: number
 }
 
 export type UiGenericCodexDirectiveAttribute = {

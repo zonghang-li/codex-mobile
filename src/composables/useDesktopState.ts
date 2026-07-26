@@ -9,6 +9,7 @@ import {
   getAvailableModelIds,
   getCurrentModelConfig,
   getExternalThreadLiveSnapshot,
+  getThreadGoal,
   getPendingServerRequests,
   getSkillsList,
   getThreadDetail,
@@ -24,6 +25,7 @@ import {
   getThreadQueueState,
   getWorkspaceRootsState,
   setCodexSpeedMode,
+  setThreadGoal,
   setThreadQueueState,
   setWorkspaceRootsState,
   getThreadTitleCache,
@@ -34,6 +36,7 @@ import {
   startThread,
   subscribeCodexNotifications,
   startThreadTurn,
+  clearThreadGoal,
   type RpcNotification,
   type SkillInfo,
   type ThreadQueueState,
@@ -61,6 +64,8 @@ import type {
   UiThreadTokenUsage,
   UiTokenUsageBreakdown,
   UiThread,
+  UiThreadGoal,
+  UiThreadGoalStatus,
 } from '../types/codex'
 import type { ThreadRuntimeOwnership } from '../types/threadRuntime'
 import { getPathParent, isProjectlessChatPath, normalizePathForUi, toProjectName } from '../pathUtils.js'
@@ -101,6 +106,7 @@ const READ_STATE_STORAGE_KEY = 'codex-web-local.thread-read-state.v1'
 const UNREAD_CUTOFF_STORAGE_KEY = 'codex-web-local.thread-unread-cutoff.v1'
 const THREAD_TOKEN_USAGE_STORAGE_KEY = 'codex-web-local.thread-token-usage.v1'
 const THREAD_TERMINAL_OPEN_STORAGE_KEY = 'codex-web-local.thread-terminal-open.v1'
+const TURN_COMPLETION_SUMMARY_STORAGE_KEY = 'codex-web-local.turn-completion-summaries.v1'
 const SELECTED_THREAD_STORAGE_KEY = 'codex-web-local.selected-thread-id.v1'
 const SELECTED_MODEL_BY_CONTEXT_STORAGE_KEY = 'codex-web-local.selected-model-by-context.v1'
 const LEGACY_SELECTED_MODEL_STORAGE_KEY = 'codex-web-local.selected-model-id.v1'
@@ -129,6 +135,14 @@ const DEFAULT_CODEX_NEW_THREAD_SPEED_MODE: SpeedMode = 'fast'
 const MODEL_FALLBACK_ID = 'gpt-5.4-mini'
 const OPENCODE_ZEN_DEFAULT_MODEL = 'big-pickle'
 const CODEX_CLI_MISSING_MESSAGE = 'Codex CLI not found. Install @openai/codex or set CODEXUI_CODEX_COMMAND.'
+const THREAD_GOAL_STATUSES = new Set<UiThreadGoalStatus>([
+  'active',
+  'paused',
+  'blocked',
+  'usageLimited',
+  'budgetLimited',
+  'complete',
+])
 type SelectThreadResult = 'ok' | 'not-found' | 'error'
 
 function isCodexCliMissingError(error: unknown): boolean {
@@ -857,7 +871,8 @@ function upsertMessage(previous: UiMessage[], nextMessage: UiMessage): UiMessage
 
 type TurnSummaryState = {
   turnId: string
-  durationMs: number
+  durationMs: number | null
+  status: TurnTerminalStatus
 }
 
 type TurnActivityState = {
@@ -892,8 +907,11 @@ function parseIsoTimestamp(value: string): number | null {
   return Number.isNaN(ms) ? null : ms
 }
 
-function formatTurnDuration(durationMs: number): string {
-  if (!Number.isFinite(durationMs) || durationMs <= 0) {
+function formatTurnDuration(durationMs: number | null): string {
+  if (durationMs === null || !Number.isFinite(durationMs)) {
+    return ''
+  }
+  if (durationMs <= 0) {
     return '<1s'
   }
 
@@ -919,7 +937,9 @@ function formatTurnDuration(durationMs: number): string {
 function areTurnSummariesEqual(first?: TurnSummaryState, second?: TurnSummaryState): boolean {
   if (!first && !second) return true
   if (!first || !second) return false
-  return first.turnId === second.turnId && first.durationMs === second.durationMs
+  return first.turnId === second.turnId
+    && first.durationMs === second.durationMs
+    && first.status === second.status
 }
 
 function areTurnActivitiesEqual(first?: TurnActivityState, second?: TurnActivityState): boolean {
@@ -934,18 +954,23 @@ function areTurnActivitiesEqual(first?: TurnActivityState, second?: TurnActivity
 }
 
 function buildTurnSummaryMessage(summary: TurnSummaryState): UiMessage {
+  const durationLabel = formatTurnDuration(summary.durationMs)
+  const durationSuffix = durationLabel ? ` after ${durationLabel}` : ''
+  const workedSuffix = durationLabel ? ` for ${durationLabel}` : ''
   return {
     id: `turn-summary:${summary.turnId}`,
     role: 'system',
-    text: `Worked for ${formatTurnDuration(summary.durationMs)}`,
+    text: summary.status === 'interrupted'
+      ? `You stopped${durationSuffix}`
+      : `Worked${workedSuffix}`,
     messageType: WORKED_MESSAGE_TYPE,
     turnId: summary.turnId,
   }
 }
 
-function findLastAssistantMessageIndex(messages: UiMessage[]): number {
+function findLastAssistantMessageIndex(messages: UiMessage[], turnId: string): number {
   for (let index = messages.length - 1; index >= 0; index -= 1) {
-    if (messages[index].role === 'assistant') {
+    if (messages[index].role === 'assistant' && messages[index].turnId === turnId) {
       return index
     }
   }
@@ -954,14 +979,100 @@ function findLastAssistantMessageIndex(messages: UiMessage[]): number {
 
 function insertTurnSummaryMessage(messages: UiMessage[], summary: TurnSummaryState): UiMessage[] {
   const summaryMessage = buildTurnSummaryMessage(summary)
-  const sanitizedMessages = messages.filter((message) => message.messageType !== WORKED_MESSAGE_TYPE)
-  const insertIndex = findLastAssistantMessageIndex(sanitizedMessages)
-  if (insertIndex < 0) {
+  const sanitizedMessages = messages.filter((message) => (
+    message.id !== summaryMessage.id
+    && !(message.messageType === WORKED_MESSAGE_TYPE && message.turnId === summary.turnId)
+  ))
+  const finalAssistantIndex = findLastAssistantMessageIndex(sanitizedMessages, summary.turnId)
+  if (finalAssistantIndex >= 0) {
+    const next = [...sanitizedMessages]
+    next.splice(finalAssistantIndex, 0, summaryMessage)
+    return next
+  }
+  let lastTurnIndex = -1
+  for (let index = sanitizedMessages.length - 1; index >= 0; index -= 1) {
+    if (sanitizedMessages[index].turnId === summary.turnId) {
+      lastTurnIndex = index
+      break
+    }
+  }
+  if (lastTurnIndex < 0) {
+    const hasTurnMetadata = sanitizedMessages.some((message) => Boolean(message.turnId))
+    if (!hasTurnMetadata) {
+      let legacyAssistantIndex = -1
+      for (let index = sanitizedMessages.length - 1; index >= 0; index -= 1) {
+        if (sanitizedMessages[index].role === 'assistant') {
+          legacyAssistantIndex = index
+          break
+        }
+      }
+      if (legacyAssistantIndex >= 0) {
+        const next = [...sanitizedMessages]
+        next.splice(legacyAssistantIndex, 0, summaryMessage)
+        return next
+      }
+    }
     return [...sanitizedMessages, summaryMessage]
   }
   const next = [...sanitizedMessages]
-  next.splice(insertIndex, 0, summaryMessage)
+  next.splice(lastTurnIndex + 1, 0, summaryMessage)
   return next
+}
+
+function insertTurnSummaryMessages(
+  messages: UiMessage[],
+  summaries: readonly TurnSummaryState[],
+): UiMessage[] {
+  return summaries.reduce(
+    (next, summary) => insertTurnSummaryMessage(next, summary),
+    messages,
+  )
+}
+
+function loadPersistedTurnSummaryMap(): Record<string, Record<string, TurnSummaryState>> {
+  if (typeof window === 'undefined') return {}
+
+  try {
+    const raw = window.localStorage.getItem(TURN_COMPLETION_SUMMARY_STORAGE_KEY)
+    if (!raw) return {}
+    const parsed = JSON.parse(raw) as unknown
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return {}
+
+    const result: Record<string, Record<string, TurnSummaryState>> = {}
+    for (const [threadId, threadValue] of Object.entries(parsed as Record<string, unknown>)) {
+      if (!threadId || !threadValue || typeof threadValue !== 'object' || Array.isArray(threadValue)) continue
+      const summaries: Record<string, TurnSummaryState> = {}
+      for (const [turnId, summaryValue] of Object.entries(threadValue as Record<string, unknown>)) {
+        if (!turnId || !summaryValue || typeof summaryValue !== 'object' || Array.isArray(summaryValue)) continue
+        const summary = summaryValue as Record<string, unknown>
+        const status = typeof summary.status === 'string' ? summary.status.trim() : ''
+        const durationMs = summary.durationMs === null
+          ? null
+          : typeof summary.durationMs === 'number' && Number.isFinite(summary.durationMs)
+            ? Math.max(0, summary.durationMs)
+            : null
+        if (!status) continue
+        summaries[turnId] = { turnId, status, durationMs }
+      }
+      if (Object.keys(summaries).length > 0) {
+        result[threadId] = summaries
+      }
+    }
+    return result
+  } catch {
+    return {}
+  }
+}
+
+function savePersistedTurnSummaryMap(
+  state: Record<string, Record<string, TurnSummaryState>>,
+): void {
+  if (typeof window === 'undefined') return
+  try {
+    window.localStorage.setItem(TURN_COMPLETION_SUMMARY_STORAGE_KEY, JSON.stringify(state))
+  } catch {
+    // Keep live completion boundaries usable when storage is unavailable.
+  }
 }
 
 function omitKey<TValue>(record: Record<string, TValue>, key: string): Record<string, TValue> {
@@ -1502,6 +1613,9 @@ export function useDesktopState() {
   const resumedThreadById = ref<Record<string, boolean>>({})
   const turnIndexByTurnIdByThreadId = ref<Record<string, Record<string, number>>>({})
   const turnSummaryByThreadId = ref<Record<string, TurnSummaryState>>({})
+  const persistedTurnSummaryByThreadId = ref<Record<string, Record<string, TurnSummaryState>>>(
+    loadPersistedTurnSummaryMap(),
+  )
   const turnActivityByThreadId = ref<Record<string, TurnActivityState>>({})
   const turnErrorByThreadId = ref<Record<string, TurnErrorState>>({})
   const activeTurnIdByThreadId = ref<Record<string, string>>({})
@@ -1516,6 +1630,9 @@ export function useDesktopState() {
   const threadTokenUsageByThreadId = ref<Record<string, UiThreadTokenUsage>>(loadThreadTokenUsageMap())
   const terminalOpenByThreadId = ref<Record<string, boolean>>(loadThreadTerminalOpenMap())
   const threadModelProviderByThreadId = ref<Record<string, string>>({})
+  const threadGoalByThreadId = ref<Record<string, UiThreadGoal>>({})
+  const threadGoalSupportByThreadId = ref<Record<string, boolean>>({})
+  const updatingThreadGoalByThreadId = ref<Record<string, boolean>>({})
 
   const threadTitleById = ref<Record<string, string>>({})
 
@@ -1594,6 +1711,8 @@ export function useDesktopState() {
   const loadMessagePromiseByThreadId = new Map<string, Promise<void>>()
   const rollbackPromiseByThreadId = new Map<string, Promise<void>>()
   const detailRequestEpochByThreadId = new Map<string, number>()
+  const threadGoalRequestEpochByThreadId = new Map<string, number>()
+  let threadGoalRequestGeneration = 0
   const detailRequestByThreadId = new Map<string, {
     epoch: number
     promise: Promise<ThreadDetailSnapshot>
@@ -1623,6 +1742,7 @@ export function useDesktopState() {
   const pendingTurnStartsById = new Map<string, TurnStartedInfo>()
   const fallbackRetryInFlightThreadIds = new Set<string>()
   const nonSuccessCompletionReadBaselineByThreadId = new Map<string, string>()
+  const resolvingServerRequestIds = new Set<number>()
 
 
   const allThreads = computed(() => flattenThreads(projectGroups.value))
@@ -1688,6 +1808,22 @@ export function useDesktopState() {
       reasoningText,
       errorText,
     }
+  })
+  const selectedActiveTurnId = computed(() => {
+    const threadId = selectedThreadId.value
+    return threadId ? activeTurnIdByThreadId.value[threadId] ?? '' : ''
+  })
+  const selectedThreadGoal = computed<UiThreadGoal | null>(() => {
+    const threadId = selectedThreadId.value
+    return threadId ? threadGoalByThreadId.value[threadId] ?? null : null
+  })
+  const selectedThreadGoalSupported = computed(() => {
+    const threadId = selectedThreadId.value
+    return threadId ? threadGoalSupportByThreadId.value[threadId] !== false : true
+  })
+  const isUpdatingThreadGoal = computed(() => {
+    const threadId = selectedThreadId.value
+    return Boolean(threadId && updatingThreadGoalByThreadId.value[threadId] === true)
   })
   const codexQuota = computed<UiRateLimitSnapshot | null>(() => codexRateLimit.value)
   const selectedThreadTokenUsage = computed<UiThreadTokenUsage | null>(() => {
@@ -2549,6 +2685,42 @@ export function useDesktopState() {
     }
   }
 
+  function persistTurnSummaryForThread(threadId: string, summary: TurnSummaryState): void {
+    if (!threadId || !summary.turnId) return
+    const previousThreadSummaries = persistedTurnSummaryByThreadId.value[threadId] ?? {}
+    const nextThreadEntries = Object.entries({
+      ...previousThreadSummaries,
+      [summary.turnId]: summary,
+    }).slice(-50)
+    const nextThreadSummaries = Object.fromEntries(nextThreadEntries) as Record<string, TurnSummaryState>
+    const nextEntries = Object.entries({
+      ...persistedTurnSummaryByThreadId.value,
+      [threadId]: nextThreadSummaries,
+    }).slice(-100)
+    persistedTurnSummaryByThreadId.value = Object.fromEntries(nextEntries) as Record<
+      string,
+      Record<string, TurnSummaryState>
+    >
+    savePersistedTurnSummaryMap(persistedTurnSummaryByThreadId.value)
+  }
+
+  function mergeTurnSummariesWithPersistedDurations(
+    threadId: string,
+    summaries: readonly TurnSummaryState[],
+  ): TurnSummaryState[] {
+    const persisted = persistedTurnSummaryByThreadId.value[threadId] ?? {}
+    return summaries.map((summary) => {
+      const persistedSummary = persisted[summary.turnId]
+      if (summary.durationMs !== null || persistedSummary?.durationMs === null || !persistedSummary) {
+        return summary
+      }
+      return {
+        ...summary,
+        durationMs: persistedSummary.durationMs,
+      }
+    })
+  }
+
   function isCurrentThreadDetailEpoch(threadId: string, epoch: number): boolean {
     return (detailRequestEpochByThreadId.get(threadId) ?? 0) === epoch
   }
@@ -3380,6 +3552,79 @@ export function useDesktopState() {
 
   function readNumber(value: unknown): number | null {
     return typeof value === 'number' && Number.isFinite(value) ? value : null
+  }
+
+  function readThreadGoal(value: unknown): UiThreadGoal | null {
+    const record = asRecord(value)
+    if (!record) return null
+    const status = readString(record.status) as UiThreadGoalStatus
+    const updatedAt = readNumber(record.updatedAt)
+    const timeUsedSeconds = readNumber(record.timeUsedSeconds)
+    const tokensUsed = readNumber(record.tokensUsed)
+    const tokenBudget = record.tokenBudget === null ? null : readNumber(record.tokenBudget)
+    if (
+      !THREAD_GOAL_STATUSES.has(status)
+      || updatedAt === null
+      || timeUsedSeconds === null
+      || tokensUsed === null
+      || (record.tokenBudget !== null && tokenBudget === null)
+    ) return null
+    return {
+      objective: readString(record.objective),
+      status,
+      updatedAt,
+      timeUsedSeconds,
+      tokensUsed,
+      tokenBudget,
+    }
+  }
+
+  function isThreadGoalUnsupportedError(value: unknown): boolean {
+    const message = value instanceof Error ? value.message : String(value ?? '')
+    return value instanceof CodexApiError && value.status === 404
+      || /(?:method|rpc).*(?:not found|unknown|unsupported)|-32601|thread\/goal.*(?:not found|unsupported)/iu.test(message)
+  }
+
+  function invalidateThreadGoalRequest(threadId: string): void {
+    threadGoalRequestEpochByThreadId.set(
+      threadId,
+      (threadGoalRequestEpochByThreadId.get(threadId) ?? 0) + 1,
+    )
+  }
+
+  async function refreshThreadGoal(threadId: string): Promise<void> {
+    const generation = threadGoalRequestGeneration
+    const requestEpoch = (threadGoalRequestEpochByThreadId.get(threadId) ?? 0) + 1
+    threadGoalRequestEpochByThreadId.set(threadId, requestEpoch)
+    const isCurrentRequest = () => (
+      generation === threadGoalRequestGeneration
+      && threadGoalRequestEpochByThreadId.get(threadId) === requestEpoch
+    )
+    try {
+      const goal = await getThreadGoal(threadId)
+      if (!isCurrentRequest()) return
+      threadGoalSupportByThreadId.value = {
+        ...threadGoalSupportByThreadId.value,
+        [threadId]: true,
+      }
+      if (goal) {
+        threadGoalByThreadId.value = {
+          ...threadGoalByThreadId.value,
+          [threadId]: goal,
+        }
+      } else {
+        threadGoalByThreadId.value = omitKey(threadGoalByThreadId.value, threadId)
+      }
+    } catch (goalError) {
+      if (!isCurrentRequest()) return
+      if (isThreadGoalUnsupportedError(goalError)) {
+        threadGoalSupportByThreadId.value = {
+          ...threadGoalSupportByThreadId.value,
+          [threadId]: false,
+        }
+        threadGoalByThreadId.value = omitKey(threadGoalByThreadId.value, threadId)
+      }
+    }
   }
 
   function getRateLimitSnapshotKey(snapshot: UiRateLimitSnapshot): string {
@@ -4416,6 +4661,37 @@ export function useDesktopState() {
       return
     }
 
+    if (notification.method === 'thread/goal/updated') {
+      const params = asRecord(notification.params)
+      const threadId = extractThreadIdFromNotification(notification)
+      const goal = readThreadGoal(params?.goal ?? notification.params)
+      if (threadId && goal) {
+        invalidateThreadGoalRequest(threadId)
+        threadGoalByThreadId.value = {
+          ...threadGoalByThreadId.value,
+          [threadId]: goal,
+        }
+        threadGoalSupportByThreadId.value = {
+          ...threadGoalSupportByThreadId.value,
+          [threadId]: true,
+        }
+      }
+      return
+    }
+
+    if (notification.method === 'thread/goal/cleared') {
+      const threadId = extractThreadIdFromNotification(notification)
+      if (threadId) {
+        invalidateThreadGoalRequest(threadId)
+        threadGoalByThreadId.value = omitKey(threadGoalByThreadId.value, threadId)
+        threadGoalSupportByThreadId.value = {
+          ...threadGoalSupportByThreadId.value,
+          [threadId]: true,
+        }
+      }
+      return
+    }
+
     const tokenUsageUpdate = readThreadTokenUsageUpdate(notification)
     if (tokenUsageUpdate) {
       setThreadTokenUsage(tokenUsageUpdate.threadId, tokenUsageUpdate.usage)
@@ -4496,12 +4772,20 @@ export function useDesktopState() {
           : null) ??
         (startedTurnState ? completedTurn.completedAtMs - startedTurnState.startedAtMs : null)
 
-      const durationMs = typeof rawDurationMs === 'number' ? Math.max(0, rawDurationMs) : 0
+      const durationMs = typeof rawDurationMs === 'number' ? Math.max(0, rawDurationMs) : null
+      const summary: TurnSummaryState = {
+        turnId: completedTurn.turnId,
+        durationMs,
+        status: completedTurn.status,
+      }
+      persistTurnSummaryForThread(completedTurn.threadId, summary)
       if (completionDisposition.ownsActiveLease) {
-        setTurnSummaryForThread(completedTurn.threadId, {
-          turnId: completedTurn.turnId,
-          durationMs,
-        })
+        const persistedMessages = persistedMessagesByThreadId.value[completedTurn.threadId] ?? []
+        setPersistedMessagesForThread(
+          completedTurn.threadId,
+          insertTurnSummaryMessage(persistedMessages, summary),
+        )
+        setTurnSummaryForThread(completedTurn.threadId, summary)
         if (activeTurnIdByThreadId.value[completedTurn.threadId]) {
           activeTurnIdByThreadId.value = omitKey(activeTurnIdByThreadId.value, completedTurn.threadId)
         }
@@ -5099,8 +5383,20 @@ export function useDesktopState() {
       setThreadModelId(threadId, resolveThreadModelForProvider(threadId, detail.model, detail.modelProvider))
     }
 
-    const { messages: nextMessages, inProgress: serverInProgress, activeTurnId, turnIndexByTurnId } = detail
-    const localActiveTurnId = activeTurnIdByThreadId.value[threadId] ?? ''
+    const {
+      messages: detailMessages,
+      completionSummaries = [],
+      inProgress: serverInProgress,
+      activeTurnId,
+      turnIndexByTurnId,
+    } = detail
+    const nextMessages = insertTurnSummaryMessages(
+      detailMessages,
+      mergeTurnSummariesWithPersistedDurations(threadId, completionSummaries),
+    )
+    const localActiveTurnId = runtimeOwnershipByThreadId.value[threadId] === 'local'
+      ? activeTurnIdByThreadId.value[threadId] ?? ''
+      : ''
     const detailOwnership: ThreadRuntimeOwnership = detail.ownership === 'external'
       ? 'external'
       : detail.ownership === 'local' || serverInProgress
@@ -5136,7 +5432,7 @@ export function useDesktopState() {
     replaceTurnIndexLookupForThread(threadId, turnIndexByTurnId)
     rebindLiveFileChangeTurnIndices(threadId)
     const previousPersisted = persistedMessagesByThreadId.value[threadId] ?? []
-    const mergedMessages = mergeMessages(previousPersisted, detail.messages, {
+    const mergedMessages = mergeMessages(previousPersisted, nextMessages, {
       preserveMissing: options.preserveMissing || hasOptimisticUserMessages(previousPersisted),
     })
     setPersistedMessagesForThread(threadId, mergedMessages)
@@ -5172,7 +5468,7 @@ export function useDesktopState() {
       setThreadRuntimeOwnership(threadId, ownership)
     }
     reconcileExternalReasoningSnapshot(threadId, detail, ownership, inProgress)
-    if (ownership === 'local' && activeTurnId) {
+    if (inProgress && activeTurnId) {
       activeTurnIdByThreadId.value = {
         ...activeTurnIdByThreadId.value,
         [threadId]: activeTurnId,
@@ -5225,52 +5521,55 @@ export function useDesktopState() {
 
     const loadPromise = (async () => {
       try {
-      const version = currentThreadVersion(threadId)
-      const loadedVersion = loadedVersionByThreadId.value[threadId] ?? ''
-      const loadedRecently =
-        Date.now() - (lastMessageLoadAtByThreadId.get(threadId) ?? 0) < RECENT_THREAD_MESSAGE_LOAD_REUSE_MS
-      const canReuseLoadedMessages =
-        options.force !== true &&
-        alreadyLoaded &&
-        (
-          loadedRecently ||
-          (
-            (version.length === 0 || loadedVersion === version) &&
-            inProgressById.value[threadId] !== true
-          )
-        )
-
-      if (canReuseLoadedMessages) {
-        markThreadAsRead(threadId)
-        return
-      }
-
-      const needsResume = resumedThreadById.value[threadId] !== true
-      const detailRequest = acquireThreadDetailRequest(
-        threadId,
-        async () => {
-          if (!needsResume) return getThreadDetail(threadId)
-          return (await resumeThread(threadId)) ?? getThreadDetail(threadId)
-        },
-      )
-      try {
-        const detail = await detailRequest.promise
-
-        if (needsResume && detailRequest.ownsRequest) {
-          resumedThreadById.value = {
-            ...resumedThreadById.value,
-            [threadId]: true,
-          }
+        if (!(threadId in threadGoalSupportByThreadId.value)) {
+          void refreshThreadGoal(threadId)
         }
-        reconcileThreadDetailSnapshot(threadId, detail, {
-          preserveMissing: options.silent === true,
-          markRead: true,
-          requestedVersion: version,
-          detailEpoch: detailRequest.epoch,
-        })
-      } finally {
-        releaseThreadDetailRequest(threadId, detailRequest)
-      }
+        const version = currentThreadVersion(threadId)
+        const loadedVersion = loadedVersionByThreadId.value[threadId] ?? ''
+        const loadedRecently =
+          Date.now() - (lastMessageLoadAtByThreadId.get(threadId) ?? 0) < RECENT_THREAD_MESSAGE_LOAD_REUSE_MS
+        const canReuseLoadedMessages =
+          options.force !== true &&
+          alreadyLoaded &&
+          (
+            loadedRecently ||
+            (
+              (version.length === 0 || loadedVersion === version) &&
+              inProgressById.value[threadId] !== true
+            )
+          )
+
+        if (canReuseLoadedMessages) {
+          markThreadAsRead(threadId)
+          return
+        }
+
+        const needsResume = resumedThreadById.value[threadId] !== true
+        const detailRequest = acquireThreadDetailRequest(
+          threadId,
+          async () => {
+            if (!needsResume) return getThreadDetail(threadId)
+            return (await resumeThread(threadId)) ?? getThreadDetail(threadId)
+          },
+        )
+        try {
+          const detail = await detailRequest.promise
+
+          if (needsResume && detailRequest.ownsRequest) {
+            resumedThreadById.value = {
+              ...resumedThreadById.value,
+              [threadId]: true,
+            }
+          }
+          reconcileThreadDetailSnapshot(threadId, detail, {
+            preserveMissing: options.silent === true,
+            markRead: true,
+            requestedVersion: version,
+            detailEpoch: detailRequest.epoch,
+          })
+        } finally {
+          releaseThreadDetailRequest(threadId, detailRequest)
+        }
       } catch (unknownError) {
         const message = unknownError instanceof Error ? unknownError.message : 'Unknown application error'
         if (selectedThreadId.value === threadId) {
@@ -5279,9 +5578,9 @@ export function useDesktopState() {
         lastMessageLoadFailureAtByThreadId.set(threadId, Date.now())
         throw unknownError
       } finally {
-      if (shouldShowLoading) {
-        isLoadingMessages.value = false
-      }
+        if (shouldShowLoading) {
+          isLoadingMessages.value = false
+        }
       }
     })().finally(() => {
       loadMessagePromiseByThreadId.delete(threadId)
@@ -5313,7 +5612,11 @@ export function useDesktopState() {
     try {
       const page = await getOlderThreadMessages(threadId, beforeTurnId)
       const previousPersisted = persistedMessagesByThreadId.value[threadId] ?? []
-      const mergedMessages = mergeMessages(page.messages, previousPersisted, { preserveMissing: true })
+      const pageMessages = insertTurnSummaryMessages(
+        page.messages,
+        mergeTurnSummariesWithPersistedDurations(threadId, page.completionSummaries),
+      )
+      const mergedMessages = mergeMessages(pageMessages, previousPersisted, { preserveMissing: true })
       setPersistedMessagesForThread(threadId, mergedMessages)
       replaceTurnIndexLookupForThread(threadId, {
         ...(turnIndexByTurnIdByThreadId.value[threadId] ?? {}),
@@ -6388,9 +6691,11 @@ export function useDesktopState() {
   }
 
   async function respondToPendingServerRequest(reply: UiServerRequestReply): Promise<boolean> {
+    if (resolvingServerRequestIds.has(reply.id)) return false
     const requestScope = findPendingServerRequestScope(reply.id)
     if (!requestScope) return false
     if (requestScope !== GLOBAL_SERVER_REQUEST_SCOPE && isExternallyOwned(requestScope)) return false
+    resolvingServerRequestIds.add(reply.id)
     try {
       await replyToServerRequest(reply.id, {
         result: reply.result,
@@ -6400,11 +6705,16 @@ export function useDesktopState() {
       return true
     } catch (unknownError) {
       error.value = unknownError instanceof Error ? unknownError.message : 'Failed to reply to server request'
+      void loadPendingServerRequestsFromBridge()
       return false
+    } finally {
+      resolvingServerRequestIds.delete(reply.id)
     }
   }
 
   function stopPolling(): void {
+    threadGoalRequestGeneration += 1
+    threadGoalRequestEpochByThreadId.clear()
     externalRuntimePollingEnabled = false
     cancelExternalRuntimePolling()
     backgroundRuntimePollingEnabled = false
@@ -6426,6 +6736,7 @@ export function useDesktopState() {
     pendingThreadMessageRefresh.clear()
     pendingTurnStartsById.clear()
     nonSuccessCompletionReadBaselineByThreadId.clear()
+    resolvingServerRequestIds.clear()
     if (eventSyncTimer !== null && typeof window !== 'undefined') {
       window.clearTimeout(eventSyncTimer)
       eventSyncTimer = null
@@ -6467,6 +6778,9 @@ export function useDesktopState() {
     persistQueueState()
     codexRateLimit.value = null
     threadTokenUsageByThreadId.value = {}
+    threadGoalByThreadId.value = {}
+    threadGoalSupportByThreadId.value = {}
+    updatingThreadGoalByThreadId.value = {}
   }
 
   const selectedThreadQueuedMessages = computed<QueuedMessage[]>(() => {
@@ -6519,6 +6833,82 @@ export function useDesktopState() {
     void sendMessageToSelectedThread(msg.text, msg.imageUrls, msg.skills, 'steer', msg.fileAttachments)
   }
 
+  async function updateSelectedThreadGoal(input: {
+    objective?: string
+    status: UiThreadGoalStatus
+  }): Promise<boolean> {
+    const threadId = selectedThreadId.value.trim()
+    if (!threadId || isExternallyOwned(threadId) || threadGoalSupportByThreadId.value[threadId] === false) {
+      return false
+    }
+    invalidateThreadGoalRequest(threadId)
+    if (updatingThreadGoalByThreadId.value[threadId] === true) return false
+    updatingThreadGoalByThreadId.value = {
+      ...updatingThreadGoalByThreadId.value,
+      [threadId]: true,
+    }
+    try {
+      const goal = await setThreadGoal({
+        threadId,
+        objective: input.objective,
+        status: input.status,
+      })
+      threadGoalByThreadId.value = {
+        ...threadGoalByThreadId.value,
+        [threadId]: goal,
+      }
+      threadGoalSupportByThreadId.value = {
+        ...threadGoalSupportByThreadId.value,
+        [threadId]: true,
+      }
+      return true
+    } catch (goalError) {
+      if (isThreadGoalUnsupportedError(goalError)) {
+        threadGoalSupportByThreadId.value = {
+          ...threadGoalSupportByThreadId.value,
+          [threadId]: false,
+        }
+      }
+      error.value = goalError instanceof Error ? goalError.message : 'Unable to update thread goal'
+      return false
+    } finally {
+      updatingThreadGoalByThreadId.value = omitKey(updatingThreadGoalByThreadId.value, threadId)
+    }
+  }
+
+  async function clearSelectedThreadGoal(): Promise<boolean> {
+    const threadId = selectedThreadId.value.trim()
+    if (!threadId || isExternallyOwned(threadId) || threadGoalSupportByThreadId.value[threadId] === false) {
+      return false
+    }
+    invalidateThreadGoalRequest(threadId)
+    if (updatingThreadGoalByThreadId.value[threadId] === true) return false
+    updatingThreadGoalByThreadId.value = {
+      ...updatingThreadGoalByThreadId.value,
+      [threadId]: true,
+    }
+    try {
+      await clearThreadGoal(threadId)
+      threadGoalByThreadId.value = omitKey(threadGoalByThreadId.value, threadId)
+      threadGoalSupportByThreadId.value = {
+        ...threadGoalSupportByThreadId.value,
+        [threadId]: true,
+      }
+      return true
+    } catch (goalError) {
+      if (isThreadGoalUnsupportedError(goalError)) {
+        threadGoalSupportByThreadId.value = {
+          ...threadGoalSupportByThreadId.value,
+          [threadId]: false,
+        }
+      }
+      error.value = goalError instanceof Error ? goalError.message : 'Unable to clear thread goal'
+      return false
+    } finally {
+      updatingThreadGoalByThreadId.value = omitKey(updatingThreadGoalByThreadId.value, threadId)
+    }
+  }
+
   function primeSelectedThread(threadId: string, options: { persist?: boolean } = {}): void {
     setSelectedThreadId(threadId, options)
   }
@@ -6533,6 +6923,9 @@ export function useDesktopState() {
     isSelectedThreadInterruptPending,
     selectedThreadServerRequests,
     selectedLiveOverlay,
+    selectedActiveTurnId,
+    selectedThreadGoal,
+    selectedThreadGoalSupported,
     codexQuota,
     selectedThreadId,
     availableCollaborationModes,
@@ -6553,6 +6946,7 @@ export function useDesktopState() {
     isSendingMessage,
     isInterruptingTurn,
     isUpdatingSpeedMode,
+    isUpdatingThreadGoal,
     isRollingBack,
 
     error,
@@ -6577,6 +6971,8 @@ export function useDesktopState() {
     removeQueuedMessage,
     reorderQueuedMessage,
     steerQueuedMessage,
+    updateSelectedThreadGoal,
+    clearSelectedThreadGoal,
     setSelectedCollaborationMode,
     readModelIdForThread,
     setSelectedModelIdForThread,

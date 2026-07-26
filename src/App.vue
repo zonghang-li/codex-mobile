@@ -521,7 +521,13 @@
         :style="contentStyle"
       >
         <span v-if="isVirtualKeyboardOpen" class="content-keyboard-spacer" aria-hidden="true" />
-        <ContentHeader :title="contentTitle" :accent="isSkillsRoute || isAutomationsRoute">
+        <ContentHeader
+          :title="contentTitle"
+          :accent="isSkillsRoute || isAutomationsRoute"
+          :editable="route.name === 'thread' && selectedThreadId.length > 0"
+          :disabled="!selectedThreadId"
+          @rename="onRenameSelectedThread"
+        >
           <template #leading>
             <SidebarThreadControls
               v-if="isSidebarCollapsed || isMobile"
@@ -558,12 +564,14 @@
               :placeholder="terminalCommandPlaceholder"
               :selected-prefix-icon="IconTablerTerminal"
               :icon-only="true"
+              :disabled="isComposerTerminalControlDisabled"
               menu-align="end"
               :empty-label="t('No commands')"
               @update:model-value="onSelectHeaderTerminalCommand"
             />
             <HeaderGitBranchDropdown
               v-if="canShowContentHeaderBranchDropdown"
+              :key="selectedThreadId"
               class="content-header-branch-dropdown"
               :current-branch="currentThreadBranch"
               :head-sha="currentThreadHeadSha"
@@ -990,6 +998,7 @@
                 <div class="content-thread">
                   <ThreadConversation ref="threadConversationRef" :messages="filteredMessages" :is-loading="isLoadingMessages"
                     :active-thread-id="composerThreadContextId" :cwd="composerCwd"
+                    :active-turn-id="selectedActiveTurnId"
                     :read-only="selectedThreadRuntimeOwnership === 'external'"
                     :live-overlay="liveOverlay"
                     :pending-requests="selectedThreadServerRequests"
@@ -1024,6 +1033,15 @@
                     @hide="onHideSelectedThreadTerminal"
                     @terminal-focus-change="onTerminalFocusChange"
                   />
+                  <ConversationRunFooter
+                    :footer-state="selectedConversationFooterState"
+                    :goal="selectedThreadGoal"
+                    :goal-supported="selectedThreadGoalSupported"
+                    :read-only="selectedThreadRuntimeOwnership === 'external'"
+                    :is-updating-goal="isUpdatingThreadGoal"
+                    @set-goal="updateSelectedThreadGoal"
+                    @clear-goal="clearSelectedThreadGoal"
+                  />
                   <ThreadPendingRequestPanel
                     v-if="selectedThreadPendingRequest"
                     :request="selectedThreadPendingRequest"
@@ -1044,6 +1062,9 @@
                     :selected-reasoning-effort="selectedReasoningEffort"
                     :selected-speed-mode="selectedSpeedMode"
                     :is-updating-speed-mode="isUpdatingSpeedMode"
+                    :goal-supported="selectedThreadGoalSupported"
+                    :has-goal="selectedThreadGoal !== null"
+                    :is-updating-goal="isUpdatingThreadGoal"
                     :skills="installedSkills"
                     :thread-token-usage="selectedThreadTokenUsage"
                     :codex-quota="codexQuota"
@@ -1059,6 +1080,7 @@
                     @submit="onSubmitThreadMessage" @update:selected-model="onSelectModel"
                     @update:selected-reasoning-effort="onSelectReasoningEffort"
                     @update:selected-speed-mode="onSelectSpeedMode"
+                    @set-goal="updateSelectedThreadGoal"
                     @interrupt="onInterruptTurn" />
                 </div>
               </template>
@@ -1188,6 +1210,7 @@ import SidebarThreadTree from './components/sidebar/SidebarThreadTree.vue'
 import ContentHeader from './components/content/ContentHeader.vue'
 import ThreadComposer from './components/content/ThreadComposer.vue'
 import ThreadPendingRequestPanel from './components/content/ThreadPendingRequestPanel.vue'
+import ConversationRunFooter from './components/content/ConversationRunFooter.vue'
 import QueuedMessages from './components/content/QueuedMessages.vue'
 import RateLimitStatus from './components/content/RateLimitStatus.vue'
 import ComposerDropdown from './components/content/ComposerDropdown.vue'
@@ -1205,6 +1228,7 @@ import { useDesktopState } from './composables/useDesktopState'
 import { useMobile } from './composables/useMobile'
 import { useUiLanguage } from './composables/useUiLanguage'
 import { useFeedbackDiagnostics } from './composables/useFeedbackDiagnostics'
+import { deriveConversationFooterState } from './components/content/conversationFooterState'
 import {
   checkoutGitBranch,
   cloneGithubRepository,
@@ -1432,6 +1456,9 @@ const {
   selectedThreadTerminalOpen,
   selectedThreadServerRequests,
   selectedLiveOverlay,
+  selectedActiveTurnId,
+  selectedThreadGoal,
+  selectedThreadGoalSupported,
   codexQuota,
   selectedThreadId,
   availableCollaborationModes,
@@ -1454,6 +1481,7 @@ const {
   isSelectedThreadInterruptPending,
   selectedThreadRuntimeOwnership,
   isUpdatingSpeedMode,
+  isUpdatingThreadGoal,
   error: desktopError,
   refreshAll,
   refreshSkills,
@@ -1473,6 +1501,8 @@ const {
   removeQueuedMessage,
   reorderQueuedMessage,
   steerQueuedMessage,
+  updateSelectedThreadGoal,
+  clearSelectedThreadGoal,
   setSelectedCollaborationMode,
   readModelIdForThread,
   setSelectedModelIdForThread,
@@ -1776,15 +1806,6 @@ const filteredMessages = computed(() =>
     return true
   }),
 )
-const latestUserTurnId = computed(() => {
-  for (let index = messages.value.length - 1; index >= 0; index -= 1) {
-    const message = messages.value[index]
-    if (message.role !== 'user') continue
-    const turnId = message.turnId?.trim() ?? ''
-    if (turnId.length > 0) return turnId
-  }
-  return ''
-})
 const liveOverlay = computed(() => selectedLiveOverlay.value)
 const composerThreadContextId = computed(() => (isHomeRoute.value ? '__new-thread__' : selectedThreadId.value))
 const composerSelectedModelId = computed(() => readModelIdForThread(composerThreadContextId.value))
@@ -1801,6 +1822,9 @@ const canShowTerminalToggle = computed(() => (
     (isHomeRoute.value && composerCwd.value.length > 0) ||
     (route.name === 'thread' && selectedThreadId.value.length > 0)
   )
+))
+const isComposerTerminalControlDisabled = computed(() => (
+  route.name === 'thread' && selectedThreadRuntimeOwnership.value === 'external'
 ))
 const canShowContentHeaderBranchDropdown = computed(() => (
   (route.name === 'thread' && selectedThreadId.value.length > 0) ||
@@ -1820,6 +1844,11 @@ const isTerminalKeyboardLayoutActive = computed(() => (
 ))
 const directoryCwd = computed(() => selectedThread.value?.cwd?.trim() ?? newThreadCwd.value.trim())
 const isSelectedThreadInProgress = computed(() => !isHomeRoute.value && selectedThread.value?.inProgress === true)
+const selectedConversationFooterState = computed(() => deriveConversationFooterState({
+  messages: filteredMessages.value,
+  turnId: selectedActiveTurnId.value,
+  isTurnInProgress: isSelectedThreadInProgress.value,
+}))
 const showThreadContextBadge = computed(() => !isHomeRoute.value && !isSkillsRoute.value && !isAutomationsRoute.value && selectedThreadId.value.trim().length > 0)
 const isAccountSwitchBlocked = computed(() =>
   isSendingMessage.value ||
@@ -3479,6 +3508,13 @@ function onEditQueuedMessage(messageId: string): void {
   removeQueuedMessage(messageId)
 }
 
+function onRenameSelectedThread(title: string): void {
+  const threadId = selectedThreadId.value.trim()
+  const nextTitle = title.trim()
+  if (!threadId || !nextTitle) return
+  onRenameThread({ threadId, title: nextTitle })
+}
+
 
 function scheduleMobileConversationJumpToLatest(): void {
   if (!isMobile.value || isHomeRoute.value) return
@@ -5029,6 +5065,13 @@ async function loadWorktreeBranches(sourceCwd: string): Promise<void> {
 
 .content-root {
   @apply h-full min-h-0 min-w-0 w-full flex flex-col overflow-y-hidden overflow-x-hidden bg-white;
+  --codex-conversation-font:
+    ui-sans-serif, -apple-system, BlinkMacSystemFont, "SF Pro Text", "PingFang SC", "Segoe UI", sans-serif;
+  --codex-conversation-mono:
+    ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+  max-width: 100%;
+  overflow-x: hidden;
+  overscroll-behavior-x: none;
 }
 
 .content-root.is-virtual-keyboard-open {
@@ -5166,6 +5209,10 @@ async function loadWorktreeBranches(sourceCwd: string): Promise<void> {
 
 .content-grid {
   @apply flex-1 min-h-0 flex flex-col gap-3;
+  min-width: 0;
+  width: 100%;
+  max-width: 100%;
+  overflow-x: hidden;
 }
 
 .content-grid-home {
@@ -5174,10 +5221,16 @@ async function loadWorktreeBranches(sourceCwd: string): Promise<void> {
 
 .content-thread {
   @apply flex-1 min-h-0;
+  min-width: 0;
+  max-width: 100%;
+  overflow-x: hidden;
 }
 
 .composer-with-queue {
   @apply w-full shrink-0 px-2 sm:px-6 flex flex-col gap-2;
+  min-width: 0;
+  max-width: 100%;
+  overflow-x: clip;
 }
 
 .composer-runtime-error {

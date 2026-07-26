@@ -34,6 +34,7 @@ export type ThreadActivitySegment =
       kind: 'summary'
       id: string
       label: string
+      iconKind: ThreadActivityIconKind
       sourceMessageIds: string[]
     }
   | {
@@ -49,6 +50,8 @@ export type ThreadActivitySegment =
       label: string
       sourceMessageIds: string[]
     }
+
+export type ThreadActivityIconKind = 'edit' | 'search' | 'terminal'
 
 type ActionSummaryState = {
   sourceMessageIds: string[]
@@ -89,6 +92,12 @@ function actionSummaryLabel(state: ActionSummaryState): string {
   }
   const label = parts.join(', ')
   return label ? label.charAt(0).toUpperCase() + label.slice(1) : 'Ran activity'
+}
+
+function actionSummaryIconKind(state: ActionSummaryState): ThreadActivityIconKind {
+  if (state.editedFileCount > 0) return 'edit'
+  if (state.readCount > 0 || state.listCount > 0 || state.searchCount > 0) return 'search'
+  return 'terminal'
 }
 
 function appendCommandActivity(state: ActionSummaryState, message: UiMessage): void {
@@ -134,6 +143,7 @@ export function buildThreadActivitySegments(
       kind: 'summary',
       id: actions.sourceMessageIds.at(-1) ?? '',
       label: actionSummaryLabel(actions),
+      iconKind: actionSummaryIconKind(actions),
       sourceMessageIds: [...actions.sourceMessageIds],
     })
     actions = emptyActionSummary()

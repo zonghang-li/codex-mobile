@@ -31,6 +31,9 @@ describe('external thread runtime read-only wiring', () => {
     expect(pendingRequestSource).toContain('proposedExecpolicyAmendment')
     expect(pendingRequestSource).toContain('acceptWithExecpolicyAmendment')
     expect(pendingRequestSource).toContain('approved_execpolicy_amendment')
+    expect(pendingRequestSource).not.toContain('Tool call waiting for response')
+    expect(pendingRequestSource).toContain("isPermissionsApprovalRequest(request)")
+    expect(pendingRequestSource).toContain('Approve for me')
   })
 
   it('makes an externally owned composer read-only while retaining a labelled stop control', async () => {
@@ -52,14 +55,14 @@ describe('external thread runtime read-only wiring', () => {
     const composerSource = await readFile(new URL('./ThreadComposer.vue', import.meta.url), 'utf8')
 
     expect(composerSource).toContain('getSupportedReasoningEfforts')
-    expect(composerSource).toContain('supportedReasoningOptions')
+    expect(composerSource).toContain('desktopModelEffortOptions')
+    expect(composerSource).toContain('composerControlState.value.selectedEffort')
     expect(composerSource).toContain("const isFastModeSupported = computed(() => /^gpt-5\\.(?:4|5|6)(?:$|-)/.test(props.selectedModel.trim()))")
   })
 
-  it('disables every queued-message action and guards drag handlers', async () => {
+  it('disables every queued-message action and guards explicit reorder controls', async () => {
     const queueSource = await readFile(new URL('./QueuedMessages.vue', import.meta.url), 'utf8')
 
-    expect(queueSource).toContain(':draggable="!disabled"')
     expect(queueSource).toContain(':disabled="disabled"')
     expect(queueSource).not.toContain("$emit('edit'")
     expect(queueSource).not.toContain("$emit('steer'")
@@ -67,9 +70,7 @@ describe('external thread runtime read-only wiring', () => {
     expect(queueSource).toMatch(/function onEdit\(messageId: string\): void \{\n  if \(props\.disabled\) return\n  emit\('edit', messageId\)/u)
     expect(queueSource).toMatch(/function onSteer\(messageId: string\): void \{\n  if \(props\.disabled\) return\n  emit\('steer', messageId\)/u)
     expect(queueSource).toMatch(/function onDelete\(messageId: string\): void \{\n  if \(props\.disabled\) return\n  emit\('delete', messageId\)/u)
-    expect(queueSource).toMatch(/function onDragStart\(event: DragEvent, messageId: string\): void \{\n  if \(props\.disabled\) return/u)
-    expect(queueSource).toMatch(/function onDragOver\(messageId: string\): void \{\n  if \(props\.disabled\) return/u)
-    expect(queueSource).toMatch(/function onDragLeave\(messageId: string\): void \{\n  if \(props\.disabled\) return/u)
-    expect(queueSource).toMatch(/function onDrop\(targetId: string\): void \{\n  if \(props\.disabled\) return/u)
+    expect(queueSource).toMatch(/function onMove\(messageId: string, direction: -1 \| 1\): void \{\n  if \(props\.disabled\) return/u)
+    expect(queueSource).not.toContain('@dragstart=')
   })
 })

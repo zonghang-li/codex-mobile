@@ -25,6 +25,7 @@
         class="conversation-item"
         :data-role="message.role"
         :data-message-type="message.messageType || ''"
+        :data-turn-final-response="isProjectedFinalResponse(message) ? 'true' : undefined"
       >
         <div v-if="readActivitySegment(message)" class="message-row" data-role="system">
           <div class="message-stack codex-activity-stack" data-role="system">
@@ -53,7 +54,9 @@
               :class="{ 'codex-activity-row-expanded': isActivitySegmentExpanded(message.id) }"
               @click="toggleActivitySegment(message.id)"
             >
-              <IconTablerTerminal class="icon-svg codex-activity-icon" />
+              <IconTablerFilePencil v-if="activitySegmentIconKind(readActivitySegment(message)) === 'edit'" class="icon-svg codex-activity-icon" />
+              <IconTablerSearch v-else-if="activitySegmentIconKind(readActivitySegment(message)) === 'search'" class="icon-svg codex-activity-icon" />
+              <IconTablerTerminal v-else class="icon-svg codex-activity-icon" />
               <span class="codex-activity-label">{{ activitySegmentLabel(readActivitySegment(message)) }}</span>
               <span class="cmd-chevron" :class="{ 'cmd-chevron-open': isActivitySegmentExpanded(message.id) }">›</span>
             </button>
@@ -62,7 +65,9 @@
               class="codex-activity-row"
               :data-activity-kind="readActivitySegment(message)?.kind"
             >
-              <IconTablerTerminal v-if="readActivitySegment(message)?.kind === 'summary'" class="icon-svg codex-activity-icon" />
+              <IconTablerFilePencil v-if="activitySegmentIconKind(readActivitySegment(message)) === 'edit'" class="icon-svg codex-activity-icon" />
+              <IconTablerSearch v-else-if="activitySegmentIconKind(readActivitySegment(message)) === 'search'" class="icon-svg codex-activity-icon" />
+              <IconTablerTerminal v-else-if="readActivitySegment(message)?.kind === 'summary'" class="icon-svg codex-activity-icon" />
               <IconTablerSearch v-else-if="message.messageType === 'webSearch'" class="icon-svg codex-activity-icon" />
               <IconTablerFilePencil v-else-if="message.messageType === 'imageView' || message.messageType === 'imageGeneration' || message.messageType === 'contextCompaction'" class="icon-svg codex-activity-icon" />
               <IconTablerBolt v-else class="icon-svg codex-activity-icon" />
@@ -81,6 +86,7 @@
                   class="worked-cmd-item"
                 >
                   <button
+                    v-if="commandCanExpand(cmd)"
                     type="button"
                     class="cmd-row cmd-compact"
                     :class="[commandStatusClass(cmd), { 'cmd-expanded': isCommandExpanded(cmd) }]"
@@ -91,7 +97,12 @@
                     <span class="cmd-status">{{ commandStatusLabel(cmd) }}</span>
                     <span class="cmd-chevron" :class="{ 'cmd-chevron-open': isCommandExpanded(cmd) }">›</span>
                   </button>
-                  <div class="cmd-output-wrap" :class="{ 'cmd-output-visible': isCommandExpanded(cmd) }">
+                  <article v-else class="cmd-row cmd-compact cmd-status-only" :class="commandStatusClass(cmd)">
+                    <IconTablerTerminal class="icon-svg cmd-icon" />
+                    <span class="cmd-label">{{ commandDisplayLabel(cmd) }}</span>
+                    <span class="cmd-status">{{ commandStatusLabel(cmd) }}</span>
+                  </article>
+                  <div v-if="commandCanExpand(cmd)" class="cmd-output-wrap" :class="{ 'cmd-output-visible': isCommandExpanded(cmd) }">
                     <div class="cmd-output-inner">
                       <pre
                         class="cmd-output"
@@ -158,6 +169,7 @@
                   class="worked-cmd-item"
                 >
                   <button
+                    v-if="commandCanExpand(cmd)"
                     type="button"
                     class="cmd-row"
                     :class="[
@@ -174,7 +186,13 @@
                     <span class="cmd-status">{{ commandStatusLabel(cmd) }}</span>
                     <span class="cmd-chevron" :class="{ 'cmd-chevron-open': isCommandExpanded(cmd) }">›</span>
                   </button>
+                  <article v-else class="cmd-row cmd-compact cmd-status-only" :class="commandStatusClass(cmd)">
+                    <IconTablerTerminal class="icon-svg cmd-icon" />
+                    <span class="cmd-label">{{ commandDisplayLabel(cmd) }}</span>
+                    <span class="cmd-status">{{ commandStatusLabel(cmd) }}</span>
+                  </article>
                   <div
+                    v-if="commandCanExpand(cmd)"
                     class="cmd-output-wrap"
                     :class="{ 'cmd-output-visible': isCommandExpanded(cmd) }"
                   >
@@ -191,6 +209,7 @@
             </div>
             <template v-else>
               <button
+                v-if="commandCanExpand(message)"
                 type="button"
                 class="cmd-row"
                 :class="[
@@ -207,7 +226,13 @@
                 <span class="cmd-status">{{ commandStatusLabel(message) }}</span>
                 <span class="cmd-chevron" :class="{ 'cmd-chevron-open': isCommandExpanded(message) }">›</span>
               </button>
+              <article v-else class="cmd-row cmd-status-only" :class="[commandStatusClass(message), { 'cmd-compact': isCommandCompact(message) }]">
+                <IconTablerTerminal class="icon-svg cmd-icon" />
+                <span class="cmd-label">{{ commandDisplayLabel(message) }}</span>
+                <span class="cmd-status">{{ commandStatusLabel(message) }}</span>
+              </article>
               <div
+                v-if="commandCanExpand(message)"
                 class="cmd-output-wrap"
                 :class="{ 'cmd-output-visible': isCommandExpanded(message) }"
               >
@@ -448,12 +473,16 @@
                         :class="{ 'codex-activity-row-expanded': isActivitySegmentExpanded(segment.id) }"
                         @click="toggleActivitySegment(segment.id)"
                       >
-                        <IconTablerTerminal class="icon-svg codex-activity-icon" />
+                        <IconTablerFilePencil v-if="activitySegmentIconKind(segment) === 'edit'" class="icon-svg codex-activity-icon" />
+                        <IconTablerSearch v-else-if="activitySegmentIconKind(segment) === 'search'" class="icon-svg codex-activity-icon" />
+                        <IconTablerTerminal v-else class="icon-svg codex-activity-icon" />
                         <span class="codex-activity-label">{{ segment.label }}</span>
                         <span class="cmd-chevron" :class="{ 'cmd-chevron-open': isActivitySegmentExpanded(segment.id) }">›</span>
                       </button>
                       <article v-else class="codex-activity-row" :data-activity-kind="segment.kind">
-                        <IconTablerTerminal v-if="segment.kind === 'summary'" class="icon-svg codex-activity-icon" />
+                        <IconTablerFilePencil v-if="activitySegmentIconKind(segment) === 'edit'" class="icon-svg codex-activity-icon" />
+                        <IconTablerSearch v-else-if="activitySegmentIconKind(segment) === 'search'" class="icon-svg codex-activity-icon" />
+                        <IconTablerTerminal v-else-if="segment.kind === 'summary'" class="icon-svg codex-activity-icon" />
                         <IconTablerBolt v-else class="icon-svg codex-activity-icon" />
                         <span class="codex-activity-label">{{ segment.label }}</span>
                       </article>
@@ -469,6 +498,7 @@
                             class="worked-cmd-item"
                           >
                             <button
+                              v-if="commandCanExpand(cmd)"
                               type="button"
                               class="cmd-row cmd-compact"
                               :class="[commandStatusClass(cmd), { 'cmd-expanded': isCommandExpanded(cmd) }]"
@@ -479,7 +509,12 @@
                               <span class="cmd-status">{{ commandStatusLabel(cmd) }}</span>
                               <span class="cmd-chevron" :class="{ 'cmd-chevron-open': isCommandExpanded(cmd) }">›</span>
                             </button>
-                            <div class="cmd-output-wrap" :class="{ 'cmd-output-visible': isCommandExpanded(cmd) }">
+                            <article v-else class="cmd-row cmd-compact cmd-status-only" :class="commandStatusClass(cmd)">
+                              <IconTablerTerminal class="icon-svg cmd-icon" />
+                              <span class="cmd-label">{{ commandDisplayLabel(cmd) }}</span>
+                              <span class="cmd-status">{{ commandStatusLabel(cmd) }}</span>
+                            </article>
+                            <div v-if="commandCanExpand(cmd)" class="cmd-output-wrap" :class="{ 'cmd-output-visible': isCommandExpanded(cmd) }">
                               <div class="cmd-output-inner">
                                 <pre
                                   class="cmd-output"
@@ -1164,11 +1199,12 @@ import {
 } from './threadConversationWindow'
 import {
   buildThreadActivitySegments,
-  getHiddenCompletedActivityMessageIds,
   getTurnActivitySegmentsForWorked,
   isThreadActivityMessage,
+  type ThreadActivityIconKind,
   type ThreadActivitySegment,
 } from './threadConversationActivity'
+import { projectConversationTurns } from './conversationTurnPresentation'
 import { splitDisplayMathSpans } from './displayMath'
 import { splitInlineMathSpans } from './inlineMath'
 import {
@@ -1363,6 +1399,7 @@ function activityMessageLabel(message: UiMessage): string {
 function isCopyableAssistantMessage(message: UiMessage): boolean {
   return message.role === 'assistant'
     && !isCommandMessage(message)
+    && !projectedActivityMessageIds.value.has(message.id)
     && message.messageType !== 'worked'
     && !(message.messageType ?? '').endsWith('.live')
 }
@@ -1390,6 +1427,22 @@ const isLiveTurnRuntime = computed(() =>
 )
 
 const activitySegments = computed(() => buildThreadActivitySegments(props.messages))
+const conversationTurnSections = computed(() => projectConversationTurns({
+  messages: props.messages,
+  activeTurnId: props.activeTurnId?.trim() || null,
+}))
+const projectedActivityMessageIds = computed(() => new Set(
+  conversationTurnSections.value.flatMap((section) => section.activityMessageIds),
+))
+const projectedFinalMessageIds = computed(() => new Set(
+  conversationTurnSections.value
+    .map((section) => section.finalMessageId)
+    .filter((messageId): messageId is string => messageId !== null),
+))
+
+function isProjectedFinalResponse(message: UiMessage): boolean {
+  return projectedFinalMessageIds.value.has(message.id)
+}
 
 const activitySegmentByAnchorId = computed<Record<string, ThreadActivitySegment>>(() => {
   const next: Record<string, ThreadActivitySegment> = {}
@@ -1446,6 +1499,10 @@ function activitySegmentAgentStatus(segment: ThreadActivitySegment | null): stri
 
 function activitySegmentLabel(segment: ThreadActivitySegment | null): string {
   return segment && segment.kind !== 'subAgent' ? segment.label : ''
+}
+
+function activitySegmentIconKind(segment: ThreadActivitySegment | null): ThreadActivityIconKind {
+  return segment?.kind === 'summary' ? segment.iconKind : 'terminal'
 }
 
 function activitySegmentAgents(segment: ThreadActivitySegment | null) {
@@ -1518,8 +1575,13 @@ function isCommandAutoExpanded(message: UiMessage): boolean {
   return !hasLiveAssistantText.value && message.id === activeCommandMessageId.value
 }
 
+function commandCanExpand(message: UiMessage): boolean {
+  return isCommandMessage(message)
+    && (message.commandExecution?.aggregatedOutput ?? '').trim().length > 0
+}
+
 function isCommandExpanded(message: UiMessage): boolean {
-  if (!isCommandMessage(message)) return false
+  if (!commandCanExpand(message)) return false
   return expandedCommandIds.value.has(message.id)
     || (!collapsedAutoCommandIds.value.has(message.id) && isCommandAutoExpanded(message))
 }
@@ -1533,7 +1595,7 @@ function isCommandOutputCondensed(message: UiMessage): boolean {
 }
 
 function toggleCommandExpand(message: UiMessage): void {
-  if (!isCommandMessage(message)) return
+  if (!commandCanExpand(message)) return
 
   const nextExpanded = new Set(expandedCommandIds.value)
   const nextCollapsedAuto = new Set(collapsedAutoCommandIds.value)
@@ -1679,6 +1741,7 @@ const props = defineProps<{
   liveOverlay: UiLiveOverlay | null
   isLoading: boolean
   activeThreadId: string
+  activeTurnId?: string
   cwd: string
   readOnly?: boolean
   hasMorePersistedAbove?: boolean
@@ -2384,12 +2447,37 @@ const hiddenFileChangeMessageIds = computed(() => {
   return next
 })
 
-const hiddenCompletedActivityMessageIds = computed(() => getHiddenCompletedActivityMessageIds(props.messages))
+const hiddenActiveFooterMessageIds = computed(() => {
+  const turnId = props.activeTurnId?.trim() ?? ''
+  if (!turnId) return new Set<string>()
+  return new Set(
+    props.messages
+      .filter((message) =>
+        message.turnId === turnId
+        && (
+          message.messageType === 'fileChange'
+          || message.messageType === 'plan.live'
+        ),
+      )
+      .map((message) => message.id),
+  )
+})
+
+const hiddenFileAndFooterMessageIds = computed(() => new Set([
+  ...hiddenFileChangeMessageIds.value,
+  ...hiddenActiveFooterMessageIds.value,
+]))
+
+const hiddenCompletedActivityMessageIds = computed(() => new Set(
+  conversationTurnSections.value
+    .filter((section) => section.isCollapsed && section.completionMessageId !== null)
+    .flatMap((section) => section.activityMessageIds),
+))
 
 const renderableMessages = computed(() => filterRenderableThreadMessages(
   props.messages,
   hiddenGroupedCommandIds.value,
-  hiddenFileChangeMessageIds.value,
+  hiddenFileAndFooterMessageIds.value,
   hiddenCompletedActivityMessageIds.value,
   hiddenActivitySegmentSourceIds.value,
 ))
@@ -4254,7 +4342,7 @@ function requestDisplayTitle(request: UiServerRequest): string {
   if (request.method === 'item/permissions/requestApproval') return 'Permissions approval required'
   if (request.method === 'mcpServer/elicitation/request') return 'MCP server input required'
   if (request.method === 'item/tool/requestUserInput') return 'Input required'
-  if (request.method === 'item/tool/call') return 'Tool call waiting for response'
+  if (request.method === 'item/tool/call') return 'Tool response needed'
   return request.method
 }
 
@@ -4964,6 +5052,8 @@ onBeforeUnmount(() => {
 
 .conversation-root {
   @apply relative h-full min-h-0 min-w-0 p-0 flex flex-col overflow-y-hidden overflow-x-hidden bg-transparent border-none rounded-none;
+  max-width: 100%;
+  font-family: var(--codex-conversation-font);
 }
 
 .conversation-loading {
@@ -5550,10 +5640,15 @@ onBeforeUnmount(() => {
   border-radius: 0.45rem;
   background: rgb(39 39 42 / 0.10);
   line-height: inherit;
+  font-family: var(--codex-conversation-mono);
+  overflow-wrap: anywhere;
+  word-break: break-word;
 }
 
 .message-code-block {
   @apply min-w-0 max-w-full overflow-hidden rounded-xl border border-slate-200 bg-slate-950 text-slate-100;
+  min-width: 0;
+  max-width: 100%;
 }
 
 .message-code-language {
@@ -5562,6 +5657,9 @@ onBeforeUnmount(() => {
 
 .message-code-pre {
   @apply m-0 overflow-x-auto px-3 py-3 text-[13px] leading-relaxed font-mono whitespace-pre;
+  max-width: 100%;
+  font-family: var(--codex-conversation-mono);
+  overscroll-behavior-x: contain;
 }
 
 .message-code-pre :deep(.hljs) {
@@ -5570,6 +5668,8 @@ onBeforeUnmount(() => {
 
 .message-file-link {
   @apply text-sm leading-relaxed text-[#0969da] no-underline hover:text-[#1f6feb] hover:underline underline-offset-2;
+  overflow-wrap: anywhere;
+  word-break: break-word;
 }
 
 .file-link-context-menu {
@@ -5742,6 +5842,10 @@ onBeforeUnmount(() => {
 
 .cmd-row {
   @apply w-full flex items-center gap-2 border-0 bg-transparent px-0 py-1 text-left text-zinc-500 transition hover:text-zinc-700;
+}
+
+.cmd-row.cmd-status-only {
+  @apply cursor-default hover:text-zinc-500;
 }
 
 .cmd-row.cmd-row-group {
