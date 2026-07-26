@@ -26,6 +26,17 @@ describe('server security policy', () => {
     await expect(policy.resolveLocalPath('/tmp/example')).resolves.toBeNull()
   })
 
+  it('allows only the exact native Goal RPC surface in safe mode', () => {
+    const policy = buildSafeSecurityPolicy(loadSafeRuntimeConfig({}))
+
+    expect(policy.isRpcMethodAllowed('thread/goal/get')).toBe(true)
+    expect(policy.isRpcMethodAllowed('thread/goal/set')).toBe(true)
+    expect(policy.isRpcMethodAllowed('thread/goal/clear')).toBe(true)
+    expect(policy.isRpcMethodAllowed('thread/goal/*')).toBe(false)
+    expect(policy.isRpcMethodAllowed('thread/goal/get/metadata')).toBe(false)
+    expect(policy.isRpcMethodAllowed('thread/goal/delete')).toBe(false)
+  })
+
   it('honors explicit safe raw-RPC and terminal/file switches without enabling disabled routes', () => {
     const policy = buildSafeSecurityPolicy(loadSafeRuntimeConfig({
       CODEX_MOBILE_SAFE_RAW_RPC: 'true',

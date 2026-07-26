@@ -9,6 +9,10 @@ const footerSource = readFileSync(
   new URL('./ConversationRunFooter.vue', import.meta.url),
   'utf8',
 )
+const composerSource = readFileSync(
+  new URL('./ThreadComposer.vue', import.meta.url),
+  'utf8',
+)
 const donutSource = readFileSync(
   new URL('./ConversationProgressDonut.vue', import.meta.url),
   'utf8',
@@ -42,17 +46,29 @@ describe('ConversationRunFooter desktop parity wiring', () => {
     expect(footerSource).toContain('aria-live="polite"')
   })
 
-  it('renders the desktop goal strip with edit, pause/resume, delete, and expansion controls', () => {
+  it('renders create, edit, pause, resume, complete, blocked, clear, and expansion Goal controls', () => {
     expect(appSource).toContain(':goal="selectedThreadGoal"')
     expect(appSource).toContain('@set-goal="updateSelectedThreadGoal"')
     expect(appSource).toContain('@clear-goal="clearSelectedThreadGoal"')
+    expect(composerSource).toContain("emit('set-goal', { objective, status: 'active' })")
     expect(footerSource).toContain('deriveThreadGoalPresentation')
     expect(footerSource).toContain('goal-pause-button')
     expect(footerSource).toContain('goal-resume-button')
     expect(footerSource).toContain('goal-edit-button')
+    expect(footerSource).toContain('goal-complete-button')
+    expect(footerSource).toContain("emit('set-goal', { status: 'complete' })")
+    expect(footerSource).toContain('goal-blocked-button')
+    expect(footerSource).toContain("emit('set-goal', { status: 'blocked' })")
     expect(footerSource).toContain('goal-clear-button')
     expect(footerSource).toContain('goal-expand-button')
     expect(globalStyleSource).toContain(':root.dark .conversation-goal-strip')
+  })
+
+  it('does not make Goal controls read-only for an external turn owner', () => {
+    expect(appSource).not.toContain(
+      '<ConversationRunFooter\n                    :footer-state="selectedConversationFooterState"\n                    :goal="selectedThreadGoal"\n                    :goal-supported="selectedThreadGoalSupported"\n                    :read-only="selectedThreadRuntimeOwnership === \'external\'"',
+    )
+    expect(footerSource).not.toContain('v-if="!readOnly"')
   })
 
   it('requires an accessible inline second click before clearing a goal', () => {

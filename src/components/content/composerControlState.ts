@@ -73,7 +73,7 @@ export function deriveComposerControlState(
     canSubmit,
     canStop,
     canEditConfiguration,
-    canToggleGoal: canEditConfiguration && input.goalSupported,
+    canToggleGoal: composerVisible && !input.disabled && input.goalSupported,
     modelEffortLabel,
     showFastIcon: input.selectedSpeedMode === 'fast'
       && /^gpt-5\.(?:4|5|6)(?:$|-)/iu.test(input.selectedModel.trim()),

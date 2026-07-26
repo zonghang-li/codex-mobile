@@ -1037,7 +1037,6 @@
                     :footer-state="selectedConversationFooterState"
                     :goal="selectedThreadGoal"
                     :goal-supported="selectedThreadGoalSupported"
-                    :read-only="selectedThreadRuntimeOwnership === 'external'"
                     :is-updating-goal="isUpdatingThreadGoal"
                     @set-goal="updateSelectedThreadGoal"
                     @clear-goal="clearSelectedThreadGoal"

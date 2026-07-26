@@ -443,6 +443,48 @@ describe('thread goal state', () => {
     expect(state.selectedThreadGoal.value).toBeNull()
   })
 
+  it('views and mutates Goal metadata without resuming or taking ownership from an external writer', async () => {
+    installTestWindow()
+    const completedGoal = {
+      ...activeGoal,
+      status: 'complete' as const,
+      updatedAt: activeGoal.updatedAt + 10,
+      timeUsedSeconds: 91,
+      tokensUsed: 1700,
+      tokenBudget: 9000,
+    }
+    gatewayMocks.getThreadDetail.mockResolvedValue(externalDetail())
+    gatewayMocks.getThreadGoal.mockResolvedValue(activeGoal)
+    gatewayMocks.setThreadGoal.mockResolvedValue(completedGoal)
+    gatewayMocks.clearThreadGoal.mockResolvedValue(undefined)
+
+    const state = useDesktopState()
+    state.primeSelectedThread('thread-1')
+    await state.loadMessages('thread-1')
+    await flushMicrotasks()
+
+    expect(state.selectedThreadRuntimeOwnership.value).toBe('external')
+    expect(state.selectedThreadGoal.value).toEqual(activeGoal)
+
+    await expect(state.updateSelectedThreadGoal({
+      objective: 'Finish while another client runs the turn',
+      status: 'complete',
+    })).resolves.toBe(true)
+    expect(gatewayMocks.setThreadGoal).toHaveBeenCalledWith({
+      threadId: 'thread-1',
+      objective: 'Finish while another client runs the turn',
+      status: 'complete',
+    })
+    expect(state.selectedThreadGoal.value).toEqual(completedGoal)
+    expect(state.selectedThreadRuntimeOwnership.value).toBe('external')
+
+    await expect(state.clearSelectedThreadGoal()).resolves.toBe(true)
+    expect(gatewayMocks.clearThreadGoal).toHaveBeenCalledWith('thread-1')
+    expect(state.selectedThreadGoal.value).toBeNull()
+    expect(state.selectedThreadRuntimeOwnership.value).toBe('external')
+    expect(gatewayMocks.resumeThread).not.toHaveBeenCalled()
+  })
+
   it('keeps goal mutation progress scoped to the thread that started it', async () => {
     installTestWindow()
     let resolveGoal!: (goal: typeof activeGoal) => void

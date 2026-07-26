@@ -8,6 +8,15 @@ describe('safe feature gate', () => {
     expect(isAllowedRpcMethod('turn/start')).toBe(true)
   })
 
+  it('allows only the three exact native Goal RPC methods', () => {
+    expect(isAllowedRpcMethod('thread/goal/get')).toBe(true)
+    expect(isAllowedRpcMethod('thread/goal/set')).toBe(true)
+    expect(isAllowedRpcMethod('thread/goal/clear')).toBe(true)
+    expect(isAllowedRpcMethod('thread/goal/*')).toBe(false)
+    expect(isAllowedRpcMethod('thread/goal/get/metadata')).toBe(false)
+    expect(isAllowedRpcMethod('thread/goal/delete')).toBe(false)
+  })
+
   it('rejects raw or integration RPC methods outside the allowlist', () => {
     expect(isAllowedRpcMethod('command/exec')).toBe(false)
     expect(isAllowedRpcMethod('composio/connect')).toBe(false)

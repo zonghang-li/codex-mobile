@@ -46,7 +46,7 @@
           <span class="conversation-goal-duration">{{ goalPresentation.durationLabel }}</span>
         </button>
 
-        <div v-if="!readOnly" class="conversation-goal-actions">
+        <div class="conversation-goal-actions">
           <button
             class="conversation-goal-action goal-edit-button"
             type="button"
@@ -78,6 +78,28 @@
             @click="emit('set-goal', { status: 'active' })"
           >
             <IconTablerPlayerPlay />
+          </button>
+          <button
+            v-if="goal.status !== 'complete'"
+            class="conversation-goal-action goal-complete-button"
+            type="button"
+            :disabled="isUpdatingGoal"
+            :aria-label="t('Complete goal')"
+            :title="t('Complete goal')"
+            @click="emit('set-goal', { status: 'complete' })"
+          >
+            <IconTablerTargetArrow />
+          </button>
+          <button
+            v-if="goal.status === 'active' || goal.status === 'paused'"
+            class="conversation-goal-action goal-blocked-button"
+            type="button"
+            :disabled="isUpdatingGoal"
+            :aria-label="t('Mark goal blocked')"
+            :title="t('Mark goal blocked')"
+            @click="emit('set-goal', { status: 'blocked' })"
+          >
+            <IconTablerX />
           </button>
           <div
             v-if="isClearGoalConfirming"
@@ -174,6 +196,7 @@ import IconTablerPlayerPause from '../icons/IconTablerPlayerPause.vue'
 import IconTablerPlayerPlay from '../icons/IconTablerPlayerPlay.vue'
 import IconTablerTargetArrow from '../icons/IconTablerTargetArrow.vue'
 import IconTablerTrash from '../icons/IconTablerTrash.vue'
+import IconTablerX from '../icons/IconTablerX.vue'
 import ConversationProgressDonut from './ConversationProgressDonut.vue'
 import { deriveThreadGoalPresentation } from './threadGoalPresentation'
 
@@ -181,7 +204,6 @@ const props = defineProps<{
   footerState: ConversationFooterState | null
   goal: UiThreadGoal | null
   goalSupported: boolean
-  readOnly: boolean
   isUpdatingGoal: boolean
 }>()
 
@@ -274,7 +296,7 @@ function cancelGoalClear(restoreFocus = true): void {
 }
 
 function requestGoalClear(): void {
-  if (props.readOnly || props.isUpdatingGoal) return
+  if (props.isUpdatingGoal) return
   if (isClearGoalConfirming.value) {
     cancelGoalClear(false)
     emit('clear-goal')

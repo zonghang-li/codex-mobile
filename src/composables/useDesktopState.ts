@@ -6953,7 +6953,7 @@ export function useDesktopState() {
     status: UiThreadGoalStatus
   }): Promise<boolean> {
     const threadId = selectedThreadId.value.trim()
-    if (!threadId || isExternallyOwned(threadId) || threadGoalSupportByThreadId.value[threadId] === false) {
+    if (!threadId || threadGoalSupportByThreadId.value[threadId] === false) {
       return false
     }
     invalidateThreadGoalRequest(threadId)
@@ -6993,7 +6993,7 @@ export function useDesktopState() {
 
   async function clearSelectedThreadGoal(): Promise<boolean> {
     const threadId = selectedThreadId.value.trim()
-    if (!threadId || isExternallyOwned(threadId) || threadGoalSupportByThreadId.value[threadId] === false) {
+    if (!threadId || threadGoalSupportByThreadId.value[threadId] === false) {
       return false
     }
     invalidateThreadGoalRequest(threadId)

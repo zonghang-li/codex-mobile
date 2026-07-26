@@ -74,6 +74,19 @@ describe('deriveComposerControlState', () => {
       primaryAction: 'externalRunning',
       canSubmit: false,
       canStop: false,
+      canToggleGoal: true,
+    })
+  })
+
+  it('keeps Goal metadata available while a local turn is running', () => {
+    expect(deriveComposerControlState({
+      ...localIdle,
+      runtimeOwnership: 'local',
+      isTurnInProgress: true,
+      hasSubmitContent: false,
+    })).toMatchObject({
+      canEditConfiguration: false,
+      canToggleGoal: true,
     })
   })
 
