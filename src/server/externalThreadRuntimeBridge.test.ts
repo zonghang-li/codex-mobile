@@ -67,7 +67,7 @@ describe('external thread runtime bridge augmentation', () => {
     expect(probe.inspect).toHaveBeenCalledWith('thread-1', 4242)
   })
 
-  it('registers but does not inspect or augment a locally active thread', async () => {
+  it('lets a confirmed external writer override an active app-server status', async () => {
     const probe = fakeProbe({
       state: 'running',
       turnId: 'turn-external',
@@ -88,10 +88,44 @@ describe('external thread runtime bridge augmentation', () => {
       payload,
       probe,
       4242,
-    )).resolves.toBe(payload)
+    )).resolves.toEqual({
+      thread: {
+        ...payload.thread,
+        externalRuntime: {
+          state: 'running',
+          turnId: 'turn-external',
+          interruptible: false,
+          source: 'external-session-writer',
+        },
+      },
+    })
     expect(probe.registerThread).toHaveBeenCalledOnce()
-    expect(probe.inspect).not.toHaveBeenCalled()
-    expect(payload.thread).not.toHaveProperty('externalRuntime')
+    expect(probe.inspect).toHaveBeenCalledWith('thread-1', 4242)
+  })
+
+  it('attaches unknown writer evidence to an active thread so clients fail closed', async () => {
+    const probe = fakeProbe({ state: 'unknown' })
+    const payload = {
+      thread: {
+        id: 'thread-unknown',
+        path: '/home/user/.codex/sessions/rollout-thread-unknown.jsonl',
+        status: { type: 'active' },
+        turns: [{ id: 'turn-observed', status: 'inProgress' }],
+      },
+    }
+
+    await expect(augmentThreadResultWithExternalRuntime(
+      'thread/read',
+      payload,
+      probe,
+      4242,
+    )).resolves.toEqual({
+      thread: {
+        ...payload.thread,
+        externalRuntime: { state: 'unknown' },
+      },
+    })
+    expect(probe.inspect).toHaveBeenCalledWith('thread-unknown', 4242)
   })
 
   it('attaches batch runtime observations to thread-list rows', async () => {
@@ -303,6 +337,203 @@ describe('POST /codex-api/rpc guarded resume', () => {
       includeTurns: true,
     })
     expect(inspect).toHaveBeenCalledWith('thread-unknown-writer', 4242)
+  })
+})
+
+describe('POST /codex-api/rpc guarded user turns', () => {
+  it.each([
+    ['running', {
+      state: 'running' as const,
+      turnId: 'turn-desktop',
+      interruptible: false as const,
+      source: 'external-session-writer' as const,
+    }],
+    ['unknown', { state: 'unknown' as const }],
+  ])('blocks turn/start when the immediate writer probe is %s', async (_label, runtime) => {
+    const middleware = createCodexBridgeMiddleware()
+    const shared = sharedBridgeForTest()
+    vi.spyOn(shared.appServer, 'getPid').mockReturnValue(4242)
+    const inspect = vi.spyOn(shared.runtimeProbe, 'inspect').mockResolvedValue(runtime)
+    const rpc = vi.spyOn(shared.appServer as unknown as {
+      rpc(method: string, params: unknown): Promise<unknown>
+    }, 'rpc').mockImplementation(async (method) => {
+      if (method === 'thread/read') {
+        return {
+          thread: {
+            id: 'thread-existing',
+            path: '/home/user/.codex/sessions/rollout-thread-existing.jsonl',
+            status: { type: 'idle' },
+            turns: [],
+          },
+        }
+      }
+      if (method === 'turn/start') return { turn: { id: 'turn-raced' } }
+      return {}
+    })
+    const port = await listenWithMiddleware(middleware)
+
+    const response = await fetch(`http://127.0.0.1:${port}/codex-api/rpc`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        method: 'turn/start',
+        params: { threadId: 'thread-existing', input: [{ type: 'text', text: 'race' }] },
+      }),
+    })
+
+    expect(response.status).toBe(502)
+    expect(await response.json()).toMatchObject({
+      error: expect.stringContaining('writer ownership is not idle'),
+    })
+    expect(rpc).toHaveBeenCalledTimes(1)
+    expect(rpc).toHaveBeenCalledWith('thread/read', {
+      threadId: 'thread-existing',
+      includeTurns: true,
+    })
+    expect(inspect).toHaveBeenCalledWith('thread-existing', 4242)
+    expect(rpc).not.toHaveBeenCalledWith('turn/start', expect.anything())
+  })
+
+  it('allows the first turn for a thread created by this middleware without a rollout probe', async () => {
+    const middleware = createCodexBridgeMiddleware()
+    const shared = sharedBridgeForTest()
+    const inspect = vi.spyOn(shared.runtimeProbe, 'inspect')
+    const rpc = vi.spyOn(shared.appServer as unknown as {
+      rpc(method: string, params: unknown): Promise<unknown>
+    }, 'rpc').mockImplementation(async (method) => {
+      if (method === 'thread/start') {
+        return { thread: { id: 'thread-new', path: '/home/user/.codex/sessions/rollout-thread-new.jsonl' } }
+      }
+      if (method === 'turn/start') return { turn: { id: 'turn-first' } }
+      return {}
+    })
+    const port = await listenWithMiddleware(middleware)
+
+    const startResponse = await fetch(`http://127.0.0.1:${port}/codex-api/rpc`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ method: 'thread/start', params: { cwd: '/tmp/project' } }),
+    })
+    expect(startResponse.status).toBe(200)
+
+    const turnResponse = await fetch(`http://127.0.0.1:${port}/codex-api/rpc`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        method: 'turn/start',
+        params: { threadId: 'thread-new', input: [{ type: 'text', text: 'first' }] },
+      }),
+    })
+
+    expect(turnResponse.status).toBe(200)
+    await expect(turnResponse.json()).resolves.toMatchObject({
+      result: { turn: { id: 'turn-first' } },
+    })
+    expect(inspect).not.toHaveBeenCalled()
+    expect(rpc).toHaveBeenCalledWith('turn/start', expect.objectContaining({ threadId: 'thread-new' }))
+  })
+
+  it('preserves first-turn resume recovery when a newly created thread is not materialized yet', async () => {
+    const middleware = createCodexBridgeMiddleware()
+    const shared = sharedBridgeForTest()
+    const inspect = vi.spyOn(shared.runtimeProbe, 'inspect')
+    let turnStartCalls = 0
+    const rpc = vi.spyOn(shared.appServer as unknown as {
+      rpc(method: string, params: unknown): Promise<unknown>
+    }, 'rpc').mockImplementation(async (method) => {
+      if (method === 'thread/start') return { thread: { id: 'thread-new-recovery' } }
+      if (method === 'turn/start') {
+        turnStartCalls += 1
+        if (turnStartCalls === 1) throw new Error('thread not found: thread-new-recovery')
+        return { turn: { id: 'turn-first-recovered' } }
+      }
+      if (method === 'thread/resume') return { thread: { id: 'thread-new-recovery', turns: [] } }
+      throw new Error(`unexpected method ${method}`)
+    })
+    const port = await listenWithMiddleware(middleware)
+
+    await fetch(`http://127.0.0.1:${port}/codex-api/rpc`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ method: 'thread/start', params: { cwd: '/tmp/project' } }),
+    })
+    const turnResponse = await fetch(`http://127.0.0.1:${port}/codex-api/rpc`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        method: 'turn/start',
+        params: { threadId: 'thread-new-recovery', input: [{ type: 'text', text: 'first' }] },
+      }),
+    })
+
+    expect(turnResponse.status).toBe(200)
+    await expect(turnResponse.json()).resolves.toMatchObject({
+      result: { turn: { id: 'turn-first-recovered' } },
+    })
+    expect(rpc.mock.calls.map(([method]) => method)).toEqual([
+      'thread/start',
+      'turn/start',
+      'thread/resume',
+      'turn/start',
+    ])
+    expect(inspect).not.toHaveBeenCalled()
+  })
+
+  it('rechecks ownership and blocks a writer takeover after an earlier idle UI read', async () => {
+    const middleware = createCodexBridgeMiddleware()
+    const shared = sharedBridgeForTest()
+    vi.spyOn(shared.appServer, 'getPid').mockReturnValue(4242)
+    const inspect = vi.spyOn(shared.runtimeProbe, 'inspect')
+      .mockResolvedValueOnce({ state: 'idle' })
+      .mockResolvedValueOnce({
+        state: 'running',
+        turnId: 'turn-desktop-takeover',
+        interruptible: false,
+        source: 'external-session-writer',
+      })
+    const rpc = vi.spyOn(shared.appServer as unknown as {
+      rpc(method: string, params: unknown): Promise<unknown>
+    }, 'rpc').mockImplementation(async (method) => {
+      if (method === 'thread/read') {
+        return {
+          thread: {
+            id: 'thread-takeover',
+            path: '/home/user/.codex/sessions/rollout-thread-takeover.jsonl',
+            status: { type: 'idle' },
+            turns: [],
+          },
+        }
+      }
+      if (method === 'turn/start') return { turn: { id: 'turn-raced' } }
+      return {}
+    })
+    const port = await listenWithMiddleware(middleware)
+
+    const readResponse = await fetch(`http://127.0.0.1:${port}/codex-api/rpc`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        method: 'thread/read',
+        params: { threadId: 'thread-takeover', includeTurns: true },
+      }),
+    })
+    expect(readResponse.status).toBe(200)
+    await expect(readResponse.json()).resolves.toMatchObject({
+      result: { thread: { externalRuntime: { state: 'idle' } } },
+    })
+
+    const turnResponse = await fetch(`http://127.0.0.1:${port}/codex-api/rpc`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        method: 'turn/start',
+        params: { threadId: 'thread-takeover', input: [{ type: 'text', text: 'race' }] },
+      }),
+    })
+
+    expect(turnResponse.status).toBe(502)
+    expect(inspect).toHaveBeenCalledTimes(2)
+    expect(rpc).not.toHaveBeenCalledWith('turn/start', expect.anything())
   })
 })
 

@@ -1,6 +1,6 @@
 import { spawn, spawnSync, type ChildProcessWithoutNullStreams } from 'node:child_process'
-import { createHash, randomBytes, randomUUID } from 'node:crypto'
-import { mkdtemp, readFile, readdir, rename, rm, mkdir, stat, cp, lstat, readlink, symlink, realpath, utimes } from 'node:fs/promises'
+import { createHash, createHmac, randomBytes, randomUUID, timingSafeEqual } from 'node:crypto'
+import { link, mkdtemp, readFile, readdir, rename, rm, mkdir, stat, cp, lstat, readlink, symlink, realpath, utimes } from 'node:fs/promises'
 import { createReadStream, existsSync, readFileSync, statSync } from 'node:fs'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { request as httpRequest } from 'node:http'
@@ -259,10 +259,17 @@ const DEFAULT_API_PERF_BODY_MB_THRESHOLD = 1
 const MB_DIVISOR = 1024 * 1024
 const COMPOSIO_USER_DATA_PATH = join(homedir(), '.composio', 'user_data.json')
 const MANAGED_UPLOAD_ROOT = join(tmpdir(), 'codex-web-uploads')
-const managedUploads = new Map<string, { root: string; directory: string }>()
+const managedUploads = new Map<string, { root: string; directory: string; expiresAt: number }>()
 const managedUploadDeletions = new Map<string, Promise<boolean>>()
+const managedUploadCapabilityKeys = new Map<string, Promise<Buffer>>()
+const managedUploadReaperCursorByRoot = new Map<string, string>()
 const MANAGED_UPLOAD_TTL_MS = 60 * 60 * 1000
 const MANAGED_UPLOAD_REAPER_MAX_ENTRIES = 512
+const MANAGED_UPLOAD_REAPER_INTERVAL_MS = 60 * 1000
+const MANAGED_UPLOAD_REAPER_BATCHES_PER_TICK = 4
+const MANAGED_UPLOAD_CAPABILITY_KEY_FILE = '.cleanup-capability-key'
+const NEW_THREAD_FIRST_TURN_TTL_MS = 5 * 60 * 1000
+const NEW_THREAD_FIRST_TURN_MAX_ENTRIES = 256
 
 type SessionRecoveredFileChange = {
   path: string
@@ -1068,7 +1075,6 @@ export async function augmentThreadResultWithExternalRuntime(
   if (!record || !thread || !threadId) return result
 
   runtimeProbe.registerThread(threadId, readNonEmptyString(thread.path))
-  if (readThreadResultInProgress(thread)) return result
 
   return {
     ...record,
@@ -2762,6 +2768,7 @@ export async function callRpcWithArchiveRecovery(
   params: unknown,
   runtimeProbe?: Pick<ThreadRuntimeProbe, 'registerThread' | 'inspect'>,
   excludedPid: number | null = null,
+  options: { locallyCreatedFirstTurn?: boolean } = {},
 ): Promise<unknown> {
   const paramsRecord = asRecord(params)
   const threadId = readNonEmptyString(paramsRecord?.threadId)
@@ -2782,7 +2789,7 @@ export async function callRpcWithArchiveRecovery(
       : result
   } catch (error) {
     if (method === 'turn/start' && threadId && isThreadNotFoundError(error)) {
-      if (runtimeProbe) {
+      if (runtimeProbe && options.locallyCreatedFirstTurn !== true) {
         const guard = await guardThreadResumeAgainstExternalWriter(
           appServer,
           runtimeProbe,
@@ -6520,6 +6527,99 @@ function isPathInsideRoot(root: string, candidate: string): boolean {
     && !isAbsolute(relativePath)
 }
 
+async function readManagedUploadCapabilityKey(root: string): Promise<Buffer> {
+  const normalizedRoot = resolve(root)
+  const existing = managedUploadCapabilityKeys.get(normalizedRoot)
+  if (existing) return existing
+
+  const promise = (async () => {
+    const keyPath = join(normalizedRoot, MANAGED_UPLOAD_CAPABILITY_KEY_FILE)
+    const temporaryKeyPath = join(
+      normalizedRoot,
+      `${MANAGED_UPLOAD_CAPABILITY_KEY_FILE}.${randomUUID()}.tmp`,
+    )
+    try {
+      await writeFile(temporaryKeyPath, randomBytes(32), { flag: 'wx', mode: 0o600 })
+      await link(temporaryKeyPath, keyPath)
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error
+    } finally {
+      await rm(temporaryKeyPath, { force: true }).catch(() => undefined)
+    }
+
+    const keyInfo = await lstat(keyPath)
+    const currentUid = typeof process.getuid === 'function' ? process.getuid() : null
+    if (
+      !keyInfo.isFile()
+      || keyInfo.isSymbolicLink()
+      || (keyInfo.mode & 0o077) !== 0
+      || (currentUid !== null && keyInfo.uid !== currentUid)
+    ) {
+      throw new Error('Managed upload capability key is not a private current-user file')
+    }
+    const key = await readFile(keyPath)
+    if (key.length !== 32) {
+      throw new Error('Managed upload capability key is invalid')
+    }
+    return key
+  })()
+  managedUploadCapabilityKeys.set(normalizedRoot, promise)
+  try {
+    return await promise
+  } catch (error) {
+    managedUploadCapabilityKeys.delete(normalizedRoot)
+    throw error
+  }
+}
+
+function buildManagedUploadCapabilityPayload(issuedAtMs: number, uploadId: string): string {
+  return `v1:${issuedAtMs}:${uploadId}`
+}
+
+async function issueManagedUploadCapability(root: string, uploadId: string, issuedAtMs = Date.now()): Promise<string> {
+  const key = await readManagedUploadCapabilityKey(root)
+  const signature = createHmac('sha256', key)
+    .update(buildManagedUploadCapabilityPayload(issuedAtMs, uploadId))
+    .digest('base64url')
+  return `v1.${issuedAtMs.toString(36)}.${uploadId}.${signature}`
+}
+
+async function verifyManagedUploadCapability(
+  root: string,
+  uploadHandle: string,
+  options: { nowMs: number; ttlMs: number },
+): Promise<{ uploadId: string } | null> {
+  const match = uploadHandle.match(
+    /^v1\.([0-9a-z]+)\.([0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})\.([A-Za-z0-9_-]{43})$/u,
+  )
+  if (!match) return null
+  const issuedAtMs = Number.parseInt(match[1]!, 36)
+  const uploadId = match[2]!
+  const suppliedSignature = Buffer.from(match[3]!, 'ascii')
+  if (
+    !Number.isSafeInteger(issuedAtMs)
+    || issuedAtMs < 0
+    || issuedAtMs > options.nowMs
+    || options.nowMs - issuedAtMs > options.ttlMs
+  ) {
+    return null
+  }
+  const key = await readManagedUploadCapabilityKey(root)
+  const expectedSignature = Buffer.from(
+    createHmac('sha256', key)
+      .update(buildManagedUploadCapabilityPayload(issuedAtMs, uploadId))
+      .digest('base64url'),
+    'ascii',
+  )
+  if (
+    suppliedSignature.length !== expectedSignature.length
+    || !timingSafeEqual(suppliedSignature, expectedSignature)
+  ) {
+    return null
+  }
+  return { uploadId }
+}
+
 export async function createManagedUpload(
   fileName: string,
   fileData: Uint8Array,
@@ -6532,47 +6632,57 @@ export async function createManagedUpload(
     throw new Error('Managed upload root is not a real directory')
   }
 
-  const uploadHandle = randomUUID()
-  const directory = join(root, `upload-${uploadHandle}`)
+  const uploadId = randomUUID()
+  const uploadHandle = await issueManagedUploadCapability(root, uploadId)
+  const directory = join(root, `upload-${uploadId}`)
   await mkdir(directory, { recursive: false, mode: 0o700 })
   const safeFileName = basename(fileName.trim().replace(/[/\\]/gu, '_')) || 'uploaded-file'
   const path = join(directory, safeFileName)
   await writeFile(path, fileData, { mode: 0o600 })
-  managedUploads.set(uploadHandle, { root, directory })
+  managedUploads.set(uploadHandle, {
+    root,
+    directory,
+    expiresAt: Date.now() + MANAGED_UPLOAD_TTL_MS,
+  })
   return { uploadHandle, path }
 }
 
-export async function deleteManagedUpload(uploadHandle: string): Promise<boolean> {
+export async function deleteManagedUpload(
+  uploadHandle: string,
+  options: {
+    uploadRoot?: string
+    nowMs?: number
+    ttlMs?: number
+  } = {},
+): Promise<boolean> {
   const normalizedHandle = uploadHandle.trim()
-  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu.test(normalizedHandle)) {
-    return false
-  }
-  const upload = managedUploads.get(normalizedHandle)
-  if (!upload) return false
   const existingDeletion = managedUploadDeletions.get(normalizedHandle)
   if (existingDeletion) return existingDeletion
 
   const deletion = (async () => {
     try {
-      const [rootInfo, directoryInfo] = await Promise.all([
-        lstat(upload.root),
-        lstat(upload.directory),
-      ])
-      if (
-        !rootInfo.isDirectory()
-        || rootInfo.isSymbolicLink()
-        || !directoryInfo.isDirectory()
-        || directoryInfo.isSymbolicLink()
-      ) {
-        return false
+      const registeredUpload = managedUploads.get(normalizedHandle)
+      const root = resolve(options.uploadRoot ?? registeredUpload?.root ?? MANAGED_UPLOAD_ROOT)
+      const rootInfo = await lstat(root)
+      if (!rootInfo.isDirectory() || rootInfo.isSymbolicLink()) return false
+      const canonicalRoot = await realpath(root)
+      const capability = await verifyManagedUploadCapability(canonicalRoot, normalizedHandle, {
+        nowMs: options.nowMs ?? Date.now(),
+        ttlMs: Math.max(0, options.ttlMs ?? MANAGED_UPLOAD_TTL_MS),
+      })
+      if (!capability) return false
+      const directory = join(canonicalRoot, `upload-${capability.uploadId}`)
+      let directoryInfo
+      try {
+        directoryInfo = await lstat(directory)
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') return false
+        return true
       }
-      const [canonicalRoot, canonicalDirectory] = await Promise.all([
-        realpath(upload.root),
-        realpath(upload.directory),
-      ])
+      if (!directoryInfo.isDirectory() || directoryInfo.isSymbolicLink()) return false
+      const canonicalDirectory = await realpath(directory)
       if (!isPathInsideRoot(canonicalRoot, canonicalDirectory)) return false
       await rm(canonicalDirectory, { recursive: true, force: false })
-      managedUploads.delete(normalizedHandle)
       return true
     } catch {
       return false
@@ -6597,14 +6707,32 @@ export async function reapExpiredManagedUploads(options: {
   const ttlMs = Math.max(0, options.ttlMs ?? MANAGED_UPLOAD_TTL_MS)
   const maxEntries = Math.max(0, Math.floor(options.maxEntries ?? MANAGED_UPLOAD_REAPER_MAX_ENTRIES))
   if (maxEntries === 0) return 0
+  for (const [handle, upload] of managedUploads) {
+    if (upload.expiresAt <= nowMs) managedUploads.delete(handle)
+  }
 
   try {
     const rootInfo = await lstat(root)
     if (!rootInfo.isDirectory() || rootInfo.isSymbolicLink()) return 0
     const canonicalRoot = await realpath(root)
-    const entries = (await readdir(root, { withFileTypes: true })).slice(0, maxEntries)
+    const entries = (await readdir(root, { withFileTypes: true }))
+      .sort((left, right) => left.name.localeCompare(right.name))
+    const previousCursor = managedUploadReaperCursorByRoot.get(canonicalRoot) ?? ''
+    const nextIndex = previousCursor
+      ? entries.findIndex((entry) => entry.name > previousCursor)
+      : 0
+    const startIndex = nextIndex >= 0 ? nextIndex : 0
+    const orderedEntries = [
+      ...entries.slice(startIndex),
+      ...entries.slice(0, startIndex),
+    ].slice(0, maxEntries)
+    if (entries.length > maxEntries && orderedEntries.length > 0) {
+      managedUploadReaperCursorByRoot.set(canonicalRoot, orderedEntries.at(-1)!.name)
+    } else {
+      managedUploadReaperCursorByRoot.delete(canonicalRoot)
+    }
     let removed = 0
-    for (const entry of entries) {
+    for (const entry of orderedEntries) {
       if (
         !entry.isDirectory()
         || entry.isSymbolicLink()
@@ -7958,8 +8086,41 @@ async function buildThreadSearchIndex(appServer: AppServerProcess): Promise<Thre
 
 export function createCodexBridgeMiddleware(options: {
   securityPolicy?: ServerSecurityPolicy
+  managedUploadReaper?: {
+    uploadRoot?: string
+    intervalMs?: number
+    ttlMs?: number
+    maxEntries?: number
+  }
 } = {}): CodexBridgeMiddleware {
-  void reapExpiredManagedUploads().catch(() => {})
+  const managedUploadReaperOptions = options.managedUploadReaper ?? {}
+  let managedUploadReaperDisposed = false
+  let managedUploadReaperRun: Promise<void> | null = null
+  const scheduleManagedUploadReaper = () => {
+    if (managedUploadReaperRun) return managedUploadReaperRun
+    managedUploadReaperRun = (async () => {
+      const batchSize = Math.max(
+        0,
+        Math.floor(managedUploadReaperOptions.maxEntries ?? MANAGED_UPLOAD_REAPER_MAX_ENTRIES),
+      )
+      if (batchSize === 0) return
+      for (let batch = 0; batch < MANAGED_UPLOAD_REAPER_BATCHES_PER_TICK; batch += 1) {
+        if (managedUploadReaperDisposed) return
+        const removed = await reapExpiredManagedUploads(managedUploadReaperOptions)
+        if (removed < batchSize) return
+      }
+    })().finally(() => {
+      managedUploadReaperRun = null
+    })
+    return managedUploadReaperRun
+  }
+  void scheduleManagedUploadReaper().catch(() => {})
+  const managedUploadReaperTimer = setInterval(() => {
+    void scheduleManagedUploadReaper().catch(() => {})
+  }, Math.max(1, Math.floor(
+    managedUploadReaperOptions.intervalMs ?? MANAGED_UPLOAD_REAPER_INTERVAL_MS,
+  )))
+  managedUploadReaperTimer.unref?.()
   const securityPolicy = options.securityPolicy ?? PERMISSIVE_SECURITY_POLICY
   const {
     appServer,
@@ -7972,6 +8133,27 @@ export function createCodexBridgeMiddleware(options: {
   } = getSharedBridgeState()
   let threadSearchIndex: ThreadSearchIndex | null = null
   let threadSearchIndexPromise: Promise<ThreadSearchIndex> | null = null
+  const pendingFirstTurnByThreadId = new Map<string, number>()
+
+  function rememberPendingFirstTurn(threadId: string): void {
+    const nowMs = Date.now()
+    for (const [candidateThreadId, expiresAt] of pendingFirstTurnByThreadId) {
+      if (expiresAt <= nowMs) pendingFirstTurnByThreadId.delete(candidateThreadId)
+    }
+    pendingFirstTurnByThreadId.set(threadId, nowMs + NEW_THREAD_FIRST_TURN_TTL_MS)
+    while (pendingFirstTurnByThreadId.size > NEW_THREAD_FIRST_TURN_MAX_ENTRIES) {
+      const oldestThreadId = pendingFirstTurnByThreadId.keys().next().value as string | undefined
+      if (!oldestThreadId) break
+      pendingFirstTurnByThreadId.delete(oldestThreadId)
+    }
+  }
+
+  function hasPendingFirstTurn(threadId: string): boolean {
+    const expiresAt = pendingFirstTurnByThreadId.get(threadId) ?? 0
+    if (expiresAt > Date.now()) return true
+    pendingFirstTurnByThreadId.delete(threadId)
+    return false
+  }
 
   async function getThreadSearchIndex(): Promise<ThreadSearchIndex> {
     if (threadSearchIndex) return threadSearchIndex
@@ -8540,13 +8722,35 @@ export function createCodexBridgeMiddleware(options: {
 
         let rpcResult: unknown
         try {
+          const requestThreadId = readNonEmptyString(asRecord(preparedRpcRequest.params)?.threadId)
+          const isPendingFirstTurn = body.method === 'turn/start'
+            && requestThreadId.length > 0
+            && hasPendingFirstTurn(requestThreadId)
+          if (body.method === 'turn/start' && requestThreadId && !isPendingFirstTurn) {
+            const guard = await guardThreadResumeAgainstExternalWriter(
+              appServer,
+              runtimeProbe,
+              appServer.getPid(),
+              requestThreadId,
+            )
+            if (guard.blocked) {
+              throw new Error('Cannot start a turn because task writer ownership is not idle.')
+            }
+          }
           rpcResult = await callRpcWithArchiveRecovery(
             appServer,
             body.method,
             preparedRpcRequest.params,
             runtimeProbe,
             appServer.getPid(),
+            { locallyCreatedFirstTurn: isPendingFirstTurn },
           )
+          if (body.method === 'thread/start') {
+            const startedThreadId = readNonEmptyString(asRecord(asRecord(rpcResult)?.thread)?.id)
+            if (startedThreadId) rememberPendingFirstTurn(startedThreadId)
+          } else if (isPendingFirstTurn) {
+            pendingFirstTurnByThreadId.delete(requestThreadId)
+          }
         } catch (error) {
 	          if (body.method === 'account/rateLimits/read' && isUnauthenticatedRateLimitError(error)) {
 	            setJson(res, 200, { result: null })
@@ -10280,7 +10484,10 @@ export function createCodexBridgeMiddleware(options: {
   }
 
   middleware.dispose = () => {
+    managedUploadReaperDisposed = true
+    clearInterval(managedUploadReaperTimer)
     threadSearchIndex = null
+    pendingFirstTurnByThreadId.clear()
     telegramBridge.stop()
     terminalManager.dispose()
     backendQueueProcessor.dispose()

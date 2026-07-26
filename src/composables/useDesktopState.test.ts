@@ -3611,6 +3611,23 @@ describe('external runtime ownership', () => {
     expect(gatewayMocks.startThreadTurn).toHaveBeenCalledTimes(1)
   })
 
+  it.each([
+    ['external', externalDetail('turn-desktop')],
+    ['unknown', { ...idleDetail(), externalRuntimeState: 'unknown' as const }],
+  ])('does not dispatch turn/start when resume returns %s ownership', async (_label, resumed) => {
+    const { state } = await setupExternalRuntimeState()
+    gatewayMocks.resumeThread.mockResolvedValue(resumed)
+    gatewayMocks.startThreadTurn.mockResolvedValue('turn-must-not-start')
+
+    await expect(state.sendMessageToSelectedThread('do not race desktop')).rejects.toThrow(
+      'task writer ownership is not idle',
+    )
+
+    expect(gatewayMocks.resumeThread).toHaveBeenCalledWith('thread-1')
+    expect(gatewayMocks.startThreadTurn).not.toHaveBeenCalled()
+    expect(state.selectedThreadRuntimeOwnership.value).toBe('external')
+  })
+
   it('does not let a delayed terminal detail clear a newer local lease', async () => {
     const { state, emit } = await setupExternalRuntimeState()
     const terminalDetail = deferred<ReturnType<typeof idleDetail>>()
@@ -5035,6 +5052,32 @@ describe('provider model selection', () => {
       'user:hi',
       'assistant:Hi.',
     ])
+  })
+
+  it('renders a managed image as an @filename token before first-turn reconciliation', async () => {
+    installTestWindow()
+    const pendingTurn = deferred<string>()
+    gatewayMocks.startThread.mockResolvedValue({
+      threadId: 'new-image-thread',
+      model: 'gpt-5.4-mini',
+      modelProvider: 'openai',
+    })
+    gatewayMocks.startThreadTurn.mockReturnValue(pendingTurn.promise)
+    const managedImageUrl = '/codex-local-image?path=%2Ftmp%2Fcodex-web-uploads%2Fupload-123%2Fphoto.png&uploadHandle=managed-photo'
+    const state = useDesktopState()
+
+    await expect(state.sendMessageToNewThread('describe this', '/tmp/project', [managedImageUrl]))
+      .resolves.toBe('new-image-thread')
+
+    const optimistic = state.messages.value.find((message) => message.messageType === 'userMessage.optimistic')
+    expect(optimistic).toMatchObject({
+      role: 'user',
+      text: '@photo.png\n\ndescribe this',
+    })
+    expect(optimistic?.images ?? []).toEqual([])
+
+    pendingTurn.resolve('turn-first')
+    await flushMicrotasks()
   })
 
   it('releases a new-thread upload once after primary and fallback thread/start both fail', async () => {

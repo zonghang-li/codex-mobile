@@ -1,8 +1,9 @@
 import { lstat, mkdir, mkdtemp, readFile, rm, symlink, utimes, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import {
+  createCodexBridgeMiddleware,
   createManagedUpload,
   deleteManagedUpload,
   reapExpiredManagedUploads,
@@ -11,6 +12,7 @@ import {
 const cleanupRoots: string[] = []
 
 afterEach(async () => {
+  vi.useRealTimers()
   await Promise.all(cleanupRoots.splice(0).map((root) => rm(root, { recursive: true, force: true })))
 })
 
@@ -31,7 +33,7 @@ describe('Codex bridge security-policy wiring', () => {
 
     await expect(deleteManagedUpload(upload.uploadHandle)).resolves.toBe(true)
     await expect(lstat(dirname(upload.path))).rejects.toThrow()
-    await expect(deleteManagedUpload(upload.uploadHandle)).resolves.toBe(false)
+    await expect(deleteManagedUpload(upload.uploadHandle)).resolves.toBe(true)
   })
 
   it.each([
@@ -75,6 +77,39 @@ describe('Codex bridge security-policy wiring', () => {
     ])).resolves.toEqual([true, true])
   })
 
+  it('recovers cleanup authority from a signed handle after the in-memory registry is lost', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'codex-managed-upload-restart-'))
+    cleanupRoots.push(root)
+    const upload = await createManagedUpload('restart.png', Buffer.from('image'), root)
+
+    vi.resetModules()
+    const restartedBridge = await import('./codexAppServerBridge')
+
+    await expect(restartedBridge.deleteManagedUpload(upload.uploadHandle, {
+      uploadRoot: root,
+    })).resolves.toBe(true)
+    await expect(lstat(dirname(upload.path))).rejects.toThrow()
+    await expect(restartedBridge.deleteManagedUpload(upload.uploadHandle, {
+      uploadRoot: root,
+    })).resolves.toBe(true)
+  })
+
+  it('rejects expired or tampered cleanup capabilities without deleting the upload', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'codex-managed-upload-expiry-'))
+    cleanupRoots.push(root)
+    const upload = await createManagedUpload('expiry.png', Buffer.from('image'), root)
+    const issuedAtMs = Number.parseInt(upload.uploadHandle.split('.')[1] ?? '', 36)
+    const tampered = `${upload.uploadHandle.slice(0, -1)}${upload.uploadHandle.endsWith('A') ? 'B' : 'A'}`
+
+    await expect(deleteManagedUpload(tampered, { uploadRoot: root })).resolves.toBe(false)
+    await expect(deleteManagedUpload(upload.uploadHandle, {
+      uploadRoot: root,
+      nowMs: issuedAtMs + 1_001,
+      ttlMs: 1_000,
+    })).resolves.toBe(false)
+    await expect(lstat(dirname(upload.path))).resolves.toBeDefined()
+  })
+
   it('reaps bounded expired managed-upload orphans without following symlinks', async () => {
     const root = await mkdtemp(join(tmpdir(), 'codex-managed-upload-reaper-'))
     const outside = await mkdtemp(join(tmpdir(), 'codex-managed-upload-outside-'))
@@ -113,5 +148,65 @@ describe('Codex bridge security-policy wiring', () => {
     await expect(lstat(unrelated)).resolves.toBeDefined()
     await expect(lstat(escapedLink)).resolves.toBeDefined()
     await expect(readFile(join(outside, 'keep.txt'), 'utf8')).resolves.toBe('keep')
+  })
+
+  it('eventually reaps more than 512 expired uploads across repeated bounded batches', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'codex-managed-upload-batches-'))
+    cleanupRoots.push(root)
+    const nowMs = Date.now()
+    const expiredDate = new Date(nowMs - 10_000)
+    const directories = Array.from({ length: 520 }, (_, index) => join(
+      root,
+      `upload-00000000-0000-4000-8000-${index.toString(16).padStart(12, '0')}`,
+    ))
+    await Promise.all(directories.map(async (directory) => {
+      await mkdir(directory)
+      await utimes(directory, expiredDate, expiredDate)
+    }))
+
+    await expect(reapExpiredManagedUploads({
+      uploadRoot: root,
+      nowMs,
+      ttlMs: 5_000,
+      maxEntries: 512,
+    })).resolves.toBe(512)
+    await expect(reapExpiredManagedUploads({
+      uploadRoot: root,
+      nowMs,
+      ttlMs: 5_000,
+      maxEntries: 512,
+    })).resolves.toBe(8)
+    await expect(Promise.all(directories.map((directory) => lstat(directory).then(
+      () => true,
+      () => false,
+    )))).resolves.not.toContain(true)
+  })
+
+  it('periodically reaps uploads that expire after middleware startup and clears its timer', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'codex-managed-upload-periodic-'))
+    cleanupRoots.push(root)
+    const middleware = createCodexBridgeMiddleware({
+      managedUploadReaper: {
+        uploadRoot: root,
+        intervalMs: 10,
+        ttlMs: 500,
+        maxEntries: 8,
+      },
+    })
+    const first = await createManagedUpload('first.png', Buffer.from('image'), root)
+    const firstDirectory = dirname(first.path)
+    const expiredDate = new Date(Date.now() - 1_000)
+    await utimes(firstDirectory, expiredDate, expiredDate)
+
+    await vi.waitFor(async () => {
+      await expect(lstat(firstDirectory)).rejects.toThrow()
+    }, { timeout: 1_000, interval: 10 })
+
+    middleware.dispose()
+    const second = await createManagedUpload('second.png', Buffer.from('image'), root)
+    const secondDirectory = dirname(second.path)
+    await utimes(secondDirectory, expiredDate, expiredDate)
+    await new Promise((resolve) => setTimeout(resolve, 50))
+    await expect(lstat(secondDirectory)).resolves.toBeDefined()
   })
 })

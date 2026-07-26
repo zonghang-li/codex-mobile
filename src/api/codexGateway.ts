@@ -554,21 +554,21 @@ function readExternalRuntime(payload: ThreadReadResponse): ExternalThreadRuntime
 
 export function readThreadDetailRuntime(payload: ThreadReadResponse): ThreadDetailRuntime {
   const external = readExternalRuntime(payload)
-  if (readThreadInProgressFromResponse(payload)) {
-    return {
-      inProgress: true,
-      activeTurnId: readActiveTurnIdFromResponse(payload),
-      ownership: 'local',
-      canInterrupt: true,
-      externalRuntimeState: external.state,
-    }
-  }
   if (external.state === 'running') {
     return {
       inProgress: true,
       activeTurnId: external.turnId,
       ownership: 'external',
       canInterrupt: false,
+      externalRuntimeState: external.state,
+    }
+  }
+  if (readThreadInProgressFromResponse(payload)) {
+    return {
+      inProgress: true,
+      activeTurnId: readActiveTurnIdFromResponse(payload),
+      ownership: external.state === 'idle' ? 'local' : 'external',
+      canInterrupt: external.state === 'idle',
       externalRuntimeState: external.state,
     }
   }

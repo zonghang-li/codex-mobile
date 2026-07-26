@@ -15,6 +15,8 @@
 6. Confirm the user message still shows the `@<filename>` text but no user image preview.
 7. Confirm any assistant-generated image in the same thread still renders normally.
 8. In dark theme, repeat attachment and removal, then switch to another thread without sending.
+9. From the new-chat screen, attach an image and send the first turn; before the first server reconciliation, confirm the optimistic user row contains only `@<filename>` text and no image preview.
+10. Retry cleanup for the same accepted upload twice and restart the mobile server between two cleanup attempts; confirm both valid cleanup requests succeed and no arbitrary sibling path is removed.
 
 #### Expected Results
 
@@ -24,6 +26,8 @@
 - Managed attachments are never written into persistent queue state; a queue action sends them immediately.
 - Removal, thread-switch discard, and final failed handoff also request deletion.
 - Assistant-generated image previews are unchanged.
+- New-thread optimistic rows follow the same text-only token rule before their first persisted `thread/read`.
+- Valid cleanup is idempotent across sequential retries and server restart; expired uploads are reaped later without following symlinks or accepting guessed paths.
 
 #### Rollback/Cleanup
 

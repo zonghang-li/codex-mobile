@@ -831,7 +831,7 @@ describe('getThreadDetail', () => {
     })
   })
 
-  it('gives local app-server activity precedence over external metadata', () => {
+  it('gives a confirmed external writer precedence over active app-server status', () => {
     const payload = runtimePayload({
       id: 'thread-1',
       turns: [{ id: 'turn-local', status: 'inProgress', items: [] }],
@@ -845,29 +845,42 @@ describe('getThreadDetail', () => {
 
     expect(readThreadDetailRuntime(payload)).toMatchObject({
       inProgress: true,
-      activeTurnId: 'turn-local',
-      ownership: 'local',
-      canInterrupt: true,
+      activeTurnId: 'turn-external',
+      ownership: 'external',
+      canInterrupt: false,
+      externalRuntimeState: 'running',
     })
   })
 
-  it('treats nested running thread status as local activity before external metadata', () => {
+  it('treats active status with unknown writer ownership as non-interruptible', () => {
+    const payload = runtimePayload({
+      id: 'thread-unknown',
+      turns: [{ id: 'turn-observed', status: 'inProgress', items: [] }],
+      externalRuntime: { state: 'unknown' },
+    })
+
+    expect(readThreadDetailRuntime(payload)).toEqual({
+      inProgress: true,
+      activeTurnId: 'turn-observed',
+      ownership: 'external',
+      canInterrupt: false,
+      externalRuntimeState: 'unknown',
+    })
+  })
+
+  it('treats nested running thread status as local only after an idle writer probe', () => {
     const payload = runtimePayload({
       id: 'thread-1',
       status: { type: 'running' },
       turns: [{ id: 'turn-local', status: 'completed', items: [] }],
-      externalRuntime: {
-        state: 'running',
-        turnId: 'turn-external',
-        interruptible: false,
-        source: 'external-session-writer',
-      },
+      externalRuntime: { state: 'idle' },
     })
 
     expect(readThreadDetailRuntime(payload)).toMatchObject({
       inProgress: true,
       ownership: 'local',
       canInterrupt: true,
+      externalRuntimeState: 'idle',
     })
   })
 })

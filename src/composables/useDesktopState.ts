@@ -2169,6 +2169,29 @@ export function useDesktopState() {
         || attachment.path.replace(/\\/gu, '/').includes('/codex-web-uploads/'))
   }
 
+  function requireIdleResumeForUserTurn(
+    threadId: string,
+    resumedThread: Awaited<ReturnType<typeof resumeThread>>,
+  ): void {
+    if (
+      resumedThread.ownership === 'idle'
+      && resumedThread.externalRuntimeState === 'idle'
+      && resumedThread.inProgress === false
+    ) {
+      return
+    }
+
+    setThreadRuntimeOwnership(threadId, 'external')
+    setThreadInProgress(threadId, resumedThread.inProgress)
+    if (resumedThread.activeTurnId) {
+      activeTurnIdByThreadId.value = {
+        ...activeTurnIdByThreadId.value,
+        [threadId]: resumedThread.activeTurnId,
+      }
+    }
+    throw new Error('Cannot start a turn because task writer ownership is not idle.')
+  }
+
   function releasePendingTurnRequest(
     threadId: string,
     request: PendingTurnRequest | undefined = pendingTurnRequestByThreadId.value[threadId],
@@ -2216,6 +2239,7 @@ export function useDesktopState() {
 
       if (resumedThreadById.value[threadId] !== true) {
         const resumedThread = await resumeThread(threadId)
+        requireIdleResumeForUserTurn(threadId, resumedThread)
         if (resumedThread.model) {
           setThreadModelId(threadId, resolveThreadModelForProvider(threadId, resumedThread.model, resumedThread.modelProvider))
         }
@@ -2255,9 +2279,11 @@ export function useDesktopState() {
       const errorMessage = unknownError instanceof Error ? unknownError.message : 'Unknown application error'
       setTurnErrorForThread(threadId, errorMessage)
       error.value = errorMessage
-      setThreadRuntimeOwnership(threadId, 'idle')
-      setThreadInProgress(threadId, false)
-      setTurnActivityForThread(threadId, null)
+      if (!isExternallyOwned(threadId)) {
+        setThreadRuntimeOwnership(threadId, 'idle')
+        setThreadInProgress(threadId, false)
+        setTurnActivityForThread(threadId, null)
+      }
     } finally {
       fallbackRetryInFlightThreadIds.delete(threadId)
     }
@@ -3373,11 +3399,31 @@ export function useDesktopState() {
     fileAttachments: FileAttachment[] = [],
   ): void {
     const existing = persistedMessagesByThreadId.value[threadId] ?? []
+    const managedImageTokens: string[] = []
+    const previewImageUrls: string[] = []
+    for (const imageUrl of imageUrls) {
+      if (!isManagedUploadImageUrl(imageUrl)) {
+        previewImageUrls.push(imageUrl)
+        continue
+      }
+      try {
+        const parsed = new URL(imageUrl, 'http://localhost')
+        const imagePath = parsed.searchParams.get('path')?.replace(/\\/gu, '/') ?? ''
+        const label = imagePath.split('/').filter(Boolean).at(-1)?.trim() ?? ''
+        if (label) managedImageTokens.push(`@${label}`)
+      } catch {
+        // Managed URL validation already succeeded; an unreadable label stays hidden.
+      }
+    }
+    const tokenPrefix = managedImageTokens.join(' ')
+    const optimisticText = tokenPrefix
+      ? (text.trim() ? `${tokenPrefix}\n\n${text}` : tokenPrefix)
+      : text
     const nextMessage: UiMessage = {
       id: `optimistic-user:${threadId}:${Date.now()}`,
       role: 'user',
-      text,
-      images: imageUrls.length > 0 ? [...imageUrls] : undefined,
+      text: optimisticText,
+      images: previewImageUrls.length > 0 ? previewImageUrls : undefined,
       skills: skills.length > 0 ? skills.map((skill) => ({ name: skill.name, path: skill.path })) : undefined,
       fileAttachments: fileAttachments.length > 0 ? fileAttachments.map((file) => ({ ...file })) : undefined,
       messageType: 'userMessage.optimistic',
@@ -6164,9 +6210,11 @@ export function useDesktopState() {
     } catch (unknownError) {
       await uploadLease.release()
       shouldAutoScrollOnNextAgentEvent = false
-      setThreadRuntimeOwnership(threadId, 'idle')
-      setThreadInProgress(threadId, false)
-      setTurnActivityForThread(threadId, null)
+      if (!isExternallyOwned(threadId)) {
+        setThreadRuntimeOwnership(threadId, 'idle')
+        setThreadInProgress(threadId, false)
+        setTurnActivityForThread(threadId, null)
+      }
       const errorMessage = unknownError instanceof Error ? unknownError.message : 'Unknown application error'
       setTurnErrorForThread(threadId, errorMessage)
       error.value = errorMessage
@@ -6334,6 +6382,7 @@ export function useDesktopState() {
     try {
       if (resumedThreadById.value[threadId] !== true) {
         const resumedThread = await resumeThread(threadId)
+        requireIdleResumeForUserTurn(threadId, resumedThread)
         if (resumedThread.model) {
           setThreadModelId(threadId, resolveThreadModelForProvider(threadId, resumedThread.model, resumedThread.modelProvider))
         }
