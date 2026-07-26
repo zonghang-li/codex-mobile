@@ -42,6 +42,7 @@ import { handleZenProxyRequest } from './zenProxy.js'
 import { handleCustomEndpointProxyRequest } from './customEndpointProxy.js'
 import { ExternalThreadRuntimeProbe } from './externalThreadRuntime.js'
 import { LocalThreadRuntimeLedger } from './localThreadRuntime.js'
+import { readThreadLiveSnapshotFile } from './threadLiveSnapshot.js'
 import { ThreadTerminalManager } from './terminalManager.js'
 import { getSpawnInvocation } from '../utils/commandInvocation.js'
 import {
@@ -1190,6 +1191,8 @@ export function buildThreadLiveStateReadFailureFallback(
       message: getErrorMessage(error, 'thread/read failed'),
     },
     isInProgress: false,
+    liveAuthority: 'missing',
+    liveSnapshot: null,
   }
 }
 
@@ -4498,6 +4501,11 @@ async function listFilesWithRipgrep(cwd: string): Promise<string[]> {
 function getCodexHomeDir(): string {
   const codexHome = process.env.CODEX_HOME?.trim()
   return codexHome && codexHome.length > 0 ? codexHome : join(homedir(), '.codex')
+}
+
+function getThreadLiveStateDir(): string {
+  const configured = process.env.CODEX_MOBILE_LIVE_STATE_DIR?.trim()
+  return configured || join(getCodexHomeDir(), 'live-state')
 }
 
 function getSkillsInstallDir(): string {
@@ -9049,7 +9057,20 @@ export function createCodexBridgeMiddleware(options: {
               && cached?.isInProgress === true
               && cachedExternalRuntime?.state === 'running'
             ) {
-              setJson(res, 200, cached)
+              const activeExternalTurnId = readNonEmptyString(asRecord(externalRuntime)?.turnId)
+              const liveSnapshot = activeExternalTurnId
+                ? await readThreadLiveSnapshotFile(getThreadLiveStateDir(), threadId, {
+                    activeTurnId: activeExternalTurnId,
+                    nowMs: Date.now(),
+                  })
+                : null
+              setJson(res, 200, {
+                ...(asRecord(cached) ?? {}),
+                isInProgress: true,
+                externalRuntime,
+                liveAuthority: liveSnapshot ? 'writer-snapshot' : 'missing',
+                liveSnapshot,
+              })
               return
             }
           }
@@ -9106,6 +9127,22 @@ export function createCodexBridgeMiddleware(options: {
             return
           }
           const isInProgress = isLocallyInProgress || isExternalInProgress
+          const activeExternalTurnId = isExternalInProgress
+            ? readNonEmptyString(asRecord(externalRuntime)?.turnId)
+            : ''
+          const liveSnapshot = activeExternalTurnId
+            ? await readThreadLiveSnapshotFile(getThreadLiveStateDir(), threadId, {
+                activeTurnId: activeExternalTurnId,
+                nowMs: Date.now(),
+              })
+            : null
+          const liveAuthority = liveSnapshot
+            ? 'writer-snapshot'
+            : isExternalInProgress
+              ? 'missing'
+              : isLocallyInProgress
+                ? 'local-stream'
+                : 'persisted'
 
           const responseData = {
             threadId,
@@ -9118,6 +9155,8 @@ export function createCodexBridgeMiddleware(options: {
             liveStateError: null,
             isInProgress,
             externalRuntime,
+            liveAuthority,
+            liveSnapshot,
           }
 
           if (!isLocallyInProgress) {
@@ -9133,6 +9172,8 @@ export function createCodexBridgeMiddleware(options: {
               ownerClientId: null,
               liveStateError: null,
               isInProgress: true,
+              liveAuthority: 'missing',
+              liveSnapshot: null,
             })
             return
           }
@@ -9155,6 +9196,8 @@ export function createCodexBridgeMiddleware(options: {
                 message: getErrorMessage(error, 'thread/read failed'),
               },
               isInProgress: false,
+              liveAuthority: 'missing',
+              liveSnapshot: null,
             })
           }
         }
