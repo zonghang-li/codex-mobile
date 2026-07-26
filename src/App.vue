@@ -1852,7 +1852,7 @@ const selectedConversationFooterState = computed(() => deriveConversationFooterS
   turnId: selectedActiveTurnId.value,
   isTurnInProgress: isSelectedThreadInProgress.value,
   externalLiveAuthority: selectedThreadRuntimeOwnership.value === 'external'
-    ? selectedLiveAuthority.value
+    ? selectedLiveAuthority.value ?? 'missing'
     : null,
   authoritativeFooter: selectedThreadRuntimeOwnership.value === 'external'
     ? selectedLiveSnapshot.value?.footer ?? null

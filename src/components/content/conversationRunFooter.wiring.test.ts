@@ -39,6 +39,7 @@ describe('ConversationRunFooter desktop parity wiring', () => {
     expect(appSource).toContain('externalLiveAuthority:')
     expect(appSource).toContain('authoritativeFooter:')
     expect(appSource).toContain('selectedThreadRuntimeOwnership')
+    expect(appSource).toContain("selectedLiveAuthority.value ?? 'missing'")
   })
 
   it('renders the desktop step, file, addition, and deletion fields', () => {
