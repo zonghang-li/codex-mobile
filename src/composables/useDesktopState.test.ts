@@ -571,6 +571,75 @@ describe('thread goal state', () => {
     expect(state.selectedThreadGoal.value).toEqual(refreshedGoal)
   })
 
+  it('does not let an old set finally unlock a newer clear mutation', async () => {
+    installTestWindow()
+    const pendingSet = deferred<typeof activeGoal>()
+    const pendingClear = deferred<void>()
+    gatewayMocks.setThreadGoal.mockReset().mockReturnValueOnce(pendingSet.promise)
+    gatewayMocks.clearThreadGoal.mockReset().mockReturnValueOnce(pendingClear.promise)
+
+    const state = useDesktopState()
+    state.primeSelectedThread('thread-1')
+    const oldSet = state.updateSelectedThreadGoal({
+      objective: 'Old generation set',
+      status: 'active',
+    })
+
+    state.stopPolling()
+    state.startPolling()
+    pollingCleanups.push(() => state.stopPolling())
+    const currentClear = state.clearSelectedThreadGoal()
+    expect(state.isUpdatingThreadGoal.value).toBe(true)
+
+    pendingSet.resolve(activeGoal)
+    await oldSet
+
+    expect(state.isUpdatingThreadGoal.value).toBe(true)
+    await expect(state.updateSelectedThreadGoal({
+      objective: 'Must remain locked',
+      status: 'active',
+    })).resolves.toBe(false)
+    expect(gatewayMocks.setThreadGoal).toHaveBeenCalledTimes(1)
+    expect(gatewayMocks.clearThreadGoal).toHaveBeenCalledTimes(1)
+
+    pendingClear.resolve()
+    await currentClear
+    expect(state.isUpdatingThreadGoal.value).toBe(false)
+  })
+
+  it('does not let an old clear finally unlock a newer set mutation', async () => {
+    installTestWindow()
+    const pendingClear = deferred<void>()
+    const pendingSet = deferred<typeof activeGoal>()
+    gatewayMocks.clearThreadGoal.mockReset().mockReturnValueOnce(pendingClear.promise)
+    gatewayMocks.setThreadGoal.mockReset().mockReturnValueOnce(pendingSet.promise)
+
+    const state = useDesktopState()
+    state.primeSelectedThread('thread-1')
+    const oldClear = state.clearSelectedThreadGoal()
+
+    state.stopPolling()
+    state.startPolling()
+    pollingCleanups.push(() => state.stopPolling())
+    const currentSet = state.updateSelectedThreadGoal({
+      objective: 'Current generation set',
+      status: 'active',
+    })
+    expect(state.isUpdatingThreadGoal.value).toBe(true)
+
+    pendingClear.resolve()
+    await oldClear
+
+    expect(state.isUpdatingThreadGoal.value).toBe(true)
+    await expect(state.clearSelectedThreadGoal()).resolves.toBe(false)
+    expect(gatewayMocks.clearThreadGoal).toHaveBeenCalledTimes(1)
+    expect(gatewayMocks.setThreadGoal).toHaveBeenCalledTimes(1)
+
+    pendingSet.resolve(activeGoal)
+    await currentSet
+    expect(state.isUpdatingThreadGoal.value).toBe(false)
+  })
+
   it('keeps goal mutation progress scoped to the thread that started it', async () => {
     installTestWindow()
     let resolveGoal!: (goal: typeof activeGoal) => void

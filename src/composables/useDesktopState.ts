@@ -1666,7 +1666,7 @@ export function useDesktopState() {
   const threadModelProviderByThreadId = ref<Record<string, string>>({})
   const threadGoalByThreadId = ref<Record<string, UiThreadGoal>>({})
   const threadGoalSupportByThreadId = ref<Record<string, boolean>>({})
-  const updatingThreadGoalByThreadId = ref<Record<string, boolean>>({})
+  const updatingThreadGoalByThreadId = ref<Record<string, symbol>>({})
 
   const threadTitleById = ref<Record<string, string>>({})
 
@@ -1857,7 +1857,7 @@ export function useDesktopState() {
   })
   const isUpdatingThreadGoal = computed(() => {
     const threadId = selectedThreadId.value
-    return Boolean(threadId && updatingThreadGoalByThreadId.value[threadId] === true)
+    return Boolean(threadId && updatingThreadGoalByThreadId.value[threadId] !== undefined)
   })
   const codexQuota = computed<UiRateLimitSnapshot | null>(() => codexRateLimit.value)
   const selectedThreadTokenUsage = computed<UiThreadTokenUsage | null>(() => {
@@ -3663,6 +3663,21 @@ export function useDesktopState() {
   ): boolean {
     return requestGeneration === threadGoalRequestGeneration
       && threadGoalRequestEpochByThreadId.get(threadId) === requestEpoch
+  }
+
+  function acquireThreadGoalMutation(threadId: string): symbol | null {
+    if (updatingThreadGoalByThreadId.value[threadId] !== undefined) return null
+    const owner = Symbol(threadId)
+    updatingThreadGoalByThreadId.value = {
+      ...updatingThreadGoalByThreadId.value,
+      [threadId]: owner,
+    }
+    return owner
+  }
+
+  function releaseThreadGoalMutation(threadId: string, owner: symbol): void {
+    if (updatingThreadGoalByThreadId.value[threadId] !== owner) return
+    updatingThreadGoalByThreadId.value = omitKey(updatingThreadGoalByThreadId.value, threadId)
   }
 
   async function refreshThreadGoal(threadId: string): Promise<void> {
@@ -6960,13 +6975,10 @@ export function useDesktopState() {
     if (!threadId || threadGoalSupportByThreadId.value[threadId] === false) {
       return false
     }
-    if (updatingThreadGoalByThreadId.value[threadId] === true) return false
+    const mutationOwner = acquireThreadGoalMutation(threadId)
+    if (!mutationOwner) return false
     const requestGeneration = threadGoalRequestGeneration
     const requestEpoch = invalidateThreadGoalRequest(threadId)
-    updatingThreadGoalByThreadId.value = {
-      ...updatingThreadGoalByThreadId.value,
-      [threadId]: true,
-    }
     try {
       const goal = await setThreadGoal({
         threadId,
@@ -6994,7 +7006,7 @@ export function useDesktopState() {
       error.value = goalError instanceof Error ? goalError.message : 'Unable to update thread goal'
       return false
     } finally {
-      updatingThreadGoalByThreadId.value = omitKey(updatingThreadGoalByThreadId.value, threadId)
+      releaseThreadGoalMutation(threadId, mutationOwner)
     }
   }
 
@@ -7003,13 +7015,10 @@ export function useDesktopState() {
     if (!threadId || threadGoalSupportByThreadId.value[threadId] === false) {
       return false
     }
-    if (updatingThreadGoalByThreadId.value[threadId] === true) return false
+    const mutationOwner = acquireThreadGoalMutation(threadId)
+    if (!mutationOwner) return false
     const requestGeneration = threadGoalRequestGeneration
     const requestEpoch = invalidateThreadGoalRequest(threadId)
-    updatingThreadGoalByThreadId.value = {
-      ...updatingThreadGoalByThreadId.value,
-      [threadId]: true,
-    }
     try {
       await clearThreadGoal(threadId)
       if (!isCurrentThreadGoalRequest(threadId, requestEpoch, requestGeneration)) return true
@@ -7030,7 +7039,7 @@ export function useDesktopState() {
       error.value = goalError instanceof Error ? goalError.message : 'Unable to clear thread goal'
       return false
     } finally {
-      updatingThreadGoalByThreadId.value = omitKey(updatingThreadGoalByThreadId.value, threadId)
+      releaseThreadGoalMutation(threadId, mutationOwner)
     }
   }
 
