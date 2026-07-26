@@ -55,6 +55,19 @@ describe('ConversationRunFooter desktop parity wiring', () => {
     expect(globalStyleSource).toContain(':root.dark .conversation-goal-strip')
   })
 
+  it('requires an accessible inline second click before clearing a goal', () => {
+    expect(footerSource).toContain('isClearGoalConfirming')
+    expect(footerSource).toContain('conversation-goal-clear-confirmation')
+    expect(footerSource).toContain('role="group"')
+    expect(footerSource).toContain(':aria-label="t(\'Confirm clear goal\')"')
+    expect(footerSource).toContain('@click="cancelGoalClear()"')
+    expect(footerSource).toContain('@click="requestGoalClear"')
+    expect(footerSource).toContain('CLEAR_GOAL_CONFIRMATION_TIMEOUT_MS')
+    expect(footerSource).toMatch(
+      /function requestGoalClear\(\): void \{[\s\S]*if \(isClearGoalConfirming\.value\) \{[\s\S]*emit\('clear-goal'\)[\s\S]*return[\s\S]*\}[\s\S]*armGoalClearConfirmation\(\)/u,
+    )
+  })
+
   it('uses an accessible progress primitive', () => {
     expect(donutSource).toContain('role="progressbar"')
     expect(donutSource).toContain(':aria-valuenow="roundedValue"')

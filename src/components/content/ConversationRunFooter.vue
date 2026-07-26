@@ -79,13 +79,40 @@
           >
             <IconTablerPlayerPlay />
           </button>
+          <div
+            v-if="isClearGoalConfirming"
+            class="conversation-goal-clear-confirmation"
+            role="group"
+            :aria-label="t('Confirm clear goal')"
+            aria-live="polite"
+          >
+            <span>{{ t('Clear goal') }}?</span>
+            <button
+              type="button"
+              :disabled="isUpdatingGoal"
+              @click="cancelGoalClear()"
+            >
+              {{ t('Cancel') }}
+            </button>
+            <button
+              ref="confirmGoalClearButtonRef"
+              class="is-destructive"
+              type="button"
+              :disabled="isUpdatingGoal"
+              @click="requestGoalClear"
+            >
+              {{ t('Clear goal') }}
+            </button>
+          </div>
           <button
+            v-else
+            ref="clearGoalButtonRef"
             class="conversation-goal-action goal-clear-button"
             type="button"
             :disabled="isUpdatingGoal"
             :aria-label="t('Clear goal')"
             :title="t('Clear goal')"
-            @click="emit('clear-goal')"
+            @click="requestGoalClear"
           >
             <IconTablerTrash />
           </button>
@@ -138,7 +165,7 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
+import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 import type { ConversationFooterState, UiThreadGoal, UiThreadGoalStatus } from '../../types/codex'
 import { useUiLanguage } from '../../composables/useUiLanguage'
 import IconTablerChevronRight from '../icons/IconTablerChevronRight.vue'
@@ -167,14 +194,20 @@ const { t } = useUiLanguage()
 const nowMs = ref(Date.now())
 const isGoalExpanded = ref(false)
 const isEditingGoal = ref(false)
+const isClearGoalConfirming = ref(false)
 const editingObjective = ref('')
+const clearGoalButtonRef = ref<HTMLButtonElement | null>(null)
+const confirmGoalClearButtonRef = ref<HTMLButtonElement | null>(null)
+const CLEAR_GOAL_CONFIRMATION_TIMEOUT_MS = 5000
 let timer: ReturnType<typeof setInterval> | null = null
+let clearGoalConfirmationTimer: ReturnType<typeof setTimeout> | null = null
 
 const goalPresentation = computed(() => (
   props.goal ? deriveThreadGoalPresentation(props.goal, nowMs.value) : null
 ))
 
 watch(() => props.goal?.objective, (objective) => {
+  cancelGoalClear(false)
   if (!isEditingGoal.value) editingObjective.value = objective ?? ''
 }, { immediate: true })
 
@@ -186,6 +219,7 @@ onMounted(() => {
 
 onUnmounted(() => {
   if (timer) clearInterval(timer)
+  clearGoalConfirmationTimerIfNeeded()
 })
 
 function formatFileCount(count: number): string {
@@ -193,6 +227,7 @@ function formatFileCount(count: number): string {
 }
 
 function beginGoalEdit(): void {
+  cancelGoalClear(false)
   editingObjective.value = props.goal?.objective ?? ''
   isEditingGoal.value = true
   isGoalExpanded.value = true
@@ -211,6 +246,41 @@ function saveGoalEdit(): void {
     status: props.goal.status,
   })
   isEditingGoal.value = false
+}
+
+function clearGoalConfirmationTimerIfNeeded(): void {
+  if (!clearGoalConfirmationTimer) return
+  clearTimeout(clearGoalConfirmationTimer)
+  clearGoalConfirmationTimer = null
+}
+
+function armGoalClearConfirmation(): void {
+  clearGoalConfirmationTimerIfNeeded()
+  isClearGoalConfirming.value = true
+  clearGoalConfirmationTimer = setTimeout(() => {
+    clearGoalConfirmationTimer = null
+    cancelGoalClear(false)
+  }, CLEAR_GOAL_CONFIRMATION_TIMEOUT_MS)
+  void nextTick(() => confirmGoalClearButtonRef.value?.focus())
+}
+
+function cancelGoalClear(restoreFocus = true): void {
+  clearGoalConfirmationTimerIfNeeded()
+  const wasConfirming = isClearGoalConfirming.value
+  isClearGoalConfirming.value = false
+  if (wasConfirming && restoreFocus) {
+    void nextTick(() => clearGoalButtonRef.value?.focus())
+  }
+}
+
+function requestGoalClear(): void {
+  if (props.readOnly || props.isUpdatingGoal) return
+  if (isClearGoalConfirming.value) {
+    cancelGoalClear(false)
+    emit('clear-goal')
+    return
+  }
+  armGoalClearConfirmation()
 }
 </script>
 
@@ -272,6 +342,18 @@ function saveGoalEdit(): void {
 
 .conversation-goal-action :deep(svg) {
   @apply h-4 w-4;
+}
+
+.conversation-goal-clear-confirmation {
+  @apply flex shrink-0 items-center gap-1 text-xs text-zinc-500;
+}
+
+.conversation-goal-clear-confirmation button {
+  @apply rounded-full border border-zinc-300 bg-white px-2 py-1 text-xs font-medium text-zinc-700 hover:bg-zinc-50 disabled:cursor-default disabled:opacity-40;
+}
+
+.conversation-goal-clear-confirmation button.is-destructive {
+  @apply border-rose-300 text-rose-600 hover:bg-rose-50;
 }
 
 .goal-expand-button :deep(.is-expanded) {

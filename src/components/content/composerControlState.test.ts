@@ -40,6 +40,20 @@ describe('deriveComposerControlState', () => {
     })
   })
 
+  it('keeps Stop as the primary control while a local running draft can still be queued or steered', () => {
+    expect(deriveComposerControlState({
+      ...localIdle,
+      runtimeOwnership: 'local',
+      isTurnInProgress: true,
+      hasSubmitContent: true,
+    })).toMatchObject({
+      primaryAction: 'stop',
+      canSubmit: true,
+      canStop: true,
+      canEditConfiguration: false,
+    })
+  })
+
   it('does not pretend an externally owned turn can submit or stop', () => {
     expect(deriveComposerControlState({
       ...localIdle,

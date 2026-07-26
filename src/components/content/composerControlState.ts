@@ -51,7 +51,7 @@ export function deriveComposerControlState(
     ? 'hidden'
     : isExternal && input.isTurnInProgress
       ? 'externalRunning'
-      : input.isTurnInProgress && !input.hasSubmitContent
+      : input.isTurnInProgress
         ? 'stop'
         : 'send'
   const canSubmit = composerVisible
@@ -62,7 +62,6 @@ export function deriveComposerControlState(
     && !input.disabled
     && !isExternal
     && input.isTurnInProgress
-    && primaryAction === 'stop'
   const canEditConfiguration = composerVisible
     && !input.disabled
     && !isExternal
