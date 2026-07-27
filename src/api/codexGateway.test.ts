@@ -6,6 +6,7 @@ import {
   getExternalThreadLiveSnapshot,
   getThreadDetail,
   getThreadGroupsPage,
+  getOlderThreadMessages,
   getThreadGoal,
   getThreadRuntimeState,
   getThreadRuntimeStates,
@@ -629,6 +630,145 @@ describe('getThreadDetail', () => {
     vi.unstubAllGlobals()
   })
 
+  it('hydrates metadata and the newest native turn page without a full thread read', async () => {
+    const requests: Array<{ url: string; method?: string; params?: Record<string, unknown>; signal?: AbortSignal | null }> = []
+    const controller = new AbortController()
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input)
+      if (url === '/codex-api/rpc') {
+        const body = JSON.parse(String(init?.body)) as { method: string; params: Record<string, unknown> }
+        requests.push({ url, method: body.method, params: body.params, signal: init?.signal })
+        return new Response(JSON.stringify({
+          result: {
+            thread: {
+              id: 'thread-paged',
+              model: 'gpt-5.5',
+              reasoning_effort: 'xhigh',
+              turns: [],
+            },
+          },
+        }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      requests.push({ url, signal: init?.signal })
+      return new Response(JSON.stringify({
+        result: {
+          thread: {
+            id: 'thread-paged',
+            turns: [
+              {
+                id: 'turn-4',
+                status: 'completed',
+                items: [{ id: 'agent-4', type: 'agentMessage', text: 'four' }],
+              },
+              {
+                id: 'turn-5',
+                status: 'completed',
+                items: [{ id: 'agent-5', type: 'agentMessage', text: 'five' }],
+              },
+            ],
+          },
+        },
+        nextCursor: 'opaque-older',
+        hasMoreOlder: true,
+      }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    }))
+
+    await expect(getThreadDetail('thread-paged', controller.signal)).resolves.toMatchObject({
+      model: 'gpt-5.5',
+      reasoningEffort: 'xhigh',
+      olderCursor: 'opaque-older',
+      hasMoreOlder: true,
+      messages: [
+        expect.objectContaining({ id: 'agent-4', text: 'four' }),
+        expect.objectContaining({ id: 'agent-5', text: 'five' }),
+      ],
+    })
+    expect(requests).toContainEqual({
+      url: '/codex-api/rpc',
+      method: 'thread/read',
+      params: { threadId: 'thread-paged', includeTurns: false },
+      signal: controller.signal,
+    })
+    expect(requests).toContainEqual({
+      url: '/codex-api/thread-turn-page?threadId=thread-paged&limit=5',
+      signal: controller.signal,
+    })
+    expect(requests).not.toContainEqual(expect.objectContaining({
+      method: 'thread/read',
+      params: expect.objectContaining({ includeTurns: true }),
+    }))
+  })
+
+  it('forwards an opaque cursor when loading older native turns', async () => {
+    let requestUrl = ''
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
+      requestUrl = String(input)
+      return new Response(JSON.stringify({
+        result: {
+          thread: {
+            id: 'thread-paged',
+            turns: [{
+              id: 'turn-3',
+              status: 'completed',
+              items: [{ id: 'agent-3', type: 'agentMessage', text: 'three' }],
+            }],
+          },
+        },
+        nextCursor: 'opaque-next',
+        hasMoreOlder: true,
+      }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    }))
+
+    await expect(getOlderThreadMessages('thread-paged', 'opaque+/= cursor', 10)).resolves.toMatchObject({
+      nextCursor: 'opaque-next',
+      turnIds: ['turn-3'],
+      hasMoreOlder: true,
+    })
+    expect(requestUrl).toBe(
+      '/codex-api/thread-turn-page?threadId=thread-paged&cursor=opaque%2B%2F%3D+cursor&limit=10',
+    )
+  })
+
+  it('falls back to one legacy full read only when native pagination is unsupported', async () => {
+    const readParams: Record<string, unknown>[] = []
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input)
+      if (url.startsWith('/codex-api/thread-turn-page')) {
+        return new Response(JSON.stringify({ fallback: 'thread/read' }), {
+          status: 501,
+          headers: { 'Content-Type': 'application/json' },
+        })
+      }
+      const body = JSON.parse(String(init?.body)) as { method: string; params: Record<string, unknown> }
+      readParams.push(body.params)
+      const includeTurns = body.params.includeTurns === true
+      return new Response(JSON.stringify({
+        result: {
+          thread: {
+            id: 'thread-legacy',
+            turns: includeTurns
+              ? [{
+                  id: 'turn-legacy',
+                  status: 'completed',
+                  items: [{ id: 'agent-legacy', type: 'agentMessage', text: 'legacy' }],
+                }]
+              : [],
+          },
+        },
+      }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    }))
+
+    await expect(getThreadDetail('thread-legacy')).resolves.toMatchObject({
+      olderCursor: null,
+      hasMoreOlder: false,
+      messages: [expect.objectContaining({ id: 'agent-legacy', text: 'legacy' })],
+    })
+    expect(readParams).toEqual([
+      { threadId: 'thread-legacy', includeTurns: false },
+      { threadId: 'thread-legacy', includeTurns: true },
+    ])
+  })
+
   it('forwards the caller abort signal to thread/read', async () => {
     const controller = new AbortController()
     let requestSignal: AbortSignal | null | undefined
@@ -916,7 +1056,22 @@ describe('getThreadDetail', () => {
   })
 
   it('reads model, reasoning effort, and modelProvider from nested thread payloads returned by thread/read', async () => {
-    vi.stubGlobal('fetch', vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      if (String(input).startsWith('/codex-api/thread-turn-page')) {
+        return new Response(JSON.stringify({
+          result: {
+            thread: {
+              id: 'legacy-thread',
+              turns: [],
+            },
+          },
+          nextCursor: null,
+          hasMoreOlder: false,
+        }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        })
+      }
       const body = typeof init?.body === 'string'
         ? JSON.parse(init.body) as { method: string; params: Record<string, unknown> }
         : { method: '', params: {} }

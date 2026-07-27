@@ -26,6 +26,7 @@ const gatewayMocks = vi.hoisted(() => ({
   getExternalThreadLiveSnapshot: vi.fn(),
   getThreadDetail: vi.fn(),
   getThreadGroupsPage: vi.fn(),
+  getOlderThreadMessages: vi.fn(),
   getThreadGoal: vi.fn(),
   getThreadRuntimeState: vi.fn(),
   getThreadRuntimeStates: vi.fn(),
@@ -306,6 +307,7 @@ async function setupCodexDirectiveNotificationState(groups: UiProjectGroup[] = [
 beforeEach(() => {
   vi.clearAllMocks()
   gatewayMocks.getThreadDetail.mockReset().mockResolvedValue(idleDetail())
+  gatewayMocks.getOlderThreadMessages.mockReset()
   gatewayMocks.resumeThread.mockReset().mockResolvedValue(idleDetail())
   gatewayMocks.getExternalThreadLiveSnapshot.mockImplementation(
     (threadId: string, signal?: AbortSignal) => gatewayMocks.getThreadDetail(threadId, signal),
@@ -334,6 +336,90 @@ describe('existing thread loading', () => {
     expect(gatewayMocks.getThreadDetail).toHaveBeenNthCalledWith(1, 'thread-1')
     expect(gatewayMocks.getThreadDetail).toHaveBeenNthCalledWith(2, 'thread-1')
     expect(gatewayMocks.resumeThread).not.toHaveBeenCalled()
+  })
+
+  it('uses the opaque older cursor and reindexes prepended turns contiguously', async () => {
+    installTestWindow()
+    gatewayMocks.getThreadDetail.mockResolvedValue({
+      ...idleDetail(),
+      olderCursor: 'opaque-page-1',
+      hasMoreOlder: true,
+      turnIndexByTurnId: {
+        'turn-4': 0,
+        'turn-5': 1,
+      },
+      messages: [
+        {
+          id: 'agent-4',
+          role: 'assistant',
+          text: 'four',
+          messageType: 'agentMessage',
+          turnId: 'turn-4',
+          turnIndex: 0,
+        },
+        {
+          id: 'agent-5',
+          role: 'assistant',
+          text: 'five',
+          messageType: 'agentMessage',
+          turnId: 'turn-5',
+          turnIndex: 1,
+        },
+      ],
+    })
+    gatewayMocks.getOlderThreadMessages.mockResolvedValue({
+      messages: [
+        {
+          id: 'agent-2',
+          role: 'assistant',
+          text: 'two',
+          messageType: 'agentMessage',
+          turnId: 'turn-2',
+          turnIndex: 0,
+        },
+        {
+          id: 'agent-3',
+          role: 'assistant',
+          text: 'three',
+          messageType: 'agentMessage',
+          turnId: 'turn-3',
+          turnIndex: 1,
+        },
+      ],
+      completionSummaries: [],
+      inProgress: false,
+      activeTurnId: '',
+      hasMoreOlder: true,
+      nextCursor: 'opaque-page-2',
+      turnIds: ['turn-2', 'turn-3'],
+      startTurnIndex: 0,
+      turnIndexByTurnId: {
+        'turn-2': 0,
+        'turn-3': 1,
+      },
+    })
+
+    const state = useDesktopState()
+    state.primeSelectedThread('thread-1')
+    await state.loadMessages('thread-1')
+    await state.loadOlderMessages('thread-1')
+
+    expect(gatewayMocks.getOlderThreadMessages).toHaveBeenCalledWith(
+      'thread-1',
+      'opaque-page-1',
+    )
+    expect(state.messages.value.map((message) => [message.id, message.turnIndex])).toEqual([
+      ['agent-2', 0],
+      ['agent-3', 1],
+      ['agent-4', 2],
+      ['agent-5', 3],
+    ])
+
+    await state.loadOlderMessages('thread-1')
+    expect(gatewayMocks.getOlderThreadMessages).toHaveBeenLastCalledWith(
+      'thread-1',
+      'opaque-page-2',
+    )
   })
 
   it('keeps the user-selected model and effort when the first follow-up resumes the thread', async () => {

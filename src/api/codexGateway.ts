@@ -19,7 +19,7 @@ import type {
   ThreadStartResponse,
   Turn,
 } from './appServerDtos'
-import { extractErrorMessage, normalizeCodexApiError } from './codexErrors'
+import { CodexApiError, extractErrorMessage, normalizeCodexApiError } from './codexErrors'
 import {
   readActiveTurnIdFromResponse,
   normalizeThreadGroupsV2,
@@ -968,8 +968,17 @@ export type ThreadTurnPage = {
   inProgress: boolean
   activeTurnId: string
   hasMoreOlder: boolean
+  nextCursor: string | null
+  turnIds: string[]
   startTurnIndex: number
   turnIndexByTurnId: ThreadTurnIndexById
+}
+
+class ThreadTurnPaginationUnsupportedError extends Error {
+  constructor() {
+    super('thread/turns/list is not supported by this Codex app-server')
+    this.name = 'ThreadTurnPaginationUnsupportedError'
+  }
 }
 
 function readThreadCompletionSummaries(payload: ThreadReadResponse): ThreadCompletionSummary[] {
@@ -1032,27 +1041,58 @@ async function getThreadDetailV2(
   inProgress: boolean
   activeTurnId: string
   hasMoreOlder: boolean
+  olderCursor?: string | null
   turnIndexByTurnId: ThreadTurnIndexById
   ownership: ThreadDetailRuntime['ownership']
   canInterrupt: boolean
   externalRuntimeState: ThreadDetailRuntime['externalRuntimeState']
 }> {
-  const payload = await callRpc<ThreadReadResponse>('thread/read', {
+  const metadataPromise = callRpc<ThreadReadResponse>('thread/read', {
     threadId,
-    includeTurns: true,
+    includeTurns: false,
   }, signal)
-  const startTurnIndex = readThreadTurnStartIndex(payload)
-  const normalized = normalizeThreadMessagesV2(payload, startTurnIndex)
-  const runtime = readThreadDetailRuntime(payload)
-  return {
-    model: normalizeThreadModelFromPayload(payload),
-    modelProvider: normalizeThreadModelProviderFromPayload(payload),
-    reasoningEffort: normalizeThreadReasoningEffortFromPayload(payload),
-    messages: normalized,
-    completionSummaries: readThreadCompletionSummaries(payload),
-    ...runtime,
-    hasMoreOlder: startTurnIndex > 0,
-    turnIndexByTurnId: buildTurnIndexByTurnId(payload, startTurnIndex),
+  try {
+    const [metadata, page] = await Promise.all([
+      metadataPromise,
+      getThreadTurnPageV2(threadId, null, 5, signal),
+    ])
+    const payload = {
+      ...metadata,
+      thread: {
+        ...metadata.thread,
+        turns: page.rawTurns,
+      },
+    } as ThreadReadResponse
+    const runtime = readThreadDetailRuntime(payload)
+    return {
+      model: normalizeThreadModelFromPayload(metadata),
+      modelProvider: normalizeThreadModelProviderFromPayload(metadata),
+      reasoningEffort: normalizeThreadReasoningEffortFromPayload(metadata),
+      messages: page.messages,
+      completionSummaries: page.completionSummaries,
+      ...runtime,
+      hasMoreOlder: page.hasMoreOlder,
+      olderCursor: page.nextCursor,
+      turnIndexByTurnId: page.turnIndexByTurnId,
+    }
+  } catch (error) {
+    if (!(error instanceof ThreadTurnPaginationUnsupportedError)) throw error
+    const payload = await callRpc<ThreadReadResponse>('thread/read', {
+      threadId,
+      includeTurns: true,
+    }, signal)
+    const startTurnIndex = readThreadTurnStartIndex(payload)
+    return {
+      model: normalizeThreadModelFromPayload(payload),
+      modelProvider: normalizeThreadModelProviderFromPayload(payload),
+      reasoningEffort: normalizeThreadReasoningEffortFromPayload(payload),
+      messages: normalizeThreadMessagesV2(payload, startTurnIndex),
+      completionSummaries: readThreadCompletionSummaries(payload),
+      ...readThreadDetailRuntime(payload),
+      hasMoreOlder: startTurnIndex > 0,
+      olderCursor: null,
+      turnIndexByTurnId: buildTurnIndexByTurnId(payload, startTurnIndex),
+    }
   }
 }
 
@@ -1128,35 +1168,70 @@ async function getExternalThreadLiveStateSnapshotV2(
   }
 }
 
-async function getOlderThreadMessagesV2(threadId: string, beforeTurnId: string, limit = 10): Promise<ThreadTurnPage> {
-  const params = new URLSearchParams({
-    threadId,
-    beforeTurnId,
-    limit: String(limit),
-  })
-  const response = await fetch(`/codex-api/thread-turn-page?${params.toString()}`)
+type InternalThreadTurnPage = ThreadTurnPage & {
+  rawTurns: unknown[]
+}
+
+async function getThreadTurnPageV2(
+  threadId: string,
+  cursor: string | null,
+  limit: number,
+  signal?: AbortSignal,
+): Promise<InternalThreadTurnPage> {
+  const params = new URLSearchParams({ threadId })
+  if (cursor) params.set('cursor', cursor)
+  params.set('limit', String(limit))
+  let response: Response
+  try {
+    response = await fetch(`/codex-api/thread-turn-page?${params.toString()}`, { signal })
+  } catch (error) {
+    if (error instanceof Error && error.name === 'AbortError') {
+      throw new CodexApiError(error.message || 'Thread page request aborted', {
+        code: 'network_error',
+        method: 'thread/read',
+      })
+    }
+    throw error
+  }
+  const payload = await response.json().catch(() => null) as {
+    result?: ThreadReadResponse
+    fallback?: unknown
+    hasMoreOlder?: unknown
+    nextCursor?: unknown
+    startTurnIndex?: unknown
+  } | null
+  if (response.status === 501 && payload?.fallback === 'thread/read') {
+    throw new ThreadTurnPaginationUnsupportedError()
+  }
   if (!response.ok) {
     throw new Error(`Older thread page request failed with ${response.status}`)
   }
-  const payload = await response.json() as {
-    result?: ThreadReadResponse
-    hasMoreOlder?: unknown
-    startTurnIndex?: unknown
-  }
-  if (!payload.result) {
+  if (!payload?.result) {
     throw new Error('Older thread page response did not include a thread result')
   }
   const startTurnIndex = Math.max(0, Math.floor(typeof payload.startTurnIndex === 'number' ? payload.startTurnIndex : 0))
+  const rawTurns = Array.isArray(payload.result.thread.turns) ? payload.result.thread.turns : []
+  const nextCursor = readString(payload.nextCursor)
 
   return {
+    rawTurns,
     messages: normalizeThreadMessagesV2(payload.result, startTurnIndex),
     completionSummaries: readThreadCompletionSummaries(payload.result),
     inProgress: readThreadInProgressFromResponse(payload.result),
     activeTurnId: readActiveTurnIdFromResponse(payload.result),
-    hasMoreOlder: payload.hasMoreOlder === true,
+    hasMoreOlder: payload.hasMoreOlder === true || nextCursor !== null,
+    nextCursor,
+    turnIds: rawTurns.flatMap((turn) => {
+      const turnId = readString(asRecord(turn)?.id)
+      return turnId ? [turnId] : []
+    }),
     startTurnIndex,
     turnIndexByTurnId: buildTurnIndexByTurnId(payload.result, startTurnIndex),
   }
+}
+
+async function getOlderThreadMessagesV2(threadId: string, cursor: string, limit = 10): Promise<ThreadTurnPage> {
+  return getThreadTurnPageV2(threadId, cursor, limit)
 }
 
 export async function getThreadGroups(): Promise<UiProjectGroup[]> {
@@ -1208,6 +1283,7 @@ export async function getThreadDetail(threadId: string, signal?: AbortSignal): P
   inProgress: boolean
   activeTurnId: string
   hasMoreOlder: boolean
+  olderCursor: string | null
   turnIndexByTurnId: ThreadTurnIndexById
   ownership: ThreadDetailRuntime['ownership']
   canInterrupt: boolean
@@ -1246,9 +1322,9 @@ export async function getExternalThreadLiveSnapshot(threadId: string, signal?: A
   }
 }
 
-export async function getOlderThreadMessages(threadId: string, beforeTurnId: string, limit?: number): Promise<ThreadTurnPage> {
+export async function getOlderThreadMessages(threadId: string, cursor: string, limit?: number): Promise<ThreadTurnPage> {
   try {
-    return await getOlderThreadMessagesV2(threadId, beforeTurnId, limit)
+    return await getOlderThreadMessagesV2(threadId, cursor, limit)
   } catch (error) {
     throw normalizeCodexApiError(error, `Failed to load earlier messages for thread ${threadId}`, 'thread/read')
   }

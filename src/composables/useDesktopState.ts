@@ -1742,6 +1742,7 @@ export function useDesktopState() {
   const loadedVersionByThreadId = ref<Record<string, string>>({})
   const loadedMessagesByThreadId = ref<Record<string, boolean>>({})
   const hasMoreOlderMessagesByThreadId = ref<Record<string, boolean>>({})
+  const olderTurnCursorByThreadId = ref<Record<string, string | null>>({})
   const loadingOlderMessagesByThreadId = ref<Record<string, boolean>>({})
   const resumedThreadById = ref<Record<string, boolean>>({})
   const turnIndexByTurnIdByThreadId = ref<Record<string, Record<string, number>>>({})
@@ -2944,6 +2945,7 @@ export function useDesktopState() {
     )
     loadedMessagesByThreadId.value = omitKey(loadedMessagesByThreadId.value, normalizedThreadId)
     loadedVersionByThreadId.value = omitKey(loadedVersionByThreadId.value, normalizedThreadId)
+    olderTurnCursorByThreadId.value = omitKey(olderTurnCursorByThreadId.value, normalizedThreadId)
     resumedThreadById.value = omitKey(resumedThreadById.value, normalizedThreadId)
     turnIndexByTurnIdByThreadId.value = omitKey(turnIndexByTurnIdByThreadId.value, normalizedThreadId)
     turnSummaryByThreadId.value = omitKey(turnSummaryByThreadId.value, normalizedThreadId)
@@ -3024,6 +3026,7 @@ export function useDesktopState() {
     }
     loadedMessagesByThreadId.value = pruneThreadStateMap(loadedMessagesByThreadId.value, activeThreadIds)
     loadedVersionByThreadId.value = pruneThreadStateMap(loadedVersionByThreadId.value, activeThreadIds)
+    olderTurnCursorByThreadId.value = pruneThreadStateMap(olderTurnCursorByThreadId.value, activeThreadIds)
     resumedThreadById.value = pruneThreadStateMap(resumedThreadById.value, activeThreadIds)
     turnIndexByTurnIdByThreadId.value = pruneThreadStateMap(turnIndexByTurnIdByThreadId.value, activeThreadIds)
     persistedMessagesByThreadId.value = pruneThreadStateMap(persistedMessagesByThreadId.value, activeThreadIds)
@@ -6120,6 +6123,12 @@ export function useDesktopState() {
       ...hasMoreOlderMessagesByThreadId.value,
       [threadId]: detail.hasMoreOlder === true,
     }
+    if (!isLiveProjection || detail.olderCursor !== undefined) {
+      olderTurnCursorByThreadId.value = {
+        ...olderTurnCursorByThreadId.value,
+        [threadId]: detail.olderCursor ?? null,
+      }
+    }
     markThreadMessagesPersisted(threadId, nextMessages)
     replaceTurnIndexLookupForThread(threadId, isLiveProjection
       ? {
@@ -6284,8 +6293,8 @@ export function useDesktopState() {
     if (loadingOlderMessagesByThreadId.value[threadId] === true) return
     if (hasMoreOlderMessagesByThreadId.value[threadId] !== true) return
 
-    const beforeTurnId = getFirstPersistedTurnId(threadId)
-    if (!beforeTurnId) {
+    const cursor = olderTurnCursorByThreadId.value[threadId] ?? null
+    if (!cursor) {
       hasMoreOlderMessagesByThreadId.value = {
         ...hasMoreOlderMessagesByThreadId.value,
         [threadId]: false,
@@ -6299,22 +6308,65 @@ export function useDesktopState() {
     }
 
     try {
-      const page = await getOlderThreadMessages(threadId, beforeTurnId)
-      const previousPersisted = persistedMessagesByThreadId.value[threadId] ?? []
+      const page = await getOlderThreadMessages(threadId, cursor)
+      const currentLookup = turnIndexByTurnIdByThreadId.value[threadId] ?? {}
+      const newTurnIds = page.turnIds.filter((turnId) => !(turnId in currentLookup))
+      const shift = newTurnIds.length
+      const shiftMessages = (messages: UiMessage[]): UiMessage[] => (
+        shift === 0
+          ? messages
+          : messages.map((message) => (
+              typeof message.turnIndex === 'number'
+                ? { ...message, turnIndex: message.turnIndex + shift }
+                : message
+            ))
+      )
+      const previousPersisted = shiftMessages(persistedMessagesByThreadId.value[threadId] ?? [])
+      if (shift > 0) {
+        setPersistedMessagesForThread(threadId, previousPersisted)
+        optimisticUserMessagesByThreadId.value = {
+          ...optimisticUserMessagesByThreadId.value,
+          [threadId]: shiftMessages(optimisticUserMessagesByThreadId.value[threadId] ?? []),
+        }
+        livePlanMessagesByThreadId.value = {
+          ...livePlanMessagesByThreadId.value,
+          [threadId]: shiftMessages(livePlanMessagesByThreadId.value[threadId] ?? []),
+        }
+        liveAgentMessagesByThreadId.value = {
+          ...liveAgentMessagesByThreadId.value,
+          [threadId]: shiftMessages(liveAgentMessagesByThreadId.value[threadId] ?? []),
+        }
+        liveCommandsByThreadId.value = {
+          ...liveCommandsByThreadId.value,
+          [threadId]: shiftMessages(liveCommandsByThreadId.value[threadId] ?? []),
+        }
+        liveFileChangeMessagesByThreadId.value = {
+          ...liveFileChangeMessagesByThreadId.value,
+          [threadId]: shiftMessages(liveFileChangeMessagesByThreadId.value[threadId] ?? []),
+        }
+      }
       const pageMessages = insertTurnSummaryMessages(
         page.messages,
         mergeTurnSummariesWithPersistedDurations(threadId, page.completionSummaries),
       )
       const mergedMessages = mergeMessages(pageMessages, previousPersisted, { preserveMissing: true })
       setPersistedMessagesForThread(threadId, mergedMessages)
+      const shiftedLookup = Object.fromEntries(
+        Object.entries(currentLookup).map(([turnId, turnIndex]) => [turnId, turnIndex + shift]),
+      )
+      const prependedLookup = Object.fromEntries(newTurnIds.map((turnId, index) => [turnId, index]))
       replaceTurnIndexLookupForThread(threadId, {
-        ...(turnIndexByTurnIdByThreadId.value[threadId] ?? {}),
-        ...page.turnIndexByTurnId,
+        ...shiftedLookup,
+        ...prependedLookup,
       })
       rebindLiveFileChangeTurnIndices(threadId)
+      olderTurnCursorByThreadId.value = {
+        ...olderTurnCursorByThreadId.value,
+        [threadId]: page.nextCursor,
+      }
       hasMoreOlderMessagesByThreadId.value = {
         ...hasMoreOlderMessagesByThreadId.value,
-        [threadId]: page.hasMoreOlder,
+        [threadId]: page.nextCursor !== null,
       }
     } catch (loadError) {
       error.value = loadError instanceof Error ? loadError.message : 'Failed to load earlier messages'
@@ -7670,6 +7722,7 @@ export function useDesktopState() {
     liveCommandsByThreadId.value = {}
     liveFileChangeMessagesByThreadId.value = {}
     turnIndexByTurnIdByThreadId.value = {}
+    olderTurnCursorByThreadId.value = {}
     turnActivityByThreadId.value = {}
     turnSummaryByThreadId.value = {}
     turnErrorByThreadId.value = {}
