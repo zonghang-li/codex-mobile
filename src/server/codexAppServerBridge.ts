@@ -47,6 +47,10 @@ import {
   isThreadTurnsListMethodNotFoundError,
   readNativeThreadTurnPage,
 } from './threadTurnPagination.js'
+import {
+  readThreadTextPage,
+  ThreadTextPageError,
+} from './threadTextPage.js'
 import { ThreadTerminalManager } from './terminalManager.js'
 import { getSpawnInvocation } from '../utils/commandInvocation.js'
 import {
@@ -9948,6 +9952,47 @@ export function createCodexBridgeMiddleware(options: {
             return
           }
           setJson(res, 500, { error: getErrorMessage(error, 'Failed to load earlier thread messages') })
+        }
+        return
+      }
+
+      if (req.method === 'GET' && url.pathname === '/codex-api/thread-text-page') {
+        const threadId = url.searchParams.get('threadId')?.trim() ?? ''
+        const turnId = url.searchParams.get('turnId')?.trim() ?? ''
+        const cursor = url.searchParams.get('cursor')?.trim() ?? ''
+        const limitRaw = url.searchParams.get('limit')?.trim() ?? ''
+        if (!threadId || !turnId) {
+          setJson(res, 400, { error: 'Missing threadId or turnId' })
+          return
+        }
+
+        try {
+          const threadRead = await appServer.rpc('thread/read', {
+            threadId,
+            includeTurns: false,
+          })
+          const thread = asRecord(asRecord(threadRead)?.thread)
+          const sessionPath = readNonEmptyString(thread?.path)
+          if (!sessionPath || !isAbsolute(sessionPath)) {
+            setJson(res, 404, { error: 'No rollout available for thread' })
+            return
+          }
+          const page = await readThreadTextPage({
+            sessionPath,
+            threadId,
+            turnId,
+            cursor: cursor || undefined,
+            limit: limitRaw ? Number.parseInt(limitRaw, 10) : undefined,
+          })
+          setJson(res, 200, page)
+        } catch (error) {
+          if (error instanceof ThreadTextPageError) {
+            setJson(res, error.statusCode, { error: error.message })
+          } else if (getErrorCode(error) === 'ENOENT') {
+            setJson(res, 404, { error: 'No rollout available for thread' })
+          } else {
+            setJson(res, 500, { error: 'Failed to load thread text page' })
+          }
         }
         return
       }

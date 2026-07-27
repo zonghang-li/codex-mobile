@@ -1,6 +1,6 @@
 import { createServer } from 'node:http'
 import type { AddressInfo } from 'node:net'
-import { mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { mkdtemp, rm, truncate, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
@@ -303,6 +303,219 @@ describe('GET /codex-api/thread-turn-page native pagination', () => {
 
     expect(response.status).toBe(501)
     expect(payload.fallback).toBe('thread/read')
+  })
+})
+
+describe('GET /codex-api/thread-text-page', () => {
+  async function createRolloutFixture(): Promise<{
+    sessionPath: string
+    cleanup: () => void
+  }> {
+    const directory = await mkdtemp(join(tmpdir(), 'codex-mobile-thread-text-page-'))
+    const rows = [
+      {
+        type: 'event_msg',
+        payload: { type: 'task_started', turn_id: 'turn-active' },
+      },
+      {
+        type: 'response_item',
+        payload: {
+          type: 'reasoning',
+          id: 'reason-1',
+          summary: [{ type: 'summary_text', text: 'First thought' }],
+        },
+      },
+      {
+        type: 'response_item',
+        payload: {
+          type: 'function_call',
+          name: 'exec_command',
+          arguments: '{"cmd":"raw function arguments must not escape"}',
+          call_id: 'call-1',
+        },
+      },
+      {
+        type: 'response_item',
+        payload: {
+          type: 'function_call_output',
+          call_id: 'call-1',
+          output: 'raw function output must not escape',
+        },
+      },
+      {
+        type: 'response_item',
+        payload: {
+          type: 'message',
+          role: 'assistant',
+          id: 'agent-1',
+          content: [{ type: 'output_text', text: 'First update' }],
+        },
+      },
+      {
+        type: 'event_msg',
+        payload: { type: 'context_compacted' },
+      },
+      {
+        type: 'response_item',
+        payload: {
+          type: 'reasoning',
+          id: 'reason-2',
+          summary: [{ type: 'summary_text', text: 'Second thought' }],
+        },
+      },
+      {
+        type: 'response_item',
+        payload: {
+          type: 'message',
+          role: 'assistant',
+          id: 'agent-2',
+          content: [{ type: 'output_text', text: 'Second update' }],
+        },
+      },
+    ]
+    const sessionPath = join(directory, 'rollout.jsonl')
+    await writeFile(
+      sessionPath,
+      `${rows.map((row) => JSON.stringify(row)).join('\n')}\n`,
+      'utf8',
+    )
+    return {
+      sessionPath,
+      cleanup: () => {
+        void rm(directory, { recursive: true, force: true })
+      },
+    }
+  }
+
+  function stubThreadRead(sessionPath: string) {
+    const shared = sharedBridgeForTest()
+    return vi.spyOn(shared.appServer as unknown as {
+      rpc(method: string, params: unknown): Promise<unknown>
+    }, 'rpc').mockImplementation(async (method, params) => {
+      if (method !== 'thread/read') throw new Error(`unexpected RPC ${method}`)
+      return {
+        thread: {
+          id: (params as { threadId?: string }).threadId,
+          path: sessionPath,
+        },
+      }
+    })
+  }
+
+  it('pages projected active-turn text from the trusted thread rollout', async () => {
+    const fixture = await createRolloutFixture()
+    disposers.push(fixture.cleanup)
+    const middleware = createCodexBridgeMiddleware()
+    const rpc = stubThreadRead(fixture.sessionPath)
+    const port = await listenWithMiddleware(middleware)
+
+    const firstResponse = await fetch(
+      `http://127.0.0.1:${port}/codex-api/thread-text-page?threadId=thread-1&turnId=turn-active&limit=3`,
+    )
+    const firstBody = await firstResponse.json() as {
+      items: Array<{ id: string; type: string }>
+      nextOlderCursor: string | null
+      hasMoreOlder: boolean
+    }
+
+    expect(firstResponse.status).toBe(200)
+    expect(rpc).toHaveBeenCalledWith('thread/read', {
+      threadId: 'thread-1',
+      includeTurns: false,
+    })
+    expect(firstBody.items.map((item) => item.type)).toEqual([
+      'contextCompaction',
+      'reasoning',
+      'agentMessage',
+    ])
+    expect(firstBody.items.slice(1).map((item) => item.id)).toEqual([
+      'reason-2',
+      'agent-2',
+    ])
+    expect(firstBody.hasMoreOlder).toBe(true)
+
+    const secondResponse = await fetch(
+      `http://127.0.0.1:${port}/codex-api/thread-text-page?threadId=thread-1&turnId=turn-active&limit=3&cursor=${encodeURIComponent(firstBody.nextOlderCursor ?? '')}`,
+    )
+    const secondBody = await secondResponse.json() as {
+      items: Array<{ id: string }>
+      hasMoreOlder: boolean
+    }
+    expect(secondResponse.status).toBe(200)
+    expect(secondBody.items.map((item) => item.id)).toEqual(['reason-1', 'agent-1'])
+    expect(secondBody.hasMoreOlder).toBe(false)
+
+    const serialized = JSON.stringify([firstBody, secondBody])
+    expect(serialized).not.toContain('raw function arguments')
+    expect(serialized).not.toContain('raw function output')
+  })
+
+  it('returns 400 when threadId or turnId is missing', async () => {
+    const middleware = createCodexBridgeMiddleware()
+    const port = await listenWithMiddleware(middleware)
+
+    const missingThread = await fetch(
+      `http://127.0.0.1:${port}/codex-api/thread-text-page?turnId=turn-active`,
+    )
+    const missingTurn = await fetch(
+      `http://127.0.0.1:${port}/codex-api/thread-text-page?threadId=thread-1`,
+    )
+
+    expect(missingThread.status).toBe(400)
+    expect(missingTurn.status).toBe(400)
+  })
+
+  it('returns 400 for a cursor from a different thread', async () => {
+    const fixture = await createRolloutFixture()
+    disposers.push(fixture.cleanup)
+    const middleware = createCodexBridgeMiddleware()
+    stubThreadRead(fixture.sessionPath)
+    const port = await listenWithMiddleware(middleware)
+    const firstResponse = await fetch(
+      `http://127.0.0.1:${port}/codex-api/thread-text-page?threadId=thread-1&turnId=turn-active&limit=1`,
+    )
+    const firstBody = await firstResponse.json() as { nextOlderCursor: string }
+
+    const response = await fetch(
+      `http://127.0.0.1:${port}/codex-api/thread-text-page?threadId=thread-2&turnId=turn-active&cursor=${encodeURIComponent(firstBody.nextOlderCursor)}`,
+    )
+
+    expect(response.status).toBe(400)
+  })
+
+  it('returns 404 when the trusted rollout file is missing', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'codex-mobile-missing-rollout-'))
+    disposers.push(() => {
+      void rm(directory, { recursive: true, force: true })
+    })
+    const middleware = createCodexBridgeMiddleware()
+    stubThreadRead(join(directory, 'missing.jsonl'))
+    const port = await listenWithMiddleware(middleware)
+
+    const response = await fetch(
+      `http://127.0.0.1:${port}/codex-api/thread-text-page?threadId=thread-1&turnId=turn-active`,
+    )
+
+    expect(response.status).toBe(404)
+  })
+
+  it('returns 409 when a cursor rollout snapshot has been truncated', async () => {
+    const fixture = await createRolloutFixture()
+    disposers.push(fixture.cleanup)
+    const middleware = createCodexBridgeMiddleware()
+    stubThreadRead(fixture.sessionPath)
+    const port = await listenWithMiddleware(middleware)
+    const firstResponse = await fetch(
+      `http://127.0.0.1:${port}/codex-api/thread-text-page?threadId=thread-1&turnId=turn-active&limit=1`,
+    )
+    const firstBody = await firstResponse.json() as { nextOlderCursor: string }
+    await truncate(fixture.sessionPath, 8)
+
+    const response = await fetch(
+      `http://127.0.0.1:${port}/codex-api/thread-text-page?threadId=thread-1&turnId=turn-active&cursor=${encodeURIComponent(firstBody.nextOlderCursor)}`,
+    )
+
+    expect(response.status).toBe(409)
   })
 })
 
