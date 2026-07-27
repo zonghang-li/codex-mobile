@@ -11,21 +11,29 @@ describe('CLI shutdown wiring', () => {
     async (relativePath) => {
       const source = await readSource(relativePath)
       expect(source).toContain('const closeWebSocket = attachWebSocket(server)')
-      expect(source).toContain('const closeServer = listening.close()')
-      expect(source).toContain('closeWebSocket()')
-      expect(source).toContain('dispose()')
-      expect(source).toContain('await closeServer')
+      expect(source).toContain('() => listening.close()')
+      expect(source).toContain('closeWebSocket,')
+      expect(source).toContain('dispose,')
       expect(source).not.toContain('server.close(() =>')
     },
   )
 
-  it('safe CLI shares in-flight shutdown and keeps signal listeners installed', async () => {
-    const source = await readSource('./safe.ts')
-    expect(source).toContain("import { createSharedShutdown } from './shared/shutdown.js'")
-    expect(source).toContain('const shutdown = createSharedShutdown(async () => {')
-    expect(source).toContain("process.on('SIGINT', () => void shutdown().finally(() => process.exit(0)))")
-    expect(source).toContain("process.on('SIGTERM', () => void shutdown().finally(() => process.exit(0)))")
-    expect(source).not.toContain("process.once('SIGINT',")
-    expect(source).not.toContain("process.once('SIGTERM',")
-  })
+  it.each(['./safe.ts', './index.ts'])(
+    '%s shares in-flight shutdown and reports signal cleanup status',
+    async (relativePath) => {
+      const source = await readSource(relativePath)
+      expect(source).toContain(
+        "import { createSharedShutdown, runBestEffortShutdown } from './shared/shutdown.js'",
+      )
+      expect(source).toContain('const shutdown = createSharedShutdown(() => runBestEffortShutdown(')
+      expect(source).toContain('const handleShutdownSignal = () => {')
+      expect(source).toContain('() => process.exit(0)')
+      expect(source).toContain('process.exit(1)')
+      expect(source).toContain("process.on('SIGINT', handleShutdownSignal)")
+      expect(source).toContain("process.on('SIGTERM', handleShutdownSignal)")
+      expect(source).not.toContain('let shuttingDown = false')
+      expect(source).not.toContain("process.once('SIGINT',")
+      expect(source).not.toContain("process.once('SIGTERM',")
+    },
+  )
 })

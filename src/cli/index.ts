@@ -26,6 +26,7 @@ import { createServer as createApp } from '../server/httpServer.js'
 import { generatePassword } from '../server/password.js'
 import { spawnSyncCommand } from '../utils/commandInvocation.js'
 import { listenWithFallback, openBrowser } from './shared/launcher.js'
+import { createSharedShutdown, runBestEffortShutdown } from './shared/shutdown.js'
 
 const program = new Command().name('codexui').description('Web interface for Codex app-server')
 const __dirname = dirname(fileURLToPath(import.meta.url))
@@ -564,28 +565,27 @@ async function startServer(options: {
   }
   if (options.open) openBrowser(`http://localhost:${String(port)}`)
 
-  let shuttingDown = false
-
-  async function shutdown() {
-    if (shuttingDown) return
-    shuttingDown = true
-    console.log('\nShutting down...')
-    if (tunnelChild && !tunnelChild.killed) {
-      tunnelChild.kill('SIGTERM')
-    }
-    const closeServer = listening.close()
-    closeWebSocket()
-    dispose()
-    try {
-      await closeServer
-      process.exit(0)
-    } catch {
-      process.exit(1)
-    }
+  const shutdown = createSharedShutdown(() => runBestEffortShutdown(
+    () => listening.close(),
+    [
+      () => {
+        console.log('\nShutting down...')
+        if (tunnelChild && !tunnelChild.killed) {
+          tunnelChild.kill('SIGTERM')
+        }
+      },
+      closeWebSocket,
+      dispose,
+    ],
+  ))
+  const handleShutdownSignal = () => {
+    void shutdown().then(
+      () => process.exit(0),
+      () => process.exit(1),
+    )
   }
-
-  process.on('SIGINT', () => void shutdown())
-  process.on('SIGTERM', () => void shutdown())
+  process.on('SIGINT', handleShutdownSignal)
+  process.on('SIGTERM', handleShutdownSignal)
 }
 
 async function runLogin() {

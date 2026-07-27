@@ -58,7 +58,67 @@ describe('local installation packaging', () => {
           ...process.env,
           CODEX_MOBILE_RESTART_REQUEST_DIR: requestDirectory,
         },
+      })).rejects.toMatchObject({
+        stderr: expect.stringContaining('Restart request directory must'),
+      })
+    } finally {
+      await rm(temporaryRoot, { recursive: true, force: true })
+    }
+  })
+
+  it('rejects an existing restart request directory without mode 0700', async () => {
+    const temporaryRoot = await mkdtemp(join(tmpdir(), 'codex-mobile-restart-mode-'))
+    try {
+      const requestDirectory = join(temporaryRoot, 'request')
+      await mkdir(requestDirectory, { mode: 0o755 })
+      await chmod(requestDirectory, 0o755)
+
+      await expect(execFileAsync('sh', [
+        fileURLToPath(new URL('../../scripts/request-user-service-restart.sh', import.meta.url)),
+      ], {
+        env: {
+          ...process.env,
+          CODEX_MOBILE_RESTART_REQUEST_DIR: requestDirectory,
+        },
       })).rejects.toThrow()
+      expect((await stat(requestDirectory)).mode & 0o777).toBe(0o755)
+      await expect(stat(join(requestDirectory, 'restart.request'))).rejects.toThrow()
+    } finally {
+      await rm(temporaryRoot, { recursive: true, force: true })
+    }
+  })
+
+  it('rejects a symlink restart request directory before rendering or activating units', async () => {
+    const temporaryRoot = await mkdtemp(join(tmpdir(), 'codex-mobile-install-symlink-'))
+    try {
+      const homeDirectory = join(temporaryRoot, 'home')
+      const configDirectory = join(temporaryRoot, 'config')
+      const prefix = join(temporaryRoot, 'prefix')
+      const realDirectory = join(temporaryRoot, 'real-request')
+      const requestDirectory = join(temporaryRoot, 'restart-request')
+      await mkdir(realDirectory)
+      await symlink(realDirectory, requestDirectory)
+
+      await expect(execFileAsync('sh', [
+        fileURLToPath(new URL('../../scripts/install-user-service.sh', import.meta.url)),
+      ], {
+        env: {
+          ...process.env,
+          HOME: homeDirectory,
+          XDG_CONFIG_HOME: configDirectory,
+          PREFIX: prefix,
+          CODEX_MOBILE_PREFIX: '',
+          CODEX_MOBILE_RESTART_REQUEST_DIR: requestDirectory,
+          CODEX_MOBILE_SERVICE_INSTALL_TEST_MODE: '1',
+        },
+      })).rejects.toMatchObject({
+        stderr: expect.stringContaining('Restart request directory must'),
+      })
+
+      const unitDirectory = join(configDirectory, 'systemd/user')
+      await expect(stat(join(unitDirectory, 'codex-mobile-safe.service'))).rejects.toThrow()
+      await expect(stat(join(unitDirectory, 'codex-mobile-safe-restart.path'))).rejects.toThrow()
+      await expect(stat(join(unitDirectory, 'codex-mobile-safe-restart.service'))).rejects.toThrow()
     } finally {
       await rm(temporaryRoot, { recursive: true, force: true })
     }
