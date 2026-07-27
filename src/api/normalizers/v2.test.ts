@@ -43,6 +43,39 @@ describe('normalizeThreadMessagesV2', () => {
     expect(messages[0]?.images).toBeUndefined()
   })
 
+  it('renders persisted user image inputs as attachment text without transcript images', () => {
+    const messages = normalizeThreadMessagesV2(threadReadResponseWithContent([{
+      type: 'userMessage',
+      id: 'user-image',
+      content: [
+        {
+          type: 'image',
+          url: '/codex-local-image?path=%2Ftmp%2Fuploads%2FIMG_2912.png&uploadHandle=managed-1',
+        },
+        { type: 'text', text: 'What is shown here?' },
+      ],
+    }]))
+
+    expect(messages).toEqual([
+      expect.objectContaining({
+        id: 'user-image',
+        role: 'user',
+        text: '@IMG_2912.png\n\nWhat is shown here?',
+      }),
+    ])
+    expect(messages[0]?.images).toBeUndefined()
+  })
+
+  it('keeps imageView and generated image URLs renderable', () => {
+    const messages = normalizeThreadMessagesV2(threadReadResponseWithContent([
+      { type: 'imageView', id: 'view-1', path: '/tmp/view.png' },
+      { type: 'imageGeneration', id: 'generated-1', result: 'data:image/png;base64,AAAA' },
+    ]))
+
+    expect(messages[0]?.images).toEqual(['/codex-local-image?path=%2Ftmp%2Fview.png'])
+    expect(messages[1]?.images).toEqual(['data:image/png;base64,AAAA'])
+  })
+
   it('extracts persisted Codex directives from assistant messages only', () => {
     const response = threadReadResponseWithContent([
       {

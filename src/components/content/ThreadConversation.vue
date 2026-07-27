@@ -70,13 +70,23 @@
               :data-role="message.role"
             >
               <li v-for="imageUrl in message.images" :key="imageUrl" class="message-image-item">
-                <button class="message-image-button" type="button" @click="openImageModal(imageUrl)">
+                <a
+                  v-if="isMessageImageFailed(message.id, imageUrl)"
+                  class="message-image-fallback-link"
+                  :href="imageUrl"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                >
+                  View image
+                </a>
+                <button v-else class="message-image-button" type="button" @click="openImageModal(imageUrl)">
                   <img
                     class="message-image-preview"
                     :class="{ 'message-generated-image-preview': message.messageType === 'imageGeneration' }"
                     :src="imageUrl"
                     alt="Message image preview"
                     loading="lazy"
+                    @error="markMessageImageFailed(message.id, imageUrl)"
                   />
                 </button>
               </li>
@@ -303,13 +313,23 @@
               :data-role="message.role"
             >
               <li v-for="imageUrl in message.images" :key="imageUrl" class="message-image-item">
-                <button class="message-image-button" type="button" @click="openImageModal(imageUrl)">
+                <a
+                  v-if="isMessageImageFailed(message.id, imageUrl)"
+                  class="message-image-fallback-link"
+                  :href="imageUrl"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                >
+                  View image
+                </a>
+                <button v-else class="message-image-button" type="button" @click="openImageModal(imageUrl)">
                   <img
                     class="message-image-preview"
                     :class="{ 'message-generated-image-preview': message.messageType === 'imageView' }"
                     :src="imageUrl"
                     alt="Message image preview"
                     loading="lazy"
+                    @error="markMessageImageFailed(message.id, imageUrl)"
                   />
                 </button>
               </li>
@@ -327,13 +347,23 @@
                 :data-role="message.role"
               >
                 <li v-for="imageUrl in message.images" :key="imageUrl" class="message-image-item">
-                  <button class="message-image-button" type="button" @click="openImageModal(imageUrl)">
+                  <a
+                    v-if="isMessageImageFailed(message.id, imageUrl)"
+                    class="message-image-fallback-link"
+                    :href="imageUrl"
+                    target="_blank"
+                    rel="noopener noreferrer"
+                  >
+                    View image
+                  </a>
+                  <button v-else class="message-image-button" type="button" @click="openImageModal(imageUrl)">
                     <img
                       class="message-image-preview"
                       :class="{ 'message-generated-image-preview': message.messageType === 'imageView' }"
                       :src="imageUrl"
                       :alt="message.messageType === 'imageView' ? 'Generated image' : 'Message image preview'"
                       loading="lazy"
+                      @error="markMessageImageFailed(message.id, imageUrl)"
                     />
                   </button>
                 </li>
@@ -727,7 +757,15 @@
                       </CopyableOutputBlock>
                     </div>
                     <hr v-else-if="block.kind === 'thematicBreak'" class="message-divider" />
-                    <p v-else-if="isMarkdownImageFailed(message.id, blockIndex)" class="message-text">{{ block.markdown }}</p>
+                    <a
+                      v-else-if="isMarkdownImageFailed(message.id, blockIndex)"
+                      class="message-image-fallback-link"
+                      :href="block.url"
+                      target="_blank"
+                      rel="noopener noreferrer"
+                    >
+                      {{ block.alt || 'View image' }}
+                    </a>
                     <button
                       v-else
                       class="message-image-button"
@@ -735,7 +773,8 @@
                       @click="openImageModal(block.url)"
                     >
                       <img
-                        class="message-image-preview message-markdown-image"
+                        class="message-markdown-image"
+                        :class="'message-image-preview'"
                         :src="block.url"
                         :alt="block.alt || 'Embedded message image'"
                         loading="lazy"
@@ -4927,6 +4966,9 @@ watch(
     fileChangeActionState.value = {}
     fileChangeActionError.value = {}
     fileChangeRedoPatchIds.value = {}
+    failedMessageImages.value = new Set()
+    failedMarkdownImages.value = new Set()
+    markdownImageFailureVersion.value += 1
     await scheduleConversationScroll()
   },
   { flush: 'post' },
@@ -4955,7 +4997,22 @@ function onConversationScroll(): void {
   maybeLoadMoreAbove(container)
 }
 
+const failedMessageImages = ref(new Set<string>())
 const failedMarkdownImages = ref(new Set<string>())
+
+function messageImageKey(messageId: string, imageUrl: string): string {
+  return `${messageId}\u0000${imageUrl}`
+}
+
+function markMessageImageFailed(messageId: string, imageUrl: string): void {
+  const next = new Set(failedMessageImages.value)
+  next.add(messageImageKey(messageId, imageUrl))
+  failedMessageImages.value = next
+}
+
+function isMessageImageFailed(messageId: string, imageUrl: string): boolean {
+  return failedMessageImages.value.has(messageImageKey(messageId, imageUrl))
+}
 
 function markdownImageKey(messageId: string, blockIndex: number): string {
   return `${messageId}:${blockIndex}`
@@ -5251,6 +5308,10 @@ onBeforeUnmount(() => {
 
 .message-image-button {
   @apply block rounded-xl overflow-hidden border border-slate-300 bg-white p-0 transition hover:border-slate-400;
+}
+
+.message-image-fallback-link {
+  @apply inline-flex min-h-10 items-center text-sm text-[#0969da] no-underline hover:text-[#1f6feb] hover:underline underline-offset-2;
 }
 
 .message-image-preview {

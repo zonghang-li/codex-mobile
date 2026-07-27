@@ -230,6 +230,21 @@ function parseHeartbeatEnvelope(value: string): { automationId: string; currentT
   }
 }
 
+function imageAttachmentLabel(value: string): string {
+  const normalized = value.trim()
+  if (!normalized) return 'image'
+  try {
+    const parsed = new URL(normalized, 'http://codex-mobile.local')
+    const localPath = parsed.pathname === '/codex-local-image'
+      ? parsed.searchParams.get('path')?.trim() ?? ''
+      : decodeURIComponent(parsed.pathname)
+    const label = localPath.replace(/\\/gu, '/').split('/').at(-1)?.trim() ?? ''
+    return label || 'image'
+  } catch {
+    return normalized.replace(/\\/gu, '/').split('/').at(-1)?.trim() || 'image'
+  }
+}
+
 function parseUserMessageContent(
   itemId: string,
   content: UserInput[] | undefined,
@@ -247,8 +262,7 @@ function parseUserMessageContent(
   }
 
   const textChunks: string[] = []
-  const images: string[] = []
-  const localImageLabels: string[] = []
+  const imageLabels: string[] = []
   const skills: Array<{ name: string; path: string }> = []
   const rawBlocks: UiMessage[] = []
 
@@ -257,12 +271,12 @@ function parseUserMessageContent(
       textChunks.push(block.text)
     }
     if (block.type === 'image' && typeof block.url === 'string' && block.url.trim().length > 0) {
-      images.push(block.url.trim())
+      const label = imageAttachmentLabel(block.url)
+      if (!imageLabels.includes(label)) imageLabels.push(label)
     }
     if (block.type === 'localImage' && typeof block.path === 'string' && block.path.trim().length > 0) {
-      const normalizedPath = block.path.trim().replace(/\\/gu, '/')
-      const label = normalizedPath.split('/').at(-1)?.trim() ?? ''
-      if (label && !localImageLabels.includes(label)) localImageLabels.push(label)
+      const label = imageAttachmentLabel(block.path)
+      if (!imageLabels.includes(label)) imageLabels.push(label)
     }
     if (block.type === 'skill') {
       const name = typeof block.name === 'string' ? block.name.trim() : ''
@@ -288,7 +302,7 @@ function parseUserMessageContent(
   const fileAttachments = extractFileAttachments(fullText)
   const heartbeat = parseHeartbeatEnvelope(fullText)
   const requestText = heartbeat?.instructions ?? extractCodexUserRequestText(fullText)
-  const missingImageTokens = localImageLabels
+  const missingImageTokens = imageLabels
     .map((label) => `@${label}`)
     .filter((token) => !requestText.includes(token))
   const text = missingImageTokens.length > 0
@@ -297,7 +311,7 @@ function parseUserMessageContent(
 
   return {
     text,
-    images,
+    images: [],
     skills,
     fileAttachments,
     rawBlocks,
