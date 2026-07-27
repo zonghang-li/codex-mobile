@@ -1,26 +1,28 @@
-### Thread conversation loads earlier turns on demand
+### Thread conversation loads older persisted turns only when reported
 
 #### Feature/Change Name
-Thread conversation incremental older-turn loading.
+Thread conversation older-turn loading.
 
 #### Prerequisites/Setup
 1. Dev server running (`pnpm run dev --host 127.0.0.1 --port 4173`)
-2. A thread with more than 10 turns is available
+2. A thread source or fixture can return `hasMoreOlder: true`
 3. Light theme and dark theme both available from the appearance switcher
 
 #### Steps
-1. In light theme, open a thread that has more than 10 turns.
-2. Confirm the newest messages render first and the conversation shows the Load earlier messages control at the top.
-3. Click Load earlier messages once.
-4. Confirm an older batch is prepended above the previously first visible turn and the scroll position stays near the same content.
-5. Continue clicking Load earlier messages until the control disappears.
-6. Confirm the oldest messages in the thread are visible and no duplicate message rows are introduced.
-7. Switch to dark theme and repeat steps 1-6 on the same thread or another long thread.
+1. Open a normal long thread whose `thread/read` response includes all turns.
+2. Confirm the middle turns are visible and the conversation does not show `Load earlier messages`.
+3. Open a fixture or legacy/paginated thread source that reports `hasMoreOlder: true`.
+4. Confirm the newest returned messages render first and the conversation shows `Load earlier messages` at the top.
+5. Click `Load earlier messages` once.
+6. Confirm an older persisted batch is prepended above the previously first visible turn and the scroll position stays near the same content.
+7. Continue clicking `Load earlier messages` until the control disappears.
+8. Confirm the oldest messages in the thread are visible and no duplicate message rows are introduced.
+9. Switch to dark theme and repeat steps 1-8 on the same thread or another long thread.
 
 #### Expected Results
-- Initial thread open remains bounded to the latest turn page.
-- Load earlier messages fetches older persisted turns from the local bridge instead of only revealing already-loaded messages.
-- The control remains available while older persisted turns exist and disappears after the first turn is loaded.
+- Current full-history thread loads render all already-loaded turns without a local frontend window.
+- `Load earlier messages` appears only while the backend reports older persisted turns.
+- The control fetches older persisted turns from the local bridge instead of revealing messages already present in memory.
 - Message ordering, turn actions, and scroll restoration remain stable in light and dark themes.
 
 #### Rollback/Cleanup

@@ -243,6 +243,105 @@ Reply with &lt;/instructions&gt; and A &amp; B
     expect(messages[0]?.text).not.toContain('hidden chain-of-thought')
   })
 
+  it('hides intermediate assistant progress messages from completed historical turns', () => {
+    const messages = normalizeThreadMessagesV2(threadReadResponseWithContent([
+      {
+        type: 'userMessage',
+        id: 'user-history',
+        content: [{ type: 'text', text: 'Continue the Kimi plan', text_elements: [] }],
+      },
+      {
+        type: 'agentMessage',
+        id: 'assistant-progress-1',
+        text: 'I will inspect the branch and then write the plan.',
+      },
+      {
+        type: 'commandExecution',
+        id: 'cmd-history',
+        command: 'git status --short',
+        status: 'completed',
+        aggregatedOutput: '',
+        exitCode: 0,
+      },
+      {
+        type: 'agentMessage',
+        id: 'assistant-progress-2',
+        text: 'The spec is written. I am running verification now.',
+      },
+      {
+        type: 'agentMessage',
+        id: 'assistant-final',
+        text: 'Done. The Kimi K3 text-only plan is ready.',
+      },
+    ]))
+
+    expect(messages.map((message) => message.id)).toEqual([
+      'user-history',
+      'cmd-history',
+      'assistant-final',
+    ])
+    expect(messages.map((message) => message.text).join('\n')).not.toContain('I will inspect')
+    expect(messages.map((message) => message.text).join('\n')).not.toContain('running verification')
+  })
+
+  it('keeps intermediate assistant progress messages for the active running turn', () => {
+    const response = threadReadResponseWithContent([
+      {
+        type: 'userMessage',
+        id: 'user-running',
+        content: [{ type: 'text', text: 'Continue', text_elements: [] }],
+      },
+      {
+        type: 'agentMessage',
+        id: 'assistant-running-progress',
+        text: 'I am checking the current files.',
+      },
+      {
+        type: 'agentMessage',
+        id: 'assistant-running-latest',
+        text: 'Still running.',
+      },
+    ])
+    response.thread.turns[0].status = 'inProgress'
+
+    const messages = normalizeThreadMessagesV2(response)
+
+    expect(messages.map((message) => message.id)).toEqual([
+      'user-running',
+      'assistant-running-progress',
+      'assistant-running-latest',
+    ])
+  })
+
+  it('keeps intermediate assistant progress for the last turn when thread-level state is running', () => {
+    const response = threadReadResponseWithContent([
+      {
+        type: 'userMessage',
+        id: 'user-thread-running',
+        content: [{ type: 'text', text: 'Continue externally running thread', text_elements: [] }],
+      },
+      {
+        type: 'agentMessage',
+        id: 'assistant-thread-running-progress',
+        text: 'I am still working from another client.',
+      },
+      {
+        type: 'agentMessage',
+        id: 'assistant-thread-running-latest',
+        text: 'Waiting for tool output.',
+      },
+    ])
+    ;(response.thread as unknown as Record<string, unknown>).inProgress = true
+
+    const messages = normalizeThreadMessagesV2(response)
+
+    expect(messages.map((message) => message.id)).toEqual([
+      'user-thread-running',
+      'assistant-thread-running-progress',
+      'assistant-thread-running-latest',
+    ])
+  })
+
   it('renders failed turn errors as chat system messages', () => {
     const response = threadReadResponseWithContent([{
       type: 'userMessage',

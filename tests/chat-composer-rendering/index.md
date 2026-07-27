@@ -29,7 +29,7 @@ Return to the [manual test index](../../tests.md).
 | [Feature: Markdown file links with spaces and parentheses in path](markdown-file-links-with-spaces-and-parentheses-in-path.md) |
 | [Feature: Markdown link with backticked label renders as file link](markdown-link-with-backticked-label-renders-as-file-link.md) |
 | [Feature: Backticked bare filenames render as file links](backticked-bare-filenames-render-as-file-links.md) |
-| [Feature: Lazy message rendering (windowed conversation)](lazy-message-rendering-windowed-conversation.md) |
+| [Feature: Full loaded history rendering](lazy-message-rendering-windowed-conversation.md) |
 | [Feature: Mobile thread single tap and terminal status](mobile-thread-single-tap-and-terminal-status.md) |
 | [Selected idle desktop turn live sync](selected-idle-desktop-turn-live-sync.md) |
 | [Codex desktop activity parity and mobile typography](codex-desktop-activity-parity-and-mobile-typography.md) |

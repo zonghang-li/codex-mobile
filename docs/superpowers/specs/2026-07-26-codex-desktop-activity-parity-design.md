@@ -208,15 +208,16 @@ stack.
 
 ## Performance
 
-Activity derivation must be a linear pass over the currently loaded message
-window. It must:
+Activity derivation must be a linear pass over the currently loaded/pruned
+message set. It must:
 
 - make no new API requests;
 - not scan unloaded history;
 - avoid deep-watching command output text;
 - use stable event IDs for Vue keys;
 - keep command output and diff content collapsed until requested;
-- preserve the existing bounded render window and payload truncation.
+- preserve payload truncation without adding a client-side render window that
+  hides already-loaded turns.
 
 The implementation should expose the pure segment builder to unit tests and
 reuse its result from a computed value rather than repeatedly scanning the

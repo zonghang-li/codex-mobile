@@ -4,7 +4,7 @@
 
 **Goal:** Make the mobile conversation page reliable under external desktop activity and compaction, remove misleading protocol/UI artifacts, and align the active conversation controls with Codex desktop behavior.
 
-**Architecture:** Treat an existing task as a read-only projection until the user explicitly sends a new turn. Keep the initial projection bounded to five turns and live polling bounded to the newest turn, merged by absolute turn index. Keep uploaded images ephemeral and represented by text tokens. Preserve native Codex goal RPCs and completion state while removing UI-only artifacts.
+**Architecture:** Treat an existing task as a read-only projection until the user explicitly sends a new turn. Keep the full turn history available, but prune historical `reasoning` items server-side and display only each completed turn's final assistant reply so only the latest running turn carries live reasoning/progress. Keep uploaded images ephemeral and represented by text tokens. Preserve native Codex goal RPCs and completion state while removing UI-only artifacts.
 
 **Tech Stack:** Vue 3, TypeScript, Vite, Vitest, Codex app-server JSON-RPC, Express-compatible server bridge, Playwright/Chromium for final visual QA.
 
@@ -14,7 +14,7 @@
 - Preserve the user's dirty main checkout.
 - Use test-first changes: add one focused failing assertion, run it, implement the smallest fix, rerun it.
 - Existing task selection and refresh must never call `thread/resume`.
-- Initial task detail contains at most five turns; live snapshots contain only the newest turn and its absolute index.
+- Initial task detail and live snapshots contain all turns, with `reasoning` items removed from every non-running turn and intermediate assistant progress hidden for completed turns.
 - Never surface `item/tool/call` as an approval choice. Never fabricate success for a tool call.
 - Uploaded image bytes may exist only as short-lived server-owned input until handoff; drafts/history show only `@filename`.
 - General `/tmp` image serving remains denied.
@@ -55,7 +55,7 @@
 
 `pnpm vitest run src/composables/useDesktopState.test.ts src/server/externalThreadRuntimeBridge.test.ts`
 
-### Task 2: Bound initial and live task projections
+### Task 2: Load full history while pruning historical reasoning/progress
 
 **Files:**
 
@@ -68,22 +68,24 @@
 
 **Red:**
 
-1. Add server tests requiring a five-turn initial detail window.
-2. Add live-snapshot tests requiring only the newest turn plus `threadTurnStartIndex = totalTurns - 1`.
-3. Add client tests proving the one-turn live projection replaces only the matching absolute turn and preserves older visible turns.
-4. Add a visibility test proving polling pauses while the document is hidden and resumes immediately when visible.
+1. Add server tests requiring initial detail to retain all turns while pruning `reasoning` from non-running turns.
+2. Add live-snapshot tests requiring the same full-history/pruned-reasoning shape and preserving `threadTurnStartIndex`.
+3. Add client tests proving live projection preserves older visible turns while updating the active turn.
+4. Add normalizer tests proving completed historical turns hide intermediate assistant progress while preserving the latest running turn's progress.
+5. Add a visibility test proving polling pauses while the document is hidden and resumes immediately when visible.
 
 **Green:**
 
-1. Set the initial response limit to five.
-2. Create the live response from only the newest sanitized turn.
+1. Remove the initial response turn limit.
+2. Create live responses from the full sanitized turn list after pruning historical reasoning.
 3. Preserve the absolute turn offset through gateway normalization.
-4. Merge live snapshots without clearing earlier loaded history.
-5. Avoid rescheduling redundant polling while a poll is already pending.
+4. Normalize completed turns to render only the final assistant reply by default.
+5. Merge live snapshots without clearing earlier loaded history.
+6. Avoid rescheduling redundant polling while a poll is already pending.
 
 **Verify:**
 
-`pnpm vitest run src/server/codexAppServerBridge.liveSnapshot.test.ts src/api/codexGateway.test.ts src/composables/useDesktopState.test.ts`
+`pnpm vitest run src/server/codexAppServerBridge.liveSnapshot.test.ts src/api/codexGateway.test.ts src/api/normalizers/v2.test.ts src/composables/useDesktopState.test.ts`
 
 ### Task 3: Replace uploaded-image previews with ephemeral text attachments
 

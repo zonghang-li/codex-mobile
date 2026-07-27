@@ -244,7 +244,7 @@ const COMPOSIO_CONNECTORS_PAGE_LIMIT_MAX = 1000
 
 const PROVIDER_MODELS_FETCH_TIMEOUT_MS = 5_000
 
-const THREAD_RESPONSE_TURN_LIMIT = 5
+const THREAD_TURN_PAGE_DEFAULT_LIMIT = 5
 const THREAD_TURN_PAGE_READ_CACHE_TTL_MS = 30_000
 const THREAD_LIST_RPC_CACHE_TTL_MS = 2_000
 const THREAD_LIST_PERSISTED_CACHE_MAX_AGE_MS = 6 * 60 * 60 * 1000
@@ -1266,35 +1266,81 @@ async function guardThreadResumeAgainstExternalWriter(
   return { blocked: true, readResult: inspection.readResult }
 }
 
+function isThreadTurnRunning(turn: unknown): boolean {
+  const turnRecord = asRecord(turn)
+  if (!turnRecord) return false
+  const status = readNonEmptyString(turnRecord.status)
+  if (status === 'inProgress' || status === 'active' || status === 'running') return true
+  const statusType = readNonEmptyString(asRecord(turnRecord.status)?.type)
+  return statusType === 'inProgress' || statusType === 'active' || statusType === 'running'
+}
+
+function isReasoningTurnItem(item: unknown): boolean {
+  const itemRecord = asRecord(item)
+  return readNonEmptyString(itemRecord?.type) === 'reasoning'
+}
+
+function findReasoningPreservedTurnIndex(turns: unknown[], activeTurnId = ''): number {
+  if (activeTurnId) {
+    for (let index = turns.length - 1; index >= 0; index -= 1) {
+      const turnId = readNonEmptyString(asRecord(turns[index])?.id)
+      if (turnId === activeTurnId) return index
+    }
+  }
+  for (let index = turns.length - 1; index >= 0; index -= 1) {
+    if (isThreadTurnRunning(turns[index])) return index
+  }
+  return -1
+}
+
+function pruneHistoricalReasoningItemsFromTurns(turns: unknown[], activeTurnId = ''): unknown[] {
+  const preservedTurnIndex = findReasoningPreservedTurnIndex(turns, activeTurnId)
+  let changed = false
+  const nextTurns = turns.map((turn, index) => {
+    if (index === preservedTurnIndex) return turn
+    const turnRecord = asRecord(turn)
+    const items = Array.isArray(turnRecord?.items) ? turnRecord.items : null
+    if (!turnRecord || !items) return turn
+
+    const nextItems = items.filter((item) => !isReasoningTurnItem(item))
+    if (nextItems.length === items.length) return turn
+
+    changed = true
+    return {
+      ...turnRecord,
+      items: nextItems,
+    }
+  })
+
+  return changed ? nextTurns : turns
+}
+
 export function trimThreadTurnsInRpcResult(
   method: string,
   result: unknown,
-  limit = THREAD_RESPONSE_TURN_LIMIT,
+  _limit = THREAD_TURN_PAGE_DEFAULT_LIMIT,
 ): unknown {
   if (!THREAD_METHODS_WITH_TURNS.has(method)) return result
 
   const record = asRecord(result)
   const thread = asRecord(record?.thread)
   const turns = Array.isArray(thread?.turns) ? thread.turns : null
-  if (!record || !thread || !turns || turns.length <= limit) return result
-  const existingStartTurnIndex = Math.max(0, Math.floor(
-    typeof record.threadTurnStartIndex === 'number' ? record.threadTurnStartIndex : 0,
-  ))
-  const relativeStartTurnIndex = Math.max(0, turns.length - limit)
-  const startTurnIndex = existingStartTurnIndex + relativeStartTurnIndex
+  if (!record || !thread || !turns || turns.length === 0) return result
+
+  const nextTurns = pruneHistoricalReasoningItemsFromTurns(turns)
+  if (nextTurns === turns) return result
 
   return {
     ...record,
-    threadTurnStartIndex: startTurnIndex,
     thread: {
       ...thread,
-      turns: turns.slice(relativeStartTurnIndex),
+      turns: nextTurns,
     },
   }
 }
 
 export function trimLiveThreadTurnsInRpcResult(result: unknown): unknown {
-  return trimThreadTurnsInRpcResult('thread/read', result, 1)
+  return trimThreadTurnsInRpcResult('thread/read', result)
 }
 
 export function buildThreadLiveStateReadFailureFallback(
@@ -1313,7 +1359,11 @@ export function buildThreadLiveStateReadFailureFallback(
   const record = asRecord(liveSnapshot)
   const thread = asRecord(record?.thread)
   const rawTurns = Array.isArray(thread?.turns) ? thread.turns : []
-  const turns = mergeItemsIntoTurns(threadId, rawTurns)
+  const activeTurnId = readNonEmptyString(asRecord(options.externalRuntime)?.turnId)
+  const turns = pruneHistoricalReasoningItemsFromTurns(
+    mergeItemsIntoTurns(threadId, rawTurns),
+    activeTurnId,
+  )
   const threadTurnStartIndex = Math.max(0, Math.floor(
     typeof record?.threadTurnStartIndex === 'number' ? record.threadTurnStartIndex : 0,
   ))
@@ -9730,8 +9780,8 @@ export function createCodexBridgeMiddleware(options: {
         try {
           const threadId = url.searchParams.get('threadId')?.trim() ?? ''
           const beforeTurnId = url.searchParams.get('beforeTurnId')?.trim() ?? ''
-          const limitRaw = url.searchParams.get('limit')?.trim() ?? String(THREAD_RESPONSE_TURN_LIMIT)
-          const limit = Math.max(1, Math.min(50, Number.parseInt(limitRaw, 10) || THREAD_RESPONSE_TURN_LIMIT))
+          const limitRaw = url.searchParams.get('limit')?.trim() ?? String(THREAD_TURN_PAGE_DEFAULT_LIMIT)
+          const limit = Math.max(1, Math.min(50, Number.parseInt(limitRaw, 10) || THREAD_TURN_PAGE_DEFAULT_LIMIT))
           if (!threadId) {
             setJson(res, 400, { error: 'Missing threadId' })
             return
@@ -9918,10 +9968,8 @@ export function createCodexBridgeMiddleware(options: {
             threadId,
             includeTurns: true,
           })
-          const trimmedThreadReadResult = trimLiveThreadTurnsInRpcResult(rawThreadReadResult)
-          const threadReadResult = mergeStreamTurnErrorsIntoThreadResult(appServer, trimmedThreadReadResult)
+          const threadReadResult = mergeStreamTurnErrorsIntoThreadResult(appServer, rawThreadReadResult)
           const sanitized = await sanitizeThreadTurnsInlinePayloads('thread/read', threadReadResult)
-          appServer.storeThreadReadSnapshot(threadId, sanitized)
 
           const record = asRecord(sanitized)
           const thread = asRecord(record?.thread)
@@ -9980,6 +10028,14 @@ export function createCodexBridgeMiddleware(options: {
           const activeExternalTurnId = isExternalInProgress
             ? readNonEmptyString(asRecord(externalRuntime)?.turnId)
             : ''
+          turns = pruneHistoricalReasoningItemsFromTurns(turns, activeExternalTurnId)
+          appServer.storeThreadReadSnapshot(threadId, {
+            ...record,
+            thread: {
+              ...thread,
+              turns,
+            },
+          })
           const liveSnapshot = activeExternalTurnId
             ? await readThreadLiveSnapshotFile(getThreadLiveStateDir(), threadId, {
                 activeTurnId: activeExternalTurnId,

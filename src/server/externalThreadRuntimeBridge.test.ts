@@ -1517,7 +1517,7 @@ describe('GET /codex-api/thread-live-state external runtime parity', () => {
     })
   })
 
-  it('projects live state to the newest absolute turn', async () => {
+  it('projects live state to full history while pruning reasoning outside the active turn', async () => {
     const middleware = createCodexBridgeMiddleware()
     const shared = sharedBridgeForTest() as ReturnType<typeof sharedBridgeForTest> & {
       appServer: ReturnType<typeof sharedBridgeForTest>['appServer'] & {
@@ -1527,11 +1527,19 @@ describe('GET /codex-api/thread-live-state external runtime parity', () => {
     const turns = Array.from({ length: 12 }, (_unused, index) => ({
       id: `turn-${index}`,
       status: index === 11 ? 'inProgress' : 'completed',
-      items: [{
-        id: `item-${index}`,
-        type: 'agentMessage',
-        text: `message ${index}`,
-      }],
+      items: [
+        {
+          id: `reasoning-${index}`,
+          type: 'reasoning',
+          summary: [`thinking ${index}`],
+          content: [],
+        },
+        {
+          id: `item-${index}`,
+          type: 'agentMessage',
+          text: `message ${index}`,
+        },
+      ],
     }))
     vi.spyOn(shared.appServer, 'getPid').mockReturnValue(4242)
     vi.spyOn(shared.appServer, 'rpc').mockResolvedValue({
@@ -1541,7 +1549,12 @@ describe('GET /codex-api/thread-live-state external runtime parity', () => {
         turns,
       },
     })
-    vi.spyOn(shared.runtimeProbe, 'inspect').mockResolvedValue({ state: 'idle' })
+    vi.spyOn(shared.runtimeProbe, 'inspect').mockResolvedValue({
+      state: 'running',
+      turnId: 'turn-11',
+      interruptible: false,
+      source: 'external-session-writer',
+    })
     const port = await listenWithMiddleware(middleware)
 
     const response = await fetch(`http://127.0.0.1:${port}/codex-api/thread-live-state?threadId=thread-windowed`)
@@ -1549,12 +1562,22 @@ describe('GET /codex-api/thread-live-state external runtime parity', () => {
     expect(response.status).toBe(200)
     await expect(response.json()).resolves.toMatchObject({
       threadId: 'thread-windowed',
-      threadTurnStartIndex: 11,
-      hasMoreOlder: true,
+      threadTurnStartIndex: 0,
+      hasMoreOlder: false,
       conversationState: {
-        turns: [
-          expect.objectContaining({ id: 'turn-11' }),
-        ],
+        turns: expect.arrayContaining([
+          expect.objectContaining({
+            id: 'turn-0',
+            items: [expect.objectContaining({ id: 'item-0' })],
+          }),
+          expect.objectContaining({
+            id: 'turn-11',
+            items: [
+              expect.objectContaining({ id: 'reasoning-11' }),
+              expect.objectContaining({ id: 'item-11' }),
+            ],
+          }),
+        ]),
       },
     })
   })
@@ -1625,7 +1648,6 @@ describe('GET /codex-api/thread-live-state external runtime parity', () => {
     expect(response.status).toBe(200)
     expect(itemIds).toEqual([
       'user-1',
-      'reasoning-1',
       'agent-1',
       'session-cmd-call-order',
       'tool-1',

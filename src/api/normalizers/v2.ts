@@ -901,7 +901,35 @@ function toThreadTitle(summary: Thread): string {
 }
 
 function isTurnInProgress(turn: Turn | null | undefined): boolean {
-  return turn?.status === 'inProgress'
+  const rawTurn = turn as unknown as Record<string, unknown> | null | undefined
+  const status = typeof rawTurn?.status === 'string' ? rawTurn.status : ''
+  if (status === 'inProgress' || status === 'active' || status === 'running') return true
+  const rawStatus = rawTurn?.status
+  if (rawStatus && typeof rawStatus === 'object') {
+    const statusType = (rawStatus as Record<string, unknown>).type
+    return statusType === 'inProgress' || statusType === 'active' || statusType === 'running'
+  }
+  return false
+}
+
+function isAgentMessageItem(item: ThreadItem | null | undefined): boolean {
+  return item?.type === 'agentMessage'
+}
+
+function displayItemsForTurn(turn: Turn, preserveAgentProgress = false): ThreadItem[] {
+  const items = Array.isArray(turn.items) ? turn.items : []
+  if (preserveAgentProgress || isTurnInProgress(turn)) return items
+
+  let finalAgentMessageIndex = -1
+  for (let index = items.length - 1; index >= 0; index -= 1) {
+    if (isAgentMessageItem(items[index])) {
+      finalAgentMessageIndex = index
+      break
+    }
+  }
+  if (finalAgentMessageIndex < 0) return items
+
+  return items.filter((item, index) => !isAgentMessageItem(item) || index === finalAgentMessageIndex)
 }
 
 function readThreadLocalInProgress(summary: Thread): boolean {
@@ -989,13 +1017,17 @@ export function normalizeThreadGroupsV2(payload: ThreadListResponse): UiProjectG
 
 export function normalizeThreadMessagesV2(payload: ThreadReadResponse, baseTurnIndex = 0): UiMessage[] {
   const turns = Array.isArray(payload.thread.turns) ? payload.thread.turns : []
+  const threadLevelInProgress = readThreadLocalInProgress(payload.thread)
   const messages: UiMessage[] = []
   for (let turnOffset = 0; turnOffset < turns.length; turnOffset++) {
     const turnIndex = baseTurnIndex + turnOffset
     const turn = turns[turnOffset]
     const rawTurnId = typeof turn?.id === 'string' ? turn.id.trim() : ''
     const turnId = rawTurnId.length > 0 ? rawTurnId : undefined
-    const items = Array.isArray(turn.items) ? turn.items : []
+    const items = displayItemsForTurn(
+      turn,
+      threadLevelInProgress && turnOffset === turns.length - 1,
+    )
     for (const item of items) {
       for (const msg of toUiMessages(item)) {
         messages.push({ ...msg, turnId, turnIndex })

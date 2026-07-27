@@ -17,14 +17,14 @@ Repeat these steps at 375x812 light, 375x812 dark, 768x1024 light, and 768x1024 
 3. Confirm adjacent file and command activity is summarized with readable desktop-style grammar such as `Edited files, read files, ran a command`.
 4. Confirm read, list, and search commands restored without `commandActions` still use conservative activity labels; mutation and general execution remain commands.
 5. Confirm `subAgentActivity` appears as a compact bordered chip whose readable name and status correspond to the desktop client.
-6. Confirm dynamic tools, image view/generation, waiting, web search, and context compaction appear as readable activity rows with no raw JSON or protocol item names.
+6. Confirm dynamic tools, image view/generation, waiting, web search, and context compaction appear as readable activity rows with no raw JSON or protocol item names while the task is running.
 7. Expand an activity summary containing commands and confirm the individual command labels, statuses, and output remain accessible.
 8. Confirm generated/viewed images still render their preview.
 
 #### Steps — completed activity
 
 9. Allow the task to complete successfully.
-10. Confirm detailed reasoning and activity disappear from the default completed view.
+10. Confirm detailed reasoning, intermediate assistant progress, and activity disappear from the default completed view.
 11. Confirm `Worked for …` remains visible above the final assistant reply.
 12. Expand `Worked for …` and confirm it contains the same ordered activity segments that were visible while running.
 13. Confirm the final assistant reply remains outside the collapsed activity region and is visible by default.
@@ -48,9 +48,9 @@ Repeat these steps at 375x812 light, 375x812 dark, 768x1024 light, and 768x1024 
 
 #### Performance Checks
 
-- Confirm the feature adds no API request, polling timer, or full-history fetch.
+- Confirm the feature adds no duplicate API request or polling timer.
 - Run `pnpm run profile:thread` and inspect request count, duplicate counts, total API KB, warnings, and the thread bundle size.
-- Confirm activity presentation remains bounded by the existing five-turn history load and 50-message DOM window.
+- Confirm full-history responses omit historical `reasoning` items server-side and activity presentation remains bounded by the 50-message DOM window.
 
 #### Rollback/Cleanup
 

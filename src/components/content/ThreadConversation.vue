@@ -1074,10 +1074,7 @@ import { useFeedbackDiagnostics } from '../../composables/useFeedbackDiagnostics
 import { useMobile } from '../../composables/useMobile'
 import { copyTextToClipboard, copyTextWithSelectionFallback } from '../../utils/clipboard'
 import {
-  clampThreadRenderWindowStart,
-  earlierThreadRenderWindowStart,
   filterRenderableThreadMessages,
-  latestThreadRenderWindowStart,
 } from './threadConversationWindow'
 import {
   buildThreadActivitySegments,
@@ -1787,7 +1784,6 @@ function setBoundedCacheEntry<K, V>(cache: Map<K, V>, key: K, value: V, limit: n
 
 const LOAD_MORE_SCROLL_THRESHOLD_PX = 200
 
-const renderWindowStart = ref(0)
 const isLoadingMore = ref(false)
 
 const showJumpToLatestButton = computed(
@@ -2433,12 +2429,8 @@ const renderableMessages = computed(() => filterRenderableThreadMessages(
   hiddenCompletedActivityMessageIds.value,
   hiddenActivitySegmentSourceIds.value,
 ))
-const effectiveRenderWindowStart = computed(() => clampThreadRenderWindowStart(
-  renderWindowStart.value,
-  renderableMessages.value.length,
-))
-const visibleMessages = computed(() => renderableMessages.value.slice(effectiveRenderWindowStart.value))
-const hasMoreAbove = computed(() => effectiveRenderWindowStart.value > 0 || props.hasMorePersistedAbove === true)
+const visibleMessages = computed(() => renderableMessages.value)
+const hasMoreAbove = computed(() => props.hasMorePersistedAbove === true)
 
 function readAnchoredFileChangeSummary(message: UiMessage): TurnFileChangeSummary | null {
   const summary = anchoredFileChangeSummaryByAnchorId.value[message.id] ?? null
@@ -4759,7 +4751,6 @@ function beginSnapshotTextStreamBottomLock(): void {
   if (!(autoFollowOutput.value || isConversationAtBottom())) return
   snapshotTextStreamBottomLock.value = true
   autoFollowOutput.value = true
-  renderWindowStart.value = latestThreadRenderWindowStart(renderableMessages.value.length)
   scheduleBottomLock(12)
 }
 
@@ -4778,7 +4769,6 @@ function onPendingImageSettled(): void {
 
 function jumpToLatest(): void {
   autoFollowOutput.value = true
-  renderWindowStart.value = latestThreadRenderWindowStart(renderableMessages.value.length)
   enforceBottomState()
   scheduleBottomLock(4)
 }
@@ -4796,12 +4786,7 @@ async function loadMoreAbove(): Promise<void> {
   const prevScrollTop = container.scrollTop
 
   try {
-    if (effectiveRenderWindowStart.value > 0) {
-      renderWindowStart.value = earlierThreadRenderWindowStart(
-        effectiveRenderWindowStart.value,
-        renderableMessages.value.length,
-      )
-    } else if (props.hasMorePersistedAbove === true) {
+    if (props.hasMorePersistedAbove === true) {
       await props.loadEarlierMessages?.(threadIdAtStart)
     }
 
@@ -4913,15 +4898,6 @@ watch(
       ]),
     )
 
-    if (autoFollowOutput.value) {
-      renderWindowStart.value = latestThreadRenderWindowStart(renderableMessages.value.length)
-    } else {
-      renderWindowStart.value = clampThreadRenderWindowStart(
-        renderWindowStart.value,
-        renderableMessages.value.length,
-      )
-    }
-
     await scheduleConversationScroll()
   },
 )
@@ -4972,7 +4948,6 @@ watch(
   () => props.isLoading,
   async (loading) => {
     if (loading) return
-    renderWindowStart.value = latestThreadRenderWindowStart(renderableMessages.value.length)
     await scheduleConversationScroll()
   },
 )
@@ -4988,8 +4963,6 @@ watch(
     fileChangeActionState.value = {}
     fileChangeActionError.value = {}
     fileChangeRedoPatchIds.value = {}
-    // Apply immediately for cached threads where isLoading never toggles.
-    renderWindowStart.value = latestThreadRenderWindowStart(renderableMessages.value.length)
     await scheduleConversationScroll()
   },
   { flush: 'post' },

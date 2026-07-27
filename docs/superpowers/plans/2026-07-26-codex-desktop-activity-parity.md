@@ -11,7 +11,7 @@
 ## Global Constraints
 
 - Do not change app-server polling, thread identity, completion detection, or notification semantics.
-- Do not add a second history request or fetch full history; presentation operates on the already loaded five-turn window.
+- Do not add a second history request. Presentation operates on the already loaded/pruned message set and must not hide already-loaded turns behind a local render window.
 - Prefer official `commandActions` over command-string inference. Unknown or destructive-looking shell commands remain `Ran …`.
 - Keep the composer input at 16px to avoid iOS focus zoom.
 - Keep activity derivation pure and linear in the number of loaded messages.
@@ -553,7 +553,7 @@ Run:
 pnpm run profile:thread
 ```
 
-Inspect `duplicateCounts`, warnings, total API KB, request count, and bundle output. Confirm the feature adds no network request and that activity derivation remains bounded by the existing five-turn render window.
+Inspect `duplicateCounts`, warnings, total API KB, request count, and bundle output. Confirm the feature adds no network request and that activity derivation remains bounded to the already-loaded/pruned message set without reintroducing a client-side render window.
 
 - [ ] **Step 6: Review requirements, then code quality**
 
