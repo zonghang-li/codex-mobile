@@ -30,6 +30,7 @@ import {
 } from '../safe/state.js'
 import { spawnSyncCommand } from '../utils/commandInvocation.js'
 import { listenWithFallback, openBrowser } from './shared/launcher.js'
+import { createSharedShutdown } from './shared/shutdown.js'
 
 const program = new Command()
   .name('codex-mobile-safe')
@@ -213,18 +214,15 @@ program.command('start')
     console.log(lines.join('\n'))
     if (options.open) openBrowser(`http://127.0.0.1:${String(listening.port)}`)
 
-    let shuttingDown = false
-    const shutdown = async () => {
-      if (shuttingDown) return
-      shuttingDown = true
+    const shutdown = createSharedShutdown(async () => {
       await clearManagedState().catch(() => {})
       const closeServer = listening.close()
       closeWebSocket()
       dispose()
       await closeServer.catch(() => {})
-    }
-    process.once('SIGINT', () => void shutdown().finally(() => process.exit(0)))
-    process.once('SIGTERM', () => void shutdown().finally(() => process.exit(0)))
+    })
+    process.on('SIGINT', () => void shutdown().finally(() => process.exit(0)))
+    process.on('SIGTERM', () => void shutdown().finally(() => process.exit(0)))
   })
 
 program.command('status').description('Show managed server state').action(async () => {

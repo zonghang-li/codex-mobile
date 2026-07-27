@@ -18,4 +18,14 @@ describe('CLI shutdown wiring', () => {
       expect(source).not.toContain('server.close(() =>')
     },
   )
+
+  it('safe CLI shares in-flight shutdown and keeps signal listeners installed', async () => {
+    const source = await readSource('./safe.ts')
+    expect(source).toContain("import { createSharedShutdown } from './shared/shutdown.js'")
+    expect(source).toContain('const shutdown = createSharedShutdown(async () => {')
+    expect(source).toContain("process.on('SIGINT', () => void shutdown().finally(() => process.exit(0)))")
+    expect(source).toContain("process.on('SIGTERM', () => void shutdown().finally(() => process.exit(0)))")
+    expect(source).not.toContain("process.once('SIGINT',")
+    expect(source).not.toContain("process.once('SIGTERM',")
+  })
 })
