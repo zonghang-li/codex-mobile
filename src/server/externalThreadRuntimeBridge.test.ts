@@ -220,6 +220,92 @@ async function listenWithMiddleware(middleware: ReturnType<typeof createCodexBri
   return (server.address() as AddressInfo).port
 }
 
+describe('GET /codex-api/thread-turn-page native pagination', () => {
+  it('uses thread/turns/list without materializing full thread history', async () => {
+    const middleware = createCodexBridgeMiddleware()
+    const shared = sharedBridgeForTest()
+    const rpc = vi.spyOn(shared.appServer as unknown as {
+      rpc(method: string, params: unknown): Promise<unknown>
+    }, 'rpc').mockImplementation(async (method, params) => {
+      if (method === 'thread/read' && (params as { includeTurns?: boolean }).includeTurns === true) {
+        throw new Error('full history read forbidden')
+      }
+      if (method === 'thread/turns/list') {
+        return {
+          data: [
+            {
+              id: 'turn-5',
+              status: 'inProgress',
+              items: [
+                { id: 'reasoning-5', type: 'reasoning', summary: ['live'], content: [] },
+                { id: 'message-5', type: 'agentMessage', text: 'latest' },
+              ],
+            },
+            {
+              id: 'turn-4',
+              status: 'completed',
+              items: [
+                { id: 'reasoning-4', type: 'reasoning', summary: ['old'], content: [] },
+                { id: 'message-4', type: 'agentMessage', text: 'older' },
+              ],
+            },
+          ],
+          nextCursor: 'older-page',
+          backwardsCursor: 'newer-page',
+        }
+      }
+      throw new Error(`unexpected RPC ${method}`)
+    })
+    const port = await listenWithMiddleware(middleware)
+
+    const response = await fetch(
+      `http://127.0.0.1:${port}/codex-api/thread-turn-page?threadId=thread-1&limit=5`,
+    )
+    const payload = await response.json() as {
+      result?: { thread?: { turns?: Array<{ id?: string; items?: Array<{ id?: string }> }> } }
+      nextCursor?: string | null
+      hasMoreOlder?: boolean
+    }
+
+    expect(response.status).toBe(200)
+    expect(rpc).toHaveBeenCalledWith('thread/turns/list', {
+      threadId: 'thread-1',
+      cursor: null,
+      limit: 5,
+      sortDirection: 'desc',
+      itemsView: 'full',
+    })
+    expect(rpc).not.toHaveBeenCalledWith('thread/read', expect.objectContaining({
+      includeTurns: true,
+    }))
+    expect(payload.nextCursor).toBe('older-page')
+    expect(payload.hasMoreOlder).toBe(true)
+    expect(payload.result?.thread?.turns?.map((turn) => turn.id)).toEqual(['turn-4', 'turn-5'])
+    expect(payload.result?.thread?.turns?.[0]?.items?.map((item) => item.id)).toEqual(['message-4'])
+    expect(payload.result?.thread?.turns?.[1]?.items?.map((item) => item.id)).toEqual([
+      'reasoning-5',
+      'message-5',
+    ])
+  })
+
+  it('returns an explicit legacy fallback only when the native method is unavailable', async () => {
+    const middleware = createCodexBridgeMiddleware()
+    const shared = sharedBridgeForTest()
+    vi.spyOn(shared.appServer as unknown as {
+      rpc(method: string, params: unknown): Promise<unknown>
+    }, 'rpc').mockRejectedValue(new Error('Method not found: thread/turns/list'))
+    const port = await listenWithMiddleware(middleware)
+
+    const response = await fetch(
+      `http://127.0.0.1:${port}/codex-api/thread-turn-page?threadId=thread-legacy&limit=5`,
+    )
+    const payload = await response.json() as { fallback?: string }
+
+    expect(response.status).toBe(501)
+    expect(payload.fallback).toBe('thread/read')
+  })
+})
+
 describe('POST /codex-api/rpc guarded resume', () => {
   it('reuses cached first-page thread/list RPC data while recomputing runtime state', async () => {
     const codexHome = await mkdtemp(join(tmpdir(), 'codex-mobile-thread-list-cache-'))

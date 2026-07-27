@@ -43,6 +43,10 @@ import { handleCustomEndpointProxyRequest } from './customEndpointProxy.js'
 import { ExternalThreadRuntimeProbe } from './externalThreadRuntime.js'
 import { LocalThreadRuntimeLedger } from './localThreadRuntime.js'
 import { readThreadLiveSnapshotFile } from './threadLiveSnapshot.js'
+import {
+  isThreadTurnsListMethodNotFoundError,
+  readNativeThreadTurnPage,
+} from './threadTurnPagination.js'
 import { ThreadTerminalManager } from './terminalManager.js'
 import { getSpawnInvocation } from '../utils/commandInvocation.js'
 import {
@@ -9902,7 +9906,7 @@ export function createCodexBridgeMiddleware(options: {
       if (req.method === 'GET' && url.pathname === '/codex-api/thread-turn-page') {
         try {
           const threadId = url.searchParams.get('threadId')?.trim() ?? ''
-          const beforeTurnId = url.searchParams.get('beforeTurnId')?.trim() ?? ''
+          const cursor = url.searchParams.get('cursor')?.trim() ?? ''
           const limitRaw = url.searchParams.get('limit')?.trim() ?? String(THREAD_TURN_PAGE_DEFAULT_LIMIT)
           const limit = Math.max(1, Math.min(50, Number.parseInt(limitRaw, 10) || THREAD_TURN_PAGE_DEFAULT_LIMIT))
           if (!threadId) {
@@ -9910,51 +9914,37 @@ export function createCodexBridgeMiddleware(options: {
             return
           }
 
-          const threadReadResult = mergeStreamTurnErrorsIntoThreadResult(appServer, await appServer.readThreadForTurnPage(threadId))
-          const record = asRecord(threadReadResult)
-          const thread = asRecord(record?.thread)
-          if (!record || !thread) {
-            setJson(res, 502, { error: 'thread/read returned an invalid thread response' })
-            return
-          }
-
-          const turns = Array.isArray(thread.turns) ? thread.turns : []
-          const beforeIndex = beforeTurnId
-            ? turns.findIndex((turn) => asRecord(turn)?.id === beforeTurnId)
-            : turns.length
-          if (beforeTurnId && beforeIndex < 0) {
-            setJson(res, 200, {
-              result: {
-                ...record,
-                thread: {
-                  ...thread,
-                  turns: [],
-                },
-              },
-              startTurnIndex: 0,
-              hasMoreOlder: false,
-            })
-            return
-          }
-
-          const endIndex = beforeIndex
-          const startIndex = Math.max(0, endIndex - limit)
-          const pageTurns = turns.slice(startIndex, endIndex)
-          const pagedResult = {
-            ...record,
-            thread: {
-              ...thread,
-              turns: pageTurns,
+          const page = await readNativeThreadTurnPage(
+            (method, params) => appServer.rpc(method, params),
+            {
+              threadId,
+              cursor: cursor || undefined,
+              limit,
             },
-          }
-          const result = await prepareThreadRpcResultForClient('thread/read', pagedResult, false)
+          )
+          const pagedResult = mergeStreamTurnErrorsIntoThreadResult(appServer, {
+            thread: {
+              id: threadId,
+              turns: pruneHistoricalReasoningItemsFromTurns(page.turns),
+            },
+          })
+          const result = await prepareThreadRpcResultForClient('thread/read', pagedResult, true)
 
           setJson(res, 200, {
             result,
-            startTurnIndex: startIndex,
-            hasMoreOlder: startIndex > 0,
+            nextCursor: page.nextCursor,
+            backwardsCursor: page.backwardsCursor,
+            startTurnIndex: 0,
+            hasMoreOlder: page.nextCursor !== null,
           })
         } catch (error) {
+          if (isThreadTurnsListMethodNotFoundError(error)) {
+            setJson(res, 501, {
+              error: 'thread/turns/list is not supported by this Codex app-server',
+              fallback: 'thread/read',
+            })
+            return
+          }
           setJson(res, 500, { error: getErrorMessage(error, 'Failed to load earlier thread messages') })
         }
         return
