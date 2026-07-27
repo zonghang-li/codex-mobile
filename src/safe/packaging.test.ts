@@ -96,7 +96,8 @@ describe('local installation packaging', () => {
     expect(packageJson.private).toBe(true)
     expect(packageJson.scripts?.['install:local']).toBe('sh scripts/install-local.sh')
     expect(packageJson.scripts?.['service:install']).toBe('sh scripts/install-user-service.sh')
-    expect(packageJson.scripts?.['service:restart']).toContain('systemctl --user restart')
+    expect(packageJson.scripts?.['service:restart'])
+      .toBe('sh scripts/request-user-service-restart.sh')
     expect(packageJson.scripts?.['network:lan']).toBe('sh scripts/codex-mobile-network-mode.sh lan')
     expect(packageJson.scripts?.['network:tailnet']).toBe('sh scripts/codex-mobile-network-mode.sh tailnet')
     expect(packageJson.scripts?.['network:stop']).toBe('sh scripts/codex-mobile-network-mode.sh stop')
@@ -173,6 +174,7 @@ describe('local installation packaging', () => {
           XDG_CONFIG_HOME: configDirectory,
           PREFIX: prefix,
           CODEX_MOBILE_PREFIX: '',
+          CODEX_MOBILE_RESTART_REQUEST_DIR: join(temporaryRoot, 'restart-request'),
           CODEX_MOBILE_SERVICE_INSTALL_TEST_MODE: '1',
           COMMAND_LOG: commandLog,
           USER: 'codex-mobile-test',
@@ -180,8 +182,18 @@ describe('local installation packaging', () => {
       })
 
       const unitPath = join(configDirectory, 'systemd/user/codex-mobile-safe.service')
+      const restartPathUnitPath = join(
+        configDirectory,
+        'systemd/user/codex-mobile-safe-restart.path',
+      )
+      const restartServiceUnitPath = join(
+        configDirectory,
+        'systemd/user/codex-mobile-safe-restart.service',
+      )
       const passwordPath = join(homeDirectory, '.codex/codex-mobile-safe-password')
       const unit = await readFile(unitPath, 'utf8')
+      const restartPathUnit = await readFile(restartPathUnitPath, 'utf8')
+      const restartServiceUnit = await readFile(restartServiceUnitPath, 'utf8')
       const repoRoot = fileURLToPath(new URL('../..', import.meta.url)).replace(/\/$/u, '')
       const expectedExecStart = `ExecStart=${prefix}/bin/codex-mobile-safe start ${repoRoot} --port 5900 --password-file %h/.codex/codex-mobile-safe-password --no-open --no-login --sandbox-mode danger-full-access --approval-policy never`
 
@@ -196,7 +208,17 @@ describe('local installation packaging', () => {
       expect(unit).not.toContain('--lan')
       expect(unit.toLowerCase()).not.toContain('cloudflared')
       expect(unit.toLowerCase()).not.toContain('funnel')
+      expect(restartPathUnit).not.toMatch(/@[A-Z_]+@/u)
+      expect(restartPathUnit).toContain(
+        `PathChanged=${join(temporaryRoot, 'restart-request/restart.request')}`,
+      )
+      expect(restartServiceUnit).not.toMatch(/@[A-Z_]+@/u)
+      expect(restartServiceUnit).toContain(
+        `ExecStart=${repoRoot}/scripts/restart-user-service-worker.sh ${prefix}/bin/codex-mobile-safe`,
+      )
       expect((await stat(unitPath)).mode & 0o777).toBe(0o600)
+      expect((await stat(restartPathUnitPath)).mode & 0o777).toBe(0o600)
+      expect((await stat(restartServiceUnitPath)).mode & 0o777).toBe(0o600)
       expect((await stat(passwordPath)).mode & 0o777).toBe(0o600)
       expect((await readFile(commandLog, 'utf8').catch(() => '')).trim()).toBe('')
     } finally {
@@ -205,9 +227,10 @@ describe('local installation packaging', () => {
   })
 
   it('installs from the current clone and verifies the user unit', async () => {
-    const [localInstaller, serviceInstaller] = await Promise.all([
+    const [localInstaller, serviceInstaller, uninstaller] = await Promise.all([
       readRepoFile('scripts/install-local.sh'),
       readRepoFile('scripts/install-user-service.sh'),
+      readRepoFile('scripts/uninstall-user-service.sh'),
     ])
     expect(localInstaller).toContain('pnpm run build')
     expect(localInstaller).toContain('npm install --global --prefix')
@@ -217,7 +240,21 @@ describe('local installation packaging', () => {
     expect(serviceInstaller).toContain('systemd-analyze --user verify')
     expect(serviceInstaller).toContain('loginctl show-user')
     expect(serviceInstaller).toContain('systemctl --user enable codex-mobile-safe.service')
-    expect(serviceInstaller).toContain('systemctl --user restart codex-mobile-safe.service')
+    expect(serviceInstaller).toContain(
+      'systemctl --user enable --now codex-mobile-safe-restart.path',
+    )
+    expect(serviceInstaller).toContain(
+      'sh "$root/scripts/request-user-service-restart.sh"',
+    )
+    expect(serviceInstaller).not.toContain(
+      'systemctl --user restart codex-mobile-safe.service',
+    )
+    expect(uninstaller).toContain(
+      'systemctl --user disable --now codex-mobile-safe-restart.path',
+    )
+    expect(uninstaller).toContain('codex-mobile-safe-restart.service')
+    expect(uninstaller).toContain('codex-mobile-safe-restart.path')
+    expect(uninstaller).toContain('restart.request')
   })
 
   it('honors the conventional PREFIX override for isolated installs', async () => {
