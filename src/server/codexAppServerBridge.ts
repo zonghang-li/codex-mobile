@@ -1206,6 +1206,81 @@ export function buildThreadLiveStateReadFailureFallback(
   return responseData
 }
 
+function buildThreadLiveStateProjectionKey(input: {
+  threadId: string
+  threadTurnStartIndex: number
+  turnCount: number
+  sessionSize: number
+  isInProgress: boolean
+  externalRuntime: unknown
+  liveAuthority: 'writer-snapshot' | 'local-stream' | 'persisted' | 'missing'
+  liveSnapshot: unknown | null
+}): string {
+  const runtime = asRecord(input.externalRuntime)
+  const liveSnapshot = asRecord(input.liveSnapshot)
+  const footer = asRecord(liveSnapshot?.footer)
+  const sidebar = asRecord(liveSnapshot?.sidebar)
+  const payload = {
+    threadId: input.threadId,
+    threadTurnStartIndex: input.threadTurnStartIndex,
+    turnCount: input.turnCount,
+    sessionSize: input.sessionSize,
+    isInProgress: input.isInProgress,
+    runtime: {
+      state: readNonEmptyString(runtime?.state),
+      turnId: readNonEmptyString(runtime?.turnId),
+      interruptible: runtime?.interruptible === true,
+      source: readNonEmptyString(runtime?.source),
+    },
+    liveAuthority: input.liveAuthority,
+    liveSnapshot: liveSnapshot
+      ? {
+          revision: typeof liveSnapshot.revision === 'number' ? liveSnapshot.revision : null,
+          activeTurnId: readNonEmptyString(liveSnapshot.activeTurnId),
+          state: readNonEmptyString(liveSnapshot.state),
+          generatedAt: readNonEmptyString(liveSnapshot.generatedAt),
+          expiresAt: readNonEmptyString(liveSnapshot.expiresAt),
+          footer: footer
+            ? {
+                stepCurrent: footer.stepCurrent,
+                stepTotal: footer.stepTotal,
+                completedPercent: footer.completedPercent,
+                fileCount: footer.fileCount,
+                additions: footer.additions,
+                deletions: footer.deletions,
+                label: readNonEmptyString(footer.label),
+              }
+            : null,
+          sidebar: sidebar
+            ? { indicator: readNonEmptyString(sidebar.indicator) }
+            : null,
+        }
+      : null,
+  }
+  return createHash('sha256').update(JSON.stringify(payload)).digest('hex').slice(0, 32)
+}
+
+function buildThreadLiveStateNotModifiedResponse(input: {
+  threadId: string
+  projectionKey: string
+  isInProgress: boolean
+  externalRuntime: unknown
+  liveAuthority: 'writer-snapshot' | 'local-stream' | 'persisted' | 'missing'
+  liveSnapshot: unknown | null
+}): Record<string, unknown> {
+  return {
+    threadId: input.threadId,
+    notModified: true,
+    projectionKey: input.projectionKey,
+    ownerClientId: null,
+    liveStateError: null,
+    isInProgress: input.isInProgress,
+    externalRuntime: input.externalRuntime,
+    liveAuthority: input.liveAuthority,
+    liveSnapshot: input.liveSnapshot,
+  }
+}
+
 function getErrorMessage(payload: unknown, fallback: string): string {
   if (payload instanceof Error && payload.message.trim().length > 0) {
     return payload.message
@@ -9037,6 +9112,7 @@ export function createCodexBridgeMiddleware(options: {
           setJson(res, 400, { error: 'Missing threadId' })
           return
         }
+        const knownProjectionKey = url.searchParams.get('knownProjectionKey')?.trim() ?? ''
 
         let precheckedExternalRuntime: unknown | null = null
         try {
@@ -9074,11 +9150,37 @@ export function createCodexBridgeMiddleware(options: {
                     nowMs: Date.now(),
                   })
                 : null
-              setJson(res, 200, {
-                ...(asRecord(cached) ?? {}),
+              const liveAuthority = liveSnapshot ? 'writer-snapshot' : 'missing'
+              const cachedThreadTurnStartIndex = Math.max(0, Math.floor(
+                typeof cached.threadTurnStartIndex === 'number' ? cached.threadTurnStartIndex : 0,
+              ))
+              const projectionKey = buildThreadLiveStateProjectionKey({
+                threadId,
+                threadTurnStartIndex: cachedThreadTurnStartIndex,
+                turnCount: snapshotTurns.length,
+                sessionSize: snapshotSessionSize,
                 isInProgress: true,
                 externalRuntime,
-                liveAuthority: liveSnapshot ? 'writer-snapshot' : 'missing',
+                liveAuthority,
+                liveSnapshot,
+              })
+              if (knownProjectionKey && knownProjectionKey === projectionKey) {
+                setJson(res, 200, buildThreadLiveStateNotModifiedResponse({
+                  threadId,
+                  projectionKey,
+                  isInProgress: true,
+                  externalRuntime,
+                  liveAuthority,
+                  liveSnapshot,
+                }))
+                return
+              }
+              setJson(res, 200, {
+                ...(asRecord(cached) ?? {}),
+                projectionKey,
+                isInProgress: true,
+                externalRuntime,
+                liveAuthority,
                 liveSnapshot,
               })
               return
@@ -9153,9 +9255,31 @@ export function createCodexBridgeMiddleware(options: {
               : isLocallyInProgress
                 ? 'local-stream'
                 : 'persisted'
+          const projectionKey = buildThreadLiveStateProjectionKey({
+            threadId,
+            threadTurnStartIndex,
+            turnCount: rawTurns.length,
+            sessionSize,
+            isInProgress,
+            externalRuntime,
+            liveAuthority,
+            liveSnapshot,
+          })
+          if (knownProjectionKey && knownProjectionKey === projectionKey) {
+            setJson(res, 200, buildThreadLiveStateNotModifiedResponse({
+              threadId,
+              projectionKey,
+              isInProgress,
+              externalRuntime,
+              liveAuthority,
+              liveSnapshot,
+            }))
+            return
+          }
 
           const responseData = {
             threadId,
+            projectionKey,
             threadTurnStartIndex,
             hasMoreOlder: threadTurnStartIndex > 0,
             conversationState: {

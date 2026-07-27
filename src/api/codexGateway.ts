@@ -1055,8 +1055,11 @@ async function getThreadDetailV2(
 async function getExternalThreadLiveStateSnapshotV2(
   threadId: string,
   signal?: AbortSignal,
+  knownProjectionKey?: string,
 ): Promise<{
   isLiveProjection: true
+  notModified?: boolean
+  projectionKey?: string
   model: string
   modelProvider: string
   messages: UiMessage[]
@@ -1072,6 +1075,9 @@ async function getExternalThreadLiveStateSnapshotV2(
   liveSnapshot: UiThreadLiveSnapshot | null
 }> {
   const params = new URLSearchParams({ threadId })
+  if (knownProjectionKey && knownProjectionKey.trim().length > 0) {
+    params.set('knownProjectionKey', knownProjectionKey.trim())
+  }
   const response = await fetch(`/codex-api/thread-live-state?${params.toString()}`, { signal })
   const payload = asRecord(await response.json().catch(() => null))
   if (!response.ok) {
@@ -1102,6 +1108,8 @@ async function getExternalThreadLiveStateSnapshotV2(
       : 'missing'
   return {
     isLiveProjection: true,
+    notModified: payload?.notModified === true ? true : undefined,
+    projectionKey: readString(payload?.projectionKey) ?? undefined,
     model: normalizeThreadModelFromPayload(payload),
     modelProvider: normalizeThreadModelProviderFromPayload(payload),
     messages: normalized,
@@ -1205,8 +1213,10 @@ export async function getThreadDetail(threadId: string, signal?: AbortSignal): P
   }
 }
 
-export async function getExternalThreadLiveSnapshot(threadId: string, signal?: AbortSignal): Promise<{
+export async function getExternalThreadLiveSnapshot(threadId: string, signal?: AbortSignal, knownProjectionKey?: string): Promise<{
   isLiveProjection: true
+  notModified?: boolean
+  projectionKey?: string
   model: string
   modelProvider: string
   messages: UiMessage[]
@@ -1222,7 +1232,7 @@ export async function getExternalThreadLiveSnapshot(threadId: string, signal?: A
   liveSnapshot: UiThreadLiveSnapshot | null
 }> {
   try {
-    return await getExternalThreadLiveStateSnapshotV2(threadId, signal)
+    return await getExternalThreadLiveStateSnapshotV2(threadId, signal, knownProjectionKey)
   } catch (error) {
     throw normalizeCodexApiError(error, `Failed to live-sync thread ${threadId}`, 'thread-live-state')
   }
