@@ -1,0 +1,9 @@
+[Unit]
+Description=Watch for Codex Mobile Safe restart requests
+
+[Path]
+PathChanged=@RESTART_REQUEST_FILE@
+Unit=codex-mobile-safe-restart.service
+
+[Install]
+WantedBy=default.target

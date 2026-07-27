@@ -1,0 +1,7 @@
+[Unit]
+Description=Restart and verify Codex Mobile Safe
+
+[Service]
+Type=oneshot
+ExecStart=@PROJECT_DIR@/scripts/restart-user-service-worker.sh @PREFIX@/bin/codex-mobile-safe
+UMask=0077

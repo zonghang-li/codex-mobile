@@ -1,5 +1,14 @@
 import { execFile } from 'node:child_process'
-import { chmod, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises'
+import {
+  chmod,
+  mkdir,
+  mkdtemp,
+  readFile,
+  rm,
+  stat,
+  symlink,
+  writeFile,
+} from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -13,6 +22,70 @@ async function readRepoFile(path: string): Promise<string> {
 }
 
 describe('local installation packaging', () => {
+  it('queues a restart through a private atomic marker without calling systemctl', async () => {
+    const temporaryRoot = await mkdtemp(join(tmpdir(), 'codex-mobile-restart-request-'))
+    try {
+      const requestDirectory = join(temporaryRoot, 'request')
+      const scriptPath = fileURLToPath(new URL('../../scripts/request-user-service-restart.sh', import.meta.url))
+      await execFileAsync('sh', [scriptPath], {
+        env: {
+          ...process.env,
+          CODEX_MOBILE_RESTART_REQUEST_DIR: requestDirectory,
+        },
+      })
+
+      expect((await stat(requestDirectory)).mode & 0o777).toBe(0o700)
+      expect((await readFile(join(requestDirectory, 'restart.request'), 'utf8')).trim())
+        .toMatch(/^[0-9]+$/u)
+      expect(await readFile(scriptPath, 'utf8')).not.toContain('systemctl')
+    } finally {
+      await rm(temporaryRoot, { recursive: true, force: true })
+    }
+  })
+
+  it('rejects a symlink restart request directory', async () => {
+    const temporaryRoot = await mkdtemp(join(tmpdir(), 'codex-mobile-restart-symlink-'))
+    try {
+      const realDirectory = join(temporaryRoot, 'real')
+      const requestDirectory = join(temporaryRoot, 'request')
+      await mkdir(realDirectory)
+      await symlink(realDirectory, requestDirectory)
+
+      await expect(execFileAsync('sh', [
+        fileURLToPath(new URL('../../scripts/request-user-service-restart.sh', import.meta.url)),
+      ], {
+        env: {
+          ...process.env,
+          CODEX_MOBILE_RESTART_REQUEST_DIR: requestDirectory,
+        },
+      })).rejects.toThrow()
+    } finally {
+      await rm(temporaryRoot, { recursive: true, force: true })
+    }
+  })
+
+  it('packages a fixed-unit restart worker and path trigger', async () => {
+    const [requestScript, workerScript, pathUnit, workerUnit] = await Promise.all([
+      readRepoFile('scripts/request-user-service-restart.sh'),
+      readRepoFile('scripts/restart-user-service-worker.sh'),
+      readRepoFile('packaging/systemd/codex-mobile-safe-restart.path.in'),
+      readRepoFile('packaging/systemd/codex-mobile-safe-restart.service.in'),
+    ])
+
+    expect(requestScript).toContain('restart.request')
+    expect(requestScript).not.toContain('systemctl')
+    expect(workerScript).toContain('systemctl --user restart codex-mobile-safe.service')
+    expect(workerScript).toContain('\"running\": true')
+    expect(pathUnit).toContain('PathChanged=@RESTART_REQUEST_FILE@')
+    expect(pathUnit).toContain('Unit=codex-mobile-safe-restart.service')
+    expect(workerUnit).toContain('Type=oneshot')
+    expect(workerUnit).toContain(
+      'ExecStart=@PROJECT_DIR@/scripts/restart-user-service-worker.sh @PREFIX@/bin/codex-mobile-safe',
+    )
+    expect(`${requestScript}\n${workerScript}\n${pathUnit}\n${workerUnit}`)
+      .not.toMatch(/ntfy\.sh|password=|NTFY_/u)
+  })
+
   it('defines clone-local install and service lifecycle scripts', async () => {
     const packageJson = JSON.parse(await readRepoFile('package.json')) as {
       private?: boolean
