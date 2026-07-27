@@ -1112,6 +1112,7 @@ async function getExternalThreadLiveStateSnapshotV2(
   knownProjectionKey?: string,
 ): Promise<{
   isLiveProjection: true
+  isPartialTurnProjection: boolean
   notModified?: boolean
   projectionKey?: string
   model: string
@@ -1145,6 +1146,10 @@ async function getExternalThreadLiveStateSnapshotV2(
   ))
   const conversationState = asRecord(payload?.conversationState)
   const turns = Array.isArray(conversationState?.turns) ? conversationState.turns : []
+  const isPartialTurnProjection = turns.some((turn) => {
+    const compression = asRecord(asRecord(turn)?.rawItemCompression)
+    return typeof compression?.omittedItemCount === 'number' && compression.omittedItemCount > 0
+  })
   const result = {
     threadTurnStartIndex,
     thread: {
@@ -1164,6 +1169,7 @@ async function getExternalThreadLiveStateSnapshotV2(
       : 'missing'
   return {
     isLiveProjection: true,
+    isPartialTurnProjection,
     notModified: payload?.notModified === true ? true : undefined,
     projectionKey: readString(payload?.projectionKey) ?? undefined,
     model: normalizeThreadModelFromPayload(payload),
@@ -1311,6 +1317,7 @@ export async function getThreadDetail(threadId: string, signal?: AbortSignal): P
 
 export async function getExternalThreadLiveSnapshot(threadId: string, signal?: AbortSignal, knownProjectionKey?: string): Promise<{
   isLiveProjection: true
+  isPartialTurnProjection: boolean
   notModified?: boolean
   projectionKey?: string
   model: string
@@ -1360,7 +1367,18 @@ export async function getThreadTextPage(
     throw normalizeCodexApiError(error, 'Failed to load active turn text', 'thread-text-page')
   }
 
-  const payload = asRecord(await response.json().catch(() => null))
+  let payloadValue: unknown = null
+  try {
+    payloadValue = await response.json()
+  } catch (error) {
+    if (error instanceof Error && error.name === 'AbortError') {
+      throw new CodexApiError(error.message || 'Thread text page request aborted', {
+        code: 'network_error',
+        method: 'thread-text-page',
+      })
+    }
+  }
+  const payload = asRecord(payloadValue)
   if (!response.ok) {
     throw new CodexApiError(
       extractErrorMessage(payload, `Thread text page request failed with ${response.status}`),

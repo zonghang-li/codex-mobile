@@ -89,6 +89,7 @@ import {
 } from './threadTextHydration'
 
 type ThreadDetailSnapshot = Awaited<ReturnType<typeof getThreadDetail>> & {
+  isPartialTurnProjection?: boolean
   liveAuthority?: UiThreadLiveAuthority
   liveSnapshot?: UiThreadLiveSnapshot | null
   projectionKey?: string
@@ -6170,9 +6171,7 @@ export function useDesktopState() {
       turnIndexByTurnId: detailTurnIndexByTurnId,
     } = detail
     const isLiveProjection = detail.isLiveProjection === true
-    const isPartialTurnProjection = (
-      detail as ThreadDetailSnapshot & { isPartialTurnProjection?: boolean }
-    ).isPartialTurnProjection === true
+    const isPartialTurnProjection = detail.isPartialTurnProjection === true
     const isPagedProjection = detail.isPagedProjection === true
     const isIncrementalProjection = isLiveProjection || isPagedProjection
     const hadLoadedMessages = loadedMessagesByThreadId.value[threadId] === true
@@ -6279,13 +6278,31 @@ export function useDesktopState() {
       ? reconciledTurnIndexByTurnId
       : detailTurnIndexByTurnId)
     rebindLiveFileChangeTurnIndices(threadId)
-    const previousPersisted = persistedMessagesByThreadId.value[threadId] ?? []
-    const mergedMessages = isIncrementalProjection
-      ? mergeLiveProjectionMessages(previousPersisted, nextMessages)
+    let previousPersisted = persistedMessagesByThreadId.value[threadId] ?? []
+    let activeTextHydration = activeTextHydrationByThreadId.get(threadId)
+    if (
+      inProgress
+      && activeTurnId
+      && activeTextHydration
+      && activeTextHydration.turnId !== activeTurnId
+    ) {
+      const previousHydratedTurnId = activeTextHydration.turnId
+      previousPersisted = previousPersisted.filter(
+        (message) => (
+          message.turnId !== previousHydratedTurnId
+          || message.messageType !== 'reasoning'
+        ),
+      )
+      cancelActiveTextHydration(threadId)
+      activeTextHydration = undefined
+    }
+    const mergedMessages = isLiveProjection && inProgress && isPartialTurnProjection
+      ? mergeMessages(previousPersisted, nextMessages, { preserveMissing: true })
+      : isIncrementalProjection
+        ? mergeLiveProjectionMessages(previousPersisted, nextMessages)
       : mergeMessages(previousPersisted, nextMessages, {
           preserveMissing: options.preserveMissing || hasOptimisticUserMessages(previousPersisted),
         })
-    const activeTextHydration = activeTextHydrationByThreadId.get(threadId)
     const messagesWithHydratedText = activeTextHydration
       ? mergeHydratedTurnTextIntoTranscript(
           mergedMessages,

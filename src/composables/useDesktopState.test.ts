@@ -5017,6 +5017,8 @@ describe('external live reasoning transcript', () => {
       })
       .mockResolvedValueOnce({
         ...externalDetail('turn-external'),
+        isLiveProjection: true,
+        isPartialTurnProjection: true,
         messages: [{
           id: 'agent-2',
           role: 'assistant',
@@ -5027,6 +5029,8 @@ describe('external live reasoning transcript', () => {
       })
       .mockResolvedValueOnce({
         ...externalDetail('turn-external'),
+        isLiveProjection: true,
+        isPartialTurnProjection: true,
         messages: [
           {
             id: 'reasoning-2',
@@ -5137,26 +5141,94 @@ describe('active turn text hydration', () => {
     id: string,
     messageType: 'agentMessage' | 'reasoning' | 'contextCompaction',
     sessionOrder?: number,
+    turnId = 'turn-external',
   ): UiMessage {
     return {
       id,
       role: messageType === 'contextCompaction' ? 'system' : 'assistant',
       text: id,
       messageType,
-      turnId: 'turn-external',
+      turnId,
       sessionOrder,
     }
   }
 
-  function partialExternalDetail(messages: UiMessage[]) {
+  function partialExternalDetail(messages: UiMessage[], turnId = 'turn-external') {
     return {
-      ...externalDetail('turn-external'),
+      ...externalDetail(turnId),
       isLiveProjection: true,
       isPartialTurnProjection: true,
       messages,
-      turnIndexByTurnId: { 'turn-external': 0 },
+      turnIndexByTurnId: { [turnId]: 0 },
     }
   }
+
+  it('derives partial status from live metadata and hydrates without an injected flag', async () => {
+    installTestWindow()
+    vi.stubGlobal('document', {
+      visibilityState: 'visible',
+      addEventListener: vi.fn(),
+      removeEventListener: vi.fn(),
+    })
+    const actualGateway = await vi.importActual<typeof import('../api/codexGateway')>('../api/codexGateway')
+    let liveSnapshotRequestCount = 0
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
+      expect(String(input)).toBe('/codex-api/thread-live-state?threadId=thread-external')
+      liveSnapshotRequestCount += 1
+      const item = liveSnapshotRequestCount === 1
+        ? { id: 'agent-live', type: 'agentMessage', text: 'live' }
+        : { id: 'agent-new', type: 'agentMessage', text: 'new' }
+      return new Response(JSON.stringify({
+        threadId: 'thread-external',
+        conversationState: {
+          turns: [{
+            id: 'turn-external',
+            status: 'inProgress',
+            rawItemCompression: {
+              originalItemCount: 500,
+              retainedItemCount: 1,
+              omittedItemCount: 499,
+            },
+            items: [item],
+          }],
+        },
+        isInProgress: true,
+        externalRuntime: {
+          state: 'running',
+          turnId: 'turn-external',
+          interruptible: false,
+          source: 'external-session-writer',
+        },
+      }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    }))
+    gatewayMocks.getThreadDetail.mockImplementation(
+      (threadId: string, signal?: AbortSignal) => actualGateway.getExternalThreadLiveSnapshot(threadId, signal),
+    )
+    gatewayMocks.getThreadTextPage.mockResolvedValueOnce({
+      threadId: 'thread-external',
+      turnId: 'turn-external',
+      messages: [
+        activeText('reason-1', 'reasoning', 100),
+        activeText('agent-1', 'agentMessage', 200),
+      ],
+      nextOlderCursor: null,
+      hasMoreOlder: false,
+    })
+
+    const state = useDesktopState()
+    state.primeSelectedThread('thread-external')
+    await state.loadMessages('thread-external')
+    await flushMicrotasks()
+    await state.loadMessages('thread-external', { silent: true, force: true })
+
+    expect(gatewayMocks.getThreadTextPage).toHaveBeenCalledTimes(1)
+    expect(state.messages.value.map((message) => message.id)).toEqual([
+      'reason-1',
+      'agent-1',
+      'agent-live',
+      'agent-new',
+    ])
+  })
 
   it('renders a bounded live detail before asynchronously prepending every text page', async () => {
     installTestWindow()
@@ -5469,6 +5541,63 @@ describe('active turn text hydration', () => {
       'agent-commentary',
       'agent-live',
       'agent-final',
+    ])
+  })
+
+  it('finalizes the previous hydration when the active turn changes without going idle', async () => {
+    installTestWindow()
+    vi.stubGlobal('document', {
+      visibilityState: 'visible',
+      addEventListener: vi.fn(),
+      removeEventListener: vi.fn(),
+    })
+    gatewayMocks.getThreadDetail
+      .mockResolvedValueOnce(partialExternalDetail([
+        activeText('agent-a-live', 'agentMessage', 300, 'turn-a'),
+      ], 'turn-a'))
+      .mockResolvedValueOnce(partialExternalDetail([
+        activeText('agent-b-live', 'agentMessage', 100, 'turn-b'),
+      ], 'turn-b'))
+      .mockResolvedValueOnce(partialExternalDetail([
+        activeText('agent-a-return', 'agentMessage', 400, 'turn-a'),
+      ], 'turn-a'))
+    let turnAPageCount = 0
+    gatewayMocks.getThreadTextPage.mockImplementation(async (
+      threadId: string,
+      turnId: string,
+    ) => ({
+      threadId,
+      turnId,
+      messages: turnId === 'turn-a' && turnAPageCount++ === 0
+        ? [
+            activeText('reason-a', 'reasoning', 100, 'turn-a'),
+            activeText('agent-a-commentary', 'agentMessage', 200, 'turn-a'),
+          ]
+        : [],
+      nextOlderCursor: null,
+      hasMoreOlder: false,
+    }))
+
+    const state = useDesktopState()
+    state.primeSelectedThread('thread-external')
+    await state.loadMessages('thread-external')
+    await flushMicrotasks()
+    await state.loadMessages('thread-external', { silent: true, force: true })
+    await flushMicrotasks()
+    await state.loadMessages('thread-external', { silent: true, force: true })
+    await flushMicrotasks()
+
+    expect(state.messages.value.map((message) => message.id)).toEqual([
+      'agent-a-commentary',
+      'agent-a-live',
+      'agent-a-return',
+      'agent-b-live',
+    ])
+    expect(state.messages.value.map((message) => message.id)).not.toContain('reason-a')
+    expect(gatewayMocks.getThreadTextPage.mock.calls.map((call) => call[1])).toEqual([
+      'turn-a',
+      'turn-b',
+      'turn-a',
     ])
   })
 })

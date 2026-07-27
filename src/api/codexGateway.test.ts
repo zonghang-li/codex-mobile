@@ -868,6 +868,11 @@ describe('getThreadDetail', () => {
           turns: [{
             id: 'turn-external',
             status: 'completed',
+            rawItemCompression: {
+              originalItemCount: 500,
+              retainedItemCount: 240,
+              omittedItemCount: 260,
+            },
             items: [{
               id: 'agent-live',
               type: 'agentMessage',
@@ -890,6 +895,7 @@ describe('getThreadDetail', () => {
 
     await expect(getExternalThreadLiveSnapshot('external-thread', controller.signal)).resolves.toMatchObject({
       isLiveProjection: true,
+      isPartialTurnProjection: true,
       ownership: 'external',
       activeTurnId: 'turn-external',
       inProgress: true,
@@ -1259,6 +1265,22 @@ describe('thread text page', () => {
     controller.abort()
 
     await expect(pagePromise).rejects.toMatchObject({
+      name: 'CodexApiError',
+      code: 'network_error',
+      method: 'thread-text-page',
+    })
+  })
+
+  it('normalizes an abort raised while parsing the response body', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => ({
+      ok: true,
+      status: 200,
+      json: vi.fn(async () => {
+        throw new DOMException('aborted while parsing', 'AbortError')
+      }),
+    }) as unknown as Response))
+
+    await expect(getThreadTextPage('thread-1', 'turn-1')).rejects.toMatchObject({
       name: 'CodexApiError',
       code: 'network_error',
       method: 'thread-text-page',
