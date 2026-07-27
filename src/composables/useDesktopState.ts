@@ -5521,6 +5521,11 @@ export function useDesktopState() {
       Boolean(turnErrorMessage) &&
       completedThreadModelId !== MODEL_FALLBACK_ID &&
       isUnsupportedChatGptModelError(new Error(turnErrorMessage))
+    const hasUnlatchedLocalSubmission = Boolean(
+      completedThreadId
+      && localSubmissionByThreadId.has(completedThreadId)
+      && !activeTurnIdByThreadId.value[completedThreadId],
+    )
     const activeLeaseTurnId = completedTurn
       ? activeTurnIdByThreadId.value[completedTurn.threadId] ?? ''
       : ''
@@ -5532,6 +5537,8 @@ export function useDesktopState() {
     const completionDisposition = completedTurn
       ? isExternallyOwned(completedTurn.threadId) && !matchesActiveLease
         ? { ownsActiveLease: false, keepRunning: true, markUnread: false }
+        : hasUnlatchedLocalSubmission && !matchesActiveLease
+          ? { ownsActiveLease: false, keepRunning: true, markUnread: false }
         : resolveTurnCompletionDisposition(
             completedTurn.status,
             shouldRetryWithFallback,

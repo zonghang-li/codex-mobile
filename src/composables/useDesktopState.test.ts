@@ -4382,6 +4382,49 @@ describe('external runtime ownership', () => {
     await state.loadMessages('thread-1')
 
     emit({
+      method: 'item/started',
+      params: {
+        threadId: 'thread-1',
+        turnId: 'turn-external',
+        item: { id: 'reasoning-external', type: 'reasoning' },
+      },
+    })
+    emit({
+      method: 'item/reasoning/summaryTextDelta',
+      params: {
+        threadId: 'thread-1',
+        turnId: 'turn-external',
+        itemId: 'reasoning-external',
+        delta: 'Checking the active lease',
+      },
+    })
+    emit({
+      method: 'item/started',
+      params: {
+        threadId: 'thread-1',
+        turnId: 'turn-external',
+        item: {
+          id: 'command-external',
+          type: 'commandExecution',
+          command: 'pwd',
+          cwd: '/tmp/project',
+        },
+      },
+    })
+
+    expect(state.selectedLiveOverlay.value).toMatchObject({
+      activityLabel: 'Running command',
+      activityDetails: ['pwd'],
+      reasoningText: 'Checking the active lease',
+    })
+    expect(state.messages.value).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        id: 'command-external',
+        messageType: 'commandExecution',
+      }),
+    ]))
+
+    emit({
       method: 'turn/completed',
       params: { threadId: 'thread-1', turn: { id: 'turn-external', status: 'completed' } },
     })
@@ -4389,6 +4432,10 @@ describe('external runtime ownership', () => {
     expect(state.selectedActiveTurnId.value).toBe('')
     expect(state.selectedThreadRuntimeOwnership.value).toBe('idle')
     expect(state.selectedThread.value?.inProgress).toBe(false)
+    expect(state.selectedLiveOverlay.value).toBe(null)
+    expect(state.messages.value).not.toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: 'command-external' }),
+    ]))
   })
 
   it('keeps an external lease when a stale turn completes', async () => {
@@ -4403,6 +4450,42 @@ describe('external runtime ownership', () => {
 
     expect(state.selectedActiveTurnId.value).toBe('turn-current')
     expect(state.selectedThreadRuntimeOwnership.value).toBe('external')
+    expect(state.selectedThread.value?.inProgress).toBe(true)
+  })
+
+  it('keeps an unlatched local submission running when a stale turn completes', async () => {
+    const { state, emit } = await setupTurnLifecycleNotificationState('thread-1')
+    const pendingTurn = deferred<string>()
+    gatewayMocks.startThreadTurn.mockReturnValue(pendingTurn.promise)
+
+    const send = state.sendMessageToSelectedThread('new request')
+    await flushMicrotasks()
+
+    expect(state.selectedActiveTurnId.value).toBe('')
+    expect(state.selectedThreadRuntimeOwnership.value).toBe('local')
+    expect(state.selectedThread.value?.inProgress).toBe(true)
+
+    emit({
+      method: 'turn/completed',
+      params: { threadId: 'thread-1', turn: { id: 'turn-stale', status: 'completed' } },
+    })
+
+    expect(state.selectedActiveTurnId.value).toBe('')
+    expect(state.selectedThreadRuntimeOwnership.value).toBe('local')
+    expect(state.selectedThread.value?.inProgress).toBe(true)
+    expect(state.messages.value).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        role: 'user',
+        text: 'new request',
+        messageType: 'userMessage.optimistic',
+      }),
+    ]))
+
+    pendingTurn.resolve('turn-current')
+    await send
+
+    expect(state.selectedActiveTurnId.value).toBe('turn-current')
+    expect(state.selectedThreadRuntimeOwnership.value).toBe('local')
     expect(state.selectedThread.value?.inProgress).toBe(true)
   })
 
