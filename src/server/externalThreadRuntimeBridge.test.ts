@@ -402,11 +402,22 @@ describe('GET /codex-api/thread-text-page', () => {
     })
   }
 
+  function stubActiveRuntime(turnId = 'turn-active') {
+    const shared = sharedBridgeForTest()
+    return vi.spyOn(shared.runtimeProbe, 'inspect').mockResolvedValue({
+      state: 'running',
+      turnId,
+      interruptible: false,
+      source: 'external-session-writer',
+    })
+  }
+
   it('pages projected active-turn text from the trusted thread rollout', async () => {
     const fixture = await createRolloutFixture()
     disposers.push(fixture.cleanup)
     const middleware = createCodexBridgeMiddleware()
     const rpc = stubThreadRead(fixture.sessionPath)
+    stubActiveRuntime()
     const port = await listenWithMiddleware(middleware)
 
     const firstResponse = await fetch(
@@ -470,6 +481,7 @@ describe('GET /codex-api/thread-text-page', () => {
     disposers.push(fixture.cleanup)
     const middleware = createCodexBridgeMiddleware()
     stubThreadRead(fixture.sessionPath)
+    stubActiveRuntime()
     const port = await listenWithMiddleware(middleware)
     const firstResponse = await fetch(
       `http://127.0.0.1:${port}/codex-api/thread-text-page?threadId=thread-1&turnId=turn-active&limit=1`,
@@ -504,6 +516,7 @@ describe('GET /codex-api/thread-text-page', () => {
     disposers.push(fixture.cleanup)
     const middleware = createCodexBridgeMiddleware()
     stubThreadRead(fixture.sessionPath)
+    stubActiveRuntime()
     const port = await listenWithMiddleware(middleware)
     const firstResponse = await fetch(
       `http://127.0.0.1:${port}/codex-api/thread-text-page?threadId=thread-1&turnId=turn-active&limit=1`,
@@ -516,6 +529,24 @@ describe('GET /codex-api/thread-text-page', () => {
     )
 
     expect(response.status).toBe(409)
+  })
+
+  it('rejects a requested turn that is not the trusted active runtime turn', async () => {
+    const fixture = await createRolloutFixture()
+    disposers.push(fixture.cleanup)
+    const middleware = createCodexBridgeMiddleware()
+    stubThreadRead(fixture.sessionPath)
+    stubActiveRuntime('turn-active')
+    const port = await listenWithMiddleware(middleware)
+
+    const response = await fetch(
+      `http://127.0.0.1:${port}/codex-api/thread-text-page?threadId=thread-1&turnId=turn-stale`,
+    )
+    const body = await response.text()
+
+    expect(response.status).toBe(409)
+    expect(body).not.toContain('agent-1')
+    expect(body).not.toContain('agent-2')
   })
 })
 

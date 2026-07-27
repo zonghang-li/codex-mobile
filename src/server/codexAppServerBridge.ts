@@ -9977,6 +9977,25 @@ export function createCodexBridgeMiddleware(options: {
             setJson(res, 404, { error: 'No rollout available for thread' })
             return
           }
+          const sessionStats = await stat(sessionPath)
+          if (!sessionStats.isFile()) {
+            setJson(res, 404, { error: 'No rollout available for thread' })
+            return
+          }
+          runtimeProbe.registerThread(threadId, sessionPath)
+          const runtime = await observeThreadRuntimeState(
+            threadId,
+            runtimeProbe,
+            localRuntimeLedger,
+            appServer.getPid(),
+          )
+          if (
+            asRecord(runtime)?.state !== 'running'
+            || readNonEmptyString(asRecord(runtime)?.turnId) !== turnId
+          ) {
+            setJson(res, 409, { error: 'Requested turn is not active' })
+            return
+          }
           const page = await readThreadTextPage({
             sessionPath,
             threadId,

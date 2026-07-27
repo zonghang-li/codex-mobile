@@ -252,4 +252,94 @@ describe('readThreadTextPage', () => {
     })
     expect(result.hasMoreOlder).toBe(false)
   })
+
+  it.each([
+    ['a stale turn', 'turn-old'],
+    ['a nonexistent turn', 'turn-missing'],
+  ])('does not cross the first intervening turn boundary for %s', async (_label, turnId) => {
+    const sessionPath = await writeRollout([
+      event('task_started', { turn_id: 'turn-old' }),
+      assistant('Old update', 'agent-old'),
+      event('task_complete', { turn_id: 'turn-old' }),
+      event('task_started', { turn_id: 'turn-active' }),
+      assistant('Active update', 'agent-active'),
+    ])
+
+    const result = readThreadTextPage({
+      sessionPath,
+      threadId: 'thread-1',
+      turnId,
+    })
+
+    await expect(result).rejects.toBeInstanceOf(ThreadTextPageError)
+    await expect(result).rejects.toMatchObject({
+      statusCode: 409,
+    })
+  })
+
+  it.each([
+    ['assistant', (text: string) => assistant(text, 'agent-oversized')],
+    ['reasoning', (text: string) => reasoning(text, 'reason-oversized')],
+    ['payload-first assistant', (text: string) => {
+      const row = assistant(text, 'agent-payload-first')
+      return {
+        payload: row.payload,
+        type: row.type,
+      }
+    }],
+  ])('fails explicitly for an oversized relevant %s record', async (_label, createRow) => {
+    const sessionPath = await writeRollout([
+      event('task_started', { turn_id: 'turn-active' }),
+      createRow('x'.repeat((1024 * 1024) + 64)),
+    ])
+
+    const result = readThreadTextPage({
+      sessionPath,
+      threadId: 'thread-1',
+      turnId: 'turn-active',
+    })
+
+    await expect(result).rejects.toBeInstanceOf(ThreadTextPageError)
+    await expect(result).rejects.toMatchObject({
+      statusCode: 413,
+    })
+  })
+
+  it('enforces the 1 MiB cap on the complete serialized response', async () => {
+    const emptyRowBytes = Buffer.byteLength(JSON.stringify(assistant('', 'agent-envelope')), 'utf8')
+    const textBytes = (1024 * 1024) - emptyRowBytes - 1
+    const sessionPath = await writeRollout([
+      event('task_started', { turn_id: 'turn-active' }),
+      assistant('x'.repeat(textBytes), 'agent-envelope'),
+    ])
+
+    const result = readThreadTextPage({
+      sessionPath,
+      threadId: 'thread-1',
+      turnId: 'turn-active',
+    })
+
+    await expect(result).rejects.toBeInstanceOf(ThreadTextPageError)
+    await expect(result).rejects.toMatchObject({
+      statusCode: 413,
+    })
+  })
+
+  it('does not advertise an older page when limit lands immediately after turn start', async () => {
+    const sessionPath = await writeRollout([
+      event('task_started', { turn_id: 'turn-active' }),
+      assistant('Only update', 'agent-only'),
+    ])
+
+    const result = await readThreadTextPage({
+      sessionPath,
+      threadId: 'thread-1',
+      turnId: 'turn-active',
+      limit: 1,
+    })
+
+    expect(result.items.map((item) => item.id)).toEqual(['agent-only'])
+    expect(result.hasMoreOlder).toBe(false)
+    expect(result.nextOlderCursor).toBeNull()
+  })
 })

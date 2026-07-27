@@ -30,11 +30,12 @@ const READ_CHUNK_BYTES = 64 * 1024
 const TARGET_PAGE_BYTES = 256 * 1024
 const MAX_PAGE_BYTES = 1024 * 1024
 const MAX_RELEVANT_LINE_BYTES = 1024 * 1024
+const OVERSIZED_CLASSIFIER_BYTES = 64 * 1024
 
 export class ThreadTextPageError extends Error {
-  readonly statusCode: 400 | 409
+  readonly statusCode: 400 | 409 | 413
 
-  constructor(message: string, statusCode: 400 | 409) {
+  constructor(message: string, statusCode: 400 | 409 | 413) {
     super(message)
     this.name = 'ThreadTextPageError'
     this.statusCode = statusCode
@@ -44,6 +45,7 @@ export class ThreadTextPageError extends Error {
 type BackwardsLine = {
   startOffset: number
   bytes: Buffer | null
+  classificationPrefix?: Buffer
 }
 
 function asRecord(value: unknown): Record<string, unknown> | null {
@@ -107,12 +109,35 @@ async function* readLinesBackwards(
   let fragments: Buffer[] = []
   let fragmentBytes = 0
   let oversized = false
+  let classificationPrefix: Buffer = Buffer.alloc(0)
 
   const prependFragment = (fragment: Buffer): void => {
-    if (oversized || fragment.length === 0) return
+    if (fragment.length === 0) return
+    if (oversized) {
+      classificationPrefix = fragment.length >= OVERSIZED_CLASSIFIER_BYTES
+        ? fragment.subarray(0, OVERSIZED_CLASSIFIER_BYTES)
+        : Buffer.concat(
+            [fragment, classificationPrefix],
+            Math.min(
+              OVERSIZED_CLASSIFIER_BYTES,
+              fragment.length + classificationPrefix.length,
+            ),
+          ).subarray(0, OVERSIZED_CLASSIFIER_BYTES)
+      return
+    }
     fragmentBytes += fragment.length
     if (fragmentBytes > MAX_RELEVANT_LINE_BYTES) {
       oversized = true
+      const prefixParts: Buffer[] = []
+      let prefixBytes = 0
+      for (const part of [fragment, ...fragments]) {
+        if (prefixBytes >= OVERSIZED_CLASSIFIER_BYTES) break
+        const remaining = OVERSIZED_CLASSIFIER_BYTES - prefixBytes
+        const nextPart = part.length > remaining ? part.subarray(0, remaining) : part
+        prefixParts.push(nextPart)
+        prefixBytes += nextPart.length
+      }
+      classificationPrefix = Buffer.concat(prefixParts, prefixBytes)
       fragments = []
       return
     }
@@ -134,7 +159,7 @@ async function* readLinesBackwards(
       prependFragment(chunk.subarray(index + 1, fragmentEnd))
       const startOffset = chunkStart + index + 1
       if (oversized) {
-        yield { startOffset, bytes: null }
+        yield { startOffset, bytes: null, classificationPrefix }
       } else if (fragmentBytes > 0) {
         yield {
           startOffset,
@@ -146,6 +171,7 @@ async function* readLinesBackwards(
       fragments = []
       fragmentBytes = 0
       oversized = false
+      classificationPrefix = Buffer.alloc(0)
       fragmentEnd = index
     }
     prependFragment(chunk.subarray(0, fragmentEnd))
@@ -153,7 +179,7 @@ async function* readLinesBackwards(
   }
 
   if (oversized) {
-    yield { startOffset: 0, bytes: null }
+    yield { startOffset: 0, bytes: null, classificationPrefix }
   } else if (fragmentBytes > 0) {
     yield {
       startOffset: 0,
@@ -162,6 +188,82 @@ async function* readLinesBackwards(
         : Buffer.concat(fragments, fragmentBytes),
     }
   }
+}
+
+function oversizedLineIsDefinitelyIrrelevant(prefix: Buffer): boolean {
+  const text = prefix.toString('utf8')
+  let objectDepth = 0
+  let payloadDepth = -1
+  let topLevelType: string | undefined
+  let payloadType: string | undefined
+  let pendingKey: { depth: number; value: string } | null = null
+
+  for (let index = 0; index < text.length; index += 1) {
+    const character = text[index]
+    if (character === '"') {
+      let end = index + 1
+      let escaped = false
+      while (end < text.length) {
+        const next = text[end]
+        if (!escaped && next === '"') break
+        if (!escaped && next === '\\') {
+          escaped = true
+        } else {
+          escaped = false
+        }
+        end += 1
+      }
+      if (end >= text.length) break
+      let value = ''
+      try {
+        value = JSON.parse(text.slice(index, end + 1)) as string
+      } catch {
+        break
+      }
+      let nextIndex = end + 1
+      while (nextIndex < text.length && /\s/u.test(text[nextIndex]!)) nextIndex += 1
+      if (text[nextIndex] === ':') {
+        pendingKey = { depth: objectDepth, value }
+      } else if (pendingKey?.depth === objectDepth) {
+        if (pendingKey.value === 'type' && objectDepth === 1) {
+          topLevelType = value
+        } else if (pendingKey.value === 'type' && objectDepth === payloadDepth) {
+          payloadType = value
+        }
+        pendingKey = null
+      }
+      index = end
+      continue
+    }
+    if (character === '{') {
+      if (
+        pendingKey?.depth === objectDepth
+        && pendingKey.value === 'payload'
+        && objectDepth === 1
+      ) {
+        payloadDepth = objectDepth + 1
+      }
+      objectDepth += 1
+      pendingKey = null
+      continue
+    }
+    if (character === '}') {
+      if (objectDepth === payloadDepth) payloadDepth = -1
+      objectDepth = Math.max(0, objectDepth - 1)
+      pendingKey = null
+      continue
+    }
+    if (character === ',') pendingKey = null
+  }
+
+  if (topLevelType !== 'response_item' && topLevelType !== 'event_msg') {
+    return topLevelType !== undefined
+  }
+  if (!payloadType) return false
+  if (topLevelType === 'response_item') {
+    return payloadType !== 'message' && payloadType !== 'reasoning'
+  }
+  return payloadType !== 'context_compacted' && payloadType !== 'task_started'
 }
 
 function projectLine(line: Buffer, sessionOrder: number): {
@@ -244,6 +346,35 @@ function projectLine(line: Buffer, sessionOrder: number): {
   return { item: null, taskStartedTurnId: null }
 }
 
+function buildPageResult(input: {
+  threadId: string
+  turnId: string
+  itemsBackwards: ThreadTextPageItem[]
+  hasMoreOlder: boolean
+  beforeOffset: number
+  snapshotEndOffset: number
+}): ThreadTextPageResult {
+  return {
+    threadId: input.threadId,
+    turnId: input.turnId,
+    items: [...input.itemsBackwards].reverse(),
+    nextOlderCursor: input.hasMoreOlder
+      ? encodeCursor({
+          v: 1,
+          threadId: input.threadId,
+          turnId: input.turnId,
+          beforeOffset: input.beforeOffset,
+          snapshotEndOffset: input.snapshotEndOffset,
+        })
+      : null,
+    hasMoreOlder: input.hasMoreOlder,
+  }
+}
+
+function serializedPageBytes(page: ThreadTextPageResult): number {
+  return Buffer.byteLength(JSON.stringify(page), 'utf8')
+}
+
 export async function readThreadTextPage(input: {
   sessionPath: string
   threadId: string
@@ -272,65 +403,78 @@ export async function readThreadTextPage(input: {
 
     const limit = normalizeLimit(input.limit)
     const collected: ThreadTextPageItem[] = []
-    let collectedBytes = 0
     let nextBeforeOffset = beforeOffset
-    let reachedTurnStart = false
-    let stoppedAtPageBoundary = false
+    let pageLimitReached = false
+    let foundOlderVisible = false
 
     for await (const line of readLinesBackwards(file, beforeOffset)) {
       if (!line.bytes) {
+        if (!oversizedLineIsDefinitelyIrrelevant(line.classificationPrefix ?? Buffer.alloc(0))) {
+          throw new ThreadTextPageError('Relevant rollout record exceeds the size limit', 413)
+        }
         nextBeforeOffset = line.startOffset
         continue
       }
       const projected = projectLine(line.bytes, line.startOffset)
-      if (projected.taskStartedTurnId === input.turnId) {
-        reachedTurnStart = true
+      if (projected.taskStartedTurnId !== null) {
+        if (projected.taskStartedTurnId !== input.turnId) {
+          throw new ThreadTextPageError('Requested turn is not the active rollout turn', 409)
+        }
         break
       }
       if (!projected.item) {
         nextBeforeOffset = line.startOffset
         continue
       }
+      if (pageLimitReached) {
+        foundOlderVisible = true
+        break
+      }
 
-      const itemBytes = Buffer.byteLength(JSON.stringify(projected.item), 'utf8')
-      if (
-        collected.length > 0
-        && collectedBytes + itemBytes > TARGET_PAGE_BYTES
-      ) {
-        stoppedAtPageBoundary = true
+      const candidateItems = [...collected, projected.item]
+      const candidatePage = buildPageResult({
+        threadId: input.threadId,
+        turnId: input.turnId,
+        itemsBackwards: candidateItems,
+        hasMoreOlder: true,
+        beforeOffset: line.startOffset,
+        snapshotEndOffset,
+      })
+      const candidateBytes = serializedPageBytes(candidatePage)
+      if (candidateBytes > MAX_PAGE_BYTES) {
+        if (collected.length === 0) {
+          throw new ThreadTextPageError('Thread text record exceeds the response size limit', 413)
+        }
+        foundOlderVisible = true
+        break
+      }
+      if (collected.length > 0 && candidateBytes > TARGET_PAGE_BYTES) {
+        foundOlderVisible = true
         break
       }
 
       collected.push(projected.item)
-      collectedBytes += itemBytes
       nextBeforeOffset = line.startOffset
       if (
         collected.length >= limit
-        || collectedBytes >= MAX_PAGE_BYTES
+        || candidateBytes >= MAX_PAGE_BYTES
       ) {
-        stoppedAtPageBoundary = true
-        break
+        pageLimitReached = true
       }
     }
 
-    const hasMoreOlder = stoppedAtPageBoundary
-      && !reachedTurnStart
-      && nextBeforeOffset > 0
-    return {
+    const result = buildPageResult({
       threadId: input.threadId,
       turnId: input.turnId,
-      items: collected.reverse(),
-      nextOlderCursor: hasMoreOlder
-        ? encodeCursor({
-            v: 1,
-            threadId: input.threadId,
-            turnId: input.turnId,
-            beforeOffset: nextBeforeOffset,
-            snapshotEndOffset,
-          })
-        : null,
-      hasMoreOlder,
+      itemsBackwards: collected,
+      hasMoreOlder: foundOlderVisible && nextBeforeOffset > 0,
+      beforeOffset: nextBeforeOffset,
+      snapshotEndOffset,
+    })
+    if (serializedPageBytes(result) > MAX_PAGE_BYTES) {
+      throw new ThreadTextPageError('Thread text page exceeds the response size limit', 413)
     }
+    return result
   } finally {
     await file.close()
   }
