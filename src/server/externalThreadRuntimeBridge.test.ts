@@ -548,6 +548,140 @@ describe('GET /codex-api/thread-text-page', () => {
     expect(body).not.toContain('agent-1')
     expect(body).not.toContain('agent-2')
   })
+
+  it('rejects a forged active-turn cursor whose offset points into an older turn', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'codex-mobile-forged-text-cursor-'))
+    disposers.push(() => {
+      void rm(directory, { recursive: true, force: true })
+    })
+    const rows = [
+      {
+        type: 'event_msg',
+        payload: { type: 'task_started', turn_id: 'turn-old' },
+      },
+      {
+        type: 'response_item',
+        payload: {
+          type: 'message',
+          role: 'assistant',
+          id: 'agent-old-1',
+          content: [{ type: 'output_text', text: 'First old update' }],
+        },
+      },
+      {
+        type: 'response_item',
+        payload: {
+          type: 'message',
+          role: 'assistant',
+          id: 'agent-old-2',
+          content: [{ type: 'output_text', text: 'Second old update' }],
+        },
+      },
+      {
+        type: 'event_msg',
+        payload: { type: 'task_complete', turn_id: 'turn-old' },
+      },
+      {
+        type: 'event_msg',
+        payload: { type: 'task_started', turn_id: 'turn-active' },
+      },
+      {
+        type: 'response_item',
+        payload: {
+          type: 'message',
+          role: 'assistant',
+          id: 'agent-active',
+          content: [{ type: 'output_text', text: 'Active update' }],
+        },
+      },
+    ]
+    const serializedRows = rows.map((row) => JSON.stringify(row))
+    const sessionPath = join(directory, 'rollout.jsonl')
+    const rollout = `${serializedRows.join('\n')}\n`
+    await writeFile(sessionPath, rollout, 'utf8')
+    const forgedCursor = Buffer.from(JSON.stringify({
+      v: 1,
+      threadId: 'thread-1',
+      turnId: 'turn-active',
+      beforeOffset: Buffer.byteLength(`${serializedRows.slice(0, 3).join('\n')}\n`, 'utf8'),
+      snapshotEndOffset: Buffer.byteLength(rollout, 'utf8'),
+    }), 'utf8').toString('base64url')
+    const middleware = createCodexBridgeMiddleware()
+    stubThreadRead(sessionPath)
+    stubActiveRuntime()
+    const port = await listenWithMiddleware(middleware)
+
+    const response = await fetch(
+      `http://127.0.0.1:${port}/codex-api/thread-text-page?threadId=thread-1&turnId=turn-active&limit=1&cursor=${encodeURIComponent(forgedCursor)}`,
+    )
+    const body = await response.text()
+
+    expect(response.status).toBe(400)
+    expect(body).not.toContain('agent-old-1')
+    expect(body).not.toContain('agent-old-2')
+  })
+
+  it('does not preflight the full active turn before returning a trusted newest page', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'codex-mobile-trusted-text-page-'))
+    disposers.push(() => {
+      void rm(directory, { recursive: true, force: true })
+    })
+    const rows = [
+      {
+        type: 'event_msg',
+        payload: { type: 'task_started', turn_id: 'turn-active' },
+      },
+      {
+        type: 'response_item',
+        payload: {
+          type: 'message',
+          role: 'assistant',
+          id: 'agent-oversized-older',
+          content: [{ type: 'output_text', text: 'x'.repeat((1024 * 1024) + 64) }],
+        },
+      },
+      {
+        type: 'response_item',
+        payload: {
+          type: 'message',
+          role: 'assistant',
+          id: 'agent-previous',
+          content: [{ type: 'output_text', text: 'Previous update' }],
+        },
+      },
+      {
+        type: 'response_item',
+        payload: {
+          type: 'message',
+          role: 'assistant',
+          id: 'agent-latest',
+          content: [{ type: 'output_text', text: 'Latest update' }],
+        },
+      },
+    ]
+    const sessionPath = join(directory, 'rollout.jsonl')
+    await writeFile(
+      sessionPath,
+      `${rows.map((row) => JSON.stringify(row)).join('\n')}\n`,
+      'utf8',
+    )
+    const middleware = createCodexBridgeMiddleware()
+    stubThreadRead(sessionPath)
+    stubActiveRuntime()
+    const port = await listenWithMiddleware(middleware)
+
+    const response = await fetch(
+      `http://127.0.0.1:${port}/codex-api/thread-text-page?threadId=thread-1&turnId=turn-active&limit=1`,
+    )
+    const body = await response.json() as {
+      items: Array<{ id: string }>
+      hasMoreOlder: boolean
+    }
+
+    expect(response.status).toBe(200)
+    expect(body.items.map((item) => item.id)).toEqual(['agent-latest'])
+    expect(body.hasMoreOlder).toBe(true)
+  })
 })
 
 describe('POST /codex-api/rpc guarded resume', () => {

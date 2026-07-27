@@ -52,6 +52,18 @@ function reasoning(text: string, id: string): Record<string, unknown> {
   }
 }
 
+function userMessage(text: string, id: string): Record<string, unknown> {
+  return {
+    type: 'response_item',
+    payload: {
+      type: 'message',
+      role: 'user',
+      id,
+      content: [{ type: 'input_text', text }],
+    },
+  }
+}
+
 function functionCall(
   name: string,
   argumentsJson: string,
@@ -341,5 +353,146 @@ describe('readThreadTextPage', () => {
     expect(result.items.map((item) => item.id)).toEqual(['agent-only'])
     expect(result.hasMoreOlder).toBe(false)
     expect(result.nextOlderCursor).toBeNull()
+  })
+
+  it('rejects a stale direct read before a low limit can return newer-turn rows', async () => {
+    const sessionPath = await writeRollout([
+      event('task_started', { turn_id: 'turn-active' }),
+      assistant('First active update', 'agent-active-1'),
+      assistant('Second active update', 'agent-active-2'),
+      assistant('Third active update', 'agent-active-3'),
+    ])
+
+    const result = readThreadTextPage({
+      sessionPath,
+      threadId: 'thread-1',
+      turnId: 'turn-stale',
+      limit: 1,
+    })
+
+    await expect(result).rejects.toBeInstanceOf(ThreadTextPageError)
+    await expect(result).rejects.toMatchObject({
+      statusCode: 409,
+    })
+  })
+
+  it('rejects a forged active-turn cursor whose offset points into an older turn', async () => {
+    const rows = [
+      event('task_started', { turn_id: 'turn-old' }),
+      assistant('First old update', 'agent-old-1'),
+      assistant('Second old update', 'agent-old-2'),
+      event('task_complete', { turn_id: 'turn-old' }),
+      event('task_started', { turn_id: 'turn-active' }),
+      assistant('Active update', 'agent-active'),
+    ]
+    const sessionPath = await writeRollout(rows)
+    const serializedRows = rows.map((row) => JSON.stringify(row))
+    const beforeOffset = Buffer.byteLength(`${serializedRows.slice(0, 3).join('\n')}\n`, 'utf8')
+    const snapshotEndOffset = Buffer.byteLength(`${serializedRows.join('\n')}\n`, 'utf8')
+    const forgedCursor = Buffer.from(JSON.stringify({
+      v: 1,
+      threadId: 'thread-1',
+      turnId: 'turn-active',
+      beforeOffset,
+      snapshotEndOffset,
+    }), 'utf8').toString('base64url')
+
+    const result = readThreadTextPage({
+      sessionPath,
+      threadId: 'thread-1',
+      turnId: 'turn-active',
+      cursor: forgedCursor,
+      limit: 1,
+    })
+
+    await expect(result).rejects.toBeInstanceOf(ThreadTextPageError)
+    await expect(result).rejects.toMatchObject({
+      statusCode: 400,
+    })
+  })
+
+  it('skips an oversized user message that is definitely irrelevant', async () => {
+    const sessionPath = await writeRollout([
+      event('task_started', { turn_id: 'turn-active' }),
+      assistant('Visible update', 'agent-visible'),
+      userMessage('x'.repeat((1024 * 1024) + 64), 'user-oversized'),
+    ])
+
+    const result = await readThreadTextPage({
+      sessionPath,
+      threadId: 'thread-1',
+      turnId: 'turn-active',
+    })
+
+    expect(result.items.map((item) => item.id)).toEqual(['agent-visible'])
+    expect(result.hasMoreOlder).toBe(false)
+  })
+
+  it('returns a cursorless terminal page when only the provisional cursor exceeds 1 MiB', async () => {
+    const marker = event('task_started', { turn_id: 'turn-active' })
+    const markerLine = JSON.stringify(marker)
+    const sessionOrder = Buffer.byteLength(`${markerLine}\n`, 'utf8')
+    const maxBytes = 1024 * 1024
+
+    const measure = (textLength: number) => {
+      const row = assistant('x'.repeat(textLength), 'agent-terminal')
+      const rowLine = JSON.stringify(row)
+      const snapshotEndOffset = sessionOrder + Buffer.byteLength(`${rowLine}\n`, 'utf8')
+      const item = {
+        id: 'agent-terminal',
+        type: 'agentMessage',
+        text: 'x'.repeat(textLength),
+        sessionOrder,
+      }
+      const cursor = Buffer.from(JSON.stringify({
+        v: 1,
+        threadId: 'thread-1',
+        turnId: 'turn-active',
+        beforeOffset: sessionOrder,
+        snapshotEndOffset,
+      }), 'utf8').toString('base64url')
+      return {
+        row,
+        rowBytes: Buffer.byteLength(rowLine, 'utf8'),
+        terminalBytes: Buffer.byteLength(JSON.stringify({
+          threadId: 'thread-1',
+          turnId: 'turn-active',
+          items: [item],
+          nextOlderCursor: null,
+          hasMoreOlder: false,
+        }), 'utf8'),
+        provisionalBytes: Buffer.byteLength(JSON.stringify({
+          threadId: 'thread-1',
+          turnId: 'turn-active',
+          items: [item],
+          nextOlderCursor: cursor,
+          hasMoreOlder: true,
+        }), 'utf8'),
+      }
+    }
+
+    let textLength = maxBytes - 512
+    let measured = measure(textLength)
+    textLength += maxBytes - measured.terminalBytes
+    measured = measure(textLength)
+    if (measured.terminalBytes > maxBytes) {
+      textLength -= measured.terminalBytes - maxBytes
+      measured = measure(textLength)
+    }
+    expect(measured.rowBytes).toBeLessThanOrEqual(maxBytes)
+    expect(measured.terminalBytes).toBeLessThanOrEqual(maxBytes)
+    expect(measured.provisionalBytes).toBeGreaterThan(maxBytes)
+
+    const sessionPath = await writeRollout([marker, measured.row])
+    const result = await readThreadTextPage({
+      sessionPath,
+      threadId: 'thread-1',
+      turnId: 'turn-active',
+    })
+
+    expect(result.items.map((item) => item.id)).toEqual(['agent-terminal'])
+    expect(result.nextOlderCursor).toBeNull()
+    expect(result.hasMoreOlder).toBe(false)
+    expect(Buffer.byteLength(JSON.stringify(result), 'utf8')).toBeLessThanOrEqual(maxBytes)
   })
 })

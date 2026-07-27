@@ -10002,6 +10002,8 @@ export function createCodexBridgeMiddleware(options: {
             turnId,
             cursor: cursor || undefined,
             limit: limitRaw ? Number.parseInt(limitRaw, 10) : undefined,
+          }, {
+            trustedActiveTurn: true,
           })
           setJson(res, 200, page)
         } catch (error) {

@@ -1,3 +1,4 @@
+import { createHmac, randomBytes, timingSafeEqual } from 'node:crypto'
 import { open, type FileHandle } from 'node:fs/promises'
 
 export type ThreadTextPageItem = {
@@ -31,6 +32,7 @@ const TARGET_PAGE_BYTES = 256 * 1024
 const MAX_PAGE_BYTES = 1024 * 1024
 const MAX_RELEVANT_LINE_BYTES = 1024 * 1024
 const OVERSIZED_CLASSIFIER_BYTES = 64 * 1024
+const THREAD_TEXT_CURSOR_KEY = randomBytes(32)
 
 export class ThreadTextPageError extends Error {
   readonly statusCode: 400 | 409 | 413
@@ -60,7 +62,11 @@ function normalizeLimit(limit: number | undefined): number {
 }
 
 function encodeCursor(cursor: ThreadTextCursor): string {
-  return Buffer.from(JSON.stringify(cursor), 'utf8').toString('base64url')
+  const payload = Buffer.from(JSON.stringify(cursor), 'utf8').toString('base64url')
+  const signature = createHmac('sha256', THREAD_TEXT_CURSOR_KEY)
+    .update(payload)
+    .digest('base64url')
+  return `${payload}.${signature}`
 }
 
 function decodeCursor(
@@ -69,10 +75,28 @@ function decodeCursor(
   turnId: string,
 ): ThreadTextCursor {
   try {
-    if (!/^[A-Za-z0-9_-]+$/u.test(encoded)) {
+    const parts = encoded.split('.')
+    if (
+      parts.length !== 2
+      || !parts[0]
+      || !parts[1]
+      || !/^[A-Za-z0-9_-]+$/u.test(parts[0])
+      || !/^[A-Za-z0-9_-]+$/u.test(parts[1])
+    ) {
       throw new Error('invalid base64url')
     }
-    const cursor = asRecord(JSON.parse(Buffer.from(encoded, 'base64url').toString('utf8')))
+    const payload = parts[0]
+    const suppliedSignature = Buffer.from(parts[1], 'base64url')
+    const expectedSignature = createHmac('sha256', THREAD_TEXT_CURSOR_KEY)
+      .update(payload)
+      .digest()
+    if (
+      suppliedSignature.length !== expectedSignature.length
+      || !timingSafeEqual(suppliedSignature, expectedSignature)
+    ) {
+      throw new Error('invalid cursor signature')
+    }
+    const cursor = asRecord(JSON.parse(Buffer.from(payload, 'base64url').toString('utf8')))
     if (
       cursor?.v !== 1
       || cursor.threadId !== threadId
@@ -196,6 +220,7 @@ function oversizedLineIsDefinitelyIrrelevant(prefix: Buffer): boolean {
   let payloadDepth = -1
   let topLevelType: string | undefined
   let payloadType: string | undefined
+  let payloadRole: string | undefined
   let pendingKey: { depth: number; value: string } | null = null
 
   for (let index = 0; index < text.length; index += 1) {
@@ -229,6 +254,8 @@ function oversizedLineIsDefinitelyIrrelevant(prefix: Buffer): boolean {
           topLevelType = value
         } else if (pendingKey.value === 'type' && objectDepth === payloadDepth) {
           payloadType = value
+        } else if (pendingKey.value === 'role' && objectDepth === payloadDepth) {
+          payloadRole = value
         }
         pendingKey = null
       }
@@ -261,7 +288,9 @@ function oversizedLineIsDefinitelyIrrelevant(prefix: Buffer): boolean {
   }
   if (!payloadType) return false
   if (topLevelType === 'response_item') {
-    return payloadType !== 'message' && payloadType !== 'reasoning'
+    if (payloadType === 'reasoning') return false
+    if (payloadType !== 'message') return true
+    return payloadRole !== undefined && payloadRole !== 'assistant'
   }
   return payloadType !== 'context_compacted' && payloadType !== 'task_started'
 }
@@ -375,13 +404,37 @@ function serializedPageBytes(page: ThreadTextPageResult): number {
   return Buffer.byteLength(JSON.stringify(page), 'utf8')
 }
 
+async function assertOffsetBelongsToTurn(
+  file: FileHandle,
+  beforeOffset: number,
+  turnId: string,
+): Promise<void> {
+  for await (const line of readLinesBackwards(file, beforeOffset)) {
+    if (!line.bytes) {
+      if (!oversizedLineIsDefinitelyIrrelevant(line.classificationPrefix ?? Buffer.alloc(0))) {
+        throw new ThreadTextPageError('Relevant rollout record exceeds the size limit', 413)
+      }
+      continue
+    }
+    const { taskStartedTurnId } = projectLine(line.bytes, line.startOffset)
+    if (taskStartedTurnId === null) continue
+    if (taskStartedTurnId !== turnId) {
+      throw new ThreadTextPageError('Requested offset is outside the active rollout turn', 409)
+    }
+    return
+  }
+  throw new ThreadTextPageError('Requested turn boundary was not found', 409)
+}
+
 export async function readThreadTextPage(input: {
   sessionPath: string
   threadId: string
   turnId: string
   cursor?: string
   limit?: number
-}): Promise<ThreadTextPageResult> {
+}, options: {
+  trustedActiveTurn?: boolean
+} = {}): Promise<ThreadTextPageResult> {
   const file = await open(input.sessionPath, 'r')
   try {
     const fileStats = await file.stat()
@@ -400,12 +453,16 @@ export async function readThreadTextPage(input: {
     ) {
       throw new ThreadTextPageError('Invalid thread text cursor', 400)
     }
+    if (!cursor && options.trustedActiveTurn !== true) {
+      await assertOffsetBelongsToTurn(file, beforeOffset, input.turnId)
+    }
 
     const limit = normalizeLimit(input.limit)
     const collected: ThreadTextPageItem[] = []
     let nextBeforeOffset = beforeOffset
     let pageLimitReached = false
     let foundOlderVisible = false
+    let cursorWouldExceedMax = false
 
     for await (const line of readLinesBackwards(file, beforeOffset)) {
       if (!line.bytes) {
@@ -427,11 +484,22 @@ export async function readThreadTextPage(input: {
         continue
       }
       if (pageLimitReached) {
+        if (cursorWouldExceedMax) {
+          throw new ThreadTextPageError('Thread text record leaves no room for a page cursor', 413)
+        }
         foundOlderVisible = true
         break
       }
 
       const candidateItems = [...collected, projected.item]
+      const terminalCandidatePage = buildPageResult({
+        threadId: input.threadId,
+        turnId: input.turnId,
+        itemsBackwards: candidateItems,
+        hasMoreOlder: false,
+        beforeOffset: line.startOffset,
+        snapshotEndOffset,
+      })
       const candidatePage = buildPageResult({
         threadId: input.threadId,
         turnId: input.turnId,
@@ -440,13 +508,25 @@ export async function readThreadTextPage(input: {
         beforeOffset: line.startOffset,
         snapshotEndOffset,
       })
+      const terminalCandidateBytes = serializedPageBytes(terminalCandidatePage)
       const candidateBytes = serializedPageBytes(candidatePage)
-      if (candidateBytes > MAX_PAGE_BYTES) {
+      if (terminalCandidateBytes > MAX_PAGE_BYTES) {
         if (collected.length === 0) {
           throw new ThreadTextPageError('Thread text record exceeds the response size limit', 413)
         }
         foundOlderVisible = true
         break
+      }
+      if (candidateBytes > MAX_PAGE_BYTES) {
+        if (collected.length > 0) {
+          foundOlderVisible = true
+          break
+        }
+        collected.push(projected.item)
+        nextBeforeOffset = line.startOffset
+        pageLimitReached = true
+        cursorWouldExceedMax = true
+        continue
       }
       if (collected.length > 0 && candidateBytes > TARGET_PAGE_BYTES) {
         foundOlderVisible = true
