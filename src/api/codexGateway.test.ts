@@ -10,6 +10,7 @@ import {
   getThreadGoal,
   getThreadRuntimeState,
   getThreadRuntimeStates,
+  getThreadTextPage,
   getThreadQueueState,
   setThreadQueueState,
   listDirectoryComposioConnectors,
@@ -1192,6 +1193,92 @@ describe('getThreadDetail', () => {
       ownership: 'local',
       canInterrupt: true,
       externalRuntimeState: 'idle',
+    })
+  })
+})
+
+describe('thread text page', () => {
+  afterEach(() => {
+    vi.unstubAllGlobals()
+  })
+
+  it('forwards the active turn cursor and normalizes messages in session order', async () => {
+    let requestUrl = ''
+    let requestSignal: AbortSignal | null | undefined
+    const controller = new AbortController()
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      requestUrl = String(input)
+      requestSignal = init?.signal
+      return new Response(JSON.stringify({
+        threadId: 'thread 1',
+        turnId: 'turn/1',
+        items: [{
+          id: 'reason-1',
+          type: 'reasoning',
+          summary: ['First thought'],
+          sessionOrder: 120,
+        }],
+        nextOlderCursor: 'next-cursor',
+        hasMoreOlder: true,
+      }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    }))
+
+    await expect(getThreadTextPage(
+      'thread 1',
+      'turn/1',
+      'opaque+/= cursor',
+      300,
+      controller.signal,
+    )).resolves.toMatchObject({
+      threadId: 'thread 1',
+      turnId: 'turn/1',
+      nextOlderCursor: 'next-cursor',
+      hasMoreOlder: true,
+      messages: [
+        expect.objectContaining({
+          id: 'reason-1',
+          messageType: 'reasoning',
+          text: 'First thought',
+          sessionOrder: 120,
+        }),
+      ],
+    })
+    expect(requestUrl).toBe(
+      '/codex-api/thread-text-page?threadId=thread+1&turnId=turn%2F1&cursor=opaque%2B%2F%3D+cursor&limit=300',
+    )
+    expect(requestSignal).toBe(controller.signal)
+  })
+
+  it('normalizes an aborted request through the thread text page API method', async () => {
+    const controller = new AbortController()
+    vi.stubGlobal('fetch', vi.fn((_input: RequestInfo | URL, init?: RequestInit) => new Promise<Response>((_resolve, reject) => {
+      init?.signal?.addEventListener('abort', () => reject(new DOMException('aborted', 'AbortError')))
+    })))
+
+    const pagePromise = getThreadTextPage('thread-1', 'turn-1', undefined, undefined, controller.signal)
+    controller.abort()
+
+    await expect(pagePromise).rejects.toMatchObject({
+      name: 'CodexApiError',
+      code: 'network_error',
+      method: 'thread-text-page',
+    })
+  })
+
+  it('preserves a conflict response message', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({
+      error: 'Rollout snapshot changed during pagination',
+    }), {
+      status: 409,
+      headers: { 'Content-Type': 'application/json' },
+    })))
+
+    await expect(getThreadTextPage('thread-1', 'turn-1')).rejects.toMatchObject({
+      name: 'CodexApiError',
+      code: 'http_error',
+      method: 'thread-text-page',
+      status: 409,
+      message: 'Rollout snapshot changed during pagination',
     })
   })
 })

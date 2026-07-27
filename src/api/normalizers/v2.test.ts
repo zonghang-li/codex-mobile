@@ -26,6 +26,38 @@ function threadReadResponseWithContent(content: unknown[]): ThreadReadResponse {
 }
 
 describe('normalizeThreadMessagesV2', () => {
+  it('propagates only finite non-negative session order values', () => {
+    const response = threadReadResponseWithContent([
+      {
+        type: 'agentMessage',
+        id: 'assistant-ordered',
+        text: 'Ordered',
+        sessionOrder: 120,
+      },
+      {
+        type: 'agentMessage',
+        id: 'assistant-negative',
+        text: 'Negative',
+        sessionOrder: -1,
+      },
+      {
+        type: 'agentMessage',
+        id: 'assistant-infinite',
+        text: 'Infinite',
+        sessionOrder: Number.POSITIVE_INFINITY,
+      },
+    ])
+    response.thread.turns[0].status = 'inProgress'
+    const messages = normalizeThreadMessagesV2(response)
+
+    expect(messages[0]).toMatchObject({
+      id: 'assistant-ordered',
+      sessionOrder: 120,
+    })
+    expect(messages[1]?.sessionOrder).toBeUndefined()
+    expect(messages[2]?.sessionOrder).toBeUndefined()
+  })
+
   it.each([
     '/tmp/codex-web-uploads/f-legacy/photo.png',
     '/private/var/folders/arbitrary/camera.jpg',

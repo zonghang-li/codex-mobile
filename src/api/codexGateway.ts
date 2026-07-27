@@ -974,6 +974,14 @@ export type ThreadTurnPage = {
   turnIndexByTurnId: ThreadTurnIndexById
 }
 
+export type ThreadTextPage = {
+  threadId: string
+  turnId: string
+  messages: UiMessage[]
+  nextOlderCursor: string | null
+  hasMoreOlder: boolean
+}
+
 class ThreadTurnPaginationUnsupportedError extends Error {
   constructor() {
     super('thread/turns/list is not supported by this Codex app-server')
@@ -1325,6 +1333,65 @@ export async function getExternalThreadLiveSnapshot(threadId: string, signal?: A
     return await getExternalThreadLiveStateSnapshotV2(threadId, signal, knownProjectionKey)
   } catch (error) {
     throw normalizeCodexApiError(error, `Failed to live-sync thread ${threadId}`, 'thread-live-state')
+  }
+}
+
+export async function getThreadTextPage(
+  threadId: string,
+  turnId: string,
+  cursor?: string,
+  limit?: number,
+  signal?: AbortSignal,
+): Promise<ThreadTextPage> {
+  const params = new URLSearchParams({ threadId, turnId })
+  if (cursor) params.set('cursor', cursor)
+  if (limit !== undefined) params.set('limit', String(limit))
+
+  let response: Response
+  try {
+    response = await fetch(`/codex-api/thread-text-page?${params.toString()}`, { signal })
+  } catch (error) {
+    if (error instanceof Error && error.name === 'AbortError') {
+      throw new CodexApiError(error.message || 'Thread text page request aborted', {
+        code: 'network_error',
+        method: 'thread-text-page',
+      })
+    }
+    throw normalizeCodexApiError(error, 'Failed to load active turn text', 'thread-text-page')
+  }
+
+  const payload = asRecord(await response.json().catch(() => null))
+  if (!response.ok) {
+    throw new CodexApiError(
+      extractErrorMessage(payload, `Thread text page request failed with ${response.status}`),
+      {
+        code: 'http_error',
+        method: 'thread-text-page',
+        status: response.status,
+      },
+    )
+  }
+
+  const payloadThreadId = readString(payload?.threadId) ?? threadId
+  const payloadTurnId = readString(payload?.turnId) ?? turnId
+  const items = Array.isArray(payload?.items) ? payload.items : []
+  const normalized = normalizeThreadMessagesV2({
+    thread: {
+      id: payloadThreadId,
+      turns: [{
+        id: payloadTurnId,
+        status: 'inProgress',
+        items,
+      }],
+    },
+  } as ThreadReadResponse)
+
+  return {
+    threadId: payloadThreadId,
+    turnId: payloadTurnId,
+    messages: normalized.filter((message) => message.turnId === turnId),
+    nextOlderCursor: readString(payload?.nextOlderCursor),
+    hasMoreOlder: payload?.hasMoreOlder === true,
   }
 }
 

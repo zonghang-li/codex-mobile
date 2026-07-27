@@ -1043,8 +1043,14 @@ export function normalizeThreadMessagesV2(payload: ThreadReadResponse, baseTurnI
       threadLevelInProgress && turnOffset === turns.length - 1,
     )
     for (const item of items) {
+      const rawItem = item as unknown as Record<string, unknown>
+      const sessionOrder = typeof rawItem.sessionOrder === 'number'
+        && Number.isFinite(rawItem.sessionOrder)
+        && rawItem.sessionOrder >= 0
+        ? rawItem.sessionOrder
+        : undefined
       for (const msg of toUiMessages(item)) {
-        messages.push({ ...msg, turnId, turnIndex })
+        messages.push({ ...msg, turnId, turnIndex, sessionOrder })
       }
     }
     const errorText = readTurnErrorText(turn)

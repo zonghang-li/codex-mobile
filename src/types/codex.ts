@@ -338,6 +338,7 @@ export type UiMessage = {
   plan?: UiPlanData
   turnId?: string
   turnIndex?: number
+  sessionOrder?: number
   isAutomationRun?: boolean
   automationDisplayName?: string | null
 }

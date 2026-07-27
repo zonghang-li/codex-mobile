@@ -25,6 +25,7 @@ const gatewayMocks = vi.hoisted(() => ({
   getSkillsList: vi.fn(),
   getExternalThreadLiveSnapshot: vi.fn(),
   getThreadDetail: vi.fn(),
+  getThreadTextPage: vi.fn(),
   getThreadGroupsPage: vi.fn(),
   getOlderThreadMessages: vi.fn(),
   getThreadGoal: vi.fn(),
@@ -307,6 +308,13 @@ async function setupCodexDirectiveNotificationState(groups: UiProjectGroup[] = [
 beforeEach(() => {
   vi.clearAllMocks()
   gatewayMocks.getThreadDetail.mockReset().mockResolvedValue(idleDetail())
+  gatewayMocks.getThreadTextPage.mockReset().mockImplementation(async (threadId: string, turnId: string) => ({
+    threadId,
+    turnId,
+    messages: [],
+    nextOlderCursor: null,
+    hasMoreOlder: false,
+  }))
   gatewayMocks.getOlderThreadMessages.mockReset()
   gatewayMocks.resumeThread.mockReset().mockResolvedValue(idleDetail())
   gatewayMocks.getExternalThreadLiveSnapshot.mockImplementation(
@@ -5121,6 +5129,347 @@ describe('external live reasoning transcript', () => {
     expect(overlayChanges.map((change) => change.label)).toEqual([null])
     expect(overlayChanges[0]?.messageIds).toContain('agent-final')
     expect(state.messages.value.map((message) => message.id)).not.toContain('reasoning-1')
+  })
+})
+
+describe('active turn text hydration', () => {
+  function activeText(
+    id: string,
+    messageType: 'agentMessage' | 'reasoning' | 'contextCompaction',
+    sessionOrder?: number,
+  ): UiMessage {
+    return {
+      id,
+      role: messageType === 'contextCompaction' ? 'system' : 'assistant',
+      text: id,
+      messageType,
+      turnId: 'turn-external',
+      sessionOrder,
+    }
+  }
+
+  function partialExternalDetail(messages: UiMessage[]) {
+    return {
+      ...externalDetail('turn-external'),
+      isLiveProjection: true,
+      isPartialTurnProjection: true,
+      messages,
+      turnIndexByTurnId: { 'turn-external': 0 },
+    }
+  }
+
+  it('renders a bounded live detail before asynchronously prepending every text page', async () => {
+    installTestWindow()
+    vi.stubGlobal('document', {
+      visibilityState: 'visible',
+      addEventListener: vi.fn(),
+      removeEventListener: vi.fn(),
+    })
+    gatewayMocks.getThreadDetail.mockResolvedValue(partialExternalDetail([
+      activeText('agent-live', 'agentMessage'),
+    ]))
+    const newest = deferred<{
+      threadId: string
+      turnId: string
+      messages: UiMessage[]
+      nextOlderCursor: string | null
+      hasMoreOlder: boolean
+    }>()
+    const older = deferred<{
+      threadId: string
+      turnId: string
+      messages: UiMessage[]
+      nextOlderCursor: string | null
+      hasMoreOlder: boolean
+    }>()
+    gatewayMocks.getThreadTextPage
+      .mockReturnValueOnce(newest.promise)
+      .mockReturnValueOnce(older.promise)
+
+    const state = useDesktopState()
+    state.primeSelectedThread('thread-external')
+    await state.loadMessages('thread-external')
+
+    expect(state.messages.value.map((message) => message.id)).toEqual(['agent-live'])
+    newest.resolve({
+      threadId: 'thread-external',
+      turnId: 'turn-external',
+      messages: [
+        activeText('reason-2', 'reasoning', 300),
+        activeText('agent-2', 'agentMessage', 400),
+      ],
+      nextOlderCursor: 'older-1',
+      hasMoreOlder: true,
+    })
+    await flushMicrotasks()
+    older.resolve({
+      threadId: 'thread-external',
+      turnId: 'turn-external',
+      messages: [
+        activeText('reason-1', 'reasoning', 100),
+        activeText('agent-1', 'agentMessage', 200),
+      ],
+      nextOlderCursor: null,
+      hasMoreOlder: false,
+    })
+    await flushMicrotasks()
+
+    expect(state.messages.value
+      .filter((message) => message.turnId === 'turn-external')
+      .map((message) => message.id))
+      .toEqual(['reason-1', 'agent-1', 'reason-2', 'agent-2', 'agent-live'])
+  })
+
+  it('does not let a later bounded live poll erase hydrated rows', async () => {
+    installTestWindow()
+    vi.stubGlobal('document', {
+      visibilityState: 'visible',
+      addEventListener: vi.fn(),
+      removeEventListener: vi.fn(),
+    })
+    gatewayMocks.getThreadDetail
+      .mockResolvedValueOnce(partialExternalDetail([activeText('agent-live', 'agentMessage', 300)]))
+      .mockResolvedValueOnce(partialExternalDetail([activeText('agent-new', 'agentMessage')]))
+    gatewayMocks.getThreadTextPage.mockResolvedValueOnce({
+      threadId: 'thread-external',
+      turnId: 'turn-external',
+      messages: [
+        activeText('reason-1', 'reasoning', 100),
+        activeText('agent-1', 'agentMessage', 200),
+      ],
+      nextOlderCursor: null,
+      hasMoreOlder: false,
+    })
+
+    const state = useDesktopState()
+    state.primeSelectedThread('thread-external')
+    await state.loadMessages('thread-external')
+    await flushMicrotasks()
+    await state.loadMessages('thread-external', { silent: true, force: true })
+
+    expect(state.messages.value.map((message) => message.id)).toEqual([
+      'reason-1',
+      'agent-1',
+      'agent-live',
+      'agent-new',
+    ])
+  })
+
+  it('never requests the same turn cursor twice in one hydration attempt', async () => {
+    installTestWindow()
+    vi.stubGlobal('document', {
+      visibilityState: 'visible',
+      addEventListener: vi.fn(),
+      removeEventListener: vi.fn(),
+    })
+    gatewayMocks.getThreadDetail.mockResolvedValue(partialExternalDetail([
+      activeText('agent-live', 'agentMessage'),
+    ]))
+    gatewayMocks.getThreadTextPage
+      .mockResolvedValueOnce({
+        threadId: 'thread-external',
+        turnId: 'turn-external',
+        messages: [activeText('agent-2', 'agentMessage', 400)],
+        nextOlderCursor: 'repeated-cursor',
+        hasMoreOlder: true,
+      })
+      .mockResolvedValueOnce({
+        threadId: 'thread-external',
+        turnId: 'turn-external',
+        messages: [activeText('agent-1', 'agentMessage', 200)],
+        nextOlderCursor: 'repeated-cursor',
+        hasMoreOlder: true,
+      })
+
+    const state = useDesktopState()
+    state.primeSelectedThread('thread-external')
+    await state.loadMessages('thread-external')
+    await flushMicrotasks()
+
+    expect(gatewayMocks.getThreadTextPage).toHaveBeenCalledTimes(2)
+    expect(gatewayMocks.getThreadTextPage.mock.calls.map((call) => call[2])).toEqual([
+      undefined,
+      'repeated-cursor',
+    ])
+  })
+
+  it('keeps hydrated rows without replaying cursors after a page error', async () => {
+    installTestWindow()
+    vi.stubGlobal('document', {
+      visibilityState: 'visible',
+      addEventListener: vi.fn(),
+      removeEventListener: vi.fn(),
+    })
+    gatewayMocks.getThreadDetail
+      .mockResolvedValueOnce(partialExternalDetail([activeText('agent-live', 'agentMessage')]))
+      .mockResolvedValueOnce(partialExternalDetail([activeText('agent-new', 'agentMessage')]))
+    gatewayMocks.getThreadTextPage
+      .mockResolvedValueOnce({
+        threadId: 'thread-external',
+        turnId: 'turn-external',
+        messages: [activeText('agent-2', 'agentMessage', 400)],
+        nextOlderCursor: 'older-fails',
+        hasMoreOlder: true,
+      })
+      .mockRejectedValueOnce(new Error('temporary page failure'))
+
+    const state = useDesktopState()
+    state.primeSelectedThread('thread-external')
+    await state.loadMessages('thread-external')
+    await flushMicrotasks()
+    await state.loadMessages('thread-external', { silent: true, force: true })
+    await flushMicrotasks()
+
+    expect(gatewayMocks.getThreadTextPage).toHaveBeenCalledTimes(2)
+    expect(state.messages.value.map((message) => message.id)).toEqual([
+      'agent-2',
+      'agent-live',
+      'agent-new',
+    ])
+  })
+
+  it('aborts the active text request when another thread is selected', async () => {
+    installTestWindow()
+    vi.stubGlobal('document', {
+      visibilityState: 'visible',
+      addEventListener: vi.fn(),
+      removeEventListener: vi.fn(),
+    })
+    gatewayMocks.getThreadDetail.mockResolvedValue(partialExternalDetail([
+      activeText('agent-live', 'agentMessage'),
+    ]))
+    let requestSignal: AbortSignal | undefined
+    const latePage = deferred<{
+      threadId: string
+      turnId: string
+      messages: UiMessage[]
+      nextOlderCursor: string | null
+      hasMoreOlder: boolean
+    }>()
+    gatewayMocks.getThreadTextPage.mockImplementation((
+      _threadId: string,
+      _turnId: string,
+      _cursor?: string,
+      _limit?: number,
+      signal?: AbortSignal,
+    ) => {
+      requestSignal = signal
+      return latePage.promise
+    })
+
+    const state = useDesktopState()
+    state.primeSelectedThread('thread-external')
+    await state.loadMessages('thread-external')
+    state.primeSelectedThread('thread-other')
+    latePage.resolve({
+      threadId: 'thread-external',
+      turnId: 'turn-external',
+      messages: [activeText('reason-late', 'reasoning', 100)],
+      nextOlderCursor: null,
+      hasMoreOlder: false,
+    })
+    await flushMicrotasks()
+
+    expect(requestSignal?.aborted).toBe(true)
+    state.primeSelectedThread('thread-external')
+    expect(state.messages.value.map((message) => message.id)).toEqual(['agent-live'])
+  })
+
+  it('pauses older-page fetching while hidden and resumes on foreground', async () => {
+    installTestWindow()
+    const documentMock = {
+      visibilityState: 'visible',
+      addEventListener: vi.fn(),
+      removeEventListener: vi.fn(),
+    }
+    vi.stubGlobal('document', documentMock)
+    gatewayMocks.getThreadDetail.mockResolvedValue(partialExternalDetail([
+      activeText('agent-live', 'agentMessage'),
+    ]))
+    const newest = deferred<{
+      threadId: string
+      turnId: string
+      messages: UiMessage[]
+      nextOlderCursor: string | null
+      hasMoreOlder: boolean
+    }>()
+    gatewayMocks.getThreadTextPage
+      .mockReturnValueOnce(newest.promise)
+      .mockResolvedValueOnce({
+        threadId: 'thread-external',
+        turnId: 'turn-external',
+        messages: [activeText('agent-1', 'agentMessage', 200)],
+        nextOlderCursor: null,
+        hasMoreOlder: false,
+      })
+
+    const state = useDesktopState()
+    state.primeSelectedThread('thread-external')
+    state.startPolling()
+    pollingCleanups.push(() => state.stopPolling())
+    await state.loadMessages('thread-external')
+    Object.assign(documentMock, { visibilityState: 'hidden' })
+    newest.resolve({
+      threadId: 'thread-external',
+      turnId: 'turn-external',
+      messages: [activeText('agent-2', 'agentMessage', 400)],
+      nextOlderCursor: 'older-1',
+      hasMoreOlder: true,
+    })
+    await flushMicrotasks()
+
+    expect(gatewayMocks.getThreadTextPage).toHaveBeenCalledTimes(1)
+    const visibilityHandler = documentMock.addEventListener.mock.calls
+      .find(([eventName]) => eventName === 'visibilitychange')?.[1] as EventListener
+    Object.assign(documentMock, { visibilityState: 'visible' })
+    visibilityHandler(new Event('visibilitychange'))
+    await flushMicrotasks()
+
+    expect(gatewayMocks.getThreadTextPage).toHaveBeenCalledTimes(2)
+    expect(gatewayMocks.getThreadTextPage).toHaveBeenLastCalledWith(
+      'thread-external',
+      'turn-external',
+      'older-1',
+      undefined,
+      expect.any(AbortSignal),
+    )
+  })
+
+  it('finalizes hydrated text on completion without dropping assistant commentary', async () => {
+    installTestWindow()
+    vi.stubGlobal('document', {
+      visibilityState: 'visible',
+      addEventListener: vi.fn(),
+      removeEventListener: vi.fn(),
+    })
+    gatewayMocks.getThreadDetail
+      .mockResolvedValueOnce(partialExternalDetail([activeText('agent-live', 'agentMessage', 300)]))
+      .mockResolvedValueOnce({
+        ...idleDetail(),
+        messages: [activeText('agent-final', 'agentMessage', 400)],
+      })
+    gatewayMocks.getThreadTextPage.mockResolvedValueOnce({
+      threadId: 'thread-external',
+      turnId: 'turn-external',
+      messages: [
+        activeText('reason-1', 'reasoning', 100),
+        activeText('agent-commentary', 'agentMessage', 200),
+      ],
+      nextOlderCursor: null,
+      hasMoreOlder: false,
+    })
+
+    const state = useDesktopState()
+    state.primeSelectedThread('thread-external')
+    await state.loadMessages('thread-external')
+    await flushMicrotasks()
+    await state.loadMessages('thread-external', { silent: true, force: true })
+
+    expect(state.messages.value.map((message) => message.id)).toEqual([
+      'agent-commentary',
+      'agent-live',
+      'agent-final',
+    ])
   })
 })
 
