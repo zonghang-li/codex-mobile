@@ -434,6 +434,7 @@ export async function readThreadTextPage(input: {
   limit?: number
 }, options: {
   trustedActiveTurn?: boolean
+  trustedSnapshotEndOffset?: number
 } = {}): Promise<ThreadTextPageResult> {
   const file = await open(input.sessionPath, 'r')
   try {
@@ -441,7 +442,18 @@ export async function readThreadTextPage(input: {
     const cursor = input.cursor
       ? decodeCursor(input.cursor, input.threadId, input.turnId)
       : null
-    const snapshotEndOffset = cursor?.snapshotEndOffset ?? fileStats.size
+    if (
+      options.trustedSnapshotEndOffset !== undefined
+      && (
+        !Number.isSafeInteger(options.trustedSnapshotEndOffset)
+        || options.trustedSnapshotEndOffset < 0
+      )
+    ) {
+      throw new ThreadTextPageError('Invalid trusted rollout snapshot', 409)
+    }
+    const snapshotEndOffset = cursor?.snapshotEndOffset
+      ?? options.trustedSnapshotEndOffset
+      ?? fileStats.size
     const beforeOffset = cursor?.beforeOffset ?? snapshotEndOffset
 
     if (fileStats.size < snapshotEndOffset) {

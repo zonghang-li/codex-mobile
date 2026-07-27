@@ -1,6 +1,6 @@
 import { createServer } from 'node:http'
 import type { AddressInfo } from 'node:net'
-import { mkdtemp, rm, truncate, writeFile } from 'node:fs/promises'
+import { appendFile, mkdtemp, rm, truncate, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
@@ -681,6 +681,79 @@ describe('GET /codex-api/thread-text-page', () => {
     expect(response.status).toBe(200)
     expect(body.items.map((item) => item.id)).toEqual(['agent-latest'])
     expect(body.hasMoreOlder).toBe(true)
+  })
+
+  it('freezes the rollout snapshot before active-turn authorization', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'codex-mobile-text-page-race-'))
+    disposers.push(() => {
+      void rm(directory, { recursive: true, force: true })
+    })
+    const sessionPath = join(directory, 'rollout.jsonl')
+    await writeFile(sessionPath, [
+      JSON.stringify({
+        type: 'event_msg',
+        payload: { type: 'task_started', turn_id: 'turn-a' },
+      }),
+      JSON.stringify({
+        type: 'response_item',
+        payload: {
+          type: 'message',
+          role: 'assistant',
+          id: 'agent-a',
+          content: [{ type: 'output_text', text: 'Authorized update' }],
+        },
+      }),
+      '',
+    ].join('\n'), 'utf8')
+    const middleware = createCodexBridgeMiddleware()
+    stubThreadRead(sessionPath)
+    const shared = sharedBridgeForTest()
+    vi.spyOn(shared.runtimeProbe, 'inspect').mockImplementation(async () => {
+      await appendFile(sessionPath, [
+        JSON.stringify({
+          type: 'event_msg',
+          payload: { type: 'task_started', turn_id: 'turn-b' },
+        }),
+        JSON.stringify({
+          type: 'response_item',
+          payload: {
+            type: 'message',
+            role: 'assistant',
+            id: 'agent-b-1',
+            content: [{ type: 'output_text', text: 'First unauthorized update' }],
+          },
+        }),
+        JSON.stringify({
+          type: 'response_item',
+          payload: {
+            type: 'message',
+            role: 'assistant',
+            id: 'agent-b-2',
+            content: [{ type: 'output_text', text: 'Second unauthorized update' }],
+          },
+        }),
+        '',
+      ].join('\n'), 'utf8')
+      return {
+        state: 'running',
+        turnId: 'turn-a',
+        interruptible: false,
+        source: 'external-session-writer',
+      }
+    })
+    const port = await listenWithMiddleware(middleware)
+
+    const response = await fetch(
+      `http://127.0.0.1:${port}/codex-api/thread-text-page?threadId=thread-1&turnId=turn-a&limit=1`,
+    )
+    const body = await response.json() as {
+      items: Array<{ id: string }>
+      hasMoreOlder: boolean
+    }
+
+    expect(response.status).toBe(200)
+    expect(body.items.map((item) => item.id)).toEqual(['agent-a'])
+    expect(body.hasMoreOlder).toBe(false)
   })
 })
 

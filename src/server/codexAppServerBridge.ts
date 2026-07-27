@@ -10004,6 +10004,7 @@ export function createCodexBridgeMiddleware(options: {
             limit: limitRaw ? Number.parseInt(limitRaw, 10) : undefined,
           }, {
             trustedActiveTurn: true,
+            trustedSnapshotEndOffset: sessionStats.size,
           })
           setJson(res, 200, page)
         } catch (error) {
