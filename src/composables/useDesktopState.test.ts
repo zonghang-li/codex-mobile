@@ -5622,6 +5622,86 @@ describe('provider model selection', () => {
     await expect(send).resolves.toBe('new-image-thread')
   })
 
+  it('retains a managed image after an ambiguous turn/start response until terminal confirmation', async () => {
+    const { state, emit } = await setupTurnLifecycleNotificationState('thread-1')
+    const managedImageUrl = '/codex-local-image?path=%2Ftmp%2Fcodex-web-uploads%2Fupload%2Fphoto.png&uploadHandle=ambiguous-existing'
+    gatewayMocks.startThreadTurn.mockRejectedValue(new CodexApiError('bad gateway', {
+      code: 'http_error',
+      method: 'turn/start',
+      status: 502,
+    }))
+
+    await expect(state.sendMessageToSelectedThread('inspect this', [managedImageUrl]))
+      .rejects.toThrow('bad gateway')
+    expect(gatewayMocks.cleanupManagedUploads).not.toHaveBeenCalled()
+
+    emit({ method: 'turn/started', params: { threadId: 'thread-1', turn: { id: 'turn-accepted' } } })
+    emit({
+      method: 'turn/completed',
+      params: { threadId: 'thread-1', turn: { id: 'turn-accepted', status: 'completed' } },
+    })
+    await flushMicrotasks()
+
+    expect(gatewayMocks.cleanupManagedUploads).toHaveBeenCalledTimes(1)
+    expect(gatewayMocks.cleanupManagedUploads).toHaveBeenCalledWith([managedImageUrl], [])
+  })
+
+  it('cleans a managed image once when immediate Stop cancels before turn/start', async () => {
+    installTestWindow()
+    const pendingResume = deferred<ReturnType<typeof idleDetail>>()
+    const managedImageUrl = '/codex-local-image?path=%2Ftmp%2Fcodex-web-uploads%2Fupload%2Fphoto.png&uploadHandle=cancel-before-start'
+    gatewayMocks.resumeThread.mockReturnValue(pendingResume.promise)
+    const state = useDesktopState()
+    state.primeSelectedThread('thread-1')
+    await state.loadMessages('thread-1')
+
+    const send = state.sendMessageToSelectedThread('inspect this', [managedImageUrl])
+    await flushMicrotasks()
+    const stop = state.interruptSelectedThreadTurn()
+    pendingResume.resolve(idleDetail())
+    await Promise.all([send, stop])
+
+    expect(gatewayMocks.startThreadTurn).not.toHaveBeenCalled()
+    expect(gatewayMocks.cleanupManagedUploads).toHaveBeenCalledTimes(1)
+    expect(gatewayMocks.cleanupManagedUploads).toHaveBeenCalledWith([managedImageUrl], [])
+  })
+
+  it('keeps an ambiguous new-thread upload owned until its accepted turn completes', async () => {
+    const { state, emit } = await setupTurnLifecycleNotificationState('thread-1')
+    const managedImageUrl = '/codex-local-image?path=%2Ftmp%2Fcodex-web-uploads%2Fupload%2Fphoto.png&uploadHandle=ambiguous-new'
+    gatewayMocks.startThread.mockResolvedValue({
+      threadId: 'new-ambiguous-thread',
+      model: 'gpt-5.5',
+      modelProvider: 'openai',
+    })
+    gatewayMocks.startThreadTurn.mockRejectedValue(new CodexApiError('bad gateway', {
+      code: 'http_error',
+      method: 'turn/start',
+      status: 502,
+    }))
+
+    await expect(state.sendMessageToNewThread('inspect this', '/tmp/project', [managedImageUrl]))
+      .resolves.toBe('new-ambiguous-thread')
+    expect(state.selectedThreadId.value).toBe('new-ambiguous-thread')
+    expect(gatewayMocks.cleanupManagedUploads).not.toHaveBeenCalled()
+
+    emit({
+      method: 'turn/started',
+      params: { threadId: 'new-ambiguous-thread', turn: { id: 'turn-accepted' } },
+    })
+    emit({
+      method: 'turn/completed',
+      params: {
+        threadId: 'new-ambiguous-thread',
+        turn: { id: 'turn-accepted', status: 'completed' },
+      },
+    })
+    await flushMicrotasks()
+
+    expect(gatewayMocks.cleanupManagedUploads).toHaveBeenCalledTimes(1)
+    expect(gatewayMocks.cleanupManagedUploads).toHaveBeenCalledWith([managedImageUrl], [])
+  })
+
   it('releases a new-thread upload once after primary and fallback thread/start both fail', async () => {
     installTestWindow()
     const state = useDesktopState()

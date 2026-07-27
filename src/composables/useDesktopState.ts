@@ -6880,6 +6880,21 @@ export function useDesktopState() {
       return threadId
     } catch (unknownError) {
       await uploadLease.release()
+      const ambiguousStart = threadId
+        && optimisticThreadInserted
+        && isAmbiguousTurnStartError(unknownError)
+      if (ambiguousStart) {
+        const errorMessage = unknownError instanceof Error ? unknownError.message : 'Unknown application error'
+        setTurnErrorForThread(threadId, errorMessage, { transient: true })
+        error.value = errorMessage
+        if (pendingNewThreadSubmission?.generation === newThreadGeneration) {
+          pendingNewThreadSubmission = null
+          isPendingNewThreadStop.value = false
+        }
+        void requestThreadTitleGeneration(threadId, nextText, targetCwd || null)
+        isSendingMessage.value = false
+        return threadId
+      }
       shouldAutoScrollOnNextAgentEvent = false
       if (threadId && optimisticThreadInserted) {
         rollbackOptimisticNewThread(threadId, previousSelectedThreadId)
@@ -7020,7 +7035,9 @@ export function useDesktopState() {
       await syncFromNotifications()
       scheduleDelayedTurnSync(threadId)
     } catch (unknownError) {
-      releasePendingTurnRequest(threadId)
+      if (!isAmbiguousTurnStartError(unknownError)) {
+        releasePendingTurnRequest(threadId)
+      }
       throw unknownError
     }
   }
