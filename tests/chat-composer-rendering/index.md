@@ -18,6 +18,7 @@ Return to the [manual test index](../../tests.md).
 | [Feature: Sandbox approval requests recognize newer Codex payloads](sandbox-approval-requests-recognize-newer-codex-payloads.md) |
 | [Feature: MCP elicitation requests and thread status labels](mcp-elicitation-requests-and-thread-status-labels.md) |
 | [Feature: Stop button interrupts active turn without missing turnId](stop-button-interrupts-active-turn-without-missing-turnid.md) |
+| [Immutable submit, immediate Stop, and running-turn queue](immutable-submit-immediate-stop-and-queue.md) |
 | [Feature: Backticked HTTP(S) URL renders as clickable link](backticked-http-s-url-renders-as-clickable-link.md) |
 | [Feature: Chat file-link context menu (open/copy/edit)](chat-file-link-context-menu-open-copy-edit.md) |
 | [Feature: Restore composer drag-and-drop file attach on input field](restore-composer-drag-and-drop-file-attach-on-input-field.md) |
