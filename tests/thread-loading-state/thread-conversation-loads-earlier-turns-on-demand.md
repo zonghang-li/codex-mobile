@@ -9,20 +9,23 @@ Thread conversation older-turn loading.
 3. Light theme and dark theme both available from the appearance switcher
 
 #### Steps
-1. Open a normal long thread whose `thread/read` response includes all turns.
-2. Confirm the middle turns are visible and the conversation does not show `Load earlier messages`.
-3. Open a fixture or legacy/paginated thread source that reports `hasMoreOlder: true`.
-4. Confirm the newest returned messages render first and the conversation shows `Load earlier messages` at the top.
-5. Click `Load earlier messages` once.
-6. Confirm an older persisted batch is prepended above the previously first visible turn and the scroll position stays near the same content.
-7. Continue clicking `Load earlier messages` until the control disappears.
-8. Confirm the oldest messages in the thread are visible and no duplicate message rows are introduced.
-9. Switch to dark theme and repeat steps 1-8 on the same thread or another long thread.
+1. Open a long native Codex thread with more than 15 turns.
+2. Confirm initial hydration renders the newest five turns and shows `Load earlier messages`.
+3. Inspect the first `/codex-api/thread-turn-page` response and record its opaque `nextCursor`.
+4. Click `Load earlier messages` once and confirm the request forwards that cursor unchanged and requests no more than ten turns.
+5. Confirm the older persisted batch is prepended above the previously first visible turn and the scroll position stays near the same content.
+6. While older history is visible, allow one live-state poll or force-refresh the selected thread.
+7. Confirm all already-loaded turns remain visible and the next older request continues from the deeper cursor instead of restarting at the first page.
+8. Continue clicking `Load earlier messages` until the cursor becomes null and the control disappears.
+9. Confirm the oldest messages are visible, indices remain ordered, and no duplicate rows are introduced.
+10. Switch to dark theme and repeat the flow.
 
 #### Expected Results
-- Current full-history thread loads render all already-loaded turns without a local frontend window.
+- Initial hydration returns the newest five full turns.
 - `Load earlier messages` appears only while the backend reports older persisted turns.
-- The control fetches older persisted turns from the local bridge instead of revealing messages already present in memory.
+- Each control activation follows the exact opaque cursor and fetches no more than ten older persisted turns.
+- Live polling and forced refreshes never hide already-loaded messages or reset pagination progress.
+- Repeated or cyclic cursors stop pagination without inserting a duplicate page.
 - Message ordering, turn actions, and scroll restoration remain stable in light and dark themes.
 
 #### Rollback/Cleanup

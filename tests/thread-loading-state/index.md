@@ -32,6 +32,7 @@ Return to the [manual test index](../../tests.md).
 | [Active thread switches after delete](active-thread-switches-after-delete.md) |
 | [Thread open always autoscrolls to latest](thread-open-always-autoscrolls-to-latest.md) |
 | [Thread conversation loads earlier turns on demand](thread-conversation-loads-earlier-turns-on-demand.md) |
+| [Native turn pagination load performance](native-turn-pagination-load-performance.md) |
 | [Missing thread route errors render in chat](missing-thread-route-errors-render-in-chat.md) |
 | [Non-thread startup selection priming](non-thread-startup-selection-priming.md) |
 | [Feature: External client running state after refresh](external-client-running-state-after-refresh.md) |
