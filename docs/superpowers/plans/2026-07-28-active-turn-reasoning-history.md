@@ -16,7 +16,8 @@
 - Historical non-active reasoning remains hidden.
 - Existing command, tool, collaboration, subagent, compaction, and completed-turn folding behavior remains unchanged.
 - Do not include the four pre-existing upload lifecycle modifications in reasoning-history commits.
-- Implement in an isolated worktree created from commit `8629400`.
+- At execution start, record `BASE_COMMIT=$(git rev-parse HEAD)` and create the
+  isolated worktree from that exact commit.
 - Do not change polling cadence, server protocol, session logs, or notification frequency.
 
 ---
@@ -316,7 +317,7 @@ Run:
 
 ```bash
 git diff --check
-git diff --name-only 8629400
+git diff --name-only "$BASE_COMMIT"
 ```
 
 Expected changed paths:
@@ -374,7 +375,7 @@ Expected:
 Review the exact range:
 
 ```bash
-git diff 8629400..HEAD
+git diff "$BASE_COMMIT"..HEAD
 ```
 
 The review must explicitly confirm:
@@ -396,7 +397,7 @@ git status --short
 git rev-parse HEAD
 ```
 
-Expected HEAD: `8629400`.
+Expected HEAD: the recorded `BASE_COMMIT`.
 
 Expected pre-existing modifications only:
 
