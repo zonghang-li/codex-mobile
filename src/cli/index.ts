@@ -500,7 +500,7 @@ async function startServer(options: {
     : null
   const { app, dispose, attachWebSocket } = createApp({ password })
   const server = createServer(app)
-  attachWebSocket(server)
+  const closeWebSocket = attachWebSocket(server)
   const listening = await listenWithFallback(server, requestedPort, '0.0.0.0')
   const port = listening.port
   process.env.CODEXUI_SERVER_PORT = String(port)
@@ -564,24 +564,28 @@ async function startServer(options: {
   }
   if (options.open) openBrowser(`http://localhost:${String(port)}`)
 
-  function shutdown() {
+  let shuttingDown = false
+
+  async function shutdown() {
+    if (shuttingDown) return
+    shuttingDown = true
     console.log('\nShutting down...')
     if (tunnelChild && !tunnelChild.killed) {
       tunnelChild.kill('SIGTERM')
     }
-    server.close(() => {
-      dispose()
+    const closeServer = listening.close()
+    closeWebSocket()
+    dispose()
+    try {
+      await closeServer
       process.exit(0)
-    })
-    // Force exit after timeout
-    setTimeout(() => {
-      dispose()
+    } catch {
       process.exit(1)
-    }, 5000).unref()
+    }
   }
 
-  process.on('SIGINT', shutdown)
-  process.on('SIGTERM', shutdown)
+  process.on('SIGINT', () => void shutdown())
+  process.on('SIGTERM', () => void shutdown())
 }
 
 async function runLogin() {

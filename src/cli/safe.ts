@@ -178,7 +178,7 @@ program.command('start')
         : {}),
     })
     const server = createHttpServer(app)
-    attachWebSocket(server)
+    const closeWebSocket = attachWebSocket(server)
     const listening = await listenWithFallback(server, requestedPort, runtimeConfig.bindHost)
     process.env.CODEXUI_SERVER_PORT = String(listening.port)
 
@@ -218,8 +218,10 @@ program.command('start')
       if (shuttingDown) return
       shuttingDown = true
       await clearManagedState().catch(() => {})
-      await listening.close().catch(() => {})
+      const closeServer = listening.close()
+      closeWebSocket()
       dispose()
+      await closeServer.catch(() => {})
     }
     process.once('SIGINT', () => void shutdown().finally(() => process.exit(0)))
     process.once('SIGTERM', () => void shutdown().finally(() => process.exit(0)))
