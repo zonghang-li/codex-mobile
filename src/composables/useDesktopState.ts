@@ -1668,6 +1668,23 @@ export function useDesktopState() {
     collaborationMode: CollaborationModeKind
     fallbackRetried: boolean
   }
+  type LocalSubmissionState = {
+    generation: number
+    optimisticMessageId: string
+    turnStartIssued: boolean
+  }
+  type PendingStopRequest = {
+    generation: number
+    promise: Promise<void>
+    resolve: () => void
+    interruptPromise: Promise<void> | null
+    settled: boolean
+  }
+  type PendingNewThreadSubmission = {
+    generation: number
+    threadId: string
+    stopRequested: boolean
+  }
   const queuedMessagesByThreadId = ref<Record<string, QueuedMessage[]>>({})
   const queueProcessingByThreadId = ref<Record<string, boolean>>({})
   let hasLoadedPersistedQueueState = false
@@ -1738,6 +1755,8 @@ export function useDesktopState() {
   const isThreadListFullyLoaded = ref(false)
   const isSendingMessage = ref(false)
   const isInterruptingTurn = ref(false)
+  const pendingStopByThreadId = ref<Record<string, boolean>>({})
+  const isPendingNewThreadStop = ref(false)
   const isUpdatingSpeedMode = ref(false)
   const isRollingBack = ref(false)
 
@@ -1835,6 +1854,10 @@ export function useDesktopState() {
   let activeReasoningItemId = ''
   let shouldAutoScrollOnNextAgentEvent = false
   const pendingTurnStartsById = new Map<string, TurnStartedInfo>()
+  const localSubmissionByThreadId = new Map<string, LocalSubmissionState>()
+  const pendingStopRequestByThreadId = new Map<string, PendingStopRequest>()
+  let pendingNewThreadSubmission: PendingNewThreadSubmission | null = null
+  let nextSubmissionGeneration = 0
   const fallbackRetryInFlightThreadIds = new Set<string>()
   const nonSuccessCompletionReadBaselineByThreadId = new Map<string, string>()
   const resolvingServerRequestIds = new Set<number>()
@@ -1855,7 +1878,7 @@ export function useDesktopState() {
   const isSelectedThreadInterruptPending = computed(() => {
     const threadId = selectedThreadId.value
     if (!threadId) return false
-    return interruptBlockedUntilPersistedByThreadId.value[threadId] === true
+    return pendingStopByThreadId.value[threadId] === true
   })
   const selectedThreadServerRequests = computed<UiServerRequest[]>(() => {
     const rows: UiServerRequest[] = []
@@ -2234,6 +2257,122 @@ export function useDesktopState() {
       setSelectedModelId(MODEL_FALLBACK_ID)
     }
     ensureAvailableModelIds(MODEL_FALLBACK_ID)
+  }
+
+  function beginLocalSubmission(threadId: string, optimisticMessageId: string): LocalSubmissionState {
+    const submission: LocalSubmissionState = {
+      generation: ++nextSubmissionGeneration,
+      optimisticMessageId,
+      turnStartIssued: false,
+    }
+    localSubmissionByThreadId.set(threadId, submission)
+    return submission
+  }
+
+  function clearLocalSubmission(threadId: string, generation?: number): void {
+    const current = localSubmissionByThreadId.get(threadId)
+    if (!current || (generation !== undefined && current.generation !== generation)) return
+    localSubmissionByThreadId.delete(threadId)
+  }
+
+  function ensurePendingStopRequest(
+    threadId: string,
+    generation: number,
+  ): PendingStopRequest {
+    const existing = pendingStopRequestByThreadId.get(threadId)
+    if (existing?.generation === generation) return existing
+    if (existing) {
+      existing.settled = true
+      existing.resolve()
+    }
+
+    let resolvePromise!: () => void
+    const promise = new Promise<void>((resolve) => {
+      resolvePromise = resolve
+    })
+    const request: PendingStopRequest = {
+      generation,
+      promise,
+      resolve: resolvePromise,
+      interruptPromise: null,
+      settled: false,
+    }
+    pendingStopRequestByThreadId.set(threadId, request)
+    pendingStopByThreadId.value = {
+      ...pendingStopByThreadId.value,
+      [threadId]: true,
+    }
+    return request
+  }
+
+  function clearPendingStopRequest(threadId: string, generation?: number): void {
+    const request = pendingStopRequestByThreadId.get(threadId)
+    if (!request || (generation !== undefined && request.generation !== generation)) return
+    pendingStopRequestByThreadId.delete(threadId)
+    pendingStopByThreadId.value = omitKey(pendingStopByThreadId.value, threadId)
+    if (!request.settled) {
+      request.settled = true
+      request.resolve()
+    }
+  }
+
+  async function interruptLatchedTurn(
+    threadId: string,
+    turnId: string,
+    request: PendingStopRequest,
+  ): Promise<void> {
+    isInterruptingTurn.value = true
+    error.value = ''
+    try {
+      await interruptThreadTurn(threadId, turnId)
+      pendingThreadMessageRefresh.add(threadId)
+      pendingThreadsRefresh = true
+      await syncFromNotifications()
+      if (!request.settled) {
+        request.settled = true
+        request.resolve()
+      }
+    } catch (unknownError) {
+      clearPendingStopRequest(threadId, request.generation)
+      const errorMessage = unknownError instanceof Error ? unknownError.message : 'Failed to interrupt active turn'
+      setTurnErrorForThread(threadId, errorMessage)
+      error.value = errorMessage
+    } finally {
+      isInterruptingTurn.value = false
+    }
+  }
+
+  function consumePendingStopForTurn(threadId: string, turnId: string): Promise<void> | null {
+    const request = pendingStopRequestByThreadId.get(threadId)
+    const submission = localSubmissionByThreadId.get(threadId)
+    if (!request || !submission || request.generation !== submission.generation) return null
+    if (!request.interruptPromise) {
+      request.interruptPromise = interruptLatchedTurn(threadId, turnId, request)
+    }
+    return request.promise
+  }
+
+  function cancelSubmissionBeforeTurnStart(
+    threadId: string,
+    submission: LocalSubmissionState,
+  ): boolean {
+    const request = pendingStopRequestByThreadId.get(threadId)
+    if (
+      !request
+      || request.generation !== submission.generation
+      || submission.turnStartIssued
+    ) {
+      return false
+    }
+
+    removeOptimisticUserMessage(threadId, submission.optimisticMessageId)
+    releasePendingTurnRequest(threadId)
+    clearLocalSubmission(threadId, submission.generation)
+    clearPendingStopRequest(threadId, submission.generation)
+    setThreadRuntimeOwnership(threadId, 'idle')
+    setThreadInProgress(threadId, false)
+    setTurnActivityForThread(threadId, null)
+    return true
   }
 
   function setPendingTurnRequest(threadId: string, request: PendingTurnRequest): void {
@@ -2775,6 +2914,8 @@ export function useDesktopState() {
     eventUnreadByThreadId.value = omitKey(eventUnreadByThreadId.value, normalizedThreadId)
     inProgressById.value = omitKey(inProgressById.value, normalizedThreadId)
     pendingTurnRequestByThreadId.value = omitKey(pendingTurnRequestByThreadId.value, normalizedThreadId)
+    clearPendingStopRequest(normalizedThreadId)
+    clearLocalSubmission(normalizedThreadId)
     selectedModelIdByContext.value = omitKey(selectedModelIdByContext.value, normalizedThreadId)
     selectedCollaborationModeByContext.value = omitKey(selectedCollaborationModeByContext.value, normalizedThreadId)
     clearLiveAgentRawTextForThread(normalizedThreadId)
@@ -5102,6 +5243,7 @@ export function useDesktopState() {
       setTurnSummaryForThread(startedTurn.threadId, null)
       setTurnErrorForThread(startedTurn.threadId, null)
       setThreadInProgress(startedTurn.threadId, true)
+      void consumePendingStopForTurn(startedTurn.threadId, startedTurn.turnId)
       scheduleQueueStateRefresh(startedTurn.threadId)
       if (eventUnreadByThreadId.value[startedTurn.threadId]) {
         eventUnreadByThreadId.value = omitKey(eventUnreadByThreadId.value, startedTurn.threadId)
@@ -5151,6 +5293,8 @@ export function useDesktopState() {
       }
       persistTurnSummaryForThread(completedTurn.threadId, summary)
       if (completionDisposition.ownsActiveLease) {
+        clearPendingStopRequest(completedTurn.threadId)
+        clearLocalSubmission(completedTurn.threadId)
         const persistedMessages = persistedMessagesByThreadId.value[completedTurn.threadId] ?? []
         setPersistedMessagesForThread(
           completedTurn.threadId,
@@ -6480,6 +6624,7 @@ export function useDesktopState() {
         skills,
         fileAttachments,
       )
+      const submission = beginLocalSubmission(threadId, optimisticMessageId)
       void startTurnForThread(
         threadId,
         nextText,
@@ -6488,9 +6633,12 @@ export function useDesktopState() {
         fileAttachments,
         collaborationModeOverride,
         uploadLease.transfer,
+        submission,
       ).catch((unknownError) => {
         if (!isAmbiguousTurnStartError(unknownError)) {
           removeOptimisticUserMessage(threadId, optimisticMessageId)
+          clearPendingStopRequest(threadId, submission.generation)
+          clearLocalSubmission(threadId, submission.generation)
         }
         const errorMessage = unknownError instanceof Error ? unknownError.message : 'Unknown application error'
         setTurnErrorForThread(threadId, errorMessage)
@@ -6528,6 +6676,7 @@ export function useDesktopState() {
       skills,
       fileAttachments,
     )
+    const submission = beginLocalSubmission(threadId, optimisticMessageId)
 
     try {
       await startTurnForThread(
@@ -6538,6 +6687,7 @@ export function useDesktopState() {
         fileAttachments,
         collaborationModeOverride,
         uploadLease.transfer,
+        submission,
       )
       await uploadLease.release()
     } catch (unknownError) {
@@ -6551,6 +6701,8 @@ export function useDesktopState() {
       }
       if (!ambiguousStart) {
         removeOptimisticUserMessage(threadId, optimisticMessageId)
+        clearPendingStopRequest(threadId, submission.generation)
+        clearLocalSubmission(threadId, submission.generation)
       }
       const errorMessage = unknownError instanceof Error ? unknownError.message : 'Unknown application error'
       setTurnErrorForThread(threadId, errorMessage)
@@ -6581,6 +6733,13 @@ export function useDesktopState() {
       return ''
     }
 
+    const newThreadGeneration = ++nextSubmissionGeneration
+    pendingNewThreadSubmission = {
+      generation: newThreadGeneration,
+      threadId: '',
+      stopRequested: false,
+    }
+    isPendingNewThreadStop.value = false
     isSendingMessage.value = true
     error.value = ''
     let threadId = ''
@@ -6608,12 +6767,35 @@ export function useDesktopState() {
       }
       if (!threadId) {
         await uploadLease.release()
+        if (pendingNewThreadSubmission?.generation === newThreadGeneration) {
+          pendingNewThreadSubmission = null
+          isPendingNewThreadStop.value = false
+        }
+        isSendingMessage.value = false
         return ''
+      }
+
+      if (pendingNewThreadSubmission?.generation === newThreadGeneration) {
+        pendingNewThreadSubmission.threadId = threadId
+        if (pendingNewThreadSubmission.stopRequested) {
+          pendingNewThreadSubmission = null
+          isPendingNewThreadStop.value = false
+          isSendingMessage.value = false
+          await uploadLease.release()
+          return ''
+        }
       }
 
       insertOptimisticThread(threadId, targetCwd, nextText || '[Image]')
       optimisticThreadInserted = true
-      appendOptimisticUserMessage(threadId, nextText, imageUrls, skills, fileAttachments)
+      const optimisticMessageId = appendOptimisticUserMessage(
+        threadId,
+        nextText,
+        imageUrls,
+        skills,
+        fileAttachments,
+      )
+      const submission = beginLocalSubmission(threadId, optimisticMessageId)
       blockInterruptUntilThreadIsPersisted(threadId)
       resumedThreadById.value = {
         ...resumedThreadById.value,
@@ -6647,9 +6829,14 @@ export function useDesktopState() {
         fileAttachments,
         selectedMode,
         uploadLease.transfer,
+        submission,
       )
       await uploadLease.release()
       void requestThreadTitleGeneration(capturedThreadId, capturedPrompt, capturedCwd)
+      if (pendingNewThreadSubmission?.generation === newThreadGeneration) {
+        pendingNewThreadSubmission = null
+        isPendingNewThreadStop.value = false
+      }
       isSendingMessage.value = false
       return threadId
     } catch (unknownError) {
@@ -6657,10 +6844,16 @@ export function useDesktopState() {
       shouldAutoScrollOnNextAgentEvent = false
       if (threadId && optimisticThreadInserted) {
         rollbackOptimisticNewThread(threadId, previousSelectedThreadId)
+        clearPendingStopRequest(threadId)
+        clearLocalSubmission(threadId)
       } else if (threadId) {
         setThreadRuntimeOwnership(threadId, 'idle')
         setThreadInProgress(threadId, false)
         setTurnActivityForThread(threadId, null)
+      }
+      if (pendingNewThreadSubmission?.generation === newThreadGeneration) {
+        pendingNewThreadSubmission = null
+        isPendingNewThreadStop.value = false
       }
       const errorMessage = unknownError instanceof Error ? unknownError.message : 'Unknown application error'
       if (threadId && !optimisticThreadInserted) {
@@ -6680,6 +6873,7 @@ export function useDesktopState() {
     fileAttachments: FileAttachment[] = [],
     collaborationModeOverride?: CollaborationModeKind,
     onPendingTurnEstablished?: () => void,
+    submission?: LocalSubmissionState,
   ): Promise<void> {
     const requestedModelId = readModelIdForThread(threadId)
     const reasoningEffort = readReasoningEffortForThread(threadId)
@@ -6728,6 +6922,12 @@ export function useDesktopState() {
       }
       const modelId = requestedModelId || readModelIdForThread(threadId)
 
+      if (submission && cancelSubmissionBeforeTurnStart(threadId, submission)) {
+        return
+      }
+      if (submission) {
+        submission.turnStartIssued = true
+      }
       let startedTurnId = ''
       try {
         startedTurnId = await startThreadTurn(
@@ -6774,6 +6974,7 @@ export function useDesktopState() {
         }
         setThreadRuntimeOwnership(threadId, 'local')
         maybeUnblockInterruptForActiveTurn(threadId, startedTurnId)
+        void consumePendingStopForTurn(threadId, startedTurnId)
       }
 
       pendingThreadMessageRefresh.add(threadId)
@@ -6812,9 +7013,13 @@ export function useDesktopState() {
     const threadId = selectedThreadId.value
     if (!threadId || isExternallyOwned(threadId)) return
     if (inProgressById.value[threadId] !== true) return
-    if (interruptBlockedUntilPersistedByThreadId.value[threadId] === true) return
     let turnId = activeTurnIdByThreadId.value[threadId]
     if (!turnId) {
+      const submission = localSubmissionByThreadId.get(threadId)
+      if (submission) {
+        const pendingStop = ensurePendingStopRequest(threadId, submission.generation)
+        return pendingStop.promise
+      }
       const fallbackGeneration = externalRuntimeGeneration
       const detail = await getThreadDetail(threadId)
       const fallbackTurnId = detail.activeTurnId.trim()
@@ -6841,6 +7046,13 @@ export function useDesktopState() {
       throw new Error('Could not determine active turn id for interrupt')
     }
 
+    const submission = localSubmissionByThreadId.get(threadId)
+    if (submission) {
+      const pendingStop = ensurePendingStopRequest(threadId, submission.generation)
+      void consumePendingStopForTurn(threadId, turnId)
+      return pendingStop.promise
+    }
+
     isInterruptingTurn.value = true
     error.value = ''
     try {
@@ -6854,6 +7066,22 @@ export function useDesktopState() {
       error.value = errorMessage
     } finally {
       isInterruptingTurn.value = false
+    }
+  }
+
+  function interruptPendingNewThreadSubmission(): void {
+    const pending = pendingNewThreadSubmission
+    if (!pending) return
+    pending.stopRequested = true
+    isPendingNewThreadStop.value = true
+    if (!pending.threadId) return
+
+    const submission = localSubmissionByThreadId.get(pending.threadId)
+    if (!submission) return
+    ensurePendingStopRequest(pending.threadId, submission.generation)
+    const turnId = activeTurnIdByThreadId.value[pending.threadId]
+    if (turnId) {
+      void consumePendingStopForTurn(pending.threadId, turnId)
     }
   }
 
@@ -7254,6 +7482,14 @@ export function useDesktopState() {
     pendingThreadsRefresh = false
     pendingThreadMessageRefresh.clear()
     pendingTurnStartsById.clear()
+    localSubmissionByThreadId.clear()
+    for (const request of pendingStopRequestByThreadId.values()) {
+      if (!request.settled) request.resolve()
+    }
+    pendingStopRequestByThreadId.clear()
+    pendingStopByThreadId.value = {}
+    pendingNewThreadSubmission = null
+    isPendingNewThreadStop.value = false
     nonSuccessCompletionReadBaselineByThreadId.clear()
     resolvingServerRequestIds.clear()
     if (eventSyncTimer !== null && typeof window !== 'undefined') {
@@ -7470,6 +7706,7 @@ export function useDesktopState() {
     isLoadingOlderMessages,
     isSendingMessage,
     isInterruptingTurn,
+    isPendingNewThreadStop,
     isUpdatingSpeedMode,
     isUpdatingThreadGoal,
     isRollingBack,
@@ -7492,6 +7729,7 @@ export function useDesktopState() {
     sendMessageToSelectedThread,
     sendMessageToNewThread,
     interruptSelectedThreadTurn,
+    interruptPendingNewThreadSubmission,
     selectedThreadQueuedMessages,
     removeQueuedMessage,
     reorderQueuedMessage,

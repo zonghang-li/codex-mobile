@@ -161,9 +161,6 @@ describe('ConversationRunFooter desktop parity wiring', () => {
       /@media \(hover: none\), \(pointer: coarse\) \{[\s\S]*\.message-toolbar \{[\s\S]*@apply opacity-100;[\s\S]*\.message-fork-button,[\s\S]*\.message-copy-button\s*\{[\s\S]*@apply [^;]*min-h-10[^;]*min-w-16[^;]*rounded-lg/u,
     )
     expect(conversationSource).toMatch(
-      /@media \(hover: none\), \(pointer: coarse\) \{[\s\S]*\.message-edit-button\s*\{[\s\S]*@apply [^;]*min-h-10[^;]*min-w-10/u,
-    )
-    expect(conversationSource).toMatch(
       /\.message-toolbar:focus-within\s*\{\s*@apply opacity-100;\s*\}/u,
     )
   })

@@ -5427,6 +5427,70 @@ describe('provider model selection', () => {
     expect(state.selectedLiveOverlay.value?.activityLabel).toBe('Thinking')
   })
 
+  it('interrupts exactly once when Stop is requested before turn/start returns an id', async () => {
+    installTestWindow()
+    const pendingTurn = deferred<string>()
+    gatewayMocks.startThreadTurn.mockReturnValue(pendingTurn.promise)
+    gatewayMocks.interruptThreadTurn.mockResolvedValue(undefined)
+
+    const state = useDesktopState()
+    state.primeSelectedThread('thread-1')
+    await state.loadMessages('thread-1')
+
+    const send = state.sendMessageToSelectedThread('run this')
+    await flushMicrotasks()
+    const stop = state.interruptSelectedThreadTurn()
+
+    expect(gatewayMocks.interruptThreadTurn).not.toHaveBeenCalled()
+    pendingTurn.resolve('turn-new')
+    await Promise.all([send, stop])
+
+    expect(gatewayMocks.interruptThreadTurn).toHaveBeenCalledTimes(1)
+    expect(gatewayMocks.interruptThreadTurn).toHaveBeenCalledWith('thread-1', 'turn-new')
+  })
+
+  it('uses a turn/started notification to satisfy a pending Stop before the RPC resolves', async () => {
+    const { state, emit } = await setupTurnLifecycleNotificationState('thread-1')
+    const pendingTurn = deferred<string>()
+    gatewayMocks.startThreadTurn.mockReturnValue(pendingTurn.promise)
+    gatewayMocks.interruptThreadTurn.mockResolvedValue(undefined)
+
+    const send = state.sendMessageToSelectedThread('run this')
+    await flushMicrotasks()
+    const stop = state.interruptSelectedThreadTurn()
+    emit({ method: 'turn/started', params: { threadId: 'thread-1', turn: { id: 'turn-new' } } })
+    await flushMicrotasks()
+
+    expect(gatewayMocks.interruptThreadTurn).toHaveBeenCalledTimes(1)
+    expect(gatewayMocks.interruptThreadTurn).toHaveBeenCalledWith('thread-1', 'turn-new')
+
+    pendingTurn.resolve('turn-new')
+    await Promise.all([send, stop])
+    expect(gatewayMocks.interruptThreadTurn).toHaveBeenCalledTimes(1)
+  })
+
+  it('cancels a new-thread submission before turn/start is issued', async () => {
+    installTestWindow()
+    const pendingThread = deferred<{ threadId: string; model: string; modelProvider: string }>()
+    gatewayMocks.startThread.mockReturnValue(pendingThread.promise)
+
+    const state = useDesktopState()
+    const send = state.sendMessageToNewThread('run this', '/tmp/project')
+    await flushMicrotasks()
+    expect(state.isSendingMessage.value).toBe(true)
+
+    state.interruptPendingNewThreadSubmission()
+    pendingThread.resolve({
+      threadId: 'thread-new',
+      model: 'gpt-5.5',
+      modelProvider: 'openai',
+    })
+
+    await expect(send).resolves.toBe('')
+    expect(gatewayMocks.startThreadTurn).not.toHaveBeenCalled()
+    expect(state.isSendingMessage.value).toBe(false)
+  })
+
   it('captures the active provider when creating a new thread', async () => {
     installTestWindow()
     gatewayMocks.getThreadGroupsPage.mockResolvedValue({ groups: [], nextCursor: null })

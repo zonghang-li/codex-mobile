@@ -947,12 +947,13 @@
                   :skills="installedSkills"
                   :thread-token-usage="selectedThreadTokenUsage"
                   :codex-quota="codexQuota"
-                  :is-turn-in-progress="false"
-                  :is-stop-pending="false"
-                  :is-interrupting-turn="false" :send-with-enter="sendWithEnter" :in-progress-submit-mode="inProgressSendMode"
+                  :is-turn-in-progress="isSendingMessage"
+                  :is-stop-pending="isPendingNewThreadStop"
+                  :is-interrupting-turn="isInterruptingTurn" :send-with-enter="sendWithEnter" :in-progress-submit-mode="inProgressSendMode"
                   :dictation-click-to-toggle="dictationClickToToggle" :dictation-auto-send="dictationAutoSend"
                   :dictation-language="dictationLanguage"
                   @submit="onSubmitThreadMessage"
+                  @interrupt="onInterruptTurn"
                   @update:selected-collaboration-mode="onSelectCollaborationMode"
                   @update:selected-model="onSelectModel"
                   @update:selected-reasoning-effort="onSelectReasoningEffort"
@@ -1430,6 +1431,7 @@ const {
   isLoadingOlderMessages,
   isSendingMessage,
   isInterruptingTurn,
+  isPendingNewThreadStop,
   isSelectedThreadInterruptPending,
   selectedThreadRuntimeOwnership,
   isUpdatingSpeedMode,
@@ -1447,6 +1449,7 @@ const {
   sendMessageToSelectedThread,
   sendMessageToNewThread,
   interruptSelectedThreadTurn,
+  interruptPendingNewThreadSubmission,
   selectedThreadQueuedMessages,
   removeQueuedMessage,
   reorderQueuedMessage,
@@ -3894,6 +3897,10 @@ function onSelectSpeedMode(mode: SpeedMode): void {
 }
 
 function onInterruptTurn(): void {
+  if (isHomeRoute.value) {
+    interruptPendingNewThreadSubmission()
+    return
+  }
   void interruptSelectedThreadTurn()
 }
 
