@@ -67,7 +67,8 @@ Before committing a runtime or packaging change, also run:
 node dist-cli/index.js --help
 node dist-cli/safe.js --help
 node dist-cli/safe.js doctor
-sh -n scripts/install-local.sh scripts/install-user-service.sh scripts/uninstall-user-service.sh
+sh -n scripts/install-local.sh scripts/install-user-service.sh scripts/uninstall-user-service.sh \
+  scripts/request-user-service-restart.sh scripts/restart-user-service-worker.sh
 ```
 
 For an isolated local-install smoke test:
@@ -119,6 +120,13 @@ pnpm run service:status
 pnpm run service:restart
 journalctl --user -u codex-mobile-safe -n 100
 ```
+
+For an installed-service deployment, never wait on
+`systemctl --user restart codex-mobile-safe.service` from a Codex turn served
+by that same process. Run `pnpm run service:restart` as the final mutation;
+it atomically queues the user-systemd path trigger and returns. On the next
+interaction, verify the main service and restart-worker journal before
+claiming deployment success.
 
 For operator-controlled network switching:
 

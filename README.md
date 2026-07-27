@@ -42,7 +42,7 @@ pnpm run service:install
 pnpm run service:status
 ```
 
-The service listens only on `127.0.0.1:5900`. `service:install` creates a mode-`0600` password file when one does not exist, installs the unit, and starts it. Tailscale exposure remains a separate, explicit action:
+The service listens only on `127.0.0.1:5900`. `service:install` creates a mode-`0600` password file when one does not exist, installs the user units, and queues a restart through the private systemd path trigger. Tailscale exposure remains a separate, explicit action:
 
 ```bash
 codex-mobile-safe expose tailscale
@@ -100,7 +100,22 @@ pnpm run service:install
 codex-mobile-safe expose tailscale
 ```
 
-`service:install` already rebuilds and reinstalls the current checkout before rendering and restarting the unit. Do not substitute `install:local` followed only by `service:restart`; that does not refresh the rendered unit/template or daemon state.
+`service:install` rebuilds and reinstalls the checkout, renders the user units,
+and queues a restart through the private systemd path trigger. The command
+returns after the request is published; it does not wait for the active
+Codex turn to release the old service.
+
+Check completion with:
+
+```bash
+pnpm run service:status
+systemctl --user --no-pager --full status codex-mobile-safe-restart.service
+```
+
+`service:restart` also queues through the marker and never invokes
+`systemctl restart` in the calling Codex turn.
+
+Do not substitute `install:local` followed only by `service:restart`; that does not refresh the rendered unit/template or daemon state.
 
 Repeat the applicable foreground or service update sequence after every repository change you want to run locally. Review incoming changes before pulling if the checkout has local modifications.
 
