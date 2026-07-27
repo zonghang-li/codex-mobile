@@ -2509,9 +2509,77 @@ describe('external runtime ownership', () => {
     expect(gatewayMocks.getExternalThreadLiveSnapshot).toHaveBeenCalledTimes(1)
     expect(state.messages.value).toEqual(expect.arrayContaining([
       expect.objectContaining({ id: 'user-external', text: 'desktop input' }),
+      expect.objectContaining({ id: 'reasoning-external', text: '**Inspecting state**' }),
       expect.objectContaining({ id: 'agent-external', text: 'desktop output' }),
     ]))
-    expect(state.selectedLiveOverlay.value?.activityLabel).toBe('Inspecting state')
+    expect(state.selectedLiveOverlay.value?.activityLabel).toBe('Thinking')
+  })
+
+  it('hides cached external reasoning after background completion while detail is pending or fails', async () => {
+    const state = await setupBackgroundRuntimeState()
+    gatewayMocks.getThreadDetail.mockResolvedValueOnce({
+      ...externalDetail('turn-external'),
+      messages: [{
+        id: 'reasoning-external',
+        role: 'assistant',
+        text: '**Inspecting background state**',
+        messageType: 'reasoning',
+        turnId: 'turn-external',
+      }],
+    })
+
+    state.primeSelectedThread('thread-running')
+    await state.loadMessages('thread-running')
+    expect(state.messages.value.map((message) => message.id)).toContain('reasoning-external')
+
+    state.primeSelectedThread('thread-selected')
+    gatewayMocks.getThreadRuntimeStates.mockResolvedValue({
+      'thread-running': { state: 'idle' },
+    })
+    state.startPolling()
+    pollingCleanups.push(() => state.stopPolling())
+    await vi.advanceTimersByTimeAsync(0)
+    await flushMicrotasks()
+
+    const pendingDetail = deferred<ReturnType<typeof idleDetail>>()
+    gatewayMocks.getThreadDetail.mockReturnValueOnce(pendingDetail.promise)
+    state.primeSelectedThread('thread-running')
+    const reload = state.loadMessages('thread-running', { silent: true, force: true })
+    await flushMicrotasks()
+
+    expect(state.messages.value.map((message) => message.id)).not.toContain('reasoning-external')
+
+    pendingDetail.reject(new Error('detail unavailable'))
+    await expect(reload).rejects.toThrow('detail unavailable')
+    expect(state.messages.value.map((message) => message.id)).not.toContain('reasoning-external')
+  })
+
+  it('does not clear cached local reasoning when background polling observes local completion', async () => {
+    const state = await setupBackgroundRuntimeState()
+    gatewayMocks.getThreadDetail.mockResolvedValueOnce({
+      ...localDetail('turn-local'),
+      messages: [{
+        id: 'reasoning-local',
+        role: 'assistant',
+        text: '**Keeping local history**',
+        messageType: 'reasoning',
+        turnId: 'turn-local',
+      }],
+    })
+
+    state.primeSelectedThread('thread-running')
+    await state.loadMessages('thread-running')
+    state.primeSelectedThread('thread-selected')
+    gatewayMocks.getThreadRuntimeStates.mockResolvedValue({
+      'thread-running': { state: 'idle' },
+    })
+    state.startPolling()
+    pollingCleanups.push(() => state.stopPolling())
+    await vi.advanceTimersByTimeAsync(0)
+    await flushMicrotasks()
+
+    state.primeSelectedThread('thread-running')
+    expect(state.messages.value.map((message) => message.id)).toContain('reasoning-local')
   })
 
   it('passes the last live projection key and preserves messages on not-modified polls', async () => {
@@ -3784,8 +3852,9 @@ describe('external runtime ownership', () => {
       expect.any(AbortSignal),
     )
     expect(gatewayMocks.getThreadRuntimeState).not.toHaveBeenCalled()
-    expect(state.selectedLiveOverlay.value?.activityLabel).toBe('Reading development-workflow.md')
+    expect(state.selectedLiveOverlay.value?.activityLabel).toBe('Thinking')
     expect(state.messages.value).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: 'reasoning-live' }),
       expect.objectContaining({ id: 'agent-live', text: 'New desktop output' }),
     ]))
 
@@ -4256,14 +4325,15 @@ describe('external runtime ownership', () => {
 
     await vi.advanceTimersByTimeAsync(1_000)
     await flushMicrotasks()
-    expect(state.selectedLiveOverlay.value?.activityLabel).toBe('Retaining detailed work')
+    expect(state.selectedLiveOverlay.value?.activityLabel).toBe('Thinking')
 
     await vi.advanceTimersByTimeAsync(1_000)
     await flushMicrotasks()
 
     expect(gatewayMocks.getThreadDetail).toHaveBeenCalledTimes(2)
-    expect(state.selectedLiveOverlay.value?.activityLabel).toBe('Retaining detailed work')
+    expect(state.selectedLiveOverlay.value?.activityLabel).toBe('Thinking')
     expect(state.messages.value).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: 'reasoning-retained', text: '**Retaining detailed work**' }),
       expect.objectContaining({ id: 'agent-retained', text: 'Detailed desktop output' }),
     ]))
     expect(state.selectedThreadRuntimeOwnership.value).toBe('external')
@@ -4848,58 +4918,20 @@ describe('external runtime ownership', () => {
   })
 })
 
-describe('external live reasoning overlay', () => {
-  it('shows the latest visible external reasoning summary without duplicating its message', async () => {
+describe('external live reasoning transcript', () => {
+  it('shows every active-turn reasoning item and keeps the live overlay generic', async () => {
     installTestWindow()
     gatewayMocks.getPendingServerRequests.mockResolvedValue([])
     gatewayMocks.getThreadDetail.mockResolvedValue({
       ...externalDetail('turn-external'),
       messages: [
         {
-          id: 'reasoning-1',
+          id: 'reasoning-old',
           role: 'assistant',
-          text: '**Inspecting fixtures**\n\n**Reading development-workflow.md**',
+          text: '**Historical reasoning**',
           messageType: 'reasoning',
-          turnId: 'turn-external',
+          turnId: 'turn-old',
         },
-        {
-          id: 'agent-1',
-          role: 'assistant',
-          text: 'Initial desktop output',
-          messageType: 'agentMessage',
-          turnId: 'turn-external',
-        },
-      ],
-    })
-
-    const state = useDesktopState()
-    state.primeSelectedThread('thread-external')
-    await state.loadMessages('thread-external')
-
-    expect(state.selectedLiveOverlay.value?.activityLabel).toBe('Reading development-workflow.md')
-    expect(state.messages.value).toEqual([
-      expect.objectContaining({ id: 'agent-1', text: 'Initial desktop output' }),
-    ])
-  })
-
-  it('falls back to Thinking until the external turn has a visible summary', async () => {
-    installTestWindow()
-    gatewayMocks.getPendingServerRequests.mockResolvedValue([])
-    gatewayMocks.getThreadDetail.mockResolvedValue(externalDetail('turn-external'))
-
-    const state = useDesktopState()
-    state.primeSelectedThread('thread-external')
-    await state.loadMessages('thread-external')
-
-    expect(state.selectedLiveOverlay.value?.activityLabel).toBe('Thinking')
-  })
-
-  it('keeps prior active-turn reasoning hidden across consecutive bounded snapshots', async () => {
-    installTestWindow()
-    gatewayMocks.getPendingServerRequests.mockResolvedValue([])
-    gatewayMocks.getThreadDetail.mockResolvedValueOnce({
-      ...externalDetail('turn-external'),
-      messages: [
         {
           id: 'reasoning-1',
           role: 'assistant',
@@ -4908,15 +4940,73 @@ describe('external live reasoning overlay', () => {
           turnId: 'turn-external',
         },
         {
-          id: 'agent-1',
+          id: 'codegraph-1',
+          role: 'system',
+          text: 'Used codegraph integration',
+          messageType: 'dynamicToolCall',
+          turnId: 'turn-external',
+        },
+        {
+          id: 'subagent-1',
+          role: 'system',
+          text: 'Started a reviewer',
+          messageType: 'subAgentActivity',
+          turnId: 'turn-external',
+        },
+        {
+          id: 'reasoning-2',
           role: 'assistant',
-          text: 'First output',
-          messageType: 'agentMessage',
+          text: '**Reading development-workflow.md**',
+          messageType: 'reasoning',
+          turnId: 'turn-external',
+        },
+        {
+          id: 'compact-1',
+          role: 'system',
+          text: 'Context automatically compacting',
+          messageType: 'contextCompaction',
           turnId: 'turn-external',
         },
       ],
     })
+
+    const state = useDesktopState()
+    state.primeSelectedThread('thread-external')
+    await state.loadMessages('thread-external')
+
+    expect(state.selectedLiveOverlay.value?.activityLabel).toBe('Thinking')
+    expect(state.messages.value.map((message) => message.id)).toEqual([
+      'reasoning-1',
+      'codegraph-1',
+      'subagent-1',
+      'reasoning-2',
+      'compact-1',
+    ])
+  })
+
+  it('preserves earlier reasoning and appends a new item across bounded snapshots', async () => {
+    installTestWindow()
+    gatewayMocks.getPendingServerRequests.mockResolvedValue([])
     gatewayMocks.getThreadDetail
+      .mockResolvedValueOnce({
+        ...externalDetail('turn-external'),
+        messages: [
+          {
+            id: 'reasoning-1',
+            role: 'assistant',
+            text: '**Inspecting fixtures**',
+            messageType: 'reasoning',
+            turnId: 'turn-external',
+          },
+          {
+            id: 'agent-1',
+            role: 'assistant',
+            text: 'First output',
+            messageType: 'agentMessage',
+            turnId: 'turn-external',
+          },
+        ],
+      })
       .mockResolvedValueOnce({
         ...externalDetail('turn-external'),
         messages: [{
@@ -4953,83 +5043,37 @@ describe('external live reasoning overlay', () => {
     await state.loadMessages('thread-external', { silent: true, force: true })
     await state.loadMessages('thread-external', { silent: true, force: true })
 
-    expect(state.selectedLiveOverlay.value?.activityLabel).toBe('Continuing analysis')
     expect(state.messages.value.map((message) => message.id)).toEqual([
+      'reasoning-1',
       'agent-1',
       'agent-2',
+      'reasoning-2',
       'agent-3',
     ])
+    expect(state.messages.value.filter((message) => message.id === 'reasoning-1')).toHaveLength(1)
+    expect(state.messages.value.filter((message) => message.id === 'reasoning-2')).toHaveLength(1)
   })
 
-  it('preserves the last external reasoning snapshot for an inconclusive detail', async () => {
+  it('does not expose reasoning when the external thread is no longer active', async () => {
     installTestWindow()
     gatewayMocks.getPendingServerRequests.mockResolvedValue([])
-    gatewayMocks.getThreadDetail.mockResolvedValueOnce({
-      ...externalDetail('turn-external'),
-      messages: [
-        {
-          id: 'reasoning-1',
-          role: 'assistant',
-          text: '**Reading runtime state**',
-          messageType: 'reasoning',
-          turnId: 'turn-external',
-        },
-        {
-          id: 'agent-1',
-          role: 'assistant',
-          text: 'Existing output',
-          messageType: 'agentMessage',
-          turnId: 'turn-external',
-        },
-      ],
-    })
     gatewayMocks.getThreadDetail.mockResolvedValue({
       ...idleDetail(),
-      externalRuntimeState: 'unknown',
-    })
-
-    const state = useDesktopState()
-    state.primeSelectedThread('thread-external')
-    await state.loadMessages('thread-external')
-    await state.loadMessages('thread-external', { silent: true, force: true })
-
-    expect(state.selectedLiveOverlay.value?.activityLabel).toBe('Reading runtime state')
-    expect(state.messages.value.map((message) => message.id)).toEqual(['agent-1'])
-  })
-
-  it('merges and hides same-turn reasoning from an inconclusive detail without an active turn id', async () => {
-    installTestWindow()
-    gatewayMocks.getPendingServerRequests.mockResolvedValue([])
-    gatewayMocks.getThreadDetail.mockResolvedValueOnce({
-      ...externalDetail('turn-external'),
+      ownership: 'external',
       messages: [{
-        id: 'reasoning-1',
+        id: 'historical-reasoning',
         role: 'assistant',
-        text: '**Reading runtime state**',
+        text: 'Historical reasoning must stay hidden',
         messageType: 'reasoning',
-        turnId: 'turn-external',
-      }],
-    })
-    gatewayMocks.getThreadDetail.mockResolvedValue({
-      ...idleDetail(),
-      inProgress: false,
-      externalRuntimeState: 'unknown',
-      messages: [{
-        id: 'reasoning-2',
-        role: 'assistant',
-        text: '**Inspecting the next snapshot**',
-        messageType: 'reasoning',
-        turnId: 'turn-external',
+        turnId: 'turn-completed',
       }],
     })
 
     const state = useDesktopState()
     state.primeSelectedThread('thread-external')
     await state.loadMessages('thread-external')
-    await state.loadMessages('thread-external', { silent: true, force: true })
 
-    expect(state.selectedLiveOverlay.value?.activityLabel).toBe('Inspecting the next snapshot')
-    expect(state.messages.value.map((message) => message.id)).not.toContain('reasoning-2')
+    expect(state.messages.value.map((message) => message.id)).not.toContain('historical-reasoning')
   })
 
   it('lands the final idle output before clearing the external overlay', async () => {
@@ -5076,6 +5120,7 @@ describe('external live reasoning overlay', () => {
 
     expect(overlayChanges.map((change) => change.label)).toEqual([null])
     expect(overlayChanges[0]?.messageIds).toContain('agent-final')
+    expect(state.messages.value.map((message) => message.id)).not.toContain('reasoning-1')
   })
 })
 

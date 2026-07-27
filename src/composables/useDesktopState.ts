@@ -78,11 +78,6 @@ import {
   coerceReasoningEffortForModel,
   isReasoningEffortSupportedByModel,
 } from '../utils/modelReasoningEfforts'
-import {
-  mergeExternalReasoningSnapshots,
-  readExternalReasoningSnapshot,
-  type ExternalReasoningSnapshot,
-} from './externalLiveSnapshot'
 import { resolveTurnCompletionDisposition, type TurnTerminalStatus } from './threadLifecycle'
 import { shouldRefreshMessagesForNotification } from './notificationSyncPolicy'
 import { createManagedUploadLease } from './managedUploadLease'
@@ -1755,7 +1750,6 @@ export function useDesktopState() {
   const turnErrorByThreadId = ref<Record<string, TurnErrorState>>({})
   const activeTurnIdByThreadId = ref<Record<string, string>>({})
   const runtimeOwnershipByThreadId = ref<Record<string, ThreadRuntimeOwnership>>({})
-  const externalReasoningSnapshotByThreadId = ref<Record<string, ExternalReasoningSnapshot>>({})
   const liveAuthorityByThreadId = ref<Record<string, UiThreadLiveAuthority>>({})
   const liveSnapshotByThreadId = ref<Record<string, UiThreadLiveSnapshot | null>>({})
   const projectionKeyByThreadId = ref<Record<string, string>>({})
@@ -1944,13 +1938,10 @@ export function useDesktopState() {
       !isInProgress && liveErrorText && latestPersistedTurnErrorText === liveErrorText
         ? ''
         : liveErrorText
-    const externalReasoning = runtimeOwnershipByThreadId.value[threadId] === 'external'
-      ? externalReasoningSnapshotByThreadId.value[threadId]
-      : undefined
 
     if (!isInProgress && !activity && !reasoningText && !errorText) return null
     return {
-      activityLabel: externalReasoning?.label || activity?.label || 'Thinking',
+      activityLabel: activity?.label || 'Thinking',
       activityDetails: activity?.details ?? [],
       reasoningText,
       errorText,
@@ -1998,12 +1989,15 @@ export function useDesktopState() {
     const liveFileChanges = liveFileChangeMessagesByThreadId.value[threadId] ?? []
     const persistedWithOptimistic = mergeOptimisticSubmissionsForDisplay(persisted, optimistic)
     const combined = [...persistedWithOptimistic, ...livePlan, ...liveCommands, ...liveFileChanges, ...liveAgent]
-    const hiddenReasoningIds = runtimeOwnershipByThreadId.value[threadId] === 'external'
-      && inProgressById.value[threadId] === true
-      ? new Set(externalReasoningSnapshotByThreadId.value[threadId]?.hiddenMessageIds ?? [])
-      : new Set<string>()
-    const visibleCombined = hiddenReasoningIds.size > 0
-      ? combined.filter((message) => !hiddenReasoningIds.has(message.id))
+    const ownership = runtimeOwnershipByThreadId.value[threadId] ?? 'idle'
+    const isExternal = ownership === 'external'
+    const isRunning = inProgressById.value[threadId] === true
+    const activeTurnId = activeTurnIdByThreadId.value[threadId] ?? ''
+    const visibleCombined = isExternal
+      ? combined.filter((message) => (
+          message.messageType !== 'reasoning'
+          || (isRunning && activeTurnId.length > 0 && message.turnId === activeTurnId)
+        ))
       : combined
 
     const summary = turnSummaryByThreadId.value[threadId]
@@ -2958,7 +2952,6 @@ export function useDesktopState() {
     liveAuthorityByThreadId.value = omitKey(liveAuthorityByThreadId.value, normalizedThreadId)
     liveSnapshotByThreadId.value = omitKey(liveSnapshotByThreadId.value, normalizedThreadId)
     projectionKeyByThreadId.value = omitKey(projectionKeyByThreadId.value, normalizedThreadId)
-    externalReasoningSnapshotByThreadId.value = omitKey(externalReasoningSnapshotByThreadId.value, normalizedThreadId)
     interruptBlockedUntilPersistedByThreadId.value = omitKey(interruptBlockedUntilPersistedByThreadId.value, normalizedThreadId)
     threadListedByServerById.value = omitKey(threadListedByServerById.value, normalizedThreadId)
     persistedUserMessageByThreadId.value = omitKey(persistedUserMessageByThreadId.value, normalizedThreadId)
@@ -3052,10 +3045,6 @@ export function useDesktopState() {
     liveAuthorityByThreadId.value = pruneThreadStateMap(liveAuthorityByThreadId.value, activeThreadIds)
     liveSnapshotByThreadId.value = pruneThreadStateMap(liveSnapshotByThreadId.value, activeThreadIds)
     projectionKeyByThreadId.value = pruneThreadStateMap(projectionKeyByThreadId.value, activeThreadIds)
-    externalReasoningSnapshotByThreadId.value = pruneThreadStateMap(
-      externalReasoningSnapshotByThreadId.value,
-      activeThreadIds,
-    )
     interruptBlockedUntilPersistedByThreadId.value = pruneThreadStateMap(
       interruptBlockedUntilPersistedByThreadId.value,
       activeThreadIds,
@@ -3536,6 +3525,13 @@ export function useDesktopState() {
     }
   }
 
+  function clearPersistedExternalReasoning(threadId: string): void {
+    const persisted = persistedMessagesByThreadId.value[threadId] ?? []
+    const withoutReasoning = persisted.filter((message) => message.messageType !== 'reasoning')
+    if (withoutReasoning.length === persisted.length) return
+    setPersistedMessagesForThread(threadId, withoutReasoning)
+  }
+
   function setThreadRuntimeOwnership(
     threadId: string,
     ownership: ThreadRuntimeOwnership,
@@ -3543,8 +3539,8 @@ export function useDesktopState() {
   ): void {
     if (!threadId) return
     const currentOwnership = runtimeOwnershipByThreadId.value[threadId] ?? 'idle'
-    if (ownership !== 'external' && externalReasoningSnapshotByThreadId.value[threadId]) {
-      externalReasoningSnapshotByThreadId.value = omitKey(externalReasoningSnapshotByThreadId.value, threadId)
+    if (currentOwnership === 'external' && ownership !== 'external') {
+      clearPersistedExternalReasoning(threadId)
     }
     if (ownership !== 'external') {
       clearThreadLiveAuthority(threadId)
@@ -3584,11 +3580,11 @@ export function useDesktopState() {
         [threadId]: true,
       }
     } else {
+      if (runtimeOwnershipByThreadId.value[threadId] === 'external') {
+        clearPersistedExternalReasoning(threadId)
+      }
       inProgressById.value = omitKey(inProgressById.value, threadId)
       clearThreadLiveAuthority(threadId)
-      if (externalReasoningSnapshotByThreadId.value[threadId]) {
-        externalReasoningSnapshotByThreadId.value = omitKey(externalReasoningSnapshotByThreadId.value, threadId)
-      }
       clearCompletedTurnLiveState(threadId)
       clearInterruptPersistenceGate(threadId)
     }
@@ -5995,30 +5991,6 @@ export function useDesktopState() {
     await loadThreadsPromise
   }
 
-  function reconcileExternalReasoningSnapshot(
-    threadId: string,
-    detail: ThreadDetailSnapshot,
-    ownership: ThreadRuntimeOwnership,
-    inProgress: boolean,
-  ): void {
-    const previous = externalReasoningSnapshotByThreadId.value[threadId]
-    const reasoningTurnId = detail.activeTurnId
-      || (detail.externalRuntimeState === 'unknown' ? previous?.turnId ?? '' : '')
-    if (ownership !== 'external' || !inProgress || !reasoningTurnId) {
-      externalReasoningSnapshotByThreadId.value = omitKey(
-        externalReasoningSnapshotByThreadId.value,
-        threadId,
-      )
-      return
-    }
-    const incoming = readExternalReasoningSnapshot(detail.messages, reasoningTurnId)
-    const next = mergeExternalReasoningSnapshots(previous, incoming)
-    externalReasoningSnapshotByThreadId.value = {
-      ...externalReasoningSnapshotByThreadId.value,
-      [threadId]: next,
-    }
-  }
-
   function clearThreadLiveAuthority(threadId: string): void {
     if (!threadId) return
     if (liveAuthorityByThreadId.value[threadId]) {
@@ -6206,7 +6178,6 @@ export function useDesktopState() {
       setThreadInProgress(threadId, false)
       setThreadRuntimeOwnership(threadId, ownership)
     }
-    reconcileExternalReasoningSnapshot(threadId, detail, ownership, inProgress)
     if (inProgress && activeTurnId) {
       activeTurnIdByThreadId.value = {
         ...activeTurnIdByThreadId.value,
@@ -7792,7 +7763,6 @@ export function useDesktopState() {
     liveAuthorityByThreadId.value = {}
     liveSnapshotByThreadId.value = {}
     projectionKeyByThreadId.value = {}
-    externalReasoningSnapshotByThreadId.value = {}
     interruptBlockedUntilPersistedByThreadId.value = {}
     threadListedByServerById.value = {}
     persistedUserMessageByThreadId.value = {}
