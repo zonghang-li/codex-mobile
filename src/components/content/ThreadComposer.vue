@@ -1,5 +1,5 @@
 <template>
-  <form class="thread-composer" @submit.prevent="onSubmit(isTurnInProgress ? activeInProgressMode : 'steer')">
+  <form class="thread-composer" @submit.prevent="onSubmit(submitMode)">
     <p v-if="dictationErrorText" class="thread-composer-dictation-error">
       {{ dictationErrorText }}
     </p>
@@ -382,12 +382,12 @@
           <button
             v-else
             class="thread-composer-submit"
-            :class="{ 'thread-composer-submit--queue': isTurnInProgress && activeInProgressMode === 'queue' }"
+            :class="{ 'thread-composer-submit--queue': submitMode === 'queue' }"
             type="button"
-            :aria-label="isTurnInProgress && activeInProgressMode === 'queue' ? t('Queue message') : t('Send message')"
-            :title="isTurnInProgress ? `${t('Send')} ${activeInProgressMode === 'queue' ? t('Queue') : t('Steer')}` : t('Send')"
+            :aria-label="submitMode === 'queue' ? t('Queue message') : t('Send message')"
+            :title="submitMode === 'queue' ? `${t('Send')} ${t('Queue')}` : t('Send')"
             :disabled="!canSubmit"
-            @click="onSubmit(isTurnInProgress ? activeInProgressMode : 'steer')"
+            @click="onSubmit(submitMode)"
           >
             <IconTablerArrowUp class="thread-composer-submit-icon" />
           </button>
@@ -596,8 +596,7 @@ const {
     draft.value = draft.value ? `${draft.value}\n${text}` : text
     dictationFeedback.value = ''
     if (props.dictationAutoSend !== false) {
-      const mode = props.isTurnInProgress ? activeInProgressMode.value : 'steer'
-      onSubmit(mode)
+      onSubmit(submitMode.value)
       return
     }
     nextTick(() => inputRef.value?.focus())
@@ -763,6 +762,9 @@ const inProgressMode = computed<'steer' | 'queue'>(() =>
   props.inProgressSubmitMode === 'steer' ? 'steer' : 'queue',
 )
 const activeInProgressMode = ref<'steer' | 'queue'>(inProgressMode.value)
+const submitMode = computed<'steer' | 'queue'>(() =>
+  props.isTurnInProgress ? 'queue' : 'steer',
+)
 const isDictationRecording = computed(() => dictationState.value === 'recording')
 const dictationButtonLabel = computed(() => {
   if (dictationState.value === 'recording') return t('Stop dictation')
@@ -1797,7 +1799,7 @@ function onInputKeydown(event: KeyboardEvent): void {
     : event.key === 'Enter' && (event.metaKey || event.ctrlKey)
   if (shouldSend) {
     event.preventDefault()
-    onSubmit(props.isTurnInProgress ? activeInProgressMode.value : 'steer')
+    onSubmit(submitMode.value)
     return
   }
 }

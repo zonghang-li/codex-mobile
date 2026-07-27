@@ -119,7 +119,7 @@ export function deriveComposerControlState(
     ? 'hidden'
     : isExternal && input.isTurnInProgress
       ? 'externalRunning'
-      : input.isTurnInProgress
+      : input.isTurnInProgress && !input.hasSubmitContent
         ? 'stop'
         : 'send'
   const canSubmit = composerVisible

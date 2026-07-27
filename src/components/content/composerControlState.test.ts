@@ -62,7 +62,7 @@ describe('deriveComposerControlState', () => {
       isTurnInProgress: true,
       hasSubmitContent: true,
     })).toMatchObject({
-      primaryAction: 'stop',
+      primaryAction: 'send',
       canSubmit: true,
       canStop: true,
       canEditConfiguration: false,

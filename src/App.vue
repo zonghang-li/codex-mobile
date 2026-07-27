@@ -985,7 +985,6 @@
                     :is-loading-persisted-above="isLoadingOlderMessages"
                     :load-earlier-messages="loadOlderMessages"
                     @fork-thread="onForkThreadFromMessage"
-                    @rollback="onRollback"
                     @implement-plan="onImplementPlan"
                     @respond-server-request="onRespondServerRequest" />
                 </div>
@@ -1468,7 +1467,6 @@ const {
   startPolling,
   stopPolling,
   primeSelectedThread,
-  rollbackSelectedThread,
 } = useDesktopState()
 
 const route = useRoute()
@@ -3897,23 +3895,6 @@ function onSelectSpeedMode(mode: SpeedMode): void {
 
 function onInterruptTurn(): void {
   void interruptSelectedThreadTurn()
-}
-
-function onRollback(payload: { turnId: string }): void {
-  const targetTurnId = payload.turnId.trim()
-  if (targetTurnId.length > 0) {
-    const rollbackUserMessage = [...filteredMessages.value]
-      .reverse()
-      .find((message) => (
-        message.role === 'user'
-        && (message.turnId?.trim() ?? '') === targetTurnId
-        && message.text.trim().length > 0
-      ))
-    if (rollbackUserMessage?.text && threadComposerRef.value) {
-      threadComposerRef.value.appendTextToDraft(rollbackUserMessage.text)
-    }
-  }
-  void rollbackSelectedThread(payload.turnId)
 }
 
 function onImplementPlan(payload: { turnId: string }): void {

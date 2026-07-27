@@ -759,21 +759,10 @@
               </article>
 
               <div
-                v-if="showEditMessageButton(message) || showCopyResponseButton(message) || showForkResponseButton(message)"
+                v-if="showCopyResponseButton(message) || showForkResponseButton(message)"
                 class="message-toolbar"
                 :data-role="message.role"
               >
-                <button
-                  v-if="showEditMessageButton(message)"
-                  type="button"
-                  class="message-edit-button"
-                  aria-label="Edit this message"
-                  title="Edit this message"
-                  @click="editMessage(message.id)"
-                >
-                  <IconTablerFilePencil class="icon-svg message-edit-icon" />
-                  <span class="message-edit-label">Edit message</span>
-                </button>
                 <button
                   v-if="showCopyResponseButton(message)"
                   type="button"
@@ -1108,7 +1097,6 @@ import ThreadActivityIcon from './ThreadActivityIcon.vue'
 import IconTablerArrowBackUp from '../icons/IconTablerArrowBackUp.vue'
 import IconTablerArrowUp from '../icons/IconTablerArrowUp.vue'
 import IconTablerBolt from '../icons/IconTablerBolt.vue'
-import IconTablerFilePencil from '../icons/IconTablerFilePencil.vue'
 import IconTablerSearch from '../icons/IconTablerSearch.vue'
 import IconTablerTerminal from '../icons/IconTablerTerminal.vue'
 import IconTablerX from '../icons/IconTablerX.vue'
@@ -1680,7 +1668,6 @@ const props = defineProps<{
 
 const emit = defineEmits<{
   forkThread: [payload: { threadId: string; turnIndex: number }]
-  rollback: [payload: { turnId: string }]
   implementPlan: [payload: { turnId: string }]
   respondServerRequest: [payload: { id: number; result?: unknown; error?: { code?: number; message: string } }]
 }>()
@@ -2803,29 +2790,6 @@ function forkResponse(anchorMessageId: string): void {
     threadId: props.activeThreadId,
     turnIndex,
   })
-}
-
-const editableTurnIdByMessageId = computed<Record<string, string>>(() => {
-  const next: Record<string, string> = {}
-  for (const message of props.messages) {
-    if (message.role !== 'user' || typeof message.turnIndex !== 'number') continue
-    const turnId = typeof message.turnId === 'string' && message.turnId.length > 0 ? message.turnId : ''
-    if (!turnId || message.text.trim().length === 0) continue
-    next[message.id] = turnId
-  }
-  return next
-})
-
-function showEditMessageButton(message: UiMessage): boolean {
-  if (props.readOnly) return false
-  return typeof editableTurnIdByMessageId.value[message.id] === 'string'
-}
-
-function editMessage(messageId: string): void {
-  if (props.readOnly) return
-  const turnId = editableTurnIdByMessageId.value[messageId]
-  if (!turnId) return
-  emit('rollback', { turnId })
 }
 
 function splitPlainTextByLinks(
@@ -5252,17 +5216,8 @@ onBeforeUnmount(() => {
   @apply border-emerald-500/30 bg-transparent text-emerald-500;
 }
 
-.message-edit-button {
-  @apply inline-flex items-center gap-0.5 px-0.5 py-0 text-[9px] font-medium leading-none text-amber-600/70 transition hover:text-amber-700;
-}
-
-.message-edit-icon {
-  @apply text-[10px];
-}
-
 .message-copy-label,
-.message-fork-label,
-.message-edit-label {
+.message-fork-label {
   @apply leading-none;
 }
 
@@ -5276,9 +5231,6 @@ onBeforeUnmount(() => {
     @apply min-h-10 min-w-16 rounded-lg px-3;
   }
 
-  .message-edit-button {
-    @apply min-h-10 min-w-10;
-  }
 }
 
 .message-image-list {
