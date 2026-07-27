@@ -101,6 +101,11 @@ type ThreadDetailRequestLease = {
   promise: Promise<ThreadDetailSnapshot>
 }
 
+type OptimisticUserSubmission = {
+  message: UiMessage
+  afterMessageId: string
+}
+
 function flattenThreads(groups: UiProjectGroup[]): UiThread[] {
   return groups.flatMap((group) => group.threads)
 }
@@ -721,6 +726,13 @@ function isUnsupportedChatGptModelError(error: unknown): boolean {
   )
 }
 
+function isAmbiguousTurnStartError(error: unknown): boolean {
+  if (!(error instanceof CodexApiError)) return false
+  if (error.code === 'network_error' || error.code === 'invalid_response') return true
+  return error.code === 'http_error'
+    && (error.status === 408 || error.status === 502 || error.status === 503 || error.status === 504)
+}
+
 function areMessageFieldsEqual(first: UiMessage, second: UiMessage): boolean {
   return (
     first.id === second.id &&
@@ -748,6 +760,24 @@ function areMessageArraysEqual(first: UiMessage[], second: UiMessage[]): boolean
     if (first[index] !== second[index]) return false
   }
   return true
+}
+
+function mergeOptimisticSubmissionsForDisplay(
+  persisted: UiMessage[],
+  optimistic: OptimisticUserSubmission[],
+): UiMessage[] {
+  if (optimistic.length === 0) return persisted
+  const merged = [...persisted]
+  for (const submission of optimistic) {
+    const anchorIndex = submission.afterMessageId
+      ? merged.findIndex((message) => message.id === submission.afterMessageId)
+      : -1
+    const insertionIndex = submission.afterMessageId
+      ? (anchorIndex >= 0 ? anchorIndex + 1 : merged.length)
+      : 0
+    merged.splice(insertionIndex, 0, submission.message)
+  }
+  return merged
 }
 
 function mergeMessages(
@@ -1610,6 +1640,7 @@ export function useDesktopState() {
   const sourceGroups = ref<UiProjectGroup[]>([])
   const selectedThreadId = ref(loadSelectedThreadId())
   const persistedMessagesByThreadId = ref<Record<string, UiMessage[]>>({})
+  const optimisticUserMessagesByThreadId = ref<Record<string, OptimisticUserSubmission[]>>({})
   const livePlanMessagesByThreadId = ref<Record<string, UiMessage[]>>({})
   const liveAgentMessagesByThreadId = ref<Record<string, UiMessage[]>>({})
   const liveAgentRawTextByThreadId = new Map<string, Map<string, string>>()
@@ -1908,11 +1939,13 @@ export function useDesktopState() {
     if (!threadId) return []
 
     const persisted = persistedMessagesByThreadId.value[threadId] ?? []
+    const optimistic = optimisticUserMessagesByThreadId.value[threadId] ?? []
     const livePlan = livePlanMessagesByThreadId.value[threadId] ?? []
     const liveAgent = liveAgentMessagesByThreadId.value[threadId] ?? []
     const liveCommands = liveCommandsByThreadId.value[threadId] ?? []
     const liveFileChanges = liveFileChangeMessagesByThreadId.value[threadId] ?? []
-    const combined = [...persisted, ...livePlan, ...liveCommands, ...liveFileChanges, ...liveAgent]
+    const persistedWithOptimistic = mergeOptimisticSubmissionsForDisplay(persisted, optimistic)
+    const combined = [...persistedWithOptimistic, ...livePlan, ...liveCommands, ...liveFileChanges, ...liveAgent]
     const hiddenReasoningIds = runtimeOwnershipByThreadId.value[threadId] === 'external'
       && inProgressById.value[threadId] === true
       ? new Set(externalReasoningSnapshotByThreadId.value[threadId]?.hiddenMessageIds ?? [])
@@ -2715,6 +2748,10 @@ export function useDesktopState() {
     projectGroups.value = removeThreadFromGroups(projectGroups.value, normalizedThreadId)
 
     persistedMessagesByThreadId.value = omitKey(persistedMessagesByThreadId.value, normalizedThreadId)
+    optimisticUserMessagesByThreadId.value = omitKey(
+      optimisticUserMessagesByThreadId.value,
+      normalizedThreadId,
+    )
     loadedMessagesByThreadId.value = omitKey(loadedMessagesByThreadId.value, normalizedThreadId)
     loadedVersionByThreadId.value = omitKey(loadedVersionByThreadId.value, normalizedThreadId)
     resumedThreadById.value = omitKey(resumedThreadById.value, normalizedThreadId)
@@ -2797,6 +2834,10 @@ export function useDesktopState() {
     resumedThreadById.value = pruneThreadStateMap(resumedThreadById.value, activeThreadIds)
     turnIndexByTurnIdByThreadId.value = pruneThreadStateMap(turnIndexByTurnIdByThreadId.value, activeThreadIds)
     persistedMessagesByThreadId.value = pruneThreadStateMap(persistedMessagesByThreadId.value, activeThreadIds)
+    optimisticUserMessagesByThreadId.value = pruneThreadStateMap(
+      optimisticUserMessagesByThreadId.value,
+      activeThreadIds,
+    )
     pruneLiveAgentRawText(activeThreadIds)
     liveAgentMessagesByThreadId.value = pruneThreadStateMap(liveAgentMessagesByThreadId.value, activeThreadIds)
     liveReasoningTextByThreadId.value = pruneThreadStateMap(liveReasoningTextByThreadId.value, activeThreadIds)
@@ -3540,11 +3581,28 @@ export function useDesktopState() {
 
   function setPersistedMessagesForThread(threadId: string, nextMessages: UiMessage[]): void {
     const previous = persistedMessagesByThreadId.value[threadId] ?? []
-    if (areMessageArraysEqual(previous, nextMessages)) return
-    persistedMessagesByThreadId.value = {
-      ...persistedMessagesByThreadId.value,
-      [threadId]: nextMessages,
+    if (!areMessageArraysEqual(previous, nextMessages)) {
+      persistedMessagesByThreadId.value = {
+        ...persistedMessagesByThreadId.value,
+        [threadId]: nextMessages,
+      }
     }
+    reconcileOptimisticUserMessages(threadId, nextMessages)
+  }
+
+  function reconcileOptimisticUserMessages(threadId: string, persisted: UiMessage[]): void {
+    const pending = optimisticUserMessagesByThreadId.value[threadId] ?? []
+    if (pending.length === 0) return
+    const remaining = pending.filter(
+      (submission) => !hasEquivalentUserMessage(submission.message, persisted),
+    )
+    if (remaining.length === pending.length) return
+    optimisticUserMessagesByThreadId.value = remaining.length > 0
+      ? {
+          ...optimisticUserMessagesByThreadId.value,
+          [threadId]: remaining,
+        }
+      : omitKey(optimisticUserMessagesByThreadId.value, threadId)
   }
 
   function appendOptimisticUserMessage(
@@ -3554,7 +3612,8 @@ export function useDesktopState() {
     skills: Array<{ name: string; path: string }> = [],
     fileAttachments: FileAttachment[] = [],
   ): string {
-    const existing = persistedMessagesByThreadId.value[threadId] ?? []
+    const existing = optimisticUserMessagesByThreadId.value[threadId] ?? []
+    const persisted = persistedMessagesByThreadId.value[threadId] ?? []
     const managedImageTokens: string[] = []
     const previewImageUrls: string[] = []
     for (const imageUrl of imageUrls) {
@@ -3585,16 +3644,25 @@ export function useDesktopState() {
       fileAttachments: fileAttachments.length > 0 ? fileAttachments.map((file) => ({ ...file })) : undefined,
       messageType: 'userMessage.optimistic',
     }
-    setPersistedMessagesForThread(threadId, [...existing, nextMessage])
+    const afterMessageId = existing.at(-1)?.message.id ?? persisted.at(-1)?.id ?? ''
+    optimisticUserMessagesByThreadId.value = {
+      ...optimisticUserMessagesByThreadId.value,
+      [threadId]: [...existing, { message: nextMessage, afterMessageId }],
+    }
     return messageId
   }
 
   function removeOptimisticUserMessage(threadId: string, messageId: string): void {
     if (!threadId || !messageId) return
-    const existing = persistedMessagesByThreadId.value[threadId] ?? []
-    const next = existing.filter((message) => message.id !== messageId)
+    const existing = optimisticUserMessagesByThreadId.value[threadId] ?? []
+    const next = existing.filter((submission) => submission.message.id !== messageId)
     if (next.length === existing.length) return
-    setPersistedMessagesForThread(threadId, next)
+    optimisticUserMessagesByThreadId.value = next.length > 0
+      ? {
+          ...optimisticUserMessagesByThreadId.value,
+          [threadId]: next,
+        }
+      : omitKey(optimisticUserMessagesByThreadId.value, threadId)
   }
 
   function readLiveAgentRawText(threadId: string, messageId: string, fallback: string): string {
@@ -6421,7 +6489,9 @@ export function useDesktopState() {
         collaborationModeOverride,
         uploadLease.transfer,
       ).catch((unknownError) => {
-        removeOptimisticUserMessage(threadId, optimisticMessageId)
+        if (!isAmbiguousTurnStartError(unknownError)) {
+          removeOptimisticUserMessage(threadId, optimisticMessageId)
+        }
         const errorMessage = unknownError instanceof Error ? unknownError.message : 'Unknown application error'
         setTurnErrorForThread(threadId, errorMessage)
         error.value = errorMessage
@@ -6472,13 +6542,16 @@ export function useDesktopState() {
       await uploadLease.release()
     } catch (unknownError) {
       await uploadLease.release()
-      shouldAutoScrollOnNextAgentEvent = false
-      if (!isExternallyOwned(threadId)) {
+      const ambiguousStart = isAmbiguousTurnStartError(unknownError)
+      shouldAutoScrollOnNextAgentEvent = ambiguousStart
+      if (!ambiguousStart && !isExternallyOwned(threadId)) {
         setThreadRuntimeOwnership(threadId, 'idle')
         setThreadInProgress(threadId, false)
         setTurnActivityForThread(threadId, null)
       }
-      removeOptimisticUserMessage(threadId, optimisticMessageId)
+      if (!ambiguousStart) {
+        removeOptimisticUserMessage(threadId, optimisticMessageId)
+      }
       const errorMessage = unknownError instanceof Error ? unknownError.message : 'Unknown application error'
       setTurnErrorForThread(threadId, errorMessage)
       error.value = errorMessage
@@ -7204,6 +7277,7 @@ export function useDesktopState() {
     activeReasoningItemId = ''
     shouldAutoScrollOnNextAgentEvent = false
     persistedMessagesByThreadId.value = {}
+    optimisticUserMessagesByThreadId.value = {}
     livePlanMessagesByThreadId.value = {}
     liveAgentMessagesByThreadId.value = {}
     liveAgentRawTextByThreadId.clear()

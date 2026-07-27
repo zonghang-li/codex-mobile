@@ -5347,6 +5347,86 @@ describe('provider model selection', () => {
     await send
   })
 
+  it('keeps an optimistic user row visible across an empty running detail projection', async () => {
+    installTestWindow()
+    const pendingTurn = deferred<string>()
+    gatewayMocks.getThreadDetail
+      .mockResolvedValueOnce({
+        ...idleDetail(),
+        messages: [
+          {
+            id: 'user-existing',
+            role: 'user',
+            text: 'previous',
+            messageType: 'userMessage',
+          },
+          {
+            id: 'assistant-existing',
+            role: 'assistant',
+            text: 'ready',
+            messageType: 'agentMessage',
+          },
+        ],
+      })
+      .mockResolvedValueOnce({
+        ...idleDetail(),
+        inProgress: true,
+        activeTurnId: 'turn-follow-up',
+        ownership: 'local',
+        messages: [],
+      })
+    gatewayMocks.resumeThread.mockResolvedValue(idleDetail())
+    gatewayMocks.startThreadTurn.mockReturnValue(pendingTurn.promise)
+
+    const state = useDesktopState()
+    state.primeSelectedThread('thread-1')
+    await state.loadMessages('thread-1')
+
+    const send = state.sendMessageToSelectedThread('next question')
+    await flushMicrotasks()
+    expect(state.messages.value.some((message) => message.text === 'next question')).toBe(true)
+
+    pendingTurn.resolve('turn-follow-up')
+    await send
+    await state.loadMessages('thread-1', { force: true })
+
+    expect(state.messages.value.some((message) => message.text === 'next question')).toBe(true)
+  })
+
+  it('keeps an optimistic user row while a transient turn-start response is ambiguous', async () => {
+    installTestWindow()
+    gatewayMocks.getThreadDetail.mockResolvedValue({
+      ...idleDetail(),
+      messages: [
+        {
+          id: 'user-existing',
+          role: 'user',
+          text: 'previous',
+          messageType: 'userMessage',
+        },
+      ],
+    })
+    gatewayMocks.resumeThread.mockResolvedValue(idleDetail())
+    gatewayMocks.startThreadTurn.mockRejectedValue(new CodexApiError('bad gateway', {
+      code: 'http_error',
+      method: 'turn/start',
+      status: 502,
+    }))
+
+    const state = useDesktopState()
+    state.primeSelectedThread('thread-1')
+    await state.loadMessages('thread-1')
+
+    await expect(state.sendMessageToSelectedThread('next question')).rejects.toThrow('bad gateway')
+
+    expect(state.messages.value.some((message) => (
+      message.role === 'user'
+      && message.text === 'next question'
+      && message.messageType === 'userMessage.optimistic'
+    ))).toBe(true)
+    expect(state.selectedLiveOverlay.value?.activityLabel).toBe('Thinking')
+  })
+
   it('captures the active provider when creating a new thread', async () => {
     installTestWindow()
     gatewayMocks.getThreadGroupsPage.mockResolvedValue({ groups: [], nextCursor: null })
