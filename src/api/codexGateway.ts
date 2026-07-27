@@ -1041,7 +1041,7 @@ async function getThreadDetailV2(
   inProgress: boolean
   activeTurnId: string
   hasMoreOlder: boolean
-  olderCursor?: string | null
+  olderCursor: string | null
   turnIndexByTurnId: ThreadTurnIndexById
   ownership: ThreadDetailRuntime['ownership']
   canInterrupt: boolean
@@ -1112,6 +1112,7 @@ async function getExternalThreadLiveStateSnapshotV2(
   inProgress: boolean
   activeTurnId: string
   hasMoreOlder: boolean
+  olderCursor: string | null
   turnIndexByTurnId: ThreadTurnIndexById
   ownership: ThreadDetailRuntime['ownership']
   canInterrupt: boolean
@@ -1162,6 +1163,7 @@ async function getExternalThreadLiveStateSnapshotV2(
     completionSummaries: readThreadCompletionSummaries(result),
     ...runtime,
     hasMoreOlder: payload?.hasMoreOlder === true || threadTurnStartIndex > 0,
+    olderCursor: readString(payload?.olderCursor),
     turnIndexByTurnId: buildTurnIndexByTurnId(result, threadTurnStartIndex),
     liveAuthority,
     liveSnapshot: liveAuthority === 'writer-snapshot' ? rawSnapshot : null,
@@ -1308,6 +1310,7 @@ export async function getExternalThreadLiveSnapshot(threadId: string, signal?: A
   inProgress: boolean
   activeTurnId: string
   hasMoreOlder: boolean
+  olderCursor: string | null
   turnIndexByTurnId: ThreadTurnIndexById
   ownership: ThreadDetailRuntime['ownership']
   canInterrupt: boolean

@@ -1383,12 +1383,21 @@ describe('GET /codex-api/thread-live-state external runtime parity', () => {
       }
     }
     vi.spyOn(shared.appServer, 'getPid').mockReturnValue(4242)
-    const rpc = vi.spyOn(shared.appServer, 'rpc').mockResolvedValue({
-      thread: {
-        id: 'thread-running',
-        path: rolloutPath,
-        turns: [{ id: 'turn-complete', status: 'completed', items: [] }],
-      },
+    const rpc = vi.spyOn(shared.appServer, 'rpc').mockImplementation(async (method) => {
+      if (method === 'thread/turns/list') {
+        return {
+          data: [{ id: 'turn-complete', status: 'completed', items: [] }],
+          nextCursor: null,
+          backwardsCursor: null,
+        }
+      }
+      return {
+        thread: {
+          id: 'thread-running',
+          path: rolloutPath,
+          turns: [],
+        },
+      }
     })
     vi.spyOn(shared.runtimeProbe, 'inspect').mockResolvedValue({
       state: 'running',
@@ -1404,7 +1413,7 @@ describe('GET /codex-api/thread-live-state external runtime parity', () => {
     const second = await fetch(`http://127.0.0.1:${port}/codex-api/thread-live-state?threadId=thread-running`)
     await expect(second.json()).resolves.toMatchObject({ isInProgress: true })
 
-    expect(rpc).toHaveBeenCalledTimes(1)
+    expect(rpc).toHaveBeenCalledTimes(2)
   })
 
   it('returns a lightweight not-modified live-state when the projection key matches', async () => {
@@ -1422,20 +1431,29 @@ describe('GET /codex-api/thread-live-state external runtime parity', () => {
       }
     }
     vi.spyOn(shared.appServer, 'getPid').mockReturnValue(4242)
-    const rpc = vi.spyOn(shared.appServer, 'rpc').mockResolvedValue({
-      thread: {
-        id: 'thread-not-modified',
-        path: rolloutPath,
-        turns: [{
-          id: 'turn-complete',
-          status: 'completed',
-          items: [{
-            id: 'large-item',
-            type: 'agentMessage',
-            text: 'x'.repeat(128_000),
+    const rpc = vi.spyOn(shared.appServer, 'rpc').mockImplementation(async (method) => {
+      if (method === 'thread/turns/list') {
+        return {
+          data: [{
+            id: 'turn-complete',
+            status: 'completed',
+            items: [{
+              id: 'large-item',
+              type: 'agentMessage',
+              text: 'x'.repeat(128_000),
+            }],
           }],
-        }],
-      },
+          nextCursor: null,
+          backwardsCursor: null,
+        }
+      }
+      return {
+        thread: {
+          id: 'thread-not-modified',
+          path: rolloutPath,
+          turns: [],
+        },
+      }
     })
     vi.spyOn(shared.runtimeProbe, 'inspect').mockResolvedValue({
       state: 'running',
@@ -1477,7 +1495,7 @@ describe('GET /codex-api/thread-live-state external runtime parity', () => {
     })
     expect(secondPayload).not.toHaveProperty('conversationState')
     expect(JSON.stringify(secondPayload).length).toBeLessThan(2048)
-    expect(rpc).toHaveBeenCalledTimes(1)
+    expect(rpc).toHaveBeenCalledTimes(2)
   })
 
   it('returns a full live-state when the known projection key is stale', async () => {
@@ -1603,7 +1621,7 @@ describe('GET /codex-api/thread-live-state external runtime parity', () => {
     })
   })
 
-  it('projects live state to full history while pruning reasoning outside the active turn', async () => {
+  it('projects live state from a bounded native turn page without a full thread read', async () => {
     const middleware = createCodexBridgeMiddleware()
     const shared = sharedBridgeForTest() as ReturnType<typeof sharedBridgeForTest> & {
       appServer: ReturnType<typeof sharedBridgeForTest>['appServer'] & {
@@ -1628,12 +1646,35 @@ describe('GET /codex-api/thread-live-state external runtime parity', () => {
       ],
     }))
     vi.spyOn(shared.appServer, 'getPid').mockReturnValue(4242)
-    vi.spyOn(shared.appServer, 'rpc').mockResolvedValue({
-      thread: {
-        id: 'thread-windowed',
-        path: '/sessions/thread-windowed.jsonl',
-        turns,
-      },
+    const rpc = vi.spyOn(shared.appServer, 'rpc').mockImplementation(async (method, params) => {
+      if (method === 'thread/read') {
+        expect(params).toEqual({
+          threadId: 'thread-windowed',
+          includeTurns: false,
+        })
+        return {
+          thread: {
+            id: 'thread-windowed',
+            path: '/sessions/thread-windowed.jsonl',
+            turns: [],
+          },
+        }
+      }
+      if (method === 'thread/turns/list') {
+        expect(params).toEqual({
+          threadId: 'thread-windowed',
+          cursor: null,
+          limit: 5,
+          sortDirection: 'desc',
+          itemsView: 'full',
+        })
+        return {
+          data: turns.slice(-5).reverse(),
+          nextCursor: 'opaque-older',
+          backwardsCursor: null,
+        }
+      }
+      throw new Error(`Unexpected RPC method: ${method}`)
     })
     vi.spyOn(shared.runtimeProbe, 'inspect').mockResolvedValue({
       state: 'running',
@@ -1649,13 +1690,10 @@ describe('GET /codex-api/thread-live-state external runtime parity', () => {
     await expect(response.json()).resolves.toMatchObject({
       threadId: 'thread-windowed',
       threadTurnStartIndex: 0,
-      hasMoreOlder: false,
+      hasMoreOlder: true,
+      olderCursor: 'opaque-older',
       conversationState: {
         turns: expect.arrayContaining([
-          expect.objectContaining({
-            id: 'turn-0',
-            items: [expect.objectContaining({ id: 'item-0' })],
-          }),
           expect.objectContaining({
             id: 'turn-11',
             items: [
@@ -1666,6 +1704,10 @@ describe('GET /codex-api/thread-live-state external runtime parity', () => {
         ]),
       },
     })
+    expect(rpc).not.toHaveBeenCalledWith(
+      'thread/read',
+      expect.objectContaining({ includeTurns: true }),
+    )
   })
 
   it('preserves canonical item order when recovering command items from the session log', async () => {

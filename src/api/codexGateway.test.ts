@@ -875,6 +875,7 @@ describe('getThreadDetail', () => {
         },
         threadTurnStartIndex: 8,
         hasMoreOlder: true,
+        olderCursor: 'opaque-live-older',
         isInProgress: true,
         externalRuntime: {
           state: 'running',
@@ -891,6 +892,7 @@ describe('getThreadDetail', () => {
       activeTurnId: 'turn-external',
       inProgress: true,
       hasMoreOlder: true,
+      olderCursor: 'opaque-live-older',
       turnIndexByTurnId: { 'turn-external': 8 },
       messages: [expect.objectContaining({
         id: 'agent-live',

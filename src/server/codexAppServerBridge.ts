@@ -1395,6 +1395,7 @@ function buildThreadLiveStateProjectionKey(input: {
   threadId: string
   threadTurnStartIndex: number
   turnCount: number
+  olderCursor?: string | null
   sessionSize: number
   isInProgress: boolean
   externalRuntime: unknown
@@ -1409,6 +1410,7 @@ function buildThreadLiveStateProjectionKey(input: {
     threadId: input.threadId,
     threadTurnStartIndex: input.threadTurnStartIndex,
     turnCount: input.turnCount,
+    olderCursor: input.olderCursor ?? null,
     sessionSize: input.sessionSize,
     isInProgress: input.isInProgress,
     runtime: {
@@ -10048,6 +10050,7 @@ export function createCodexBridgeMiddleware(options: {
                 threadId,
                 threadTurnStartIndex: cachedThreadTurnStartIndex,
                 turnCount: snapshotTurns.length,
+                olderCursor: readNonEmptyString(cached?.olderCursor) || null,
                 sessionSize: snapshotSessionSize,
                 isInProgress: true,
                 externalRuntime,
@@ -10077,17 +10080,53 @@ export function createCodexBridgeMiddleware(options: {
             }
           }
 
-          const rawThreadReadResult = await appServer.rpc('thread/read', {
+          const rawThreadMetadataResult = await appServer.rpc('thread/read', {
             threadId,
-            includeTurns: true,
+            includeTurns: false,
           })
+          const metadataRecord = asRecord(rawThreadMetadataResult)
+          const metadataThread = asRecord(metadataRecord?.thread)
+          let rawThreadReadResult: unknown
+          let olderCursor: string | null = null
+          let usedNativeTurnPagination = false
+          try {
+            const page = await readNativeThreadTurnPage(
+              (method, params) => appServer.rpc(method, params),
+              {
+                threadId,
+                limit: THREAD_TURN_PAGE_DEFAULT_LIMIT,
+              },
+            )
+            olderCursor = page.nextCursor
+            usedNativeTurnPagination = true
+            rawThreadReadResult = {
+              ...(metadataRecord ?? {}),
+              thread: {
+                ...(metadataThread ?? {}),
+                id: readNonEmptyString(metadataThread?.id) || threadId,
+                turns: page.turns,
+              },
+            }
+          } catch (paginationError) {
+            const paginationMessage = getErrorMessage(paginationError, '')
+            if (
+              !isThreadTurnsListMethodNotFoundError(paginationError)
+              && !paginationMessage.includes('returned an invalid response')
+            ) {
+              throw paginationError
+            }
+            rawThreadReadResult = await appServer.rpc('thread/read', {
+              threadId,
+              includeTurns: true,
+            })
+          }
           const threadReadResult = mergeStreamTurnErrorsIntoThreadResult(appServer, rawThreadReadResult)
           const sanitized = await sanitizeThreadTurnsInlinePayloads('thread/read', threadReadResult)
 
           const record = asRecord(sanitized)
           const thread = asRecord(record?.thread)
           const rawTurns = Array.isArray(thread?.turns) ? thread.turns : []
-          const threadTurnStartIndexRaw = record?.threadTurnStartIndex
+          const threadTurnStartIndexRaw = usedNativeTurnPagination ? 0 : record?.threadTurnStartIndex
           const threadTurnStartIndex = Math.max(0, Math.floor(
             typeof threadTurnStartIndexRaw === 'number' ? threadTurnStartIndexRaw : 0,
           ))
@@ -10105,7 +10144,7 @@ export function createCodexBridgeMiddleware(options: {
 
           let turns = appServer.mergeItemsIntoTurns(threadId, rawTurns)
 
-          if (sessionPath && isAbsolute(sessionPath) && sessionSize > 0) {
+          if (!usedNativeTurnPagination && sessionPath && isAbsolute(sessionPath) && sessionSize > 0) {
             try {
               const recoveredItems = await readCachedSessionRecoveredItems(sessionPath)
               turns = mergeSessionCommandsIntoTurns(turns, '', recoveredItems.orderByTurnId)
@@ -10166,6 +10205,7 @@ export function createCodexBridgeMiddleware(options: {
             threadId,
             threadTurnStartIndex,
             turnCount: rawTurns.length,
+            olderCursor,
             sessionSize,
             isInProgress,
             externalRuntime,
@@ -10196,7 +10236,8 @@ export function createCodexBridgeMiddleware(options: {
               : {}),
             projectionKey,
             threadTurnStartIndex,
-            hasMoreOlder: threadTurnStartIndex > 0,
+            olderCursor,
+            hasMoreOlder: olderCursor !== null || threadTurnStartIndex > 0,
             conversationState: {
               turns,
             },

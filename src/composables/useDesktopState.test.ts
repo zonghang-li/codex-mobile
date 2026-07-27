@@ -3866,15 +3866,15 @@ describe('external runtime ownership', () => {
     ]))
   })
 
-  it('replaces only the matching absolute turn from a one-turn live projection', async () => {
+  it('rebases a paged live projection onto the already-loaded absolute turn indices', async () => {
     const state = await setupBackgroundRuntimeState()
     gatewayMocks.getThreadDetail.mockResolvedValue({
       ...externalDetail('turn-2'),
       hasMoreOlder: true,
       turnIndexByTurnId: {
-        'turn-0': 0,
-        'turn-1': 1,
-        'turn-2': 2,
+        'turn-0': 2,
+        'turn-1': 3,
+        'turn-2': 4,
       },
       messages: [
         {
@@ -3883,7 +3883,7 @@ describe('external runtime ownership', () => {
           text: 'older prompt',
           messageType: 'userMessage',
           turnId: 'turn-0',
-          turnIndex: 0,
+          turnIndex: 2,
         },
         {
           id: 'older-agent',
@@ -3891,7 +3891,7 @@ describe('external runtime ownership', () => {
           text: 'older answer',
           messageType: 'agentMessage',
           turnId: 'turn-1',
-          turnIndex: 1,
+          turnIndex: 3,
         },
         {
           id: 'stale-current-agent',
@@ -3899,7 +3899,7 @@ describe('external runtime ownership', () => {
           text: 'stale current answer',
           messageType: 'agentMessage',
           turnId: 'turn-2',
-          turnIndex: 2,
+          turnIndex: 4,
         },
       ],
     })
@@ -3907,14 +3907,14 @@ describe('external runtime ownership', () => {
       ...externalDetail('turn-2'),
       isLiveProjection: true,
       hasMoreOlder: true,
-      turnIndexByTurnId: { 'turn-2': 2 },
+      turnIndexByTurnId: { 'turn-2': 0 },
       messages: [{
         id: 'fresh-current-agent',
         role: 'assistant',
         text: 'fresh current answer',
         messageType: 'agentMessage',
         turnId: 'turn-2',
-        turnIndex: 2,
+        turnIndex: 0,
       }],
     })
 
@@ -3929,6 +3929,7 @@ describe('external runtime ownership', () => {
       'older-agent',
       'fresh-current-agent',
     ])
+    expect(state.messages.value.map((message) => message.turnIndex)).toEqual([2, 3, 4])
   })
 
   it('pauses selected live projection polling while hidden and resumes immediately when visible', async () => {

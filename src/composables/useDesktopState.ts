@@ -6054,11 +6054,37 @@ export function useDesktopState() {
       completionSummaries = [],
       inProgress: serverInProgress,
       activeTurnId,
-      turnIndexByTurnId,
+      turnIndexByTurnId: detailTurnIndexByTurnId,
     } = detail
     const isLiveProjection = detail.isLiveProjection === true
+    let reconciledTurnIndexByTurnId = detailTurnIndexByTurnId
+    let reconciledDetailMessages = detailMessages
+    if (isLiveProjection) {
+      const existingLookup = turnIndexByTurnIdByThreadId.value[threadId] ?? {}
+      const nextLookup = { ...existingLookup }
+      let nextTurnIndex = Object.values(existingLookup).reduce(
+        (maximum, turnIndex) => Math.max(maximum, turnIndex),
+        -1,
+      ) + 1
+      const pagedTurnIds = Object.entries(detailTurnIndexByTurnId)
+        .sort((left, right) => left[1] - right[1])
+        .map(([turnId]) => turnId)
+      for (const turnId of pagedTurnIds) {
+        if (nextLookup[turnId] !== undefined) continue
+        nextLookup[turnId] = nextTurnIndex
+        nextTurnIndex += 1
+      }
+      reconciledTurnIndexByTurnId = nextLookup
+      reconciledDetailMessages = detailMessages.map((message) => {
+        if (!message.turnId) return message
+        const turnIndex = nextLookup[message.turnId]
+        return typeof turnIndex === 'number' && message.turnIndex !== turnIndex
+          ? { ...message, turnIndex }
+          : message
+      })
+    }
     const nextMessages = insertTurnSummaryMessages(
-      detailMessages,
+      reconciledDetailMessages,
       mergeTurnSummariesWithPersistedDurations(threadId, completionSummaries),
     )
     const localActiveTurnId = runtimeOwnershipByThreadId.value[threadId] === 'local'
@@ -6131,11 +6157,8 @@ export function useDesktopState() {
     }
     markThreadMessagesPersisted(threadId, nextMessages)
     replaceTurnIndexLookupForThread(threadId, isLiveProjection
-      ? {
-          ...(turnIndexByTurnIdByThreadId.value[threadId] ?? {}),
-          ...turnIndexByTurnId,
-        }
-      : turnIndexByTurnId)
+      ? reconciledTurnIndexByTurnId
+      : detailTurnIndexByTurnId)
     rebindLiveFileChangeTurnIndices(threadId)
     const previousPersisted = persistedMessagesByThreadId.value[threadId] ?? []
     const mergedMessages = isLiveProjection
@@ -6326,7 +6349,10 @@ export function useDesktopState() {
         setPersistedMessagesForThread(threadId, previousPersisted)
         optimisticUserMessagesByThreadId.value = {
           ...optimisticUserMessagesByThreadId.value,
-          [threadId]: shiftMessages(optimisticUserMessagesByThreadId.value[threadId] ?? []),
+          [threadId]: (optimisticUserMessagesByThreadId.value[threadId] ?? []).map((submission) => ({
+            ...submission,
+            message: shiftMessages([submission.message])[0] ?? submission.message,
+          })),
         }
         livePlanMessagesByThreadId.value = {
           ...livePlanMessagesByThreadId.value,
