@@ -5521,14 +5521,22 @@ export function useDesktopState() {
       Boolean(turnErrorMessage) &&
       completedThreadModelId !== MODEL_FALLBACK_ID &&
       isUnsupportedChatGptModelError(new Error(turnErrorMessage))
+    const activeLeaseTurnId = completedTurn
+      ? activeTurnIdByThreadId.value[completedTurn.threadId] ?? ''
+      : ''
+    const matchesActiveLease = Boolean(
+      completedTurn
+      && activeLeaseTurnId
+      && activeLeaseTurnId === completedTurn.turnId,
+    )
     const completionDisposition = completedTurn
-      ? isExternallyOwned(completedTurn.threadId)
+      ? isExternallyOwned(completedTurn.threadId) && !matchesActiveLease
         ? { ownsActiveLease: false, keepRunning: true, markUnread: false }
         : resolveTurnCompletionDisposition(
             completedTurn.status,
             shouldRetryWithFallback,
             completedTurn.threadId === selectedThreadId.value,
-            activeTurnIdByThreadId.value[completedTurn.threadId] ?? '',
+            activeLeaseTurnId,
             completedTurn.turnId,
           )
       : null

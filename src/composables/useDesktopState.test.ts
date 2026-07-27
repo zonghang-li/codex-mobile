@@ -4376,9 +4376,9 @@ describe('external runtime ownership', () => {
     ]))
   })
 
-  it('does not let a completion without a matching local lease clear external ownership', async () => {
+  it('releases an external lease when its active turn completes', async () => {
     const { state, emit } = await setupExternalRuntimeState()
-    gatewayMocks.getThreadDetail.mockResolvedValue(externalDetail())
+    gatewayMocks.getThreadDetail.mockResolvedValue(externalDetail('turn-external'))
     await state.loadMessages('thread-1')
 
     emit({
@@ -4386,6 +4386,22 @@ describe('external runtime ownership', () => {
       params: { threadId: 'thread-1', turn: { id: 'turn-external', status: 'completed' } },
     })
 
+    expect(state.selectedActiveTurnId.value).toBe('')
+    expect(state.selectedThreadRuntimeOwnership.value).toBe('idle')
+    expect(state.selectedThread.value?.inProgress).toBe(false)
+  })
+
+  it('keeps an external lease when a stale turn completes', async () => {
+    const { state, emit } = await setupExternalRuntimeState()
+    gatewayMocks.getThreadDetail.mockResolvedValue(externalDetail('turn-current'))
+    await state.loadMessages('thread-1')
+
+    emit({
+      method: 'turn/completed',
+      params: { threadId: 'thread-1', turn: { id: 'turn-stale', status: 'completed' } },
+    })
+
+    expect(state.selectedActiveTurnId.value).toBe('turn-current')
     expect(state.selectedThreadRuntimeOwnership.value).toBe('external')
     expect(state.selectedThread.value?.inProgress).toBe(true)
   })
