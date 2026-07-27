@@ -77,6 +77,7 @@ function getWorktreeName(): string {
 
 const worktreeName = getWorktreeName();
 const appVersion = typeof pkg.version === "string" ? pkg.version : "unknown";
+const appBuildId = process.env.VITE_APP_BUILD_ID || `${appVersion}-${Date.now()}`;
 const WS_UPGRADE_ATTACHED_KEY = "__codexBridgeWsAttached__";
 
 function readEnvValueFromFile(filePath: string, key: string): string {
@@ -106,6 +107,7 @@ export default defineConfig({
   define: {
     "import.meta.env.VITE_WORKTREE_NAME": JSON.stringify(worktreeName),
     "import.meta.env.VITE_APP_VERSION": JSON.stringify(appVersion),
+    "import.meta.env.VITE_APP_BUILD_ID": JSON.stringify(appBuildId),
     "import.meta.env.VITE_ROLLBACK_DEBUG_FALLBACK": JSON.stringify(viteRollbackDebugFallback),
   },
   server: {

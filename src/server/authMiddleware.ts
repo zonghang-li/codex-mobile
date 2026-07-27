@@ -43,7 +43,13 @@ function isLocalhostRemote(remote: string): boolean {
 
 function isLocalhostHost(host: string): boolean {
   const normalized = host.toLowerCase()
-  return normalized.startsWith('localhost:') || normalized === 'localhost' || normalized.startsWith('127.0.0.1:')
+  return normalized.startsWith('localhost:')
+    || normalized === 'localhost'
+    || normalized.startsWith('127.0.0.1:')
+    || normalized === '127.0.0.1'
+    || normalized.startsWith('[::1]:')
+    || normalized === '[::1]'
+    || normalized === '::1'
 }
 
 function isIPv4Octet(value: string): boolean {
@@ -170,7 +176,8 @@ function isAuthorizedByRequestLike(
   return typeof expiresAt === 'number' && expiresAt > Date.now()
 }
 
-const LOGIN_PAGE_HTML = `<!DOCTYPE html>
+function renderLoginPage(showError = false): string {
+  return `<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
@@ -187,30 +194,66 @@ input:focus{border-color:#3b82f6}
 button{width:100%;padding:.625rem;margin-top:1rem;background:#3b82f6;color:#fff;border:none;border-radius:8px;font-size:.9375rem;font-weight:500;cursor:pointer;transition:background .15s}
 button:hover{background:#2563eb}
 .error{color:#ef4444;font-size:.8125rem;margin-top:.75rem;text-align:center;display:none}
+.error.is-visible{display:block}
 </style>
 </head>
 <body>
 <div class="card">
 <h1>Codex Web</h1>
-<form id="f">
+<form id="f" method="post" action="/auth/login">
 <label for="pw">Password</label>
 <input id="pw" name="password" type="password" autocomplete="current-password" autofocus required>
 <button type="submit">Sign in</button>
-<p class="error" id="err">Incorrect password</p>
+<p class="error${showError ? ' is-visible' : ''}" id="err">Incorrect password</p>
 </form>
 </div>
-<script>
-const form=document.getElementById('f');
-const errEl=document.getElementById('err');
-form.addEventListener('submit',async e=>{
-  e.preventDefault();
-  errEl.style.display='none';
-  const res=await fetch('/auth/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:document.getElementById('pw').value})});
-  if(res.ok){window.location.reload()}else{errEl.style.display='block';document.getElementById('pw').value='';document.getElementById('pw').focus()}
-});
-</script>
 </body>
 </html>`
+}
+
+function isUrlEncodedRequest(req: Request): boolean {
+  return String(req.headers['content-type'] ?? '').toLowerCase().includes('application/x-www-form-urlencoded')
+}
+
+function parseLoginPassword(body: string, req: Request): string | null {
+  if (isUrlEncodedRequest(req)) {
+    return new URLSearchParams(body).get('password') ?? ''
+  }
+
+  try {
+    const parsed = JSON.parse(body) as { password?: string }
+    return typeof parsed.password === 'string' ? parsed.password : ''
+  } catch {
+    return null
+  }
+}
+
+function sendLoginFailure(req: Request, res: Response, status: number): void {
+  if (isUrlEncodedRequest(req)) {
+    res.setHeader('Content-Type', 'text/html; charset=utf-8')
+    setNoStoreHeaders(res)
+    res.status(status).send(renderLoginPage(true))
+    return
+  }
+
+  res.status(status).json({ error: status === 400 ? 'Invalid request body' : 'Invalid password' })
+}
+
+function sendLoginSuccess(req: Request, res: Response, token: string, expiresAt: number): void {
+  res.setHeader('Set-Cookie', buildSessionCookie(token, expiresAt))
+  if (isUrlEncodedRequest(req)) {
+    res.redirect(303, '/')
+    return
+  }
+
+  res.json({ ok: true })
+}
+
+function setNoStoreHeaders(res: Response): void {
+  res.setHeader('Cache-Control', 'no-store, max-age=0')
+  res.setHeader('Pragma', 'no-cache')
+  res.setHeader('Expires', '0')
+}
 
 export function createAuthMiddleware(password: string): RequestHandler {
   return createAuthSession(password).middleware
@@ -232,28 +275,20 @@ export function createAuthSession(password: string): AuthSession {
       tryPersistSessions(validTokens)
     }
 
-    if (isAuthorizedByRequestLike(req.socket.remoteAddress, req.headers.host, req.headers.cookie, validTokens)) {
-      next()
-      return
-    }
-
     // Handle login POST
     if (req.method === 'POST' && req.path === '/auth/login') {
       let body = ''
       req.setEncoding('utf8')
       req.on('data', (chunk: string) => { body += chunk })
       req.on('end', () => {
-        let parsed: { password?: string }
-        try {
-          parsed = JSON.parse(body) as { password?: string }
-        } catch {
-          res.status(400).json({ error: 'Invalid request body' })
+        const provided = parseLoginPassword(body, req)
+        if (provided === null) {
+          sendLoginFailure(req, res, 400)
           return
         }
 
-        const provided = typeof parsed.password === 'string' ? parsed.password : ''
         if (!constantTimeCompare(provided, password)) {
-          res.status(401).json({ error: 'Invalid password' })
+          sendLoginFailure(req, res, 401)
           return
         }
 
@@ -262,8 +297,7 @@ export function createAuthSession(password: string): AuthSession {
           const expiresAt = Date.now() + SESSION_TTL_MS
           validTokens.set(token, expiresAt)
           tryPersistSessions(validTokens)
-          res.setHeader('Set-Cookie', buildSessionCookie(token, expiresAt))
-          res.json({ ok: true })
+          sendLoginSuccess(req, res, token, expiresAt)
         } catch {
           res.status(500).json({ error: 'Failed to create login session' })
         }
@@ -285,6 +319,11 @@ export function createAuthSession(password: string): AuthSession {
       }
     }
 
+    if (isAuthorizedByRequestLike(req.socket.remoteAddress, req.headers.host, req.headers.cookie, validTokens)) {
+      next()
+      return
+    }
+
     if (req.path.startsWith('/codex-api/')) {
       res.status(401).json({ error: 'Authentication required' })
       return
@@ -292,7 +331,8 @@ export function createAuthSession(password: string): AuthSession {
 
     // No valid session — serve login page
     res.setHeader('Content-Type', 'text/html; charset=utf-8')
-    res.status(200).send(LOGIN_PAGE_HTML)
+    setNoStoreHeaders(res)
+    res.status(200).send(renderLoginPage())
   }
 
   return {

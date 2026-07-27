@@ -1,4 +1,4 @@
-const CACHE_NAME = 'codexweb-shell-v2'
+const CACHE_NAME = 'codexweb-shell-v3'
 const APP_SHELL_PATHS = ['/', '/manifest.webmanifest']
 const STATIC_DESTINATIONS = new Set(['document', 'script', 'style', 'image', 'font'])
 const BYPASS_PREFIXES = ['/codex-api/', '/codex-local-image', '/codex-local-file', '/codex-local-browse/', '/codex-local-edit/']

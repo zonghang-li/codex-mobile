@@ -9,7 +9,14 @@
       No messages in this thread yet.
     </p>
 
-    <ul v-else ref="conversationListRef" class="conversation-list" @scroll="onConversationScroll">
+    <ul
+      v-else
+      ref="conversationListRef"
+      class="conversation-list"
+      @scroll="onConversationScroll"
+      @touchstart.passive="onConversationUserScrollIntent"
+      @wheel.passive="onConversationUserScrollIntent"
+    >
       <li v-if="hasMoreAbove" class="conversation-load-more">
         <button
           type="button"
@@ -48,17 +55,6 @@
                 {{ activitySegmentAgentStatus(readActivitySegment(message)) }}
               </span>
             </article>
-            <button
-              v-else-if="readActivitySegment(message)?.kind === 'summary' && activitySegmentCanExpand(readActivitySegment(message))"
-              type="button"
-              class="codex-activity-row codex-activity-button"
-              :class="{ 'codex-activity-row-expanded': isActivitySegmentExpanded(message.id) }"
-              @click="toggleActivitySegment(message.id)"
-            >
-              <ThreadActivityIcon :kind="activitySegmentIconKind(readActivitySegment(message))" />
-              <span class="codex-activity-label">{{ activitySegmentLabel(readActivitySegment(message)) }}</span>
-              <span class="cmd-chevron" :class="{ 'cmd-chevron-open': isActivitySegmentExpanded(message.id) }">›</span>
-            </button>
             <article
               v-else
               class="codex-activity-row"
@@ -67,55 +63,6 @@
               <ThreadActivityIcon :kind="activitySegmentIconKind(readActivitySegment(message))" />
               <span class="codex-activity-label">{{ activitySegmentLabel(readActivitySegment(message)) }}</span>
             </article>
-
-            <div
-              v-if="readActivitySegment(message)?.kind === 'summary'"
-              class="cmd-group-wrap codex-activity-details"
-              :class="{ 'cmd-group-visible': isActivitySegmentExpanded(message.id) }"
-            >
-              <div class="cmd-group-inner">
-                <div
-                  v-for="cmd in activitySegmentCommands(readActivitySegment(message))"
-                  :key="`activity-cmd-${cmd.id}`"
-                  class="worked-cmd-item"
-                >
-                  <button
-                    v-if="commandCanExpand(cmd)"
-                    type="button"
-                    class="cmd-row cmd-compact"
-                    :class="[commandStatusClass(cmd), { 'cmd-expanded': isCommandExpanded(cmd) }]"
-                    @click="toggleCommandExpand(cmd)"
-                  >
-                    <IconTablerTerminal class="icon-svg cmd-icon" />
-                    <span class="cmd-label">{{ commandDisplayLabel(cmd) }}</span>
-                    <span class="cmd-status">{{ commandStatusLabel(cmd) }}</span>
-                    <span class="cmd-chevron" :class="{ 'cmd-chevron-open': isCommandExpanded(cmd) }">›</span>
-                  </button>
-                  <article v-else class="cmd-row cmd-compact cmd-status-only" :class="commandStatusClass(cmd)">
-                    <IconTablerTerminal class="icon-svg cmd-icon" />
-                    <span class="cmd-label">{{ commandDisplayLabel(cmd) }}</span>
-                    <span class="cmd-status">{{ commandStatusLabel(cmd) }}</span>
-                  </article>
-                  <div v-if="commandCanExpand(cmd)" class="cmd-output-wrap" :class="{ 'cmd-output-visible': isCommandExpanded(cmd) }">
-                    <div class="cmd-output-inner">
-                      <pre
-                        class="cmd-output"
-                        :class="{ 'cmd-output-condensed': isCommandOutputCondensed(cmd) }"
-                        v-text="cmd.commandExecution?.aggregatedOutput || '(no output)'"
-                      ></pre>
-                    </div>
-                  </div>
-                </div>
-                <article
-                  v-for="fileActivity in activitySegmentFileChanges(readActivitySegment(message))"
-                  :key="`activity-file-${fileActivity.id}`"
-                  class="codex-activity-row codex-activity-detail-row"
-                >
-                  <IconTablerFilePencil class="icon-svg codex-activity-icon" />
-                  <span class="codex-activity-label">{{ activityMessageLabel(fileActivity) }}</span>
-                </article>
-              </div>
-            </div>
 
             <ul
               v-if="message.images && message.images.length > 0"
@@ -459,61 +406,10 @@
                         </span>
                         <span class="codex-agent-activity-status">{{ segment.status }}</span>
                       </article>
-                      <button
-                        v-else-if="segment.kind === 'summary' && activitySegmentCanExpand(segment)"
-                        type="button"
-                        class="codex-activity-row codex-activity-button"
-                        :class="{ 'codex-activity-row-expanded': isActivitySegmentExpanded(segment.id) }"
-                        @click="toggleActivitySegment(segment.id)"
-                      >
-                        <ThreadActivityIcon :kind="activitySegmentIconKind(segment)" />
-                        <span class="codex-activity-label">{{ segment.label }}</span>
-                        <span class="cmd-chevron" :class="{ 'cmd-chevron-open': isActivitySegmentExpanded(segment.id) }">›</span>
-                      </button>
                       <article v-else class="codex-activity-row" :data-activity-kind="segment.kind">
                         <ThreadActivityIcon :kind="activitySegmentIconKind(segment)" />
                         <span class="codex-activity-label">{{ segment.label }}</span>
                       </article>
-                      <div
-                        v-if="segment.kind === 'summary'"
-                        class="cmd-group-wrap codex-activity-details"
-                        :class="{ 'cmd-group-visible': isActivitySegmentExpanded(segment.id) }"
-                      >
-                        <div class="cmd-group-inner">
-                          <div
-                            v-for="cmd in activitySegmentCommands(segment)"
-                            :key="`worked-activity-cmd-${cmd.id}`"
-                            class="worked-cmd-item"
-                          >
-                            <button
-                              v-if="commandCanExpand(cmd)"
-                              type="button"
-                              class="cmd-row cmd-compact"
-                              :class="[commandStatusClass(cmd), { 'cmd-expanded': isCommandExpanded(cmd) }]"
-                              @click="toggleCommandExpand(cmd)"
-                            >
-                              <IconTablerTerminal class="icon-svg cmd-icon" />
-                              <span class="cmd-label">{{ commandDisplayLabel(cmd) }}</span>
-                              <span class="cmd-status">{{ commandStatusLabel(cmd) }}</span>
-                              <span class="cmd-chevron" :class="{ 'cmd-chevron-open': isCommandExpanded(cmd) }">›</span>
-                            </button>
-                            <article v-else class="cmd-row cmd-compact cmd-status-only" :class="commandStatusClass(cmd)">
-                              <IconTablerTerminal class="icon-svg cmd-icon" />
-                              <span class="cmd-label">{{ commandDisplayLabel(cmd) }}</span>
-                              <span class="cmd-status">{{ commandStatusLabel(cmd) }}</span>
-                            </article>
-                            <div v-if="commandCanExpand(cmd)" class="cmd-output-wrap" :class="{ 'cmd-output-visible': isCommandExpanded(cmd) }">
-                              <div class="cmd-output-inner">
-                                <pre
-                                  class="cmd-output"
-                                  :class="{ 'cmd-output-condensed': isCommandOutputCondensed(cmd) }"
-                                  v-text="cmd.commandExecution?.aggregatedOutput || '(no output)'"
-                                ></pre>
-                              </div>
-                            </div>
-                          </div>
-                        </div>
-                      </div>
                     </div>
                   </div>
                 </div>
@@ -887,7 +783,7 @@
                   :title="copiedResponseAnchorId === message.id ? 'Response copied' : 'Copy response'"
                   @click="copyResponse(message.id)"
                 >
-                  <IconTablerCopy class="icon-svg message-copy-icon" />
+                  <span class="message-copy-label">{{ copiedResponseAnchorId === message.id ? 'Copied' : 'Copy' }}</span>
                 </button>
                 <button
                   v-if="showForkResponseButton(message)"
@@ -897,7 +793,7 @@
                   title="Fork thread from this response"
                   @click="forkResponse(message.id)"
                 >
-                  <IconTablerGitFork class="icon-svg message-fork-icon" />
+                  <span class="message-fork-label">Fork</span>
                 </button>
               </div>
 
@@ -1194,6 +1090,11 @@ import {
   projectConversationTurns,
   suppressResponseActions,
 } from './conversationTurnPresentation'
+import {
+  isCommandOutputExpanded,
+  toggleCommandOutputExpanded,
+} from './commandOutputDisclosure'
+import { createSnapshotTextStreamer } from './snapshotTextStreaming'
 import { splitDisplayMathSpans } from './displayMath'
 import { splitInlineMathSpans } from './inlineMath'
 import {
@@ -1210,9 +1111,7 @@ import ThreadActivityIcon from './ThreadActivityIcon.vue'
 import IconTablerArrowBackUp from '../icons/IconTablerArrowBackUp.vue'
 import IconTablerArrowUp from '../icons/IconTablerArrowUp.vue'
 import IconTablerBolt from '../icons/IconTablerBolt.vue'
-import IconTablerCopy from '../icons/IconTablerCopy.vue'
 import IconTablerFilePencil from '../icons/IconTablerFilePencil.vue'
-import IconTablerGitFork from '../icons/IconTablerGitFork.vue'
 import IconTablerSearch from '../icons/IconTablerSearch.vue'
 import IconTablerTerminal from '../icons/IconTablerTerminal.vue'
 import IconTablerX from '../icons/IconTablerX.vue'
@@ -1220,8 +1119,6 @@ import IconTablerX from '../icons/IconTablerX.vue'
 type HighlightJsModule = (typeof import('highlight.js/lib/common'))['default']
 
 const expandedCommandIds = ref<Set<string>>(new Set())
-const collapsedAutoCommandIds = ref<Set<string>>(new Set())
-const expandedActivitySegmentIds = ref<Set<string>>(new Set())
 const expandedCommandGroupIds = ref<Set<string>>(new Set())
 const expandedWorkedIds = ref<Set<string>>(new Set())
 const expandedFileChangeSummaryIds = ref<Set<string>>(new Set())
@@ -1415,6 +1312,124 @@ const isLiveTurnRuntime = computed(() =>
   Boolean(props.liveOverlay) || activeCommandMessageId.value.length > 0 || hasLiveAssistantText.value,
 )
 
+function hasSnapshotTextStreamContent(message: UiMessage): boolean {
+  if (isCommandMessage(message)) {
+    return (message.commandExecution?.aggregatedOutput ?? '').length > 0
+  }
+  return [
+    'agentMessage',
+    'agentMessage.live',
+    'reasoning',
+    'plan',
+    'plan.live',
+  ].includes(message.messageType ?? '') && message.text.length > 0
+}
+
+const latestSnapshotTextStreamTurnId = computed(() => {
+  for (let index = props.messages.length - 1; index >= 0; index -= 1) {
+    const message = props.messages[index]
+    const turnId = message.turnId?.trim() ?? ''
+    if (!turnId || message.role === 'user') continue
+    if (hasSnapshotTextStreamContent(message)) return turnId
+  }
+  return ''
+})
+
+const activeSnapshotTextStreamTurnId = computed(() =>
+  props.activeTurnId?.trim() || latestSnapshotTextStreamTurnId.value,
+)
+
+const isSnapshotTextStreamingEnabled = computed(() =>
+  props.readOnly === true &&
+  Boolean(activeSnapshotTextStreamTurnId.value) &&
+  props.isThreadInProgress === true,
+)
+
+function isSnapshotTextStreamableMessage(message: UiMessage): boolean {
+  if (!isSnapshotTextStreamingEnabled.value) return false
+  const activeTurnId = activeSnapshotTextStreamTurnId.value
+  if (!activeTurnId || message.turnId !== activeTurnId) return false
+  if (message.role === 'user') return false
+  return hasSnapshotTextStreamContent(message)
+}
+
+function isSnapshotTextStreamRenderableMessage(message: UiMessage): boolean {
+  return message.messageType !== 'plan.live'
+}
+
+const snapshotTextStreamTargetMessageId = computed(() => {
+  for (let index = props.messages.length - 1; index >= 0; index -= 1) {
+    const message = props.messages[index]
+    if (!isSnapshotTextStreamableMessage(message)) continue
+    if (!isSnapshotTextStreamRenderableMessage(message)) continue
+    return message.id
+  }
+  return ''
+})
+
+function isSnapshotTextStreamTargetMessage(message: UiMessage): boolean {
+  return Boolean(snapshotTextStreamTargetMessageId.value) && message.id === snapshotTextStreamTargetMessageId.value
+}
+
+const snapshotTextStreamInputs = computed(() => props.messages.map((message) => ({
+  id: message.id,
+  text: message.text,
+  commandOutput: message.commandExecution?.aggregatedOutput ?? '',
+  streamable: isSnapshotTextStreamableMessage(message),
+  renderable: isSnapshotTextStreamRenderableMessage(message),
+})))
+
+function cancelSnapshotTextStreamTimer(): void {
+  if (snapshotTextStreamTimer === null) return
+  window.clearTimeout(snapshotTextStreamTimer)
+  snapshotTextStreamTimer = null
+}
+
+function scheduleSnapshotTextStream(): void {
+  if (snapshotTextStreamTimer !== null || typeof window === 'undefined') return
+  snapshotTextStreamTimer = window.setTimeout(() => {
+    snapshotTextStreamTimer = null
+    const changed = snapshotTextStreamer.advance()
+    if (changed) {
+      snapshotTextStreamRevision.value += 1
+      if (shouldLockToBottom()) {
+        void scheduleConversationScroll()
+      }
+    }
+    if (snapshotTextStreamer.hasPending()) {
+      scheduleSnapshotTextStream()
+    } else {
+      endSnapshotTextStreamBottomLock()
+    }
+  }, SNAPSHOT_TEXT_STREAM_INTERVAL_MS)
+}
+
+function applySnapshotTextStreamingDisplay(message: UiMessage): UiMessage {
+  snapshotTextStreamRevision.value
+  const displayText = snapshotTextStreamer.readText(message.id)
+  const displayCommandOutput = snapshotTextStreamer.readCommandOutput(message.id)
+  let next = message
+  if (displayText !== undefined && displayText !== message.text) {
+    next = { ...next, text: displayText }
+  }
+  if (
+    message.commandExecution &&
+    displayCommandOutput !== undefined &&
+    displayCommandOutput !== message.commandExecution.aggregatedOutput
+  ) {
+    next = {
+      ...next,
+      commandExecution: {
+        ...message.commandExecution,
+        aggregatedOutput: displayCommandOutput,
+      },
+    }
+  }
+  return next
+}
+
+const displayMessages = computed(() => props.messages.map((message) => applySnapshotTextStreamingDisplay(message)))
+
 const activitySegments = computed(() => buildThreadActivitySegments(props.messages))
 const conversationTurnSections = computed(() => projectConversationTurns({
   messages: props.messages,
@@ -1441,14 +1456,6 @@ const activitySegmentByAnchorId = computed<Record<string, ThreadActivitySegment>
   return next
 })
 
-const activityMessageById = computed<Record<string, UiMessage>>(() => {
-  const next: Record<string, UiMessage> = {}
-  for (const message of props.messages) {
-    next[message.id] = message
-  }
-  return next
-})
-
 const hiddenActivitySegmentSourceIds = computed(() => {
   const next = new Set<string>()
   for (const segment of activitySegments.value) {
@@ -1460,26 +1467,8 @@ const hiddenActivitySegmentSourceIds = computed(() => {
 })
 
 function readActivitySegment(message: UiMessage): ThreadActivitySegment | null {
+  if (isSnapshotTextStreamTargetMessage(message)) return null
   return activitySegmentByAnchorId.value[message.id] ?? null
-}
-
-function activitySegmentMessages(segment: ThreadActivitySegment | null): UiMessage[] {
-  if (!segment) return []
-  return segment.sourceMessageIds
-    .map((id) => activityMessageById.value[id])
-    .filter((message): message is UiMessage => Boolean(message))
-}
-
-function activitySegmentCommands(segment: ThreadActivitySegment | null): UiMessage[] {
-  return activitySegmentMessages(segment).filter((message) => isCommandMessage(message))
-}
-
-function activitySegmentFileChanges(segment: ThreadActivitySegment | null): UiMessage[] {
-  return activitySegmentMessages(segment).filter((message) => isFileChangeMessage(message))
-}
-
-function activitySegmentCanExpand(segment: ThreadActivitySegment | null): boolean {
-  return activitySegmentCommands(segment).length > 0 || activitySegmentFileChanges(segment).length > 0
 }
 
 function activitySegmentAgentStatus(segment: ThreadActivitySegment | null): string {
@@ -1499,38 +1488,7 @@ function activitySegmentAgents(segment: ThreadActivitySegment | null) {
   return segment?.kind === 'subAgent' ? segment.agents : []
 }
 
-function isActivitySegmentExpanded(segmentId: string): boolean {
-  return expandedActivitySegmentIds.value.has(segmentId)
-}
-
-function toggleActivitySegment(segmentId: string): void {
-  const next = new Set(expandedActivitySegmentIds.value)
-  if (next.has(segmentId)) next.delete(segmentId)
-  else next.add(segmentId)
-  expandedActivitySegmentIds.value = next
-}
-
-const groupedCommandsByLatestId = computed<Record<string, UiMessage[]>>(() => {
-  const next: Record<string, UiMessage[]> = {}
-  for (let index = 0; index < props.messages.length;) {
-    const message = props.messages[index]
-    if (!isCommandMessage(message)) {
-      index += 1
-      continue
-    }
-
-    const block: UiMessage[] = []
-    while (index < props.messages.length && isCommandMessage(props.messages[index])) {
-      block.push(props.messages[index])
-      index += 1
-    }
-
-    if (block.length <= 1) continue
-    const latest = block[block.length - 1]
-    next[latest.id] = block.slice(0, -1)
-  }
-  return next
-})
+const groupedCommandsByLatestId = computed<Record<string, UiMessage[]>>(() => ({}))
 
 const hiddenGroupedCommandIds = computed(() => {
   const next = new Set<string>()
@@ -1561,19 +1519,17 @@ function planStepStatusIcon(status: UiPlanStep['status']): string {
   }
 }
 
-function isCommandAutoExpanded(message: UiMessage): boolean {
-  return !hasLiveAssistantText.value && message.id === activeCommandMessageId.value
-}
-
 function commandCanExpand(message: UiMessage): boolean {
   return isCommandMessage(message)
     && (message.commandExecution?.aggregatedOutput ?? '').trim().length > 0
 }
 
 function isCommandExpanded(message: UiMessage): boolean {
-  if (!commandCanExpand(message)) return false
-  return expandedCommandIds.value.has(message.id)
-    || (!collapsedAutoCommandIds.value.has(message.id) && isCommandAutoExpanded(message))
+  return isCommandOutputExpanded(
+    expandedCommandIds.value,
+    message.id,
+    commandCanExpand(message),
+  )
 }
 
 function isCommandCompact(message: UiMessage): boolean {
@@ -1585,25 +1541,11 @@ function isCommandOutputCondensed(message: UiMessage): boolean {
 }
 
 function toggleCommandExpand(message: UiMessage): void {
-  if (!commandCanExpand(message)) return
-
-  const nextExpanded = new Set(expandedCommandIds.value)
-  const nextCollapsedAuto = new Set(collapsedAutoCommandIds.value)
-  const isAutoExpanded = isCommandAutoExpanded(message)
-  const isManuallyExpanded = nextExpanded.has(message.id)
-
-  if (isManuallyExpanded) {
-    nextExpanded.delete(message.id)
-    if (isAutoExpanded) nextCollapsedAuto.add(message.id)
-  } else if (isAutoExpanded && !nextCollapsedAuto.has(message.id)) {
-    nextCollapsedAuto.add(message.id)
-  } else {
-    nextExpanded.add(message.id)
-    nextCollapsedAuto.delete(message.id)
-  }
-
-  expandedCommandIds.value = nextExpanded
-  collapsedAutoCommandIds.value = nextCollapsedAuto
+  expandedCommandIds.value = toggleCommandOutputExpanded(
+    expandedCommandIds.value,
+    message.id,
+    commandCanExpand(message),
+  )
 }
 
 function getGroupedCommandsForLatest(message: UiMessage): UiMessage[] {
@@ -1631,7 +1573,6 @@ function isCommandGroupExpanded(message: UiMessage): boolean {
 function commandGroupSummaryLabel(message: UiMessage): string {
   const commands = getCommandBlockForLatest(message)
   const count = commands.length
-  if (count > 1) return 'Ran commands'
   const latestCommand = commandDisplayLabel(message)
   const countLabel = count === 1 ? '1 command' : `${count} commands`
   return `${countLabel} · latest: ${latestCommand}`
@@ -1700,7 +1641,7 @@ function commandStatusLabel(message: UiMessage): string {
   if (!ce) return ''
   const compact = isCommandCompact(message)
   switch (ce.status) {
-    case 'inProgress': return compact ? 'Running' : '⟳ Running'
+    case 'inProgress': return 'RUNNING'
     case 'completed': return ce.exitCode === 0 ? (compact ? 'Done' : '✓ Completed') : `Exit ${ce.exitCode ?? '?'}`
     case 'failed': return compact ? 'Failed' : '✗ Failed'
     case 'declined': return compact ? 'Declined' : '⊘ Declined'
@@ -1732,6 +1673,7 @@ const props = defineProps<{
   isLoading: boolean
   activeThreadId: string
   activeTurnId?: string
+  isThreadInProgress?: boolean
   cwd: string
   readOnly?: boolean
   hasMorePersistedAbove?: boolean
@@ -1757,7 +1699,16 @@ const toolQuestionAnswers = ref<Record<string, string>>({})
 const toolQuestionOtherAnswers = ref<Record<string, string>>({})
 const mcpElicitationAnswers = ref<Record<string, string | number | boolean | string[]>>({})
 const autoFollowOutput = ref(true)
+const snapshotTextStreamBottomLock = ref(false)
 const BOTTOM_THRESHOLD_PX = 16
+const SNAPSHOT_TEXT_STREAM_INTERVAL_MS = 56
+const USER_SCROLL_INTENT_WINDOW_MS = 1200
+const snapshotTextStreamer = createSnapshotTextStreamer({
+  textChunkSize: 18,
+  outputChunkSize: 96,
+})
+const snapshotTextStreamRevision = ref(0)
+let snapshotTextStreamTimer: number | null = null
 const CODE_LANGUAGE_ALIASES: Record<string, string> = {
   js: 'javascript',
   jsx: 'jsx',
@@ -1786,6 +1737,7 @@ type InlineSegment =
 let conversationScrollFrame = 0
 let bottomLockFrame = 0
 let bottomLockFramesLeft = 0
+let userScrollIntentUntilMs = 0
 let copiedMessageResetTimer: ReturnType<typeof setTimeout> | null = null
 let conversationScrollPromise: Promise<void> | null = null
 const trackedPendingImages = new WeakSet<HTMLImageElement>()
@@ -2475,7 +2427,7 @@ const hiddenCompletedActivityMessageIds = computed(() => new Set(
 ))
 
 const renderableMessages = computed(() => filterRenderableThreadMessages(
-  props.messages,
+  displayMessages.value,
   hiddenGroupedCommandIds.value,
   hiddenFileAndFooterMessageIds.value,
   hiddenCompletedActivityMessageIds.value,
@@ -4736,11 +4688,32 @@ function isAtBottom(container: HTMLElement): boolean {
   return distance <= BOTTOM_THRESHOLD_PX
 }
 
+function isConversationAtBottom(): boolean {
+  const container = conversationListRef.value
+  return container ? isAtBottom(container) : false
+}
+
+function readNowMs(): number {
+  return typeof performance !== 'undefined' && typeof performance.now === 'function'
+    ? performance.now()
+    : Date.now()
+}
+
+function hasRecentUserScrollIntent(): boolean {
+  return readNowMs() <= userScrollIntentUntilMs
+}
+
+function maybeLoadMoreAbove(container: HTMLElement): void {
+  if (hasMoreAbove.value && !isLoadingMore.value && container.scrollTop < LOAD_MORE_SCROLL_THRESHOLD_PX) {
+    void loadMoreAbove()
+  }
+}
+
 function applyConversationScrollState(): void {
   const container = conversationListRef.value
   if (!container) return
 
-  if (autoFollowOutput.value) {
+  if (shouldLockToBottom()) {
     enforceBottomState()
     return
   }
@@ -4753,7 +4726,7 @@ function enforceBottomState(): void {
 }
 
 function shouldLockToBottom(): boolean {
-  return autoFollowOutput.value
+  return autoFollowOutput.value || snapshotTextStreamBottomLock.value
 }
 
 function runBottomLockFrame(): void {
@@ -4782,6 +4755,23 @@ function scheduleBottomLock(frames = 6): void {
   bottomLockFrame = requestAnimationFrame(runBottomLockFrame)
 }
 
+function beginSnapshotTextStreamBottomLock(): void {
+  if (!(autoFollowOutput.value || isConversationAtBottom())) return
+  snapshotTextStreamBottomLock.value = true
+  autoFollowOutput.value = true
+  renderWindowStart.value = latestThreadRenderWindowStart(renderableMessages.value.length)
+  scheduleBottomLock(12)
+}
+
+function endSnapshotTextStreamBottomLock(): void {
+  snapshotTextStreamBottomLock.value = false
+}
+
+function onConversationUserScrollIntent(): void {
+  userScrollIntentUntilMs = readNowMs() + USER_SCROLL_INTENT_WINDOW_MS
+  snapshotTextStreamBottomLock.value = false
+}
+
 function onPendingImageSettled(): void {
   scheduleBottomLock(3)
 }
@@ -4798,6 +4788,7 @@ async function loadMoreAbove(): Promise<void> {
   if (!container || !hasMoreAbove.value || isLoadingMore.value || props.isLoadingPersistedAbove === true) return
 
   autoFollowOutput.value = false
+  snapshotTextStreamBottomLock.value = false
   isLoadingMore.value = true
   const threadIdAtStart = props.activeThreadId
 
@@ -4872,6 +4863,34 @@ function clearRenderCaches(): void {
 }
 
 watch(
+  () => `${props.activeThreadId}\u0000${activeSnapshotTextStreamTurnId.value}\u0000${props.readOnly === true ? '1' : '0'}\u0000${props.isThreadInProgress === true ? '1' : '0'}`,
+  () => {
+    cancelSnapshotTextStreamTimer()
+    endSnapshotTextStreamBottomLock()
+    snapshotTextStreamer.reset()
+    snapshotTextStreamRevision.value += 1
+  },
+  { flush: 'sync' },
+)
+
+watch(
+  snapshotTextStreamInputs,
+  (inputs) => {
+    const result = snapshotTextStreamer.update(inputs)
+    if (result.changed) {
+      snapshotTextStreamRevision.value += 1
+    }
+    if (result.pending) {
+      beginSnapshotTextStreamBottomLock()
+      scheduleSnapshotTextStream()
+    } else {
+      endSnapshotTextStreamBottomLock()
+    }
+  },
+  { immediate: true },
+)
+
+watch(
   () => props.messages,
   async (next) => {
     if (props.isLoading) return
@@ -4882,14 +4901,9 @@ watch(
         .map((message) => message.id),
     )
     expandedCommandIds.value = pruneCommandIdSet(expandedCommandIds.value, commandIds)
-    collapsedAutoCommandIds.value = pruneCommandIdSet(collapsedAutoCommandIds.value, commandIds)
     expandedCommandGroupIds.value = pruneCommandIdSet(
       expandedCommandGroupIds.value,
       new Set(Object.keys(groupedCommandsByLatestId.value)),
-    )
-    expandedActivitySegmentIds.value = pruneCommandIdSet(
-      expandedActivitySegmentIds.value,
-      new Set(activitySegments.value.map((segment) => segment.id)),
     )
     expandedFileChangeSummaryIds.value = pruneCommandIdSet(
       expandedFileChangeSummaryIds.value,
@@ -4934,17 +4948,6 @@ watch(
 )
 
 watch(
-  activeCommandMessageId,
-  (nextId, prevId) => {
-    if (!prevId || prevId === nextId) return
-    if (!collapsedAutoCommandIds.value.has(prevId)) return
-    const nextCollapsedAuto = new Set(collapsedAutoCommandIds.value)
-    nextCollapsedAuto.delete(prevId)
-    collapsedAutoCommandIds.value = nextCollapsedAuto
-  },
-)
-
-watch(
   () => props.pendingRequests,
   async () => {
     if (props.isLoading) return
@@ -4978,6 +4981,8 @@ watch(
   () => props.activeThreadId,
   async () => {
     autoFollowOutput.value = true
+    snapshotTextStreamBottomLock.value = false
+    userScrollIntentUntilMs = 0
     modalImageUrl.value = ''
     isLoadingMore.value = false
     fileChangeActionState.value = {}
@@ -4993,10 +4998,24 @@ watch(
 function onConversationScroll(): void {
   const container = conversationListRef.value
   if (!container || props.isLoading) return
-  autoFollowOutput.value = isAtBottom(container)
-  if (hasMoreAbove.value && !isLoadingMore.value && container.scrollTop < LOAD_MORE_SCROLL_THRESHOLD_PX) {
-    void loadMoreAbove()
+
+  const atBottom = isAtBottom(container)
+  if (atBottom) {
+    autoFollowOutput.value = true
+    maybeLoadMoreAbove(container)
+    return
   }
+
+  if (!atBottom && shouldLockToBottom() && !hasRecentUserScrollIntent()) {
+    autoFollowOutput.value = true
+    scheduleBottomLock(3)
+    maybeLoadMoreAbove(container)
+    return
+  }
+
+  autoFollowOutput.value = false
+  snapshotTextStreamBottomLock.value = false
+  maybeLoadMoreAbove(container)
 }
 
 const failedMarkdownImages = ref(new Set<string>())
@@ -5032,6 +5051,7 @@ onMounted(() => {
 
 onBeforeUnmount(() => {
   clearRenderCaches()
+  cancelSnapshotTextStreamTimer()
   if (conversationScrollFrame) {
     cancelAnimationFrame(conversationScrollFrame)
     conversationScrollFrame = 0
@@ -5252,26 +5272,23 @@ onBeforeUnmount(() => {
 
 .message-copy-button,
 .message-fork-button {
-  @apply inline-flex h-7 w-7 items-center justify-center rounded-md border-0 bg-transparent p-0 text-slate-500 transition hover:bg-slate-200/60 hover:text-slate-900 focus:outline-none focus-visible:ring-2 focus-visible:ring-sky-400/60;
+  @apply inline-flex h-7 min-w-14 items-center justify-center rounded-lg border border-slate-500/20 bg-transparent px-2.5 text-[11px] font-medium leading-none text-slate-500 transition hover:border-slate-400/50 hover:bg-slate-200/60 hover:text-slate-900 focus:outline-none focus-visible:ring-2 focus-visible:ring-sky-400/60;
 }
 
 .message-copy-button[data-copied='true'] {
-  @apply bg-transparent text-emerald-500;
+  @apply border-emerald-500/30 bg-transparent text-emerald-500;
 }
 
 .message-edit-button {
   @apply inline-flex items-center gap-0.5 px-0.5 py-0 text-[9px] font-medium leading-none text-amber-600/70 transition hover:text-amber-700;
 }
 
-.message-copy-icon,
-.message-fork-icon {
-  @apply h-4 w-4;
-}
-
 .message-edit-icon {
   @apply text-[10px];
 }
 
+.message-copy-label,
+.message-fork-label,
 .message-edit-label {
   @apply leading-none;
 }
@@ -5282,9 +5299,12 @@ onBeforeUnmount(() => {
   }
 
   .message-fork-button,
-  .message-copy-button,
+  .message-copy-button {
+    @apply min-h-10 min-w-16 rounded-lg px-3;
+  }
+
   .message-edit-button {
-    @apply min-h-11 min-w-11;
+    @apply min-h-10 min-w-10;
   }
 }
 
@@ -5791,18 +5811,6 @@ onBeforeUnmount(() => {
   @apply min-w-0;
 }
 
-.codex-activity-button {
-  @apply cursor-pointer border-0 bg-transparent transition hover:text-zinc-700;
-}
-
-.codex-activity-details {
-  @apply w-full max-w-[min(var(--chat-card-max,76ch),100%)];
-}
-
-.codex-activity-detail-row {
-  @apply pl-2;
-}
-
 .codex-agent-activity-row {
   @apply flex w-full max-w-[min(var(--chat-card-max,76ch),100%)] min-w-0 flex-wrap items-center gap-2 py-1 text-[14px] leading-[22px] text-zinc-500;
 }
@@ -5924,7 +5932,7 @@ onBeforeUnmount(() => {
 }
 
 .cmd-status-running .cmd-status {
-  @apply text-amber-600;
+  @apply text-emerald-600;
 }
 
 .cmd-status-ok .cmd-status {
@@ -6115,10 +6123,6 @@ onBeforeUnmount(() => {
 
 :global(.dark) .codex-activity-row {
   @apply text-zinc-500;
-}
-
-:global(.dark) .codex-activity-button {
-  @apply hover:text-zinc-300;
 }
 
 :global(.dark) .codex-agent-activity-chip {

@@ -300,6 +300,8 @@ export type StoredQueuedMessage = {
   skills: Array<{ name: string; path: string }>
   fileAttachments: Array<{ label: string; path: string; fsPath: string }>
   collaborationMode: CollaborationModeKind
+  model: string
+  effort: ReasoningEffort | ''
 }
 
 export type ThreadQueueState = Record<string, StoredQueuedMessage[]>
@@ -1024,6 +1026,7 @@ async function getThreadDetailV2(
   isLiveProjection?: boolean
   model: string
   modelProvider: string
+  reasoningEffort: ReasoningEffort | ''
   messages: UiMessage[]
   completionSummaries: ThreadCompletionSummary[]
   inProgress: boolean
@@ -1044,6 +1047,7 @@ async function getThreadDetailV2(
   return {
     model: normalizeThreadModelFromPayload(payload),
     modelProvider: normalizeThreadModelProviderFromPayload(payload),
+    reasoningEffort: normalizeThreadReasoningEffortFromPayload(payload),
     messages: normalized,
     completionSummaries: readThreadCompletionSummaries(payload),
     ...runtime,
@@ -1062,6 +1066,7 @@ async function getExternalThreadLiveStateSnapshotV2(
   projectionKey?: string
   model: string
   modelProvider: string
+  reasoningEffort: ReasoningEffort | ''
   messages: UiMessage[]
   completionSummaries: ThreadCompletionSummary[]
   inProgress: boolean
@@ -1112,6 +1117,7 @@ async function getExternalThreadLiveStateSnapshotV2(
     projectionKey: readString(payload?.projectionKey) ?? undefined,
     model: normalizeThreadModelFromPayload(payload),
     modelProvider: normalizeThreadModelProviderFromPayload(payload),
+    reasoningEffort: normalizeThreadReasoningEffortFromPayload(payload),
     messages: normalized,
     completionSummaries: readThreadCompletionSummaries(result),
     ...runtime,
@@ -1196,6 +1202,7 @@ export async function getThreadDetail(threadId: string, signal?: AbortSignal): P
   isLiveProjection?: boolean
   model: string
   modelProvider: string
+  reasoningEffort: ReasoningEffort | ''
   messages: UiMessage[]
   completionSummaries: ThreadCompletionSummary[]
   inProgress: boolean
@@ -1219,6 +1226,7 @@ export async function getExternalThreadLiveSnapshot(threadId: string, signal?: A
   projectionKey?: string
   model: string
   modelProvider: string
+  reasoningEffort: ReasoningEffort | ''
   messages: UiMessage[]
   completionSummaries: ThreadCompletionSummary[]
   inProgress: boolean
@@ -2041,9 +2049,12 @@ function normalizeThreadCwdFromPayload(payload: unknown): string {
 }
 
 function normalizeThreadModelFromPayload(payload: unknown): string {
-  if (!payload || typeof payload !== 'object') return ''
-  const model = (payload as Record<string, unknown>).model
-  return typeof model === 'string' ? model.trim() : ''
+  const record = asRecord(payload)
+  if (!record) return ''
+  const model = readString(record.model)?.trim() ?? ''
+  if (model) return model
+  const thread = asRecord(record.thread)
+  return readString(thread?.model)?.trim() ?? ''
 }
 
 function normalizeThreadModelProviderFromPayload(payload: unknown): string {
@@ -2053,6 +2064,15 @@ function normalizeThreadModelProviderFromPayload(payload: unknown): string {
   if (modelProvider) return modelProvider
   const thread = asRecord(record.thread)
   return readString(thread?.modelProvider)?.trim() ?? ''
+}
+
+function normalizeThreadReasoningEffortFromPayload(payload: unknown): ReasoningEffort | '' {
+  const record = asRecord(payload)
+  if (!record) return ''
+  const direct = normalizeReasoningEffort(record.reasoningEffort ?? record.reasoning_effort ?? record.effort)
+  if (direct) return direct
+  const thread = asRecord(record.thread)
+  return normalizeReasoningEffort(thread?.reasoningEffort ?? thread?.reasoning_effort ?? thread?.effort)
 }
 
 export type StartedThread = {
@@ -2998,6 +3018,8 @@ function normalizeStoredQueuedMessage(value: unknown): StoredQueuedMessage | nul
     skills,
     fileAttachments,
     collaborationMode: record.collaborationMode === 'plan' ? 'plan' : 'default',
+    model: typeof record.model === 'string' ? record.model.trim() : '',
+    effort: normalizeReasoningEffort(record.effort),
   }
 }
 

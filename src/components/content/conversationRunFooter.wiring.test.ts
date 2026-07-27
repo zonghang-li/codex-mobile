@@ -130,8 +130,10 @@ describe('ConversationRunFooter desktop parity wiring', () => {
     expect(copyIndex).toBeGreaterThan(toolbarIndex)
     expect(forkIndex).toBeGreaterThan(copyIndex)
     expect(historicalSummaryIndex).toBeGreaterThan(forkIndex)
-    expect(conversationSource).not.toContain('class="message-copy-label"')
-    expect(conversationSource).not.toContain('class="message-fork-label"')
+    expect(conversationSource).toContain('class="message-copy-label"')
+    expect(conversationSource).toContain('class="message-fork-label"')
+    expect(conversationSource).not.toContain('message-copy-icon')
+    expect(conversationSource).not.toContain('message-fork-icon')
     expect(conversationSource).toContain('aria-label="Fork thread from this response"')
     expect(conversationSource).toContain(
       "copiedResponseAnchorId === message.id ? 'Response copied' : 'Copy response'",
@@ -141,20 +143,25 @@ describe('ConversationRunFooter desktop parity wiring', () => {
     expect(goalIndex).toBeGreaterThan(activeFooterIndex)
   })
 
-  it('uses transparent icon actions with touch-sized targets on coarse pointers', () => {
-    const forkStylesIndex = conversationSource.indexOf('.message-fork-button {')
-    const copyStylesIndex = conversationSource.indexOf('.message-copy-button {')
+  it('uses rounded-rectangle text actions with touch-sized targets on coarse pointers', () => {
+    const responseActionStylesIndex = conversationSource.indexOf('.message-copy-button,\n.message-fork-button {')
+    const responseActionStylesEnd = conversationSource.indexOf('}', responseActionStylesIndex)
+    const responseActionStyles = conversationSource.slice(responseActionStylesIndex, responseActionStylesEnd)
     const coarsePointerStylesIndex = conversationSource.indexOf(
       '@media (hover: none), (pointer: coarse)',
     )
 
-    expect(coarsePointerStylesIndex).toBeGreaterThan(forkStylesIndex)
-    expect(coarsePointerStylesIndex).toBeGreaterThan(copyStylesIndex)
+    expect(responseActionStylesIndex).toBeGreaterThan(0)
+    expect(coarsePointerStylesIndex).toBeGreaterThan(responseActionStylesIndex)
     expect(conversationSource).toMatch(
-      /\.message-copy-button,[\s\S]*\.message-fork-button\s*\{[\s\S]*@apply [^;]*border-0[^;]*bg-transparent/u,
+      /\.message-copy-button,[\s\S]*\.message-fork-button\s*\{[\s\S]*@apply [^;]*min-w-14[^;]*rounded-lg[^;]*border[^;]*bg-transparent/u,
+    )
+    expect(responseActionStyles).not.toContain('rounded-full')
+    expect(conversationSource).toMatch(
+      /@media \(hover: none\), \(pointer: coarse\) \{[\s\S]*\.message-toolbar \{[\s\S]*@apply opacity-100;[\s\S]*\.message-fork-button,[\s\S]*\.message-copy-button\s*\{[\s\S]*@apply [^;]*min-h-10[^;]*min-w-16[^;]*rounded-lg/u,
     )
     expect(conversationSource).toMatch(
-      /@media \(hover: none\), \(pointer: coarse\) \{[\s\S]*\.message-toolbar \{[\s\S]*@apply opacity-100;[\s\S]*\.message-fork-button,[\s\S]*\.message-copy-button,[\s\S]*\.message-edit-button \{[\s\S]*@apply [^;]*min-h-11[^;]*min-w-11/u,
+      /@media \(hover: none\), \(pointer: coarse\) \{[\s\S]*\.message-edit-button\s*\{[\s\S]*@apply [^;]*min-h-10[^;]*min-w-10/u,
     )
     expect(conversationSource).toMatch(
       /\.message-toolbar:focus-within\s*\{\s*@apply opacity-100;\s*\}/u,

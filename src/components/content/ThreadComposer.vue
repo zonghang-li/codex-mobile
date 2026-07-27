@@ -274,8 +274,8 @@
           </div>
         </div>
 
-        <template v-if="!isDictationRecording">
-          <div v-if="goalSupported" ref="goalMenuRootRef" class="thread-composer-goal-control">
+        <div v-if="!isDictationRecording" class="thread-composer-config-controls">
+          <div ref="goalMenuRootRef" class="thread-composer-goal-control">
             <button
               class="thread-composer-goal-trigger"
               type="button"
@@ -283,9 +283,9 @@
               :aria-expanded="isGoalMenuOpen"
               @click="toggleGoalMenu"
             >
-              {{ t('Goal') }}
+              <span class="thread-composer-control-label">{{ t('Goal') }}</span>
             </button>
-            <div v-if="isGoalMenuOpen" class="thread-composer-goal-menu">
+            <div v-if="goalSupported && isGoalMenuOpen" class="thread-composer-goal-menu">
               <template v-if="hasGoal">
                 <p class="thread-composer-goal-menu-copy">
                   {{ t('This task already has a goal. Edit it from the goal strip above.') }}
@@ -315,17 +315,12 @@
               </template>
             </div>
           </div>
-        </template>
 
-        <div
-          class="thread-composer-actions"
-          :class="{ 'thread-composer-actions--recording': isDictationRecording }"
-        >
           <ComposerDropdown
-            v-if="!isDictationRecording"
             class="thread-composer-model-effort"
             :model-value="desktopModelEffortValue"
             :options="desktopModelEffortOptions"
+            :selected-label="desktopModelEffortTriggerLabel"
             :selected-prefix-icon="composerControlState.showFastIcon ? IconTablerBolt : null"
             :placeholder="composerControlState.modelEffortLabel"
             open-direction="up"
@@ -334,7 +329,14 @@
             :search-placeholder="t('Search models...')"
             @update:model-value="onDesktopModelEffortSelect"
           />
+        </div>
 
+        <div v-if="!isDictationRecording" class="thread-composer-controls-spacer" aria-hidden="true" />
+
+        <div
+          class="thread-composer-actions"
+          :class="{ 'thread-composer-actions--recording': isDictationRecording }"
+        >
           <div v-if="dictationState === 'recording'" class="thread-composer-dictation-waveform-wrap" aria-hidden="true">
             <canvas ref="dictationWaveformCanvasRef" class="thread-composer-dictation-waveform" />
           </div>
@@ -465,7 +467,10 @@ import {
   canApplyAttachmentMutation,
   canApplyThreadUiMutation,
 } from './externalThreadRuntimeUi'
-import { deriveComposerControlState } from './composerControlState'
+import {
+  deriveComposerControlState,
+  formatComposerModelEffortTriggerLabel,
+} from './composerControlState'
 
 type SkillSourceBadge = {
   badge: string
@@ -646,7 +651,7 @@ const reasoningOptions: Array<{ value: ReasoningEffort; label: string }> = [
   { value: 'low', label: 'Low' },
   { value: 'medium', label: 'Medium' },
   { value: 'high', label: 'High' },
-  { value: 'xhigh', label: 'Extra high' },
+  { value: 'xhigh', label: 'Extra High' },
   { value: 'max', label: 'Max' },
   { value: 'ultra', label: 'Ultra' },
 ]
@@ -677,6 +682,12 @@ const desktopModelEffortOptions = computed(() => props.models.flatMap((modelId) 
 const desktopModelEffortValue = computed(() => (
   `${props.selectedModel}\u001f${composerControlState.value.selectedEffort}`
 ))
+const desktopModelEffortTriggerLabel = computed(() => {
+  return formatComposerModelEffortTriggerLabel(
+    props.selectedModel,
+    composerControlState.value.selectedEffort,
+  )
+})
 const isPlanModeSelected = computed(() => props.selectedCollaborationMode === 'plan')
 
 const isPlanModeWaitingForModel = computed(() =>
@@ -2477,8 +2488,16 @@ watch(
   @apply truncate;
 }
 
+.thread-composer-config-controls {
+  @apply flex min-w-0 flex-1 items-center gap-1;
+}
+
 .thread-composer-goal-trigger {
-  @apply inline-flex h-8 min-w-0 shrink-0 items-center rounded-full border-0 bg-transparent px-2 text-sm text-zinc-500 transition hover:bg-zinc-100 hover:text-zinc-800 disabled:cursor-default disabled:opacity-40;
+  @apply inline-flex h-8 min-w-0 shrink-0 items-center rounded-full border-0 bg-transparent px-2 text-sm leading-tight text-zinc-500 transition hover:bg-zinc-100 hover:text-zinc-800 disabled:cursor-default disabled:text-zinc-500 disabled:opacity-70;
+}
+
+.thread-composer-control-label {
+  @apply block pb-px;
 }
 
 .thread-composer-goal-control {
@@ -2506,23 +2525,25 @@ watch(
 }
 
 .thread-composer-model-effort {
-  @apply min-w-0 max-w-64 shrink;
+  @apply min-w-0;
+  flex: 1 1 auto;
+  max-width: none;
 }
 
 .thread-composer-model-effort :deep(.composer-dropdown-trigger) {
-  @apply max-w-full rounded-full border-0 bg-transparent px-2 hover:bg-zinc-100;
+  @apply h-8 max-w-full items-center rounded-full border-0 bg-transparent px-2 text-sm leading-tight hover:bg-zinc-100;
 }
 
-.thread-composer-model-effort :deep(.composer-dropdown-value) {
-  @apply truncate;
+.thread-composer-controls-spacer {
+  @apply min-w-1 flex-none;
 }
 
 .thread-composer-actions {
-  @apply ml-auto flex min-w-0 items-center gap-2;
+  @apply flex min-w-0 shrink-0 items-center gap-2;
 }
 
 .thread-composer-actions--recording {
-  @apply ml-0 flex-1;
+  @apply flex-1;
 }
 
 .thread-composer-mic {
@@ -2608,8 +2629,12 @@ watch(
     @apply gap-0.5;
   }
 
+  .thread-composer-config-controls {
+    @apply flex-1 gap-1;
+  }
+
   .thread-composer-goal-trigger {
-    @apply px-1.5 text-xs;
+    @apply px-2 text-sm;
   }
 
   .thread-composer-actions {
@@ -2617,25 +2642,30 @@ watch(
   }
 
   .thread-composer-model-effort {
-    @apply max-w-36;
+    flex-basis: auto;
+    max-width: none;
+    min-width: 6.75rem;
+  }
+
+  .thread-composer-model-effort :deep(.composer-dropdown-trigger) {
+    @apply px-2 text-sm;
   }
 }
 
 @media (max-width: 360px) {
   .thread-composer-controls {
     flex-wrap: wrap;
-    row-gap: 0.25rem;
+  }
+
+  .thread-composer-model-effort {
+    flex-basis: auto;
+    max-width: none;
+    min-width: 6.25rem;
   }
 
   .thread-composer-actions {
     flex-basis: 100%;
-    width: 100%;
     justify-content: flex-end;
-  }
-
-  .thread-composer-model-effort {
-    flex: 1 1 auto;
-    max-width: min(12rem, calc(100% - 5rem));
   }
 }
 </style>

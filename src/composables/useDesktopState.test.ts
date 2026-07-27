@@ -101,9 +101,13 @@ function thread(id: string, cwd: string, options: { hasWorktree?: boolean } = {}
   }
 }
 
-function installTestWindow(initialStorage: Record<string, string> = {}) {
+function installTestWindow(
+  initialStorage: Record<string, string> = {},
+  options: { isMobile?: boolean } = {},
+) {
   const store = new Map(Object.entries(initialStorage))
   vi.stubGlobal('window', {
+    innerWidth: options.isMobile === true ? 390 : 1024,
     localStorage: {
       getItem: vi.fn((key: string) => store.get(key) ?? null),
       setItem: vi.fn((key: string, value: string) => {
@@ -113,6 +117,12 @@ function installTestWindow(initialStorage: Record<string, string> = {}) {
         store.delete(key)
       }),
     },
+    matchMedia: vi.fn((query: string) => ({
+      matches: options.isMobile === true && /max-width:\s*767px/u.test(query),
+      media: query,
+      addEventListener: vi.fn(),
+      removeEventListener: vi.fn(),
+    })),
     setTimeout: vi.fn(),
     clearTimeout: vi.fn(),
   })
@@ -324,6 +334,35 @@ describe('existing thread loading', () => {
     expect(gatewayMocks.getThreadDetail).toHaveBeenNthCalledWith(1, 'thread-1')
     expect(gatewayMocks.getThreadDetail).toHaveBeenNthCalledWith(2, 'thread-1')
     expect(gatewayMocks.resumeThread).not.toHaveBeenCalled()
+  })
+
+  it('keeps the user-selected model and effort when the first follow-up resumes the thread', async () => {
+    installTestWindow()
+    gatewayMocks.resumeThread.mockResolvedValue({
+      ...idleDetail(),
+      model: 'gpt-5.5',
+      modelProvider: 'openai',
+    })
+    gatewayMocks.startThreadTurn.mockResolvedValue('turn-selected-settings')
+
+    const state = useDesktopState()
+    state.primeSelectedThread('thread-1')
+    state.setSelectedModelIdForThread('thread-1', 'gpt-5.6-sol')
+    state.setSelectedReasoningEffort('max')
+
+    await state.sendMessageToSelectedThread('use the selected settings')
+
+    expect(gatewayMocks.resumeThread).toHaveBeenCalledWith('thread-1')
+    expect(gatewayMocks.startThreadTurn).toHaveBeenCalledWith(
+      'thread-1',
+      'use the selected settings',
+      [],
+      'gpt-5.6-sol',
+      'max',
+      undefined,
+      [],
+      'default',
+    )
   })
 })
 
@@ -1208,6 +1247,59 @@ describe('Codex CLI availability', () => {
 })
 
 describe('startup request deduplication', () => {
+  it('renders the first thread page before ancillary thread-list metadata settles', async () => {
+    installTestWindow()
+    const titleCache = deferred<{ titles: Record<string, string> }>()
+    const rootsState = deferred<WorkspaceRootsState>()
+    gatewayMocks.getThreadGroupsPage.mockResolvedValue({
+      groups: [{ projectName: 'Project', threads: [thread('thread-1', '/tmp/project')] }],
+      nextCursor: null,
+    })
+    gatewayMocks.getThreadTitleCache.mockReturnValue(titleCache.promise)
+    gatewayMocks.getWorkspaceRootsState.mockReturnValue(rootsState.promise)
+
+    const state = useDesktopState()
+    const refresh = state.refreshAll({ includeSelectedThreadMessages: false })
+    await flushMicrotasks()
+
+    expect(state.projectGroups.value[0]?.threads.map((row) => row.id)).toEqual(['thread-1'])
+    expect(state.isLoadingThreads.value).toBe(false)
+
+    titleCache.resolve({ titles: { 'thread-1': 'Imported title' } })
+    rootsState.resolve({
+      order: ['/tmp/project'],
+      labels: {},
+      active: ['/tmp/project'],
+      projectOrder: ['Project'],
+      remoteProjects: [],
+    })
+    await refresh
+  })
+
+  it('starts loading a URL-selected thread without waiting for the thread list', async () => {
+    installTestWindow()
+    const threadPage = {
+      groups: [{ projectName: 'Project', threads: [thread('thread-1', '/tmp/project')] }],
+      nextCursor: null,
+    }
+    const pendingThreadList = deferred<typeof threadPage>()
+    const pendingThreadDetail = deferred<ReturnType<typeof idleDetail>>()
+    gatewayMocks.getThreadGroupsPage.mockReturnValue(pendingThreadList.promise)
+    gatewayMocks.getThreadDetail.mockReturnValue(pendingThreadDetail.promise)
+
+    const state = useDesktopState()
+    state.primeSelectedThread('thread-1')
+    const refresh = state.refreshAll()
+    await flushMicrotasks()
+
+    expect(gatewayMocks.getThreadGroupsPage).toHaveBeenCalledTimes(1)
+    expect(gatewayMocks.getThreadDetail).toHaveBeenCalledWith('thread-1')
+
+    pendingThreadList.resolve(threadPage)
+    pendingThreadDetail.resolve(idleDetail())
+    await refresh
+  })
+
   it('reloads cached thread titles on forced thread refresh', async () => {
     installTestWindow()
     gatewayMocks.getThreadGroupsPage.mockResolvedValue({
@@ -1992,6 +2084,105 @@ describe('subagent item notification synchronization', () => {
 })
 
 describe('external runtime ownership', () => {
+  it('preserves running state from thread list rows before background polling', async () => {
+    installTestWindow({
+      'codex-web-local.thread-unread-cutoff.v1': '2026-01-01T00:00:00.000Z',
+    })
+    gatewayMocks.getThreadGroupsPage.mockResolvedValue({
+      groups: [{ projectName: 'Project', threads: [
+        {
+          ...thread('thread-running', '/tmp/project'),
+          updatedAtIso: '2026-07-14T00:00:00.000Z',
+          inProgress: true,
+        },
+        thread('thread-selected', '/tmp/project'),
+      ] }],
+      nextCursor: null,
+    })
+
+    const state = useDesktopState()
+    state.primeSelectedThread('thread-selected')
+    await state.refreshAll({ includeSelectedThreadMessages: false })
+
+    expect(state.projectGroups.value[0]?.threads[0]).toMatchObject({
+      id: 'thread-running',
+      inProgress: true,
+      unread: false,
+    })
+  })
+
+  it('defers background runtime polling while selected thread detail is loading', async () => {
+    vi.useFakeTimers()
+    installFakeTimerWindow()
+    vi.stubGlobal('document', {
+      visibilityState: 'visible',
+      addEventListener: vi.fn(),
+      removeEventListener: vi.fn(),
+    })
+    const pendingDetail = deferred<ReturnType<typeof idleDetail>>()
+    gatewayMocks.getThreadGroupsPage.mockResolvedValue({
+      groups: [{ projectName: 'Project', threads: [thread('thread-selected', '/tmp/project')] }],
+      nextCursor: null,
+    })
+    gatewayMocks.getThreadDetail.mockReturnValue(pendingDetail.promise)
+    gatewayMocks.getThreadRuntimeStates.mockResolvedValue({})
+
+    const state = useDesktopState()
+    state.primeSelectedThread('thread-selected')
+    await state.refreshAll({ includeSelectedThreadMessages: false })
+    expect(state.projectGroups.value[0]?.threads.map((row) => row.id)).toEqual(['thread-selected'])
+    const load = state.loadMessages('thread-selected')
+    await flushMicrotasks()
+    state.startPolling()
+    pollingCleanups.push(() => state.stopPolling())
+
+    await vi.advanceTimersByTimeAsync(0)
+    expect(gatewayMocks.getThreadRuntimeStates).not.toHaveBeenCalled()
+
+    pendingDetail.resolve(idleDetail())
+    await load
+    await vi.runOnlyPendingTimersAsync()
+    await vi.runOnlyPendingTimersAsync()
+
+    expect(gatewayMocks.getThreadRuntimeStates).toHaveBeenCalledWith(
+      ['thread-selected'],
+      expect.any(AbortSignal),
+    )
+  })
+
+  it('continues background runtime polling for sidebar tasks while selected detail is loading', async () => {
+    const state = await setupBackgroundRuntimeState()
+    const pendingDetail = deferred<ReturnType<typeof idleDetail>>()
+    gatewayMocks.getThreadDetail.mockReturnValue(pendingDetail.promise)
+    gatewayMocks.getThreadRuntimeStates.mockResolvedValue({
+      'thread-running': {
+        state: 'running',
+        turnId: 'turn-external',
+        interruptible: false,
+        source: 'external-session-writer',
+      },
+    })
+
+    const load = state.loadMessages('thread-selected')
+    await flushMicrotasks()
+    state.startPolling()
+    pollingCleanups.push(() => state.stopPolling())
+    await vi.advanceTimersByTimeAsync(0)
+    await flushMicrotasks()
+
+    expect(gatewayMocks.getThreadRuntimeStates).toHaveBeenCalledWith(
+      ['thread-running'],
+      expect.any(AbortSignal),
+    )
+    expect(state.projectGroups.value[0]?.threads[0]).toMatchObject({
+      inProgress: true,
+      unread: false,
+    })
+
+    pendingDetail.resolve(idleDetail())
+    await load
+  })
+
   it('discovers a new desktop turn for the selected idle task and immediately loads its output', async () => {
     const state = await setupBackgroundRuntimeState()
     gatewayMocks.getThreadRuntimeStates.mockResolvedValue({
@@ -4348,6 +4539,23 @@ describe('external runtime ownership', () => {
     expect(gatewayMocks.startThreadTurn).toHaveBeenCalled()
     expect(gatewayMocks.interruptThreadTurn).toHaveBeenCalledWith('thread-1', expect.any(String))
   })
+
+  it('persists the selected thread model and effort with queued messages', async () => {
+    const { state, emit } = await setupExternalRuntimeState()
+    emit({ method: 'turn/started', params: { threadId: 'thread-1', turn: { id: 'turn-local' } } })
+    state.setSelectedModelIdForThread('thread-1', 'gpt-5.6-sol')
+    state.setSelectedReasoningEffort('max')
+
+    await state.sendMessageToSelectedThread('queued with selected settings', [], [], 'queue')
+
+    expect(gatewayMocks.setThreadQueueState).toHaveBeenLastCalledWith({
+      'thread-1': [expect.objectContaining({
+        text: 'queued with selected settings',
+        model: 'gpt-5.6-sol',
+        effort: 'max',
+      })],
+    })
+  })
 })
 
 describe('external live reasoning overlay', () => {
@@ -4792,6 +5000,64 @@ describe('provider model selection', () => {
     })
   })
 
+  it('defaults existing Codex mobile task contexts to fast mode', async () => {
+    installTestWindow({}, { isMobile: true })
+    gatewayMocks.getThreadGroupsPage.mockResolvedValue({
+      groups: [{ projectName: 'Project', threads: [thread('thread-1', '/tmp/project')] }],
+      nextCursor: null,
+    })
+    gatewayMocks.getAvailableCollaborationModes.mockResolvedValue([{ value: 'default', label: 'Default' }])
+    gatewayMocks.getSkillsList.mockResolvedValue([])
+    gatewayMocks.getAccountRateLimits.mockResolvedValue(null)
+    gatewayMocks.getCurrentModelConfig.mockResolvedValue({
+      model: 'gpt-5.5',
+      providerId: '',
+      reasoningEffort: 'medium',
+      speedMode: 'standard',
+    })
+    gatewayMocks.getAvailableModelIds.mockResolvedValue(['gpt-5.5'])
+
+    const state = useDesktopState()
+    state.primeSelectedThread('thread-1')
+    await state.refreshAll({ includeSelectedThreadMessages: false, awaitAncillaryRefreshes: true })
+
+    expect(state.selectedSpeedMode.value).toBe('fast')
+    expect(gatewayMocks.setCodexSpeedMode).toHaveBeenCalledWith('fast')
+  })
+
+  it('uses selected external thread model and effort instead of mobile defaults', async () => {
+    installTestWindow({}, { isMobile: true })
+    gatewayMocks.getThreadGroupsPage.mockResolvedValue({
+      groups: [{ projectName: 'Project', threads: [thread('external-thread', '/tmp/project')] }],
+      nextCursor: null,
+    })
+    gatewayMocks.getAvailableCollaborationModes.mockResolvedValue([{ value: 'default', label: 'Default' }])
+    gatewayMocks.getSkillsList.mockResolvedValue([])
+    gatewayMocks.getAccountRateLimits.mockResolvedValue(null)
+    gatewayMocks.getCurrentModelConfig.mockResolvedValue({
+      model: 'gpt-5.6-sol',
+      providerId: '',
+      reasoningEffort: 'medium',
+      speedMode: 'standard',
+    })
+    gatewayMocks.getAvailableModelIds.mockResolvedValue(['gpt-5.5', 'gpt-5.6-sol'])
+    gatewayMocks.getThreadDetail.mockResolvedValue({
+      ...externalDetail('turn-external'),
+      model: 'gpt-5.5',
+      modelProvider: 'openai',
+      reasoningEffort: 'xhigh',
+    })
+
+    const state = useDesktopState()
+    state.primeSelectedThread('external-thread')
+    await state.refreshAll({ includeSelectedThreadMessages: true, awaitAncillaryRefreshes: true })
+
+    expect(state.selectedModelId.value).toBe('gpt-5.5')
+    expect(state.readModelIdForThread('external-thread')).toBe('gpt-5.5')
+    expect(state.selectedReasoningEffort.value).toBe('xhigh')
+    expect(state.selectedSpeedMode.value).toBe('fast')
+  })
+
   it('ignores global selected-model localStorage when OpenCode Zen is the active provider', async () => {
     installTestWindow({
       'codex-web-local.selected-model-by-context.v1': JSON.stringify({
@@ -5043,6 +5309,44 @@ describe('provider model selection', () => {
     expect(state.selectedModelId.value).toBe('big-pickle')
   })
 
+  it('renders a follow-up user message immediately in an existing thread while turn start is pending', async () => {
+    installTestWindow()
+    const pendingTurn = deferred<string>()
+    gatewayMocks.getThreadDetail.mockResolvedValue({
+      ...idleDetail(),
+      messages: [
+        {
+          id: 'user-existing',
+          role: 'user',
+          text: 'previous',
+          messageType: 'userMessage',
+        },
+        {
+          id: 'assistant-existing',
+          role: 'assistant',
+          text: 'ready',
+          messageType: 'agentMessage',
+        },
+      ],
+    })
+    gatewayMocks.resumeThread.mockResolvedValue(idleDetail())
+    gatewayMocks.startThreadTurn.mockReturnValue(pendingTurn.promise)
+
+    const state = useDesktopState()
+    state.primeSelectedThread('thread-1')
+    await state.loadMessages('thread-1')
+
+    const send = state.sendMessageToSelectedThread('next question')
+    await flushMicrotasks()
+
+    expect(state.messages.value.map((message) => `${message.role}:${message.text}`)).toContain('user:next question')
+    expect(state.messages.value.find((message) => message.text === 'next question')?.messageType)
+      .toBe('userMessage.optimistic')
+
+    pendingTurn.resolve('turn-follow-up')
+    await send
+  })
+
   it('captures the active provider when creating a new thread', async () => {
     installTestWindow()
     gatewayMocks.getThreadGroupsPage.mockResolvedValue({ groups: [], nextCursor: null })
@@ -5124,8 +5428,8 @@ describe('provider model selection', () => {
     const managedImageUrl = '/codex-local-image?path=%2Ftmp%2Fcodex-web-uploads%2Fupload-123%2Fphoto.png&uploadHandle=managed-photo'
     const state = useDesktopState()
 
-    await expect(state.sendMessageToNewThread('describe this', '/tmp/project', [managedImageUrl]))
-      .resolves.toBe('new-image-thread')
+    const send = state.sendMessageToNewThread('describe this', '/tmp/project', [managedImageUrl])
+    await flushMicrotasks()
 
     const optimistic = state.messages.value.find((message) => message.messageType === 'userMessage.optimistic')
     expect(optimistic).toMatchObject({
@@ -5135,7 +5439,7 @@ describe('provider model selection', () => {
     expect(optimistic?.images ?? []).toEqual([])
 
     pendingTurn.resolve('turn-first')
-    await flushMicrotasks()
+    await expect(send).resolves.toBe('new-image-thread')
   })
 
   it('releases a new-thread upload once after primary and fallback thread/start both fail', async () => {
@@ -5171,7 +5475,7 @@ describe('provider model selection', () => {
     expect(gatewayMocks.cleanupManagedUploads).toHaveBeenCalledWith([managedImageUrl], [])
   })
 
-  it('transfers a new-thread upload to pending-turn cleanup without double deletion', async () => {
+  it('rejects and rolls back an optimistic new thread when first turn start fails', async () => {
     installTestWindow()
     const state = useDesktopState()
     const managedImageUrl = '/codex-local-image?path=%2Ftmp%2Fcodex-web-uploads%2Fupload%2Fphoto.png&uploadHandle=pending-owner'
@@ -5183,10 +5487,14 @@ describe('provider model selection', () => {
     gatewayMocks.startThreadTurn.mockRejectedValue(new Error('final turn handoff failed'))
 
     await expect(state.sendMessageToNewThread('hi', '/tmp/project', [managedImageUrl]))
-      .resolves.toBe('new-thread')
-    await vi.waitFor(() => {
-      expect(gatewayMocks.cleanupManagedUploads).toHaveBeenCalledTimes(1)
-    })
+      .rejects.toThrow('final turn handoff failed')
+
+    expect(state.selectedThreadId.value).toBe('')
+    expect(state.messages.value).toEqual([])
+    expect(state.projectGroups.value.flatMap((group) => group.threads).some((thread) => thread.id === 'new-thread'))
+      .toBe(false)
+    expect(state.error.value).toBe('final turn handoff failed')
+    expect(gatewayMocks.cleanupManagedUploads).toHaveBeenCalledTimes(1)
     expect(gatewayMocks.cleanupManagedUploads).toHaveBeenCalledWith([managedImageUrl], [])
   })
 

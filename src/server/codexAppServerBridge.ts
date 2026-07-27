@@ -1,6 +1,6 @@
 import { spawn, spawnSync, type ChildProcessWithoutNullStreams } from 'node:child_process'
 import { createHash, createHmac, randomBytes, randomUUID, timingSafeEqual } from 'node:crypto'
-import { link, mkdtemp, readFile, readdir, rename, rm, mkdir, stat, cp, lstat, readlink, symlink, realpath, utimes } from 'node:fs/promises'
+import { link, mkdtemp, open, readFile, readdir, rename, rm, mkdir, stat, cp, lstat, readlink, symlink, realpath, utimes, type FileHandle } from 'node:fs/promises'
 import { createReadStream, existsSync, readFileSync, statSync } from 'node:fs'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { request as httpRequest } from 'node:http'
@@ -81,6 +81,8 @@ type RpcProxyRequest = {
 }
 
 const CODEX_MOBILE_LIVE_SNAPSHOT_PARAM = '__codexMobileLiveSnapshot'
+const SESSION_MODEL_SETTINGS_SCAN_BLOCK_BYTES = 512 * 1024
+const SESSION_TURN_CONTEXT_MARKER = Buffer.from('"type":"turn_context"', 'utf8')
 
 type RpcExecutor = {
   rpc: (method: string, params: unknown) => Promise<unknown>
@@ -244,6 +246,8 @@ const PROVIDER_MODELS_FETCH_TIMEOUT_MS = 5_000
 
 const THREAD_RESPONSE_TURN_LIMIT = 5
 const THREAD_TURN_PAGE_READ_CACHE_TTL_MS = 30_000
+const THREAD_LIST_RPC_CACHE_TTL_MS = 2_000
+const THREAD_LIST_PERSISTED_CACHE_MAX_AGE_MS = 6 * 60 * 60 * 1000
 const THREAD_METHODS_WITH_TURNS = new Set(['thread/read', 'thread/resume', 'thread/fork', 'thread/rollback'])
 const THREAD_METHODS_WITH_THREAD_SNAPSHOT = new Set([...THREAD_METHODS_WITH_TURNS, 'thread/start'])
 const THREAD_SEARCH_FULL_TEXT_THREAD_LIMIT = 100
@@ -488,11 +492,71 @@ export async function applySessionSkillEnrichmentForRpc(
   return enrich(result)
 }
 
+export async function prepareThreadRpcResultForClient(
+  method: string,
+  result: unknown,
+  skipSessionSkillEnrichment: boolean,
+  enrich: (value: unknown) => Promise<unknown> = mergeSessionRecoveredItemsIntoThreadResult,
+): Promise<unknown> {
+  const enrichedResult = await applySessionSkillEnrichmentForRpc(
+    method,
+    skipSessionSkillEnrichment,
+    result,
+    enrich,
+  )
+  return sanitizeThreadTurnsInlinePayloads(method, enrichedResult)
+}
+
 export function shouldStoreThreadReadSnapshotForRpc(
   method: string,
   skipSessionSkillEnrichment: boolean,
 ): boolean {
   return THREAD_METHODS_WITH_THREAD_SNAPSHOT.has(method) && !skipSessionSkillEnrichment
+}
+
+export function mergeSessionModelSettingsIntoThreadResult(result: unknown, settings: SessionModelSettings): unknown {
+  const record = asRecord(result)
+  const thread = asRecord(record?.thread)
+  if (!record || !thread) return result
+  if (!settings.model && !settings.modelProvider && !settings.reasoningEffort) return result
+
+  const model = settings.model
+    || readNonEmptyString(record.model)
+    || readNonEmptyString(thread.model)
+  const modelProvider = settings.modelProvider
+    || readNonEmptyString(record.modelProvider)
+    || readNonEmptyString(thread.modelProvider)
+  const reasoningEffort = settings.reasoningEffort
+    || normalizeReasoningEffort(record.reasoningEffort)
+    || normalizeReasoningEffort(record.reasoning_effort)
+    || normalizeReasoningEffort(thread.reasoningEffort)
+    || normalizeReasoningEffort(thread.reasoning_effort)
+
+  return {
+    ...record,
+    ...(model ? { model } : {}),
+    ...(modelProvider ? { modelProvider } : {}),
+    ...(reasoningEffort ? { reasoningEffort, reasoning_effort: reasoningEffort } : {}),
+    thread: {
+      ...thread,
+      ...(model ? { model } : {}),
+      ...(modelProvider ? { modelProvider } : {}),
+      ...(reasoningEffort ? { reasoningEffort, reasoning_effort: reasoningEffort } : {}),
+    },
+  }
+}
+
+async function enrichThreadResultWithSessionModelSettings(method: string, result: unknown): Promise<unknown> {
+  if (method !== 'thread/read' && method !== 'thread/resume' && method !== 'thread/start' && method !== 'thread/fork') {
+    return result
+  }
+  const thread = asRecord(asRecord(result)?.thread)
+  const sessionPath = readNonEmptyString(thread?.path)
+  if (!sessionPath || !isAbsolute(sessionPath)) return result
+  return mergeSessionModelSettingsIntoThreadResult(
+    result,
+    await readSessionModelSettingsFromFile(sessionPath),
+  )
 }
 
 function readEnvValueFromFile(filePath: string, key: string): string | null {
@@ -928,11 +992,17 @@ export async function sanitizeThreadTurnsInlinePayloads(method: string, result: 
         continue
       }
       let itemForSanitization: unknown = item
-      if (itemRecord.type === 'commandExecution' && typeof itemRecord.aggregatedOutput === 'string') {
-        const nextAggregatedOutput = truncateThreadCommandOutput(itemRecord.aggregatedOutput)
-        if (nextAggregatedOutput !== itemRecord.aggregatedOutput) {
+      const compressedRawItem = compressThreadActivityRawPayloads(itemRecord)
+      if (compressedRawItem.changed) {
+        itemForSanitization = compressedRawItem.value
+        itemChanged = true
+      }
+      const itemRecordForCommand = asRecord(itemForSanitization)
+      if (itemRecordForCommand?.type === 'commandExecution' && typeof itemRecordForCommand.aggregatedOutput === 'string') {
+        const nextAggregatedOutput = truncateThreadCommandOutput(itemRecordForCommand.aggregatedOutput)
+        if (nextAggregatedOutput !== itemRecordForCommand.aggregatedOutput) {
           itemForSanitization = {
-            ...itemRecord,
+            ...itemRecordForCommand,
             aggregatedOutput: nextAggregatedOutput,
           }
           itemChanged = true
@@ -951,14 +1021,16 @@ export async function sanitizeThreadTurnsInlinePayloads(method: string, result: 
       nextItems.push(sanitizedItem.value)
     }
 
-    if (!itemChanged) {
+    const windowedItems = windowThreadTurnItems(turnId, nextItems)
+    if (!itemChanged && !windowedItems.compression) {
       nextTurns.push(turn)
       continue
     }
     changed = true
     nextTurns.push({
       ...turnRecord,
-      items: nextItems,
+      items: windowedItems.items,
+      ...(windowedItems.compression ? { rawItemCompression: windowedItems.compression } : {}),
     })
   }
 
@@ -970,6 +1042,17 @@ export async function sanitizeThreadTurnsInlinePayloads(method: string, result: 
       turns: nextTurns,
     },
   }
+}
+
+async function sanitizeThreadTurnsArrayForClient(turns: unknown[]): Promise<unknown[]> {
+  const sanitized = await sanitizeThreadTurnsInlinePayloads('thread/read', {
+    thread: {
+      turns,
+    },
+  })
+  const record = asRecord(sanitized)
+  const thread = asRecord(record?.thread)
+  return Array.isArray(thread?.turns) ? thread.turns : turns
 }
 
 type ThreadRuntimeProbe = Pick<
@@ -1012,6 +1095,54 @@ export async function observeThreadRuntimeStates(
     }
   }
   return states
+}
+
+async function observeThreadRuntimeState(
+  threadId: string,
+  runtimeProbe: Pick<ExternalThreadRuntimeProbe, 'inspect'>,
+  localRuntimeLedger: Pick<LocalThreadRuntimeLedger, 'getRunning'>,
+  excludedPid: number | null,
+): Promise<ThreadRuntimeObservation> {
+  const external = await runtimeProbe.inspect(threadId, excludedPid)
+  const local = localRuntimeLedger.getRunning(threadId)
+  if (!local) return external
+  return {
+    state: 'running',
+    turnId: local.turnId,
+    interruptible: true,
+    source: 'local-app-server',
+  }
+}
+
+function markOrphanedLocalTurnItems(items: unknown): unknown {
+  if (!Array.isArray(items)) return items
+  let changed = false
+  const nextItems = items.map((item) => {
+    const itemRecord = asRecord(item)
+    if (!itemRecord || itemRecord.status !== 'inProgress') return item
+    changed = true
+    return {
+      ...itemRecord,
+      status: 'interrupted',
+    }
+  })
+  return changed ? nextItems : items
+}
+
+function markLastLocalInProgressTurnOrphaned(turns: unknown[]): unknown[] {
+  const lastIndex = turns.length - 1
+  if (lastIndex < 0) return turns
+  const lastTurn = asRecord(turns[lastIndex])
+  if (!lastTurn || lastTurn.status !== 'inProgress') return turns
+  return turns.map((turn, index) => {
+    if (index !== lastIndex) return turn
+    return {
+      ...lastTurn,
+      status: 'orphaned',
+      orphanedReason: 'No live writer process was found for this in-progress turn.',
+      items: markOrphanedLocalTurnItems(lastTurn.items),
+    }
+  })
 }
 
 function readRuntimeBatchThreadIds(value: unknown): string[] | null {
@@ -1510,6 +1641,20 @@ type ImportedSessionRecord = {
   firstUserMessage: string
 }
 
+type SessionModelSettings = {
+  model: string
+  modelProvider: string
+  reasoningEffort: ReasoningEffort | ''
+}
+
+type SessionModelSettingsCacheEntry = {
+  fileSize: number
+  settings: SessionModelSettings
+}
+
+const SESSION_MODEL_SETTINGS_CACHE_MAX_ENTRIES = 128
+const sessionModelSettingsCache = new Map<string, SessionModelSettingsCacheEntry>()
+
 type ExportedThreadMetadata = {
   title: string
   updatedAtMs: number
@@ -1875,6 +2020,203 @@ function getCurrentImportedSessionModelDefaults(): { model: string; modelProvide
     }
   }
   return null
+}
+
+export function readSessionModelSettingsFromLog(raw: string): SessionModelSettings {
+  const settings: SessionModelSettings = {
+    model: '',
+    modelProvider: '',
+    reasoningEffort: '',
+  }
+
+  for (const line of raw.split(/\r?\n/u)) {
+    if (!line.trim()) continue
+    try {
+      const parsed = JSON.parse(line) as unknown
+      const record = asRecord(parsed)
+      const payload = asRecord(record?.payload)
+      if (!record || !payload) continue
+
+      if (record.type === 'session_meta') {
+        settings.model = readNonEmptyString(payload.model) || settings.model
+        settings.modelProvider = readNonEmptyString(payload.model_provider) || settings.modelProvider
+        continue
+      }
+
+      if (record.type === 'turn_context') {
+        const collaborationMode = asRecord(payload.collaboration_mode)
+        const collaborationSettings = asRecord(collaborationMode?.settings)
+        settings.model = readNonEmptyString(payload.model)
+          || readNonEmptyString(collaborationSettings?.model)
+          || settings.model
+        settings.modelProvider = readNonEmptyString(payload.model_provider) || settings.modelProvider
+        settings.reasoningEffort = normalizeReasoningEffort(payload.effort)
+          || normalizeReasoningEffort(collaborationSettings?.reasoning_effort)
+          || settings.reasoningEffort
+      }
+    } catch {
+      continue
+    }
+  }
+
+  return settings
+}
+
+async function readSessionRange(
+  handle: FileHandle,
+  start: number,
+  length: number,
+): Promise<Buffer> {
+  if (length <= 0) return Buffer.alloc(0)
+  const buffer = Buffer.allocUnsafe(length)
+  const { bytesRead } = await handle.read(buffer, 0, length, start)
+  return buffer.subarray(0, bytesRead)
+}
+
+async function findSessionLineStart(
+  handle: FileHandle,
+  markerOffset: number,
+): Promise<number> {
+  let cursor = markerOffset
+  while (cursor > 0) {
+    const start = Math.max(0, cursor - SESSION_MODEL_SETTINGS_SCAN_BLOCK_BYTES)
+    const buffer = await readSessionRange(handle, start, cursor - start)
+    const newlineIndex = buffer.lastIndexOf(0x0a)
+    if (newlineIndex >= 0) return start + newlineIndex + 1
+    cursor = start
+  }
+  return 0
+}
+
+async function readSessionLine(
+  handle: FileHandle,
+  fileSize: number,
+  lineStart: number,
+): Promise<string> {
+  const chunks: Buffer[] = []
+  let cursor = lineStart
+  while (cursor < fileSize) {
+    const buffer = await readSessionRange(
+      handle,
+      cursor,
+      Math.min(SESSION_MODEL_SETTINGS_SCAN_BLOCK_BYTES, fileSize - cursor),
+    )
+    if (buffer.length === 0) break
+    const newlineIndex = buffer.indexOf(0x0a)
+    chunks.push(newlineIndex >= 0 ? buffer.subarray(0, newlineIndex) : buffer)
+    if (newlineIndex >= 0) break
+    cursor += buffer.length
+  }
+  return Buffer.concat(chunks).toString('utf8').replace(/\r$/u, '')
+}
+
+async function readLatestSessionTurnContextSettings(
+  handle: FileHandle,
+  fileSize: number,
+  minimumMarkerOffset = 0,
+): Promise<SessionModelSettings | null> {
+  const settings: SessionModelSettings = {
+    model: '',
+    modelProvider: '',
+    reasoningEffort: '',
+  }
+  const markerOverlap = Math.max(0, SESSION_TURN_CONTEXT_MARKER.length - 1)
+  let scanEnd = fileSize
+
+  while (scanEnd > minimumMarkerOffset) {
+    const scanStart = Math.max(minimumMarkerOffset, scanEnd - SESSION_MODEL_SETTINGS_SCAN_BLOCK_BYTES)
+    const readEnd = Math.min(fileSize, scanEnd + markerOverlap)
+    const buffer = await readSessionRange(handle, scanStart, readEnd - scanStart)
+    let markerIndex = buffer.lastIndexOf(SESSION_TURN_CONTEXT_MARKER)
+
+    while (markerIndex >= 0) {
+      const markerOffset = scanStart + markerIndex
+      if (markerOffset < scanEnd) {
+        const lineStart = await findSessionLineStart(handle, markerOffset)
+        const candidate = readSessionModelSettingsFromLog(
+          await readSessionLine(handle, fileSize, lineStart),
+        )
+        settings.model ||= candidate.model
+        settings.modelProvider ||= candidate.modelProvider
+        settings.reasoningEffort ||= candidate.reasoningEffort
+        if (settings.model && settings.reasoningEffort) return settings
+      }
+      markerIndex = markerIndex > 0
+        ? buffer.lastIndexOf(SESSION_TURN_CONTEXT_MARKER, markerIndex - 1)
+        : -1
+    }
+
+    scanEnd = scanStart
+  }
+
+  return settings.model || settings.modelProvider || settings.reasoningEffort
+    ? settings
+    : null
+}
+
+function cacheSessionModelSettings(
+  sessionPath: string,
+  entry: SessionModelSettingsCacheEntry,
+): void {
+  sessionModelSettingsCache.delete(sessionPath)
+  sessionModelSettingsCache.set(sessionPath, entry)
+  while (sessionModelSettingsCache.size > SESSION_MODEL_SETTINGS_CACHE_MAX_ENTRIES) {
+    const oldestPath = sessionModelSettingsCache.keys().next().value
+    if (typeof oldestPath !== 'string') break
+    sessionModelSettingsCache.delete(oldestPath)
+  }
+}
+
+export async function readSessionModelSettingsFromFile(sessionPath: string): Promise<SessionModelSettings> {
+  if (!sessionPath || !isAbsolute(sessionPath)) {
+    return { model: '', modelProvider: '', reasoningEffort: '' }
+  }
+  let handle: FileHandle
+  try {
+    handle = await open(sessionPath, 'r')
+  } catch {
+    return { model: '', modelProvider: '', reasoningEffort: '' }
+  }
+  try {
+    const fileStat = await handle.stat()
+    if (fileStat.size <= 0) {
+      return { model: '', modelProvider: '', reasoningEffort: '' }
+    }
+    const cached = sessionModelSettingsCache.get(sessionPath)
+    if (cached && cached.fileSize === fileStat.size) {
+      cacheSessionModelSettings(sessionPath, cached)
+      return { ...cached.settings }
+    }
+
+    const canIncrementallyScan = Boolean(cached && fileStat.size > cached.fileSize)
+    const baseSettings = canIncrementallyScan && cached
+      ? cached.settings
+      : readSessionModelSettingsFromLog(
+          await readSessionLine(handle, fileStat.size, 0),
+        )
+    const minimumMarkerOffset = canIncrementallyScan && cached
+      ? Math.max(0, cached.fileSize - SESSION_MODEL_SETTINGS_SCAN_BLOCK_BYTES)
+      : 0
+    const turnSettings = await readLatestSessionTurnContextSettings(
+      handle,
+      fileStat.size,
+      minimumMarkerOffset,
+    )
+    const settings: SessionModelSettings = {
+      model: turnSettings?.model || baseSettings.model,
+      modelProvider: turnSettings?.modelProvider || baseSettings.modelProvider,
+      reasoningEffort: turnSettings?.reasoningEffort || baseSettings.reasoningEffort,
+    }
+    cacheSessionModelSettings(sessionPath, {
+      fileSize: fileStat.size,
+      settings,
+    })
+    return { ...settings }
+  } catch {
+    return { model: '', modelProvider: '', reasoningEffort: '' }
+  } finally {
+    await handle.close()
+  }
 }
 
 function rewriteImportedSession(raw: string, importedCwd: string, importedThreadId: string): string {
@@ -3711,13 +4053,41 @@ type SessionRecoveredCommand = {
   type: 'commandExecution'
   command: string
   cwd: string | null
-  status: 'completed' | 'failed'
+  status: 'inProgress' | 'completed' | 'failed'
   aggregatedOutput: string
   exitCode: number | null
   durationMs: number | null
 }
 
-const THREAD_COMMAND_OUTPUT_LIMIT = 8 * 1024
+const THREAD_COMMAND_OUTPUT_LIMIT = 2 * 1024
+const THREAD_RAW_ACTIVITY_PAYLOAD_LIMIT = 2 * 1024
+const THREAD_RAW_ACTIVITY_PREVIEW_LIMIT = 384
+const THREAD_TURN_ITEM_WINDOW_LIMIT = 240
+const THREAD_TURN_ITEM_HEAD_LIMIT = 1
+const THREAD_TURN_VISIBLE_ITEM_TAIL_LIMIT = 80
+const THREAD_ACTIVITY_ONLY_ITEM_TYPES = new Set([
+  'mcpToolCall',
+  'dynamicToolCall',
+  'webSearch',
+  'collabAgentToolCall',
+])
+const THREAD_VISIBLE_ITEM_TYPES = new Set([
+  'userMessage',
+  'agentMessage',
+  'agentMessage.live',
+  'reasoning',
+  'contextCompaction',
+])
+const THREAD_ACTIVITY_RAW_FIELD_NAMES = new Set([
+  'arguments',
+  'args',
+  'input',
+  'output',
+  'result',
+  'response',
+  'data',
+  'error',
+])
 
 function truncateThreadCommandOutput(output: string): string {
   if (output.length <= THREAD_COMMAND_OUTPUT_LIMIT) return output
@@ -3729,6 +4099,182 @@ function truncateThreadCommandOutput(output: string): string {
     `[output truncated: ${omittedLength} characters omitted from command output]`,
     output.slice(-tailLength).trimStart(),
   ].join('\n\n')
+}
+
+function stringifyRawPayloadForCompression(value: unknown): string {
+  if (typeof value === 'string') return value
+  try {
+    return JSON.stringify(value)
+  } catch {
+    return String(value)
+  }
+}
+
+function previewRawPayloadText(value: unknown): string {
+  if (typeof value === 'string') return value
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      const preview = previewRawPayloadText(item)
+      if (preview) return preview
+    }
+    return ''
+  }
+  const record = asRecord(value)
+  if (!record) return ''
+  for (const preferredKey of ['text', 'message', 'content', 'output', 'result', 'error']) {
+    const preview = previewRawPayloadText(record[preferredKey])
+    if (preview) return preview
+  }
+  for (const nested of Object.values(record)) {
+    const preview = previewRawPayloadText(nested)
+    if (preview) return preview
+  }
+  return ''
+}
+
+function compactRawPayloadPreview(value: unknown): string {
+  const preview = previewRawPayloadText(value).replace(/\s+/g, ' ').trim()
+  if (!preview) return ''
+  if (preview.length <= THREAD_RAW_ACTIVITY_PREVIEW_LIMIT) return preview
+  return `${preview.slice(0, THREAD_RAW_ACTIVITY_PREVIEW_LIMIT).trimEnd()}…`
+}
+
+function compressRawActivityPayloadField(value: unknown): { value: unknown; changed: boolean } {
+  const raw = stringifyRawPayloadForCompression(value)
+  const originalBytes = Buffer.byteLength(raw)
+  if (originalBytes <= THREAD_RAW_ACTIVITY_PAYLOAD_LIMIT) return { value, changed: false }
+
+  return {
+    value: {
+      type: 'compressedRawPayload',
+      originalBytes,
+      preview: compactRawPayloadPreview(value),
+    },
+    changed: true,
+  }
+}
+
+function compressCollabAgentStates(value: unknown): { value: unknown; changed: boolean } {
+  const states = asRecord(value)
+  if (!states) return { value, changed: false }
+
+  let changed = false
+  const nextStates: Record<string, unknown> = {}
+  for (const [threadId, rawState] of Object.entries(states)) {
+    const state = asRecord(rawState)
+    if (!state) {
+      nextStates[threadId] = rawState
+      continue
+    }
+    const nextState: Record<string, unknown> = {}
+    if (typeof state.status === 'string') nextState.status = state.status
+    if (typeof state.error === 'string') nextState.error = state.error.slice(0, THREAD_RAW_ACTIVITY_PREVIEW_LIMIT)
+    nextStates[threadId] = nextState
+    if (Object.keys(state).length !== Object.keys(nextState).length) changed = true
+  }
+
+  return changed ? { value: nextStates, changed: true } : { value, changed: false }
+}
+
+function compressThreadActivityRawPayloads(item: Record<string, unknown>): { value: unknown; changed: boolean } {
+  const type = typeof item.type === 'string' ? item.type : ''
+  if (!THREAD_ACTIVITY_ONLY_ITEM_TYPES.has(type)) return { value: item, changed: false }
+
+  let changed = false
+  const nextItem: Record<string, unknown> = { ...item }
+
+  for (const fieldName of THREAD_ACTIVITY_RAW_FIELD_NAMES) {
+    if (!(fieldName in nextItem)) continue
+    const compressed = compressRawActivityPayloadField(nextItem[fieldName])
+    if (!compressed.changed) continue
+    nextItem[fieldName] = compressed.value
+    changed = true
+  }
+
+  if (type === 'collabAgentToolCall' && 'agentsStates' in nextItem) {
+    const compressedStates = compressCollabAgentStates(nextItem.agentsStates)
+    if (compressedStates.changed) {
+      nextItem.agentsStates = compressedStates.value
+      changed = true
+    }
+  }
+
+  return changed ? { value: nextItem, changed: true } : { value: item, changed: false }
+}
+
+function threadTurnItemRetentionKey(item: unknown, index: number): string {
+  const itemId = asNonEmptyString(asRecord(item)?.id)
+  return itemId ? `id:${itemId}` : `index:${String(index)}`
+}
+
+function isVisibleThreadTurnItem(item: unknown): boolean {
+  const itemRecord = asRecord(item)
+  const type = typeof itemRecord?.type === 'string' ? itemRecord.type : ''
+  if (!THREAD_VISIBLE_ITEM_TYPES.has(type)) return false
+  if (type === 'agentMessage' || type === 'agentMessage.live') {
+    return Boolean(
+      readNonEmptyString(itemRecord?.text)
+      || readNonEmptyString(itemRecord?.message)
+      || compactRawPayloadPreview(itemRecord?.content),
+    )
+  }
+  return true
+}
+
+function addTailThreadTurnItems(
+  retainedKeys: Set<string>,
+  items: unknown[],
+  budget: number,
+  predicate: (item: unknown) => boolean,
+): void {
+  if (budget <= 0) return
+  let added = 0
+  for (let index = items.length - 1; index >= 0 && added < budget; index -= 1) {
+    const key = threadTurnItemRetentionKey(items[index], index)
+    if (retainedKeys.has(key) || !predicate(items[index])) continue
+    retainedKeys.add(key)
+    added += 1
+  }
+}
+
+function windowThreadTurnItems(turnId: string, items: unknown[]): {
+  items: unknown[]
+  compression: { originalItemCount: number; retainedItemCount: number; omittedItemCount: number } | null
+} {
+  if (items.length <= THREAD_TURN_ITEM_WINDOW_LIMIT) return { items, compression: null }
+
+  const headItems = items.slice(0, THREAD_TURN_ITEM_HEAD_LIMIT)
+  const retainedKeys = new Set<string>()
+  for (let index = 0; index < headItems.length; index += 1) {
+    retainedKeys.add(threadTurnItemRetentionKey(headItems[index], index))
+  }
+
+  addTailThreadTurnItems(
+    retainedKeys,
+    items,
+    Math.min(
+      THREAD_TURN_VISIBLE_ITEM_TAIL_LIMIT,
+      Math.max(0, THREAD_TURN_ITEM_WINDOW_LIMIT - retainedKeys.size),
+    ),
+    isVisibleThreadTurnItem,
+  )
+  addTailThreadTurnItems(
+    retainedKeys,
+    items,
+    Math.max(0, THREAD_TURN_ITEM_WINDOW_LIMIT - retainedKeys.size),
+    () => true,
+  )
+
+  const retainedItems = items.filter((item, index) => retainedKeys.has(threadTurnItemRetentionKey(item, index)))
+
+  return {
+    items: retainedItems,
+    compression: {
+      originalItemCount: items.length,
+      retainedItemCount: retainedItems.length,
+      omittedItemCount: items.length - retainedItems.length,
+    },
+  }
 }
 
 function parseExecCommandOutput(output: string): { exitCode: number | null; wallTime: number | null; cleanOutput: string } {
@@ -3877,7 +4423,7 @@ function buildSessionItemOrder(sessionLogRaw: string, turnIds: Set<string> | nul
         type: 'commandExecution',
         command: cmd,
         cwd: null,
-        status: 'completed',
+        status: 'inProgress',
         aggregatedOutput: '',
         exitCode: null,
         durationMs: null,
@@ -4465,10 +5011,21 @@ function mergeSessionCommandsIntoTurns(
     let slotIndex = 0
     let didRecoverItem = false
 
+    const isTurnInProgress = (): boolean => {
+      if (readNonEmptyString(turnRecord.status) === 'inProgress') return true
+      const statusType = readNonEmptyString(asRecord(turnRecord.status)?.type)
+      return statusType === 'active' || statusType === 'inProgress' || statusType === 'running'
+    }
+
+    const commandForTurn = (command: SessionRecoveredCommand): SessionRecoveredCommand => {
+      if (command.status !== 'inProgress' || isTurnInProgress()) return command
+      return { ...command, status: 'completed' }
+    }
+
     const appendRecoveredSlot = (slot: SessionItemSlot): void => {
       let recovered: Record<string, unknown> | null = null
       if (slot.type === 'commandExecution') {
-        recovered = slot.command as unknown as Record<string, unknown>
+        recovered = commandForTurn(slot.command) as unknown as Record<string, unknown>
       } else if (slot.type === 'fileChange') {
         recovered = slot.fileChange as unknown as Record<string, unknown>
       } else if (slot.type === 'collaborationActivity') {
@@ -6071,6 +6628,8 @@ type StoredQueuedMessage = {
   skills: Array<{ name: string; path: string }>
   fileAttachments: Array<{ label: string; path: string; fsPath: string }>
   collaborationMode: 'default' | 'plan'
+  model: string
+  effort: ReasoningEffort | ''
 }
 
 type ThreadQueueState = Record<string, StoredQueuedMessage[]>
@@ -6127,6 +6686,8 @@ function normalizeStoredQueuedMessage(value: unknown): StoredQueuedMessage | nul
     skills: normalizeNamedPathItems(record.skills),
     fileAttachments: normalizeFileAttachments(record.fileAttachments),
     collaborationMode: record.collaborationMode === 'plan' ? 'plan' : 'default',
+    model: readNonEmptyString(record.model),
+    effort: normalizeReasoningEffort(record.effort),
   }
 }
 
@@ -6265,6 +6826,8 @@ ${escapeHeartbeatXmlText(automation.prompt)}
     skills: [],
     fileAttachments: [],
     collaborationMode: 'default',
+    model: '',
+    effort: '',
   }
 }
 
@@ -6325,6 +6888,88 @@ async function writeFirstLaunchPluginsCardDismissed(dismissed: boolean): Promise
 
 function getSessionIndexFileSignature(stats: { mtimeMs: number; size: number }): string {
   return `${String(stats.mtimeMs)}:${String(stats.size)}`
+}
+
+function cloneCacheableRpcResult(value: unknown): unknown {
+  if (value === null || value === undefined) return value
+  return JSON.parse(JSON.stringify(value)) as unknown
+}
+
+function buildThreadListRpcCacheKey(params: unknown): string | null {
+  const record = asRecord(params)
+  if (!record) return null
+  const cursor = record.cursor
+  if (cursor !== null && cursor !== undefined && cursor !== '') return null
+  if (record.archived !== false) return null
+  const limit = typeof record.limit === 'number' && Number.isFinite(record.limit)
+    ? Math.trunc(record.limit)
+    : 0
+  if (limit < 1 || limit > 10) return null
+  if (record.sortKey !== 'updated_at') return null
+  const modelProviders = Array.isArray(record.modelProviders)
+    ? record.modelProviders.filter((value): value is string => typeof value === 'string')
+    : []
+  if (modelProviders.length !== (Array.isArray(record.modelProviders) ? record.modelProviders.length : 0)) return null
+  return JSON.stringify({
+    archived: false,
+    cursor: null,
+    limit,
+    sortKey: 'updated_at',
+    modelProviders,
+  })
+}
+
+async function readThreadListRpcCacheSignature(): Promise<string> {
+  try {
+    const stats = await stat(getCodexSessionIndexPath())
+    return `index:${getSessionIndexFileSignature(stats)}`
+  } catch {
+    try {
+      const stats = await stat(join(getCodexHomeDir(), 'sessions'))
+      return `sessions:${getSessionIndexFileSignature(stats)}`
+    } catch {
+      return 'missing'
+    }
+  }
+}
+
+function getPersistedThreadListRpcCachePath(key: string): string {
+  const digest = createHash('sha256').update(key).digest('hex').slice(0, 32)
+  return join(getCodexHomeDir(), 'codex-mobile-cache', `thread-list-${digest}.json`)
+}
+
+async function readPersistedThreadListRpcCache(key: string): Promise<unknown | null> {
+  try {
+    const raw = await readFile(getPersistedThreadListRpcCachePath(key), 'utf8')
+    const record = asRecord(JSON.parse(raw))
+    if (!record || record.version !== 1 || record.key !== key) return null
+    const savedAtMs = typeof record.savedAtMs === 'number' && Number.isFinite(record.savedAtMs)
+      ? record.savedAtMs
+      : 0
+    if (savedAtMs <= 0 || Date.now() - savedAtMs > THREAD_LIST_PERSISTED_CACHE_MAX_AGE_MS) return null
+    if (!Object.prototype.hasOwnProperty.call(record, 'result')) return null
+    return cloneCacheableRpcResult(record.result)
+  } catch {
+    return null
+  }
+}
+
+async function writePersistedThreadListRpcCache(key: string, result: unknown): Promise<void> {
+  const cachePath = getPersistedThreadListRpcCachePath(key)
+  const tempPath = `${cachePath}.${process.pid}.${Date.now()}.tmp`
+  try {
+    await mkdir(dirname(cachePath), { recursive: true })
+    await writeFile(tempPath, JSON.stringify({
+      version: 1,
+      key,
+      savedAtMs: Date.now(),
+      result: cloneCacheableRpcResult(result),
+    }), 'utf8')
+    await rename(tempPath, cachePath)
+  } catch (error) {
+    await rm(tempPath, { force: true }).catch(() => {})
+    throw error
+  }
 }
 
 async function parseThreadTitlesFromSessionIndex(sessionIndexPath: string): Promise<ThreadTitleCache> {
@@ -7167,6 +7812,8 @@ class AppServerProcess {
   private readonly threadTurnPageReadPromiseByThreadId = new Map<string, Promise<unknown>>()
   private readonly capturedItemsByThreadId = new Map<string, Map<string, CapturedItem>>()
   private readonly liveStateCache = new Map<string, { data: unknown; turnCount: number; sessionSize: number }>()
+  private readonly threadListRpcCacheByKey = new Map<string, { signature: string; result: unknown; expiresAt: number }>()
+  private readonly threadListRpcRefreshByKey = new Map<string, Promise<unknown>>()
   private chatgptAuthRefreshPromise: Promise<ChatgptAuthTokensRefreshResponse> | null = null
   private activeConfigSignature = ''
 
@@ -7319,6 +7966,7 @@ class AppServerProcess {
     this.localRuntimeLedger.record(notification)
     this.recordStreamEvent(notification)
     this.captureItemFromNotification(notification)
+    this.invalidateThreadListRpcCache()
     const nThreadId = this.extractThreadIdFromParams(notification.params)
     if (nThreadId) {
       this.invalidateLiveStateCache(nThreadId)
@@ -7423,6 +8071,38 @@ class AppServerProcess {
 
   invalidateLiveStateCache(threadId: string): void {
     this.liveStateCache.delete(threadId)
+  }
+
+  getCachedThreadListRpcResult(key: string, signature: string): unknown | null {
+    const cached = this.threadListRpcCacheByKey.get(key)
+    if (!cached) return null
+    if (cached.signature !== signature || cached.expiresAt <= Date.now()) {
+      this.threadListRpcCacheByKey.delete(key)
+      return null
+    }
+    return cloneCacheableRpcResult(cached.result)
+  }
+
+  cacheThreadListRpcResult(key: string, signature: string, result: unknown): void {
+    this.threadListRpcCacheByKey.set(key, {
+      signature,
+      result: cloneCacheableRpcResult(result),
+      expiresAt: Date.now() + THREAD_LIST_RPC_CACHE_TTL_MS,
+    })
+  }
+
+  getOrStartThreadListRpcRefresh(key: string, start: () => Promise<unknown>): Promise<unknown> {
+    const existing = this.threadListRpcRefreshByKey.get(key)
+    if (existing) return existing
+    const promise = start().finally(() => {
+      this.threadListRpcRefreshByKey.delete(key)
+    })
+    this.threadListRpcRefreshByKey.set(key, promise)
+    return promise
+  }
+
+  invalidateThreadListRpcCache(): void {
+    this.threadListRpcCacheByKey.clear()
   }
 
   private captureItemFromNotification(notification: { method: string; params: unknown }): void {
@@ -7726,6 +8406,8 @@ class AppServerProcess {
     }
     this.pending.clear()
     this.pendingServerRequests.clear()
+    this.threadListRpcCacheByKey.clear()
+    this.threadListRpcRefreshByKey.clear()
 
     try {
       proc.stdin.end()
@@ -7974,17 +8656,22 @@ export class BackendQueueProcessor {
       approvalPolicy: MOBILE_APPROVAL_POLICY,
       sandboxPolicy: MOBILE_TURN_SANDBOX_POLICY,
     }
+    const queuedModel = (turn.message.model ?? '').trim()
+    const queuedEffort = turn.message.effort ?? ''
+    if (queuedModel) params.model = queuedModel
+    if (queuedEffort) params.effort = queuedEffort
     if (dedupedFileAttachments.length > 0) {
       params.attachments = dedupedFileAttachments.map((f) => ({ label: f.label, path: f.path, fsPath: f.fsPath }))
     }
 
     try {
-      const settings = await this.resolveCollaborationModeSettings(turn.message.collaborationMode)
+      const fallbackSettings = await this.resolveCollaborationModeSettings(turn.message.collaborationMode)
       params.collaborationMode = {
         mode: turn.message.collaborationMode,
         settings: {
-          model: settings.model,
-          reasoning_effort: settings.reasoningEffort,
+          model: queuedModel || fallbackSettings.model,
+          reasoning_effort: normalizeCollaborationModeReasoningEffort(queuedEffort)
+            || fallbackSettings.reasoningEffort,
           developer_instructions: null,
         },
       }
@@ -8903,6 +9590,12 @@ export function createCodexBridgeMiddleware(options: {
         let rpcResult: unknown
         try {
           const requestThreadId = readNonEmptyString(asRecord(preparedRpcRequest.params)?.threadId)
+          const threadListCacheKey = body.method === 'thread/list'
+            ? buildThreadListRpcCacheKey(preparedRpcRequest.params)
+            : null
+          const threadListCacheSignature = threadListCacheKey
+            ? await readThreadListRpcCacheSignature()
+            : ''
           const isPendingFirstTurn = body.method === 'turn/start'
             && requestThreadId.length > 0
             && hasPendingFirstTurn(requestThreadId)
@@ -8920,14 +9613,44 @@ export function createCodexBridgeMiddleware(options: {
               throw new Error('Cannot start a turn because task writer ownership is not idle.')
             }
           }
-          rpcResult = await callRpcWithArchiveRecovery(
-            appServer,
-            body.method,
-            preparedRpcRequest.params,
-            runtimeProbe,
-            appServer.getPid(),
-            { locallyCreatedFirstTurn: isPendingFirstTurn },
-          )
+          const cachedThreadListResult = threadListCacheKey
+            ? appServer.getCachedThreadListRpcResult(threadListCacheKey, threadListCacheSignature)
+            : null
+          if (cachedThreadListResult) {
+            rpcResult = cachedThreadListResult
+          } else if (threadListCacheKey) {
+            const startThreadListRefresh = () => appServer.getOrStartThreadListRpcRefresh(threadListCacheKey, async () => {
+              const freshResult = await callRpcWithArchiveRecovery(
+                appServer,
+                body.method,
+                preparedRpcRequest.params,
+                runtimeProbe,
+                appServer.getPid(),
+                { locallyCreatedFirstTurn: isPendingFirstTurn },
+              )
+              appServer.cacheThreadListRpcResult(threadListCacheKey, threadListCacheSignature, freshResult)
+              await writePersistedThreadListRpcCache(threadListCacheKey, freshResult)
+              return freshResult
+            })
+            const persistedThreadListResult = await readPersistedThreadListRpcCache(threadListCacheKey)
+            if (persistedThreadListResult) {
+              setTimeout(() => {
+                startThreadListRefresh().catch(() => {})
+              }, 0)
+              rpcResult = persistedThreadListResult
+            } else {
+              rpcResult = await startThreadListRefresh()
+            }
+          } else {
+            rpcResult = await callRpcWithArchiveRecovery(
+              appServer,
+              body.method,
+              preparedRpcRequest.params,
+              runtimeProbe,
+              appServer.getPid(),
+              { locallyCreatedFirstTurn: isPendingFirstTurn },
+            )
+          }
           if (body.method === 'thread/start') {
             const startedThreadId = readNonEmptyString(asRecord(asRecord(rpcResult)?.thread)?.id)
             if (startedThreadId) rememberPendingFirstTurn(startedThreadId)
@@ -8973,12 +9696,12 @@ export function createCodexBridgeMiddleware(options: {
         const listMergedResult = body.method === 'thread/list'
           ? mergeImportedThreadsIntoThreadListResult(errorMergedResult)
           : errorMergedResult
-        const sanitizedResult = await sanitizeThreadTurnsInlinePayloads(body.method, listMergedResult)
-        const result = await applySessionSkillEnrichmentForRpc(
+        const clientThreadResult = await prepareThreadRpcResultForClient(
           body.method,
+          listMergedResult,
           preparedRpcRequest.skipSessionSkillEnrichment,
-          sanitizedResult,
         )
+        const result = await enrichThreadResultWithSessionModelSettings(body.method, clientThreadResult)
 
         if (shouldStoreThreadReadSnapshotForRpc(
           body.method,
@@ -9051,8 +9774,7 @@ export function createCodexBridgeMiddleware(options: {
               turns: pageTurns,
             },
           }
-          const sanitized = await sanitizeThreadTurnsInlinePayloads('thread/read', pagedResult)
-          const result = await mergeSessionRecoveredItemsIntoThreadResult(sanitized)
+          const result = await prepareThreadRpcResultForClient('thread/read', pagedResult, false)
 
           setJson(res, 200, {
             result,
@@ -9130,7 +9852,12 @@ export function createCodexBridgeMiddleware(options: {
                 snapshotSessionSize = s.size
               } catch { /* missing */ }
             }
-            const externalRuntime = await runtimeProbe.inspect(threadId, appServer.getPid())
+            const externalRuntime = await observeThreadRuntimeState(
+              threadId,
+              runtimeProbe,
+              localRuntimeLedger,
+              appServer.getPid(),
+            )
             precheckedExternalRuntime = externalRuntime
             const cached = asRecord(appServer.getCachedLiveState(
               threadId,
@@ -9213,6 +9940,7 @@ export function createCodexBridgeMiddleware(options: {
               sessionSize = s.size
             } catch { /* missing */ }
           }
+          const sessionModelSettings = await readSessionModelSettingsFromFile(sessionPath)
 
           let turns = appServer.mergeItemsIntoTurns(threadId, rawTurns)
 
@@ -9224,13 +9952,23 @@ export function createCodexBridgeMiddleware(options: {
               // Session log not available — continue without command recovery
             }
           }
+          turns = await sanitizeThreadTurnsArrayForClient(turns)
 
           const lastTurn = turns.length > 0 ? asRecord(turns[turns.length - 1]) : null
-          const isLocallyInProgress = lastTurn?.status === 'inProgress'
-          const externalRuntime = isLocallyInProgress
-            ? { state: 'unknown' }
-            : precheckedExternalRuntime ?? await runtimeProbe.inspect(threadId, appServer.getPid())
+          const rawLocallyInProgress = lastTurn?.status === 'inProgress'
+          const externalRuntime = precheckedExternalRuntime ?? await observeThreadRuntimeState(
+            threadId,
+            runtimeProbe,
+            localRuntimeLedger,
+            appServer.getPid(),
+          )
+          const externalRuntimeState = readNonEmptyString(asRecord(externalRuntime)?.state)
           const isExternalInProgress = asRecord(externalRuntime)?.state === 'running'
+          const isOrphanedLocalInProgress = rawLocallyInProgress && externalRuntimeState === 'idle'
+          if (isOrphanedLocalInProgress) {
+            turns = markLastLocalInProgressTurnOrphaned(turns)
+          }
+          const isLocallyInProgress = rawLocallyInProgress && !isOrphanedLocalInProgress
           const cached = isExternalInProgress
             ? null
             : appServer.getCachedLiveState(threadId, rawTurns.length, sessionSize)
@@ -9279,6 +10017,14 @@ export function createCodexBridgeMiddleware(options: {
 
           const responseData = {
             threadId,
+            ...(sessionModelSettings.model ? { model: sessionModelSettings.model } : {}),
+            ...(sessionModelSettings.modelProvider ? { modelProvider: sessionModelSettings.modelProvider } : {}),
+            ...(sessionModelSettings.reasoningEffort
+              ? {
+                  reasoningEffort: sessionModelSettings.reasoningEffort,
+                  reasoning_effort: sessionModelSettings.reasoningEffort,
+                }
+              : {}),
             projectionKey,
             threadTurnStartIndex,
             hasMoreOlder: threadTurnStartIndex > 0,

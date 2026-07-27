@@ -13,7 +13,10 @@ createApp(App).use(router).mount('#app')
 
 if ('serviceWorker' in navigator && import.meta.env.PROD) {
   window.addEventListener('load', () => {
-    navigator.serviceWorker.register('/sw.js').catch((error) => {
+    const serviceWorkerVersion = encodeURIComponent(
+      import.meta.env.VITE_APP_BUILD_ID ?? import.meta.env.VITE_APP_VERSION ?? 'local',
+    )
+    navigator.serviceWorker.register(`/sw.js?v=${serviceWorkerVersion}`).catch((error) => {
       console.error(t('Service worker registration failed.'), error)
     })
   })

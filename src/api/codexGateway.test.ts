@@ -313,6 +313,8 @@ describe('managed uploads', () => {
         skills: [],
         fileAttachments: [],
         collaborationMode: 'default',
+        model: '',
+        effort: '',
       }],
     })
   })
@@ -881,7 +883,7 @@ describe('getThreadDetail', () => {
     })
   })
 
-  it('reads modelProvider from nested thread payloads returned by thread/read', async () => {
+  it('reads model, reasoning effort, and modelProvider from nested thread payloads returned by thread/read', async () => {
     vi.stubGlobal('fetch', vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
       const body = typeof init?.body === 'string'
         ? JSON.parse(init.body) as { method: string; params: Record<string, unknown> }
@@ -891,6 +893,8 @@ describe('getThreadDetail', () => {
         result: {
           thread: {
             id: body.params.threadId,
+            model: 'gpt-5.5',
+            reasoning_effort: 'xhigh',
             modelProvider: 'opencode_zen',
             turns: [],
           },
@@ -902,6 +906,8 @@ describe('getThreadDetail', () => {
     }))
 
     await expect(getThreadDetail('legacy-thread')).resolves.toMatchObject({
+      model: 'gpt-5.5',
+      reasoningEffort: 'xhigh',
       modelProvider: 'opencode_zen',
       ownership: 'idle',
       canInterrupt: false,

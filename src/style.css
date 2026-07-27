@@ -839,8 +839,9 @@ a.codex-directive-title {
   @apply bg-zinc-800/80 text-zinc-300;
 }
 
-:root.dark .message-copy-button {
-  @apply border-zinc-700 bg-zinc-800/90 text-zinc-300 hover:border-zinc-600 hover:bg-zinc-800 hover:text-zinc-100;
+:root.dark .message-copy-button,
+:root.dark .message-fork-button {
+  @apply border-zinc-700/80 bg-transparent text-zinc-400 hover:border-zinc-600 hover:bg-zinc-800/70 hover:text-zinc-100;
 }
 
 :root.dark .message-copy-button[data-copied='true'] {
@@ -982,7 +983,7 @@ a.codex-directive-title {
 }
 
 :root.dark .cmd-status-running .cmd-status {
-  @apply text-amber-300;
+  @apply text-emerald-300;
 }
 
 :root.dark .cmd-status-ok .cmd-status {
@@ -1147,14 +1148,6 @@ a.codex-directive-title {
 
 :root.dark .content-header-branch-dropdown .composer-dropdown-trigger {
   @apply border-zinc-700 bg-zinc-900 text-zinc-300 hover:bg-zinc-800;
-}
-
-:root.dark .content-header-terminal-command .composer-dropdown-trigger {
-  @apply border-zinc-700 bg-zinc-900 text-zinc-300 hover:bg-zinc-800 focus:border-zinc-600;
-}
-
-:root.dark .content-header-terminal-command.is-open .composer-dropdown-trigger {
-  @apply border-zinc-600 bg-zinc-800 text-zinc-100;
 }
 
 :root.dark .content-header-branch-dropdown.is-review-open .composer-dropdown-trigger {

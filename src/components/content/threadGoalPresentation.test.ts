@@ -12,7 +12,7 @@ describe('deriveThreadGoalPresentation', () => {
       tokenBudget: 8000,
     }, 130_000)).toEqual({
       label: 'Pursuing goal',
-      durationLabel: '1m 45s',
+      durationLabel: '1m',
       progressPercent: 25,
       canPause: true,
       canResume: false,
@@ -35,9 +35,29 @@ describe('deriveThreadGoalPresentation', () => {
       tokenBudget: null,
     }, 900_000)).toMatchObject({
       label,
-      durationLabel: '1h 5s',
+      durationLabel: '1h',
       canPause: false,
       canResume,
     })
+  })
+
+  it('uses compact hour and minute duration labels without seconds', () => {
+    expect(deriveThreadGoalPresentation({
+      objective: 'Stay compact',
+      status: 'active',
+      updatedAt: 1_000,
+      timeUsedSeconds: 0,
+      tokensUsed: 0,
+      tokenBudget: null,
+    }, 45_000).durationLabel).toBe('<1m')
+
+    expect(deriveThreadGoalPresentation({
+      objective: 'Stay compact',
+      status: 'active',
+      updatedAt: 1_000,
+      timeUsedSeconds: 3600 + 5 * 60 + 59,
+      tokensUsed: 0,
+      tokenBudget: null,
+    }, 1_000).durationLabel).toBe('1h 5m')
   })
 })

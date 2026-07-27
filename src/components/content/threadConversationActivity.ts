@@ -33,13 +33,6 @@ export type ThreadActivitySegment =
       sourceMessageIds: string[]
     }
   | {
-      kind: 'summary'
-      id: string
-      label: string
-      iconKind: ThreadActivityIconKind
-      sourceMessageIds: string[]
-    }
-  | {
       kind: 'subAgent'
       id: string
       agents: SubAgentDisplayItem[]
@@ -66,71 +59,72 @@ export type ThreadActivityIconKind =
 
 type ActionSummaryState = {
   sourceMessageIds: string[]
-  editedFileCount: number
-  readCount: number
-  listCount: number
-  searchCount: number
-  runCount: number
+  latestMessage: UiMessage | null
 }
 
 function emptyActionSummary(): ActionSummaryState {
   return {
     sourceMessageIds: [],
-    editedFileCount: 0,
-    readCount: 0,
-    listCount: 0,
-    searchCount: 0,
-    runCount: 0,
+    latestMessage: null,
   }
 }
 
-function actionSummaryLabel(state: ActionSummaryState): string {
-  const parts: string[] = []
-  if (state.editedFileCount > 0) {
-    parts.push(state.editedFileCount === 1 ? 'edited a file' : 'edited files')
-  }
-  if (state.readCount > 0) {
-    parts.push(state.readCount === 1 ? 'read a file' : 'read files')
-  }
-  if (state.listCount > 0) {
-    parts.push(state.listCount === 1 ? 'listed files' : 'listed files')
-  }
-  if (state.searchCount > 0) {
-    parts.push(state.searchCount === 1 ? 'searched files' : 'searched files')
-  }
-  if (state.runCount > 0) {
-    parts.push(state.runCount === 1 ? 'ran a command' : 'ran commands')
-  }
-  const label = parts.join(', ')
-  return label ? label.charAt(0).toUpperCase() + label.slice(1) : 'Ran activity'
-}
-
-function actionSummaryIconKind(state: ActionSummaryState): ThreadActivityIconKind {
-  if (state.editedFileCount > 0) return 'edit'
-  if (state.readCount > 0 || state.listCount > 0) return 'book'
-  if (state.searchCount > 0) return 'search'
-  return 'terminal'
-}
-
-function appendCommandActivity(state: ActionSummaryState, message: UiMessage): void {
-  const categories = message.commandExecution?.activityCategories ?? ['unknown']
-  for (const category of new Set(categories)) {
-    if (category === 'read') state.readCount += 1
-    else if (category === 'listFiles') state.listCount += 1
-    else if (category === 'search') state.searchCount += 1
-    else state.runCount += 1
-  }
-}
-
-function activityLabel(message: UiMessage): string {
-  const compact = (value: string): string => value
+function compactActivityText(value: string): string {
+  return value
     .replace(/\*\*([^*]+)\*\*/gu, '$1')
     .replace(/__([^_]+)__/gu, '$1')
     .replace(/\s+/gu, ' ')
     .trim()
-  const label = compact(message.activity?.label ?? '')
+}
+
+function commandActivityIconKind(message: UiMessage): ThreadActivityIconKind {
+  const categories = message.commandExecution?.activityCategories ?? ['unknown']
+  if (categories.includes('unknown')) return 'terminal'
+  if (categories.includes('search')) return 'search'
+  if (categories.includes('read') || categories.includes('listFiles')) return 'book'
+  return 'terminal'
+}
+
+function commandActivityLabel(message: UiMessage): string {
+  const label = compactActivityText(message.commandExecution?.displayLabel ?? '')
   if (label) return label
-  const text = compact(message.text)
+  const command = compactActivityText(message.commandExecution?.command ?? message.text)
+  return command ? `Ran ${command}` : 'Ran a command'
+}
+
+function fileChangeActivityLabel(message: UiMessage): string {
+  const changes = message.fileChanges ?? []
+  if (changes.length !== 1) {
+    return changes.length > 0 ? `${changes.length} files changed` : 'Files changed'
+  }
+  const change = changes[0]
+  const path = compactActivityText(change.movedToPath || change.path)
+  const operation = change.movedToPath
+    ? 'Moved'
+    : change.operation === 'add'
+      ? 'Added'
+      : change.operation === 'delete'
+        ? 'Deleted'
+        : 'Edited'
+  return path ? `${operation} ${path}` : `${operation} a file`
+}
+
+function actionDetailLabel(message: UiMessage): string {
+  if (message.messageType === 'commandExecution') return commandActivityLabel(message)
+  if (message.messageType === 'fileChange') return fileChangeActivityLabel(message)
+  return activityLabel(message)
+}
+
+function actionDetailIconKind(message: UiMessage): ThreadActivityIconKind {
+  if (message.messageType === 'commandExecution') return commandActivityIconKind(message)
+  if (message.messageType === 'fileChange') return 'edit'
+  return activityMessageIconKind(message)
+}
+
+function activityLabel(message: UiMessage): string {
+  const label = compactActivityText(message.activity?.label ?? '')
+  if (label) return label
+  const text = compactActivityText(message.text)
   if (text) return text
   if (message.messageType === 'imageGeneration') return 'Generated an image'
   if (message.messageType === 'imageView') return 'Viewed an image'
@@ -177,12 +171,12 @@ export function buildThreadActivitySegments(
   let actions = emptyActionSummary()
 
   const flushActions = (): void => {
-    if (actions.sourceMessageIds.length === 0) return
+    if (actions.sourceMessageIds.length === 0 || !actions.latestMessage) return
     segments.push({
-      kind: 'summary',
-      id: actions.sourceMessageIds.at(-1) ?? '',
-      label: actionSummaryLabel(actions),
-      iconKind: actionSummaryIconKind(actions),
+      kind: 'event',
+      id: actions.latestMessage.id,
+      label: actionDetailLabel(actions.latestMessage),
+      iconKind: actionDetailIconKind(actions.latestMessage),
       sourceMessageIds: [...actions.sourceMessageIds],
     })
     actions = emptyActionSummary()
@@ -198,11 +192,7 @@ export function buildThreadActivitySegments(
 
     if (message.messageType === 'commandExecution' || message.messageType === 'fileChange') {
       actions.sourceMessageIds.push(message.id)
-      if (message.messageType === 'fileChange') {
-        actions.editedFileCount += Math.max(message.fileChanges?.length ?? 0, 1)
-      } else {
-        appendCommandActivity(actions, message)
-      }
+      actions.latestMessage = message
       index += 1
       continue
     }

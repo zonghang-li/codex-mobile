@@ -44,7 +44,7 @@ describe('thread conversation completed activity grouping', () => {
     expect(isThreadActivityMessage(message('user', 'user', 'prompt', 'userMessage'))).toBe(false)
   })
 
-  it('derives ordered desktop-style reasoning, action summaries, and agent chips', () => {
+  it('derives ordered desktop-style reasoning, concrete action rows, and agent chips', () => {
     const messages: UiMessage[] = [
       message('reasoning-1', 'assistant', 'Closing the final review', 'reasoning'),
       {
@@ -102,10 +102,10 @@ describe('thread conversation completed activity grouping', () => {
         sourceMessageIds: ['reasoning-1'],
       },
       {
-        kind: 'summary',
+        kind: 'event',
         id: 'run-1',
-        label: 'Edited a file, read a file, ran a command',
-        iconKind: 'edit',
+        label: 'Ran pnpm test',
+        iconKind: 'terminal',
         sourceMessageIds: ['file-1', 'read-1', 'run-1'],
       },
       {
@@ -121,6 +121,53 @@ describe('thread conversation completed activity grouping', () => {
         sourceMessageIds: ['agent-1'],
       },
     ])
+  })
+
+  it('shows only the latest concrete action detail for adjacent file and command activity', () => {
+    const messages: UiMessage[] = [
+      {
+        ...message('file-1', 'system', '', 'fileChange'),
+        fileChangeStatus: 'completed',
+        fileChanges: [{
+          path: 'src/App.vue',
+          operation: 'update',
+          diff: '',
+          addedLineCount: 1,
+          removedLineCount: 1,
+        }],
+      },
+      {
+        ...message('read-1', 'system', 'sed -n 1,80p src/App.vue', 'commandExecution'),
+        commandExecution: {
+          command: 'sed -n 1,80p src/App.vue',
+          cwd: '/tmp/project',
+          status: 'completed',
+          aggregatedOutput: '',
+          exitCode: 0,
+          displayLabel: 'Read App component',
+          activityCategories: ['read'],
+        },
+      },
+      {
+        ...message('run-1', 'system', 'pnpm exec vitest run src/App.test.ts', 'commandExecution'),
+        commandExecution: {
+          command: 'pnpm exec vitest run src/App.test.ts',
+          cwd: '/tmp/project',
+          status: 'inProgress',
+          aggregatedOutput: '',
+          exitCode: null,
+          activityCategories: ['unknown'],
+        },
+      },
+    ]
+
+    expect(buildThreadActivitySegments(messages)).toEqual([{
+      kind: 'event',
+      id: 'run-1',
+      label: 'Ran pnpm exec vitest run src/App.test.ts',
+      iconKind: 'terminal',
+      sourceMessageIds: ['file-1', 'read-1', 'run-1'],
+    }])
   })
 
   it('groups adjacent subagent events but keeps clusters separated by parent transcript content', () => {
@@ -210,7 +257,7 @@ describe('thread conversation completed activity grouping', () => {
     ])
   })
 
-  it('uses stable plural grammar and does not combine activity across turn boundaries', () => {
+  it('uses latest concrete action detail and does not combine activity across turn boundaries', () => {
     const command = (
       id: string,
       category: 'read' | 'listFiles' | 'search' | 'unknown',
@@ -250,12 +297,12 @@ describe('thread conversation completed activity grouping', () => {
     ])).toEqual([
       expect.objectContaining({
         id: 'run-2',
-        label: 'Edited files, read files, listed files, searched files, ran commands',
-        iconKind: 'edit',
+        label: 'Ran run-2',
+        iconKind: 'terminal',
       }),
       expect.objectContaining({
         id: 'read-3',
-        label: 'Read a file',
+        label: 'Ran read-3',
         iconKind: 'book',
       }),
     ])

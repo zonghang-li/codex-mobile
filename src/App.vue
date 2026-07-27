@@ -12,6 +12,7 @@
             class="sidebar-thread-controls-host"
             :is-sidebar-collapsed="isSidebarCollapsed"
             :show-new-thread-button="true"
+            :has-unread-threads="hasUnreadSidebarThreads"
             @toggle-sidebar="setSidebarCollapsed(!isSidebarCollapsed)"
             @start-new-thread="onStartNewThreadFromToolbar"
           >
@@ -515,8 +516,7 @@
       <section
         class="content-root"
         :class="{
-          'is-virtual-keyboard-open': isTerminalKeyboardLayoutActive,
-          'is-terminal-open': isComposerTerminalOpen,
+          'is-virtual-keyboard-open': isVirtualKeyboardOpen,
         }"
         :style="contentStyle"
       >
@@ -534,6 +534,7 @@
               class="sidebar-thread-controls-header-host"
               :is-sidebar-collapsed="isSidebarCollapsed"
               :show-new-thread-button="true"
+              :has-unread-threads="hasUnreadSidebarThreads"
               @toggle-sidebar="setSidebarCollapsed(!isSidebarCollapsed)"
               @start-new-thread="onStartNewThreadFromToolbar"
             />
@@ -555,20 +556,6 @@
             </span>
           </template>
           <template #actions>
-            <ComposerDropdown
-              v-if="canShowTerminalToggle"
-              class="content-header-terminal-command"
-              :class="{ 'is-open': isComposerTerminalOpen }"
-              :model-value="terminalHeaderDropdownValue"
-              :options="terminalHeaderDropdownOptions"
-              :placeholder="terminalCommandPlaceholder"
-              :selected-prefix-icon="IconTablerTerminal"
-              :icon-only="true"
-              :disabled="isComposerTerminalControlDisabled"
-              menu-align="end"
-              :empty-label="t('No commands')"
-              @update:model-value="onSelectHeaderTerminalCommand"
-            />
             <HeaderGitBranchDropdown
               v-if="canShowContentHeaderBranchDropdown"
               :key="selectedThreadId"
@@ -949,15 +936,6 @@
                   <span>{{ t(codexCliMissingError) }}</span>
                   <a class="visible-error-feedback" :href="feedbackMailto" @click="prepareFeedbackLink($event, codexCliMissingError)">{{ t('Send feedback') }}</a>
                 </div>
-                <ThreadTerminalPanel
-                  v-if="homeTerminalOpen && composerCwd"
-                  ref="homeTerminalPanelRef"
-                  class="content-thread-terminal-panel"
-                  :thread-id="composerThreadContextId"
-                  :cwd="composerCwd"
-                  @hide="onHideHomeTerminal"
-                  @terminal-focus-change="onTerminalFocusChange"
-                />
                 <ThreadComposer ref="homeThreadComposerRef" :active-thread-id="composerThreadContextId"
                   :cwd="composerCwd"
                   :collaboration-modes="availableCollaborationModes"
@@ -999,6 +977,7 @@
                   <ThreadConversation ref="threadConversationRef" :messages="filteredMessages" :is-loading="isLoadingMessages"
                     :active-thread-id="composerThreadContextId" :cwd="composerCwd"
                     :active-turn-id="selectedActiveTurnId"
+                    :is-thread-in-progress="isSelectedThreadInProgress"
                     :read-only="selectedThreadRuntimeOwnership === 'external'"
                     :live-overlay="liveOverlay"
                     :pending-requests="selectedThreadServerRequests"
@@ -1023,15 +1002,6 @@
                     @steer="steerQueuedMessage"
                     @delete="removeQueuedMessage"
                     @reorder="onReorderQueuedMessage"
-                  />
-                  <ThreadTerminalPanel
-                    v-if="selectedThreadTerminalOpen && selectedThreadId && composerCwd"
-                    ref="threadTerminalPanelRef"
-                    class="content-thread-terminal-panel"
-                    :thread-id="selectedThreadId"
-                    :cwd="composerCwd"
-                    @hide="onHideSelectedThreadTerminal"
-                    @terminal-focus-change="onTerminalFocusChange"
                   />
                   <ConversationRunFooter
                     :thread-id="selectedThreadId"
@@ -1222,7 +1192,6 @@ import IconTablerMoon from './components/icons/IconTablerMoon.vue'
 import IconTablerSearch from './components/icons/IconTablerSearch.vue'
 import IconTablerSettings from './components/icons/IconTablerSettings.vue'
 import IconTablerSun from './components/icons/IconTablerSun.vue'
-import IconTablerTerminal from './components/icons/IconTablerTerminal.vue'
 import IconTablerX from './components/icons/IconTablerX.vue'
 import { useDesktopState } from './composables/useDesktopState'
 import { useMobile } from './composables/useMobile'
@@ -1252,8 +1221,6 @@ import {
   getTelegramConfig,
   getProjectRootSuggestion,
   getTelegramStatus,
-  getThreadTerminalQuickCommands,
-  getThreadTerminalStatus,
   getWorkspaceRootsState,
   importProjectZip,
   listLocalDirectories,
@@ -1268,7 +1235,7 @@ import {
 } from './api/codexGateway'
 import type { ReasoningEffort, SpeedMode, UiAccountEntry, UiRateLimitWindow, UiServerRequest, UiServerRequestReply, UiThreadAutomation, UiThreadTokenUsage } from './types/codex'
 import type { ComposerDraftPayload, ThreadComposerExposed } from './components/content/ThreadComposer.vue'
-import type { GitCommitFileChange, GitCommitOption, LocalDirectoryEntry, TelegramStatus, ThreadTerminalQuickCommand, WorktreeBranchOption } from './api/codexGateway'
+import type { GitCommitFileChange, GitCommitOption, LocalDirectoryEntry, TelegramStatus, WorktreeBranchOption } from './api/codexGateway'
 import { getFreeModeStatus, setFreeMode, setFreeModeCustomKey, setCustomProvider } from './api/codexGateway'
 import { getPathLeafName, getPathParent, isProjectlessChatPath, normalizePathForUi } from './pathUtils.js'
 import { copyTextToClipboard } from './utils/clipboard'
@@ -1276,7 +1243,6 @@ import { codexDirectiveExportLines } from './utils/codexDirectives'
 import { nextQuickThemeMode, readThemeMode, resolveEffectiveTheme, type ThemeMode } from './utils/themeMode'
 
 const ThreadConversation = defineAsyncComponent(() => import('./components/content/ThreadConversation.vue'))
-const ThreadTerminalPanel = defineAsyncComponent(() => import('./components/content/ThreadTerminalPanel.vue'))
 const ReviewPane = defineAsyncComponent(() => import('./components/content/ReviewPane.vue'))
 const DirectoryHub = defineAsyncComponent(() => import('./components/content/DirectoryHub.vue'))
 const AutomationsPanel = defineAsyncComponent(() => import('./components/content/AutomationsPanel.vue'))
@@ -1284,8 +1250,6 @@ const { t, uiLanguage, uiLanguageOptions, setUiLanguage } = useUiLanguage()
 
 const SIDEBAR_COLLAPSED_STORAGE_KEY = 'codex-web-local.sidebar-collapsed.v1'
 const ACCOUNTS_SECTION_COLLAPSED_STORAGE_KEY = 'codex-web-local.accounts-section-collapsed.v1'
-const TERMINAL_QUICK_COMMAND_STORAGE_KEY = 'codex-web-local.terminal-quick-commands.v1'
-const TOGGLE_TERMINAL_COMMAND_VALUE = '__toggle_terminal__'
 const worktreeName = import.meta.env.VITE_WORKTREE_NAME ?? 'unknown'
 const appVersion = import.meta.env.VITE_APP_VERSION ?? 'unknown'
 const SETTINGS_HELP = {
@@ -1299,19 +1263,6 @@ const SETTINGS_HELP = {
 } as const
 
 type ChatWidthMode = 'standard' | 'wide' | 'extra-wide'
-
-type TerminalHeaderQuickCommand = {
-  label: string
-  value: string
-  custom?: boolean
-  usageCount: number
-  lastUsedAt: number
-  sourceIndex?: number
-}
-
-type ThreadTerminalPanelExposed = {
-  runQuickCommand: (command: string, custom?: boolean) => Promise<void>
-}
 
 type DirectoryTryItemPayload = {
   kind: 'app' | 'plugin' | 'skill' | 'composio'
@@ -1454,7 +1405,6 @@ const {
   projectDisplayNameById,
   selectedThread,
   selectedThreadTokenUsage,
-  selectedThreadTerminalOpen,
   selectedThreadServerRequests,
   selectedLiveOverlay,
   selectedLiveAuthority,
@@ -1491,8 +1441,6 @@ const {
   selectThread,
   ensureThreadMessagesLoaded,
   loadOlderMessages,
-  setThreadTerminalOpen,
-  toggleSelectedThreadTerminal,
   archiveThreadById,
   forkThreadById,
   renameThreadById,
@@ -1559,15 +1507,6 @@ function prepareFeedbackLink(event: MouseEvent, message?: string): void {
 const homeThreadComposerRef = ref<ThreadComposerExposed | null>(null)
 const threadComposerRef = ref<ThreadComposerExposed | null>(null)
 const threadConversationRef = ref<{ jumpToLatest: () => void } | null>(null)
-const homeTerminalPanelRef = ref<ThreadTerminalPanelExposed | null>(null)
-const threadTerminalPanelRef = ref<ThreadTerminalPanelExposed | null>(null)
-const homeTerminalOpen = ref(false)
-const isTerminalInputFocused = ref(false)
-const isTerminalKeyboardFocusFallbackActive = ref(false)
-const isThreadTerminalAvailable = ref(true)
-const terminalProjectQuickCommands = ref<ThreadTerminalQuickCommand[]>([])
-const terminalStoredQuickCommands = ref<TerminalHeaderQuickCommand[]>(loadTerminalStoredQuickCommands())
-const terminalHeaderDropdownValue = ref('')
 const editingQueuedMessageState = ref<{ threadId: string; queueIndex: number } | null>(null)
 const isRouteSyncInProgress = ref(false)
 const directoryTryInFlightKey = ref('')
@@ -1608,7 +1547,6 @@ const settingsPanelRef = ref<HTMLElement | null>(null)
 const settingsButtonRef = ref<HTMLElement | null>(null)
 const serverMatchedThreadIds = ref<string[] | null>(null)
 let threadSearchTimer: ReturnType<typeof setTimeout> | null = null
-let terminalKeyboardFocusFallbackTimer: ReturnType<typeof setTimeout> | null = null
 let sidebarScrollTop = 0
 let sidebarScrollRestoreRequestId = 0
 let isRestoringSidebarScroll = false
@@ -1820,33 +1758,20 @@ const composerCwd = computed(() => {
   if (isHomeRoute.value) return newThreadCwd.value.trim()
   return selectedThread.value?.cwd?.trim() ?? ''
 })
-const canShowTerminalToggle = computed(() => (
-  isThreadTerminalAvailable.value && (
-    (isHomeRoute.value && composerCwd.value.length > 0) ||
-    (route.name === 'thread' && selectedThreadId.value.length > 0)
-  )
-))
-const isComposerTerminalControlDisabled = computed(() => (
-  route.name === 'thread' && selectedThreadRuntimeOwnership.value === 'external'
-))
 const canShowContentHeaderBranchDropdown = computed(() => (
   (route.name === 'thread' && selectedThreadId.value.length > 0) ||
   (isHomeRoute.value && isNewThreadCwdGitRepo.value)
-))
-const isComposerTerminalOpen = computed(() => (
-  isHomeRoute.value ? homeTerminalOpen.value : selectedThreadTerminalOpen.value
 ))
 const isVirtualKeyboardOpen = computed(() => {
   if (!isMobile.value) return false
   if (visualViewportHeight.value <= 0 || layoutViewportHeight.value <= 0) return false
   return layoutViewportHeight.value - visualViewportHeight.value > 120
 })
-const isTerminalKeyboardLayoutActive = computed(() => (
-  isVirtualKeyboardOpen.value ||
-  (isComposerTerminalOpen.value && isTerminalKeyboardFocusFallbackActive.value)
-))
 const directoryCwd = computed(() => selectedThread.value?.cwd?.trim() ?? newThreadCwd.value.trim())
 const isSelectedThreadInProgress = computed(() => !isHomeRoute.value && selectedThread.value?.inProgress === true)
+const hasUnreadSidebarThreads = computed(() =>
+  projectGroups.value.some((group) => group.threads.some((thread) => thread.unread === true)),
+)
 const selectedConversationFooterState = computed(() => deriveConversationFooterState({
   messages: filteredMessages.value,
   turnId: selectedActiveTurnId.value,
@@ -2130,35 +2055,6 @@ const themeToggleLabel = computed(() => t(
   effectiveTheme.value === 'dark' ? 'Switch to light mode' : 'Switch to dark mode',
 ))
 const chatWidthLabel = computed(() => t(CHAT_WIDTH_PRESETS[chatWidth.value].label))
-const terminalShortcutLabel = computed(() => {
-  if (typeof navigator !== 'undefined' && /mac|iphone|ipad|ipod/i.test(navigator.platform)) {
-    return '⌘J'
-  }
-  return 'Ctrl+J'
-})
-const terminalCommandPlaceholder = computed(() => (
-  isComposerTerminalOpen.value ? t('Terminal') : t('Open terminal')
-))
-const terminalHeaderQuickCommands = computed<TerminalHeaderQuickCommand[]>(() => {
-  const storedByValue = new Map(terminalStoredQuickCommands.value.map((command) => [command.value, command]))
-  const combined: TerminalHeaderQuickCommand[] = [
-    ...terminalProjectQuickCommands.value.map((command, index) => ({
-      label: command.label,
-      value: command.value,
-      usageCount: 0,
-      lastUsedAt: 0,
-      ...(storedByValue.get(command.value) ?? {}),
-      custom: false,
-      sourceIndex: index,
-    })),
-  ]
-  return combined
-    .sort(compareTerminalQuickCommands)
-})
-const terminalHeaderDropdownOptions = computed(() => [
-  { label: isComposerTerminalOpen.value ? t('Hide terminal') : t('Open terminal'), value: TOGGLE_TERMINAL_COMMAND_VALUE },
-  ...terminalHeaderQuickCommands.value.map((command) => ({ label: command.label, value: command.value })),
-])
 const contentStyle = computed(() => {
   const preset = CHAT_WIDTH_PRESETS[chatWidth.value]
   const keyboardInset = Math.max(
@@ -2204,8 +2100,6 @@ onMounted(() => {
   void refreshTelegramConfig()
   void refreshTelegramStatus()
   void loadFreeModeStatus()
-  void refreshThreadTerminalStatus()
-  void refreshTerminalQuickCommands()
 })
 
 watch(visibleFeedbackErrors, (values, oldValues) => {
@@ -2236,7 +2130,6 @@ onUnmounted(() => {
     clearTimeout(threadSearchTimer)
     threadSearchTimer = null
   }
-  clearTerminalKeyboardFocusFallbackTimer()
   stopPolling()
 })
 
@@ -2269,11 +2162,6 @@ watch(sidebarSearchQuery, (value) => {
         serverMatchedThreadIds.value = null
       })
   }, 220)
-})
-
-watch(isVirtualKeyboardOpen, (open) => {
-  if (open) return
-  isTerminalKeyboardFocusFallbackActive.value = false
 })
 
 watch(accounts, () => {
@@ -3164,245 +3052,12 @@ function onWindowKeyDown(event: KeyboardEvent): void {
   if (key === 'b') {
     event.preventDefault()
     setSidebarCollapsed(!isSidebarCollapsed.value)
-    return
-  }
-  if (key === 'j' && route.name === 'thread' && selectedThreadId.value) {
-    event.preventDefault()
-    toggleComposerTerminal()
-    return
-  }
-  if (key === 'j' && isHomeRoute.value && composerCwd.value) {
-    event.preventDefault()
-    toggleComposerTerminal()
-  }
-}
-
-function toggleComposerTerminal(): void {
-  if (!isThreadTerminalAvailable.value) return
-  if (isHomeRoute.value) {
-    if (!composerCwd.value) return
-    homeTerminalOpen.value = !homeTerminalOpen.value
-    if (!homeTerminalOpen.value) {
-      resetTerminalKeyboardFocusState()
-    }
-    return
-  }
-  toggleSelectedThreadTerminal()
-  if (!selectedThreadTerminalOpen.value) {
-    resetTerminalKeyboardFocusState()
-  }
-}
-
-function onSelectHeaderTerminalCommand(command: string): void {
-  terminalHeaderDropdownValue.value = ''
-  if (!command) return
-  if (command === TOGGLE_TERMINAL_COMMAND_VALUE) {
-    toggleComposerTerminal()
-    return
-  }
-  void openTerminalAndRunCommand(command)
-}
-
-async function openTerminalAndRunCommand(command: string): Promise<void> {
-  if (!isThreadTerminalAvailable.value || !composerCwd.value) return
-  if (isHomeRoute.value) {
-    homeTerminalOpen.value = true
-  } else if (selectedThreadId.value) {
-    setThreadTerminalOpen(selectedThreadId.value, true)
-  } else {
-    return
-  }
-  const panel = await waitForTerminalPanel()
-  if (!panel) return
-  try {
-    await panel.runQuickCommand(command)
-    recordHeaderTerminalCommandUse(command)
-  } catch {
-    // ThreadTerminalPanel renders the terminal-specific error in place.
-  }
-}
-
-async function waitForTerminalPanel(): Promise<ThreadTerminalPanelExposed | null> {
-  for (let attempt = 0; attempt < 20; attempt += 1) {
-    await nextTick()
-    const panel = isHomeRoute.value ? homeTerminalPanelRef.value : threadTerminalPanelRef.value
-    if (panel) return panel
-    await new Promise((resolve) => window.setTimeout(resolve, 25))
-  }
-  return null
-}
-
-async function refreshTerminalQuickCommands(): Promise<void> {
-  const cwd = composerCwd.value.trim()
-  if (!cwd) {
-    terminalProjectQuickCommands.value = []
-    return
-  }
-  try {
-    terminalProjectQuickCommands.value = await getThreadTerminalQuickCommands(cwd)
-  } catch {
-    terminalProjectQuickCommands.value = []
-  }
-}
-
-function recordHeaderTerminalCommandUse(command: string): void {
-  const normalized = normalizeTerminalQuickCommandValue(command)
-  if (!normalized) return
-  const existing = terminalStoredQuickCommands.value.find((row) => row.value === normalized)
-  const projectCommandIndex = terminalProjectQuickCommands.value.findIndex((row) => row.value === normalized)
-  const projectCommand = projectCommandIndex >= 0 ? terminalProjectQuickCommands.value[projectCommandIndex] : null
-  if (!projectCommand) return
-  const nextCommand: TerminalHeaderQuickCommand = {
-    label: existing?.label || projectCommand?.label || normalized,
-    value: normalized,
-    custom: false,
-    usageCount: (existing?.usageCount ?? 0) + 1,
-    lastUsedAt: Date.now(),
-    sourceIndex: projectCommandIndex >= 0 ? projectCommandIndex : undefined,
-  }
-  const next = [
-    ...terminalStoredQuickCommands.value.filter((row) => row.value !== normalized),
-    nextCommand,
-  ]
-  terminalStoredQuickCommands.value = next
-  saveTerminalStoredQuickCommands(next)
-}
-
-function normalizeTerminalQuickCommandValue(value: string): string {
-  return value.trim().replace(/\s+/g, ' ')
-}
-
-function compareTerminalQuickCommands(first: TerminalHeaderQuickCommand, second: TerminalHeaderQuickCommand): number {
-  if (second.usageCount !== first.usageCount) return second.usageCount - first.usageCount
-  if (second.lastUsedAt !== first.lastUsedAt) return second.lastUsedAt - first.lastUsedAt
-  const firstSource = typeof first.sourceIndex === 'number' ? first.sourceIndex : Number.MAX_SAFE_INTEGER
-  const secondSource = typeof second.sourceIndex === 'number' ? second.sourceIndex : Number.MAX_SAFE_INTEGER
-  return firstSource - secondSource
-}
-
-function loadTerminalStoredQuickCommands(): TerminalHeaderQuickCommand[] {
-  if (typeof window === 'undefined') return []
-  try {
-    const raw = window.localStorage.getItem(TERMINAL_QUICK_COMMAND_STORAGE_KEY)
-    if (!raw) return []
-    const parsed = JSON.parse(raw) as unknown
-    if (!Array.isArray(parsed)) return []
-    const seen = new Set<string>()
-    const commands: TerminalHeaderQuickCommand[] = []
-    for (const row of parsed) {
-      const record = row !== null && typeof row === 'object' && !Array.isArray(row)
-        ? row as Record<string, unknown>
-        : null
-      const value = normalizeTerminalQuickCommandValue(readTerminalString(record?.value))
-      if (!value || seen.has(value)) continue
-      seen.add(value)
-      commands.push({
-        label: readTerminalString(record?.label) || value,
-        value,
-        custom: record?.custom !== false,
-        usageCount: readTerminalPositiveInteger(record?.usageCount),
-        lastUsedAt: readTerminalPositiveInteger(record?.lastUsedAt),
-      })
-    }
-    return commands
-  } catch {
-    return []
-  }
-}
-
-function saveTerminalStoredQuickCommands(commands: TerminalHeaderQuickCommand[]): void {
-  if (typeof window === 'undefined') return
-  window.localStorage.setItem(
-    TERMINAL_QUICK_COMMAND_STORAGE_KEY,
-    JSON.stringify(commands.map((command) => ({
-      label: command.label,
-      value: command.value,
-      custom: command.custom === true,
-      usageCount: command.usageCount,
-      lastUsedAt: command.lastUsedAt,
-    }))),
-  )
-}
-
-function readTerminalString(value: unknown): string {
-  return typeof value === 'string' ? value : ''
-}
-
-function readTerminalPositiveInteger(value: unknown): number {
-  if (typeof value === 'number' && Number.isFinite(value)) return Math.max(0, Math.trunc(value))
-  if (typeof value === 'string') {
-    const parsed = Number(value)
-    if (Number.isFinite(parsed)) return Math.max(0, Math.trunc(parsed))
-  }
-  return 0
-}
-
-function onTerminalFocusChange(focused: boolean): void {
-  isTerminalInputFocused.value = focused
-  if (!focused) {
-    isTerminalKeyboardFocusFallbackActive.value = false
-    clearTerminalKeyboardFocusFallbackTimer()
-    return
-  }
-  isTerminalKeyboardFocusFallbackActive.value = true
-  clearTerminalKeyboardFocusFallbackTimer()
-  terminalKeyboardFocusFallbackTimer = setTimeout(() => {
-    terminalKeyboardFocusFallbackTimer = null
-    if (!isVirtualKeyboardOpen.value) {
-      isTerminalKeyboardFocusFallbackActive.value = false
-    }
-  }, 1500)
-}
-
-function onHideHomeTerminal(): void {
-  homeTerminalOpen.value = false
-  resetTerminalKeyboardFocusState()
-}
-
-function onHideSelectedThreadTerminal(): void {
-  if (selectedThreadId.value) {
-    setThreadTerminalOpen(selectedThreadId.value, false)
-  }
-  resetTerminalKeyboardFocusState()
-}
-
-function resetTerminalKeyboardFocusState(): void {
-  isTerminalInputFocused.value = false
-  isTerminalKeyboardFocusFallbackActive.value = false
-  clearTerminalKeyboardFocusFallbackTimer()
-}
-
-function clearTerminalKeyboardFocusFallbackTimer(): void {
-  if (!terminalKeyboardFocusFallbackTimer) return
-  clearTimeout(terminalKeyboardFocusFallbackTimer)
-  terminalKeyboardFocusFallbackTimer = null
-}
-
-async function refreshThreadTerminalStatus(): Promise<void> {
-  try {
-    const status = await getThreadTerminalStatus()
-    isThreadTerminalAvailable.value = status.available
-    if (!status.available) {
-      homeTerminalOpen.value = false
-      if (selectedThreadId.value) {
-        setThreadTerminalOpen(selectedThreadId.value, false)
-      }
-    }
-  } catch {
-    isThreadTerminalAvailable.value = false
-    homeTerminalOpen.value = false
   }
 }
 
 function onDocumentPointerDown(event: PointerEvent): void {
   const target = event.target
   if (!(target instanceof Node)) return
-  if (isTerminalInputFocused.value) {
-    const targetElement = target instanceof Element ? target : target.parentElement
-    if (!targetElement?.closest('.thread-terminal-panel')) {
-      resetTerminalKeyboardFocusState()
-    }
-  }
   if (!isSettingsOpen.value) return
   if (settingsPanelRef.value?.contains(target)) return
   if (settingsButtonRef.value?.contains(target)) return
@@ -4778,13 +4433,6 @@ watch(
 )
 
 watch(
-  () => composerCwd.value,
-  () => {
-    void refreshTerminalQuickCommands()
-  },
-)
-
-watch(
   () => [selectedThreadId.value, composerCwd.value] as const,
   () => {
     clearCommitReviewContext()
@@ -5206,10 +4854,6 @@ async function loadWorktreeBranches(sourceCwd: string): Promise<void> {
   padding-bottom: max(0.25rem, env(safe-area-inset-bottom));
 }
 
-.content-root.is-virtual-keyboard-open .content-thread-terminal-panel {
-  min-height: 0;
-}
-
 .content-root.is-virtual-keyboard-open .content-keyboard-spacer {
   display: none;
 }
@@ -5258,50 +4902,10 @@ async function loadWorktreeBranches(sourceCwd: string): Promise<void> {
   @apply shrink-0 rounded-full border border-rose-200 bg-white px-2.5 py-1 text-xs font-semibold text-rose-700 transition hover:bg-rose-100 focus:outline-none focus:ring-2 focus:ring-rose-300;
 }
 
-.content-thread-terminal-panel {
-  @apply w-full;
-}
-
-.content-header-terminal-command {
-  @apply max-w-48;
-}
-
-.content-header-terminal-command :deep(.composer-dropdown-trigger) {
-  @apply h-8 rounded-full border border-zinc-200 bg-white px-3 text-xs text-zinc-700 outline-none transition hover:bg-zinc-50 focus:border-zinc-300;
-}
-
-.content-header-terminal-command :deep(.composer-dropdown-prefix-icon) {
-  @apply h-4 w-4 text-zinc-500;
-}
-
-.content-header-terminal-command.is-open :deep(.composer-dropdown-trigger) {
-  @apply border-zinc-300 bg-zinc-100 text-zinc-950;
-}
-
-.content-header-terminal-command :deep(.composer-dropdown-menu-wrap) {
-  left: auto;
-  right: 0;
-}
-
-.content-header-terminal-command :deep(.composer-dropdown-menu) {
-  width: min(18rem, calc(100vw - 1rem));
-  min-width: min(14rem, calc(100vw - 1rem));
-}
-
-.content-header-terminal-command :deep(.composer-dropdown-option) {
-  @apply block truncate;
-}
-
-.content-header-terminal-command :deep(.composer-dropdown-trigger) {
-  @apply rounded-full border border-zinc-200 bg-white px-2.5 py-1.5 text-xs text-zinc-700 transition hover:bg-zinc-50;
-}
-
-.content-header-terminal-command :deep(.composer-dropdown-prefix-icon),
 .content-header-branch-dropdown :deep(.composer-dropdown-prefix-icon) {
   @apply h-4 w-4 text-zinc-600;
 }
 
-.content-header-terminal-command :deep(.composer-dropdown-trigger),
 .content-header-branch-dropdown :deep(.composer-dropdown-trigger) {
   @apply gap-0.5;
 }

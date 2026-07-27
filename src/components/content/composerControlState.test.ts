@@ -3,6 +3,7 @@ import { describe, expect, it } from 'vitest'
 import { effectScope, nextTick, ref } from 'vue'
 import {
   deriveComposerControlState,
+  formatComposerModelEffortTriggerLabel,
   useConversationGoalEditorState,
 } from './composerControlState'
 
@@ -146,5 +147,18 @@ describe('deriveComposerControlState', () => {
     expect(state.reasoningEfforts).toEqual(['low', 'medium', 'high', 'xhigh'])
     expect(state.modelEffortLabel).toBe('GPT-5.5 Extra High')
     expect(state.showFastIcon).toBe(false)
+  })
+
+  it('shows the desktop client label and fast indicator for gpt-5.5 extra high', () => {
+    const state = deriveComposerControlState({
+      ...localIdle,
+      selectedModel: 'gpt-5.5',
+      selectedReasoningEffort: 'xhigh',
+      selectedSpeedMode: 'fast',
+    })
+
+    expect(formatComposerModelEffortTriggerLabel('gpt-5.5', state.selectedEffort)).toBe('5.5 Extra High')
+    expect(state.modelEffortLabel).toBe('GPT-5.5 Extra High')
+    expect(state.showFastIcon).toBe(true)
   })
 })

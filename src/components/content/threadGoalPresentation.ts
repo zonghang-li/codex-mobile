@@ -13,11 +13,10 @@ function formatDuration(totalSeconds: number): string {
   const seconds = Math.max(0, Math.floor(totalSeconds))
   const hours = Math.floor(seconds / 3600)
   const minutes = Math.floor((seconds % 3600) / 60)
-  const remainder = seconds % 60
   const parts: string[] = []
   if (hours > 0) parts.push(`${hours}h`)
   if (minutes > 0) parts.push(`${minutes}m`)
-  if (remainder > 0 || parts.length === 0) parts.push(`${remainder}s`)
+  if (parts.length === 0) return '<1m'
   return parts.join(' ')
 }
 
