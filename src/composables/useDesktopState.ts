@@ -91,6 +91,8 @@ import { createManagedUploadLease } from './managedUploadLease'
 type ThreadDetailSnapshot = Awaited<ReturnType<typeof getThreadDetail>> & {
   liveAuthority?: UiThreadLiveAuthority
   liveSnapshot?: UiThreadLiveSnapshot | null
+  projectionKey?: string
+  notModified?: boolean
 }
 
 type ThreadDetailRequestLease = {
@@ -1666,6 +1668,7 @@ export function useDesktopState() {
   const externalReasoningSnapshotByThreadId = ref<Record<string, ExternalReasoningSnapshot>>({})
   const liveAuthorityByThreadId = ref<Record<string, UiThreadLiveAuthority>>({})
   const liveSnapshotByThreadId = ref<Record<string, UiThreadLiveSnapshot | null>>({})
+  const projectionKeyByThreadId = ref<Record<string, string>>({})
   const interruptBlockedUntilPersistedByThreadId = ref<Record<string, boolean>>({})
   const threadListedByServerById = ref<Record<string, boolean>>({})
   const persistedUserMessageByThreadId = ref<Record<string, boolean>>({})
@@ -2688,6 +2691,7 @@ export function useDesktopState() {
     runtimeOwnershipByThreadId.value = pruneThreadStateMap(runtimeOwnershipByThreadId.value, activeThreadIds)
     liveAuthorityByThreadId.value = pruneThreadStateMap(liveAuthorityByThreadId.value, activeThreadIds)
     liveSnapshotByThreadId.value = pruneThreadStateMap(liveSnapshotByThreadId.value, activeThreadIds)
+    projectionKeyByThreadId.value = pruneThreadStateMap(projectionKeyByThreadId.value, activeThreadIds)
     externalReasoningSnapshotByThreadId.value = pruneThreadStateMap(
       externalReasoningSnapshotByThreadId.value,
       activeThreadIds,
@@ -3107,9 +3111,10 @@ export function useDesktopState() {
       externalRuntimeTimer = null
       const generation = externalRuntimeGeneration
       const controller = new AbortController()
+      const knownProjectionKey = projectionKeyByThreadId.value[threadId] ?? undefined
       const detailRequest = acquireThreadDetailRequest(
         threadId,
-        () => getExternalThreadLiveSnapshot(threadId, controller.signal),
+        () => getExternalThreadLiveSnapshot(threadId, controller.signal, knownProjectionKey),
         controller,
       )
       const request = pollExternalRuntime(threadId, generation, detailRequest)
@@ -5532,6 +5537,9 @@ export function useDesktopState() {
     if (threadId in liveSnapshotByThreadId.value) {
       liveSnapshotByThreadId.value = omitKey(liveSnapshotByThreadId.value, threadId)
     }
+    if (projectionKeyByThreadId.value[threadId]) {
+      projectionKeyByThreadId.value = omitKey(projectionKeyByThreadId.value, threadId)
+    }
   }
 
   function reconcileThreadDetailSnapshot(
@@ -5604,8 +5612,24 @@ export function useDesktopState() {
         ...liveSnapshotByThreadId.value,
         [threadId]: detail.liveSnapshot ?? null,
       }
+      if (detail.projectionKey) {
+        projectionKeyByThreadId.value = {
+          ...projectionKeyByThreadId.value,
+          [threadId]: detail.projectionKey,
+        }
+      }
     } else if (ownership !== 'external' || !inProgress) {
       clearThreadLiveAuthority(threadId)
+    }
+    if (isLiveProjection && detail.notModified === true) {
+      if (inProgress) {
+        setThreadRuntimeOwnership(threadId, ownership)
+        setThreadInProgress(threadId, true)
+      } else {
+        setThreadInProgress(threadId, false)
+        setThreadRuntimeOwnership(threadId, ownership)
+      }
+      return
     }
     hasMoreOlderMessagesByThreadId.value = {
       ...hasMoreOlderMessagesByThreadId.value,
@@ -7001,6 +7025,7 @@ export function useDesktopState() {
     activeTurnIdByThreadId.value = {}
     liveAuthorityByThreadId.value = {}
     liveSnapshotByThreadId.value = {}
+    projectionKeyByThreadId.value = {}
     externalReasoningSnapshotByThreadId.value = {}
     interruptBlockedUntilPersistedByThreadId.value = {}
     threadListedByServerById.value = {}

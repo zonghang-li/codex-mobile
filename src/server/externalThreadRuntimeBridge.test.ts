@@ -1102,6 +1102,125 @@ describe('GET /codex-api/thread-live-state external runtime parity', () => {
     expect(rpc).toHaveBeenCalledTimes(1)
   })
 
+  it('returns a lightweight not-modified live-state when the projection key matches', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'codex-mobile-live-state-not-modified-'))
+    disposers.push(() => {
+      void rm(dir, { recursive: true, force: true })
+    })
+    const rolloutPath = join(dir, 'thread-not-modified.jsonl')
+    await writeFile(rolloutPath, '{"type":"session_meta"}\n')
+
+    const middleware = createCodexBridgeMiddleware()
+    const shared = sharedBridgeForTest() as ReturnType<typeof sharedBridgeForTest> & {
+      appServer: ReturnType<typeof sharedBridgeForTest>['appServer'] & {
+        rpc: (method: string, params: unknown) => Promise<unknown>
+      }
+    }
+    vi.spyOn(shared.appServer, 'getPid').mockReturnValue(4242)
+    const rpc = vi.spyOn(shared.appServer, 'rpc').mockResolvedValue({
+      thread: {
+        id: 'thread-not-modified',
+        path: rolloutPath,
+        turns: [{
+          id: 'turn-complete',
+          status: 'completed',
+          items: [{
+            id: 'large-item',
+            type: 'agentMessage',
+            text: 'x'.repeat(128_000),
+          }],
+        }],
+      },
+    })
+    vi.spyOn(shared.runtimeProbe, 'inspect').mockResolvedValue({
+      state: 'running',
+      turnId: 'turn-external',
+      interruptible: false,
+      source: 'external-session-writer',
+    })
+    const port = await listenWithMiddleware(middleware)
+
+    const first = await fetch(`http://127.0.0.1:${port}/codex-api/thread-live-state?threadId=thread-not-modified`)
+    const firstPayload = await first.json() as {
+      projectionKey?: string
+      conversationState?: unknown
+    }
+
+    expect(firstPayload.projectionKey).toEqual(expect.any(String))
+    expect(firstPayload.conversationState).toEqual(expect.objectContaining({
+      turns: expect.any(Array),
+    }))
+
+    const second = await fetch(
+      `http://127.0.0.1:${port}/codex-api/thread-live-state?threadId=thread-not-modified&knownProjectionKey=${encodeURIComponent(firstPayload.projectionKey ?? '')}`,
+    )
+    const secondPayload = await second.json() as {
+      notModified?: boolean
+      projectionKey?: string
+      conversationState?: unknown
+      isInProgress?: boolean
+      liveAuthority?: string
+      liveSnapshot?: unknown
+    }
+
+    expect(secondPayload).toMatchObject({
+      notModified: true,
+      projectionKey: firstPayload.projectionKey,
+      isInProgress: true,
+      liveAuthority: 'missing',
+      liveSnapshot: null,
+    })
+    expect(secondPayload).not.toHaveProperty('conversationState')
+    expect(JSON.stringify(secondPayload).length).toBeLessThan(2048)
+    expect(rpc).toHaveBeenCalledTimes(1)
+  })
+
+  it('returns a full live-state when the known projection key is stale', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'codex-mobile-live-state-stale-key-'))
+    disposers.push(() => {
+      void rm(dir, { recursive: true, force: true })
+    })
+    const rolloutPath = join(dir, 'thread-stale-key.jsonl')
+    await writeFile(rolloutPath, '{"type":"session_meta"}\n')
+
+    const middleware = createCodexBridgeMiddleware()
+    const shared = sharedBridgeForTest() as ReturnType<typeof sharedBridgeForTest> & {
+      appServer: ReturnType<typeof sharedBridgeForTest>['appServer'] & {
+        rpc: (method: string, params: unknown) => Promise<unknown>
+      }
+    }
+    vi.spyOn(shared.appServer, 'getPid').mockReturnValue(4242)
+    vi.spyOn(shared.appServer, 'rpc').mockResolvedValue({
+      thread: {
+        id: 'thread-stale-key',
+        path: rolloutPath,
+        turns: [{ id: 'turn-complete', status: 'completed', items: [] }],
+      },
+    })
+    vi.spyOn(shared.runtimeProbe, 'inspect').mockResolvedValue({
+      state: 'running',
+      turnId: 'turn-external',
+      interruptible: false,
+      source: 'external-session-writer',
+    })
+    const port = await listenWithMiddleware(middleware)
+
+    const response = await fetch(
+      `http://127.0.0.1:${port}/codex-api/thread-live-state?threadId=thread-stale-key&knownProjectionKey=stale`,
+    )
+    const payload = await response.json() as {
+      notModified?: boolean
+      projectionKey?: string
+      conversationState?: unknown
+    }
+
+    expect(payload.notModified).not.toBe(true)
+    expect(payload.projectionKey).toEqual(expect.any(String))
+    expect(payload.conversationState).toEqual(expect.objectContaining({
+      turns: expect.any(Array),
+    }))
+  })
+
   it('does not reuse cached writer authority after the external runtime becomes idle', async () => {
     const dir = await mkdtemp(join(tmpdir(), 'codex-mobile-live-state-cache-authority-'))
     const previousLiveStateDir = process.env.CODEX_MOBILE_LIVE_STATE_DIR

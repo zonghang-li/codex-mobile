@@ -729,6 +729,44 @@ describe('getThreadDetail', () => {
     expect(requestSignal).toBe(controller.signal)
   })
 
+  it('sends the known live projection key and normalizes not-modified responses', async () => {
+    let requestUrl = ''
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
+      requestUrl = String(input)
+      return new Response(JSON.stringify({
+        threadId: 'external-thread',
+        notModified: true,
+        projectionKey: 'projection-2',
+        isInProgress: true,
+        externalRuntime: {
+          state: 'running',
+          turnId: 'turn-external',
+          interruptible: false,
+          source: 'external-session-writer',
+        },
+        liveAuthority: 'missing',
+        liveSnapshot: null,
+      }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    }))
+
+    await expect(getExternalThreadLiveSnapshot(
+      'external-thread',
+      undefined,
+      'projection-1',
+    )).resolves.toMatchObject({
+      isLiveProjection: true,
+      notModified: true,
+      projectionKey: 'projection-2',
+      ownership: 'external',
+      activeTurnId: 'turn-external',
+      inProgress: true,
+      messages: [],
+      liveAuthority: 'missing',
+      liveSnapshot: null,
+    })
+    expect(requestUrl).toBe('/codex-api/thread-live-state?threadId=external-thread&knownProjectionKey=projection-1')
+  })
+
   it('normalizes authoritative writer footer snapshots from thread-live-state', async () => {
     vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({
       threadId: 'external-thread',

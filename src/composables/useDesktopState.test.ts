@@ -2052,6 +2052,64 @@ describe('external runtime ownership', () => {
     expect(state.selectedLiveOverlay.value?.activityLabel).toBe('Inspecting state')
   })
 
+  it('passes the last live projection key and preserves messages on not-modified polls', async () => {
+    const state = await setupBackgroundRuntimeState()
+    gatewayMocks.getThreadRuntimeStates.mockResolvedValue({
+      'thread-selected': {
+        state: 'running',
+        turnId: 'turn-external',
+        interruptible: false,
+        source: 'external-session-writer',
+      },
+    })
+    gatewayMocks.getExternalThreadLiveSnapshot
+      .mockResolvedValueOnce({
+        ...externalDetail('turn-external'),
+        isLiveProjection: true,
+        projectionKey: 'projection-1',
+        messages: [{
+          id: 'agent-external',
+          role: 'assistant',
+          text: 'desktop output',
+          messageType: 'agentMessage',
+          turnId: 'turn-external',
+        }],
+      })
+      .mockResolvedValueOnce({
+        ...externalDetail('turn-external'),
+        isLiveProjection: true,
+        notModified: true,
+        projectionKey: 'projection-1',
+        messages: [],
+      })
+
+    state.startPolling()
+    pollingCleanups.push(() => state.stopPolling())
+    await vi.advanceTimersByTimeAsync(0)
+    await flushMicrotasks()
+    await vi.advanceTimersByTimeAsync(1)
+    await flushMicrotasks()
+
+    expect(gatewayMocks.getExternalThreadLiveSnapshot).toHaveBeenCalledTimes(1)
+    expect(state.messages.value).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: 'agent-external', text: 'desktop output' }),
+    ]))
+
+    await vi.advanceTimersByTimeAsync(1_000)
+    await flushMicrotasks()
+
+    expect(gatewayMocks.getExternalThreadLiveSnapshot).toHaveBeenCalledTimes(2)
+    expect(gatewayMocks.getExternalThreadLiveSnapshot).toHaveBeenNthCalledWith(
+      2,
+      'thread-selected',
+      expect.any(AbortSignal),
+      'projection-1',
+    )
+    expect(state.messages.value).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: 'agent-external', text: 'desktop output' }),
+    ]))
+  })
+
   it('keeps probing a selected idle task without starting detail reads for idle or unknown results', async () => {
     const state = await setupBackgroundRuntimeState()
     gatewayMocks.getThreadRuntimeStates
