@@ -1693,6 +1693,7 @@ describe('turn completion lifecycle', () => {
 
   it('ignores an older completion while a newer turn owns the running lease', async () => {
     const { state, emit } = await setupTurnLifecycleNotificationState('thread-1')
+    gatewayMocks.getThreadDetail.mockResolvedValue(localDetail('turn-b'))
     gatewayMocks.interruptThreadTurn.mockRejectedValue(new Error('expected stop probe'))
     emit({ method: 'turn/started', params: { threadId: 'thread-1', turn: { id: 'turn-a' } } })
     emit({ method: 'turn/started', params: { threadId: 'thread-1', turn: { id: 'turn-b' } } })
@@ -1711,11 +1712,46 @@ describe('turn completion lifecycle', () => {
     expect(state.projectGroups.value[0]?.threads[0]?.inProgress).toBe(false)
   })
 
+  it('clears a stale local running lease when mismatched completion is confirmed idle', async () => {
+    const { state, emit } = await setupTurnLifecycleNotificationState('thread-1')
+    emit({ method: 'turn/started', params: { threadId: 'thread-1', turn: { id: 'turn-old' } } })
+    emit({ method: 'turn/started', params: { threadId: 'thread-1', turn: { id: 'turn-cached' } } })
+    gatewayMocks.getThreadDetail.mockResolvedValue(idleDetail())
+
+    emit({
+      method: 'turn/completed',
+      params: { threadId: 'thread-1', turn: { id: 'turn-old', status: 'completed' } },
+    })
+    await flushMicrotasks()
+
+    expect(state.selectedThread.value?.inProgress).toBe(false)
+    expect(state.selectedThreadRuntimeOwnership.value).toBe('idle')
+    expect(state.selectedActiveTurnId.value).toBe('')
+  })
+
+  it('adopts the authoritative newer local turn after mismatched completion', async () => {
+    const { state, emit } = await setupTurnLifecycleNotificationState('thread-1')
+    gatewayMocks.interruptThreadTurn.mockResolvedValue(undefined)
+    emit({ method: 'turn/started', params: { threadId: 'thread-1', turn: { id: 'turn-old' } } })
+    emit({ method: 'turn/started', params: { threadId: 'thread-1', turn: { id: 'turn-cached' } } })
+    gatewayMocks.getThreadDetail.mockResolvedValue(localDetail('turn-newer'))
+
+    emit({
+      method: 'turn/completed',
+      params: { threadId: 'thread-1', turn: { id: 'turn-old', status: 'completed' } },
+    })
+    await flushMicrotasks()
+
+    expect(state.selectedThread.value?.inProgress).toBe(true)
+    expect(state.selectedThreadRuntimeOwnership.value).toBe('local')
+    expect(state.selectedActiveTurnId.value).toBe('turn-newer')
+    await state.interruptSelectedThreadTurn()
+    expect(gatewayMocks.interruptThreadTurn).toHaveBeenCalledWith('thread-1', 'turn-newer')
+  })
+
   it('preserves the current turn error through stale completion message sync', async () => {
     const { state, emit } = await setupTurnLifecycleNotificationState('thread-1')
-    gatewayMocks.getThreadDetail.mockResolvedValue({
-      messages: [], inProgress: false, activeTurnId: '', hasMoreOlder: false, turnIndexByTurnId: {},
-    })
+    gatewayMocks.getThreadDetail.mockResolvedValue(localDetail('turn-b'))
     emit({ method: 'turn/started', params: { threadId: 'thread-1', turn: { id: 'turn-a' } } })
     emit({ method: 'turn/started', params: { threadId: 'thread-1', turn: { id: 'turn-b' } } })
     emit({

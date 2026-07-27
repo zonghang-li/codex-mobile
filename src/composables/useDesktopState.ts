@@ -1854,6 +1854,7 @@ export function useDesktopState() {
   let activeReasoningItemId = ''
   let shouldAutoScrollOnNextAgentEvent = false
   const pendingTurnStartsById = new Map<string, TurnStartedInfo>()
+  const completionReconciliationGenerationByThreadId = new Map<string, number>()
   const localSubmissionByThreadId = new Map<string, LocalSubmissionState>()
   const pendingStopRequestByThreadId = new Map<string, PendingStopRequest>()
   let pendingNewThreadSubmission: PendingNewThreadSubmission | null = null
@@ -2916,6 +2917,7 @@ export function useDesktopState() {
     pendingTurnRequestByThreadId.value = omitKey(pendingTurnRequestByThreadId.value, normalizedThreadId)
     clearPendingStopRequest(normalizedThreadId)
     clearLocalSubmission(normalizedThreadId)
+    completionReconciliationGenerationByThreadId.delete(normalizedThreadId)
     selectedModelIdByContext.value = omitKey(selectedModelIdByContext.value, normalizedThreadId)
     selectedCollaborationModeByContext.value = omitKey(selectedCollaborationModeByContext.value, normalizedThreadId)
     clearLiveAgentRawTextForThread(normalizedThreadId)
@@ -3948,6 +3950,35 @@ export function useDesktopState() {
       activeTurnIdByThreadId.value = omitKey(activeTurnIdByThreadId.value, threadId)
     }
     releasePendingTurnRequest(threadId)
+  }
+
+  async function reconcileMismatchedLocalCompletion(
+    threadId: string,
+    expectedActiveTurnId: string,
+  ): Promise<void> {
+    const generation = (completionReconciliationGenerationByThreadId.get(threadId) ?? 0) + 1
+    completionReconciliationGenerationByThreadId.set(threadId, generation)
+    const authorityVersion = localRuntimeAuthorityVersionByThreadId.get(threadId) ?? 0
+    const detailRequest = acquireThreadDetailRequest(threadId, () => getThreadDetail(threadId))
+    try {
+      const detail = await detailRequest.promise
+      if (completionReconciliationGenerationByThreadId.get(threadId) !== generation) return
+      if ((localRuntimeAuthorityVersionByThreadId.get(threadId) ?? 0) !== authorityVersion) return
+      if ((activeTurnIdByThreadId.value[threadId] ?? '') !== expectedActiveTurnId) return
+      if (runtimeOwnershipByThreadId.value[threadId] === 'external') return
+
+      reconcileThreadDetailSnapshot(threadId, detail, {
+        preserveMissing: true,
+        markRead: threadId === selectedThreadId.value,
+        requestedVersion: '',
+        detailEpoch: detailRequest.epoch,
+        allowIdleLocalLeaseRelease: true,
+      })
+    } catch {
+      // A later notification or runtime poll will retry authoritative convergence.
+    } finally {
+      releaseThreadDetailRequest(threadId, detailRequest)
+    }
   }
 
   function normalizePlanStepStatus(value: unknown): UiPlanStep['status'] {
@@ -5319,6 +5350,14 @@ export function useDesktopState() {
         }
         if (!shouldRetryWithFallback) {
           scheduleQueueStateRefresh(completedTurn.threadId)
+        }
+      } else if (!isExternallyOwned(completedTurn.threadId)) {
+        const expectedActiveTurnId = activeTurnIdByThreadId.value[completedTurn.threadId] ?? ''
+        if (expectedActiveTurnId) {
+          void reconcileMismatchedLocalCompletion(
+            completedTurn.threadId,
+            expectedActiveTurnId,
+          )
         }
       }
     }
@@ -7482,6 +7521,7 @@ export function useDesktopState() {
     pendingThreadsRefresh = false
     pendingThreadMessageRefresh.clear()
     pendingTurnStartsById.clear()
+    completionReconciliationGenerationByThreadId.clear()
     localSubmissionByThreadId.clear()
     for (const request of pendingStopRequestByThreadId.values()) {
       if (!request.settled) request.resolve()
