@@ -7,6 +7,7 @@ import {
   BackendQueueProcessor,
   mergeSessionSkillInputsIntoTurns,
   parseAutomationToml,
+  prepareThreadRpcResultForClient,
   sanitizeThreadTurnsInlinePayloads,
   toAutomationApiRecord,
 } from './codexAppServerBridge'
@@ -142,6 +143,223 @@ describe('thread inline media sanitization', () => {
     expect(output).toContain('first-line')
     expect(output).toContain('last-line')
     expect(output).toContain('truncated')
+  })
+
+  it('compresses activity-only raw payload fields that are not rendered directly', async () => {
+    const longToolOutput = `tool-head\n${'x'.repeat(40_000)}\ntool-tail`
+    const result = await sanitizeThreadTurnsInlinePayloads('thread/read', {
+      thread: {
+        turns: [
+          {
+            id: 'turn-1',
+            items: [
+              {
+                id: 'mcp-1',
+                type: 'mcpToolCall',
+                server: 'codegraph',
+                tool: 'codegraph_explore',
+                status: 'completed',
+                arguments: { query: 'large query', source: 'a'.repeat(20_000) },
+                result: {
+                  content: [{ type: 'text', text: longToolOutput }],
+                },
+              },
+            ],
+          },
+        ],
+      },
+    }) as {
+      thread: {
+        turns: Array<{
+          items: Array<{
+            arguments: { type: string; originalBytes: number; preview: string }
+            result: { type: string; originalBytes: number; preview: string }
+          }>
+        }>
+      }
+    }
+
+    const item = result.thread.turns[0].items[0]
+
+    expect(item.arguments.type).toBe('compressedRawPayload')
+    expect(item.arguments.originalBytes).toBeGreaterThan(20_000)
+    expect(item.arguments.preview.length).toBeLessThan(600)
+    expect(item.result.type).toBe('compressedRawPayload')
+    expect(item.result.originalBytes).toBeGreaterThan(40_000)
+    expect(item.result.preview).toContain('tool-head')
+  })
+
+  it('windows oversized turn item arrays while retaining the user prompt and latest activity', async () => {
+    const items = [
+      {
+        id: 'user-1',
+        type: 'userMessage',
+        content: [{ type: 'text', text: 'start a huge turn' }],
+      },
+      ...Array.from({ length: 500 }, (_, index) => ({
+        id: `cmd-${index}`,
+        type: 'commandExecution',
+        command: `echo ${index}`,
+        aggregatedOutput: `output ${index}`,
+      })),
+      {
+        id: 'assistant-final',
+        type: 'agentMessage',
+        text: 'latest final text',
+      },
+    ]
+
+    const result = await sanitizeThreadTurnsInlinePayloads('thread/read', {
+      thread: {
+        turns: [
+          {
+            id: 'turn-1',
+            items,
+          },
+        ],
+      },
+    }) as {
+      thread: {
+        turns: Array<{
+          items: Array<{ id: string }>
+          rawItemCompression: {
+            originalItemCount: number
+            retainedItemCount: number
+            omittedItemCount: number
+          }
+        }>
+      }
+    }
+
+    const turn = result.thread.turns[0]
+
+    expect(turn.items.length).toBeLessThanOrEqual(240)
+    expect(turn.items[0].id).toBe('user-1')
+    expect(turn.items.at(-1)?.id).toBe('assistant-final')
+    expect(turn.rawItemCompression).toEqual({
+      originalItemCount: 502,
+      retainedItemCount: turn.items.length,
+      omittedItemCount: 502 - turn.items.length,
+    })
+  })
+
+  it('windows items appended by recovered session enrichment before returning thread RPC results', async () => {
+    const result = await prepareThreadRpcResultForClient(
+      'thread/read',
+      {
+        thread: {
+          turns: [
+            {
+              id: 'turn-1',
+              items: [
+                {
+                  id: 'user-1',
+                  type: 'userMessage',
+                  content: [{ type: 'text', text: 'start a huge turn' }],
+                },
+              ],
+            },
+          ],
+        },
+      },
+      false,
+      async (value) => {
+        const record = value as {
+          thread: {
+            turns: Array<{
+              items: Array<Record<string, unknown>>
+            }>
+          }
+        }
+        return {
+          ...record,
+          thread: {
+            ...record.thread,
+            turns: record.thread.turns.map((turn) => ({
+              ...turn,
+              items: [
+                ...turn.items,
+                ...Array.from({ length: 500 }, (_, index) => ({
+                  id: `recovered-cmd-${index}`,
+                  type: 'commandExecution',
+                  command: `echo ${index}`,
+                  aggregatedOutput: `recovered output ${index}`,
+                })),
+              ],
+            })),
+          },
+        }
+      },
+    ) as {
+      thread: {
+        turns: Array<{
+          items: Array<{ id: string }>
+          rawItemCompression: {
+            originalItemCount: number
+            retainedItemCount: number
+            omittedItemCount: number
+          }
+        }>
+      }
+    }
+
+    const turn = result.thread.turns[0]
+
+    expect(turn.items.length).toBeLessThanOrEqual(240)
+    expect(turn.items[0].id).toBe('user-1')
+    expect(turn.items.at(-1)?.id).toBe('recovered-cmd-499')
+    expect(turn.rawItemCompression).toEqual({
+      originalItemCount: 501,
+      retainedItemCount: turn.items.length,
+      omittedItemCount: 501 - turn.items.length,
+    })
+  })
+
+  it('preserves recent visible assistant text when activity items would otherwise fill the window', async () => {
+    const items = [
+      {
+        id: 'user-1',
+        type: 'userMessage',
+        content: [{ type: 'text', text: 'start a huge turn' }],
+      },
+      ...Array.from({ length: 80 }, (_, index) => ({
+        id: `assistant-${index}`,
+        type: 'agentMessage',
+        text: `visible assistant update ${index}`,
+      })),
+      ...Array.from({ length: 300 }, (_, index) => ({
+        id: `cmd-${index}`,
+        type: 'commandExecution',
+        command: `echo ${index}`,
+        aggregatedOutput: `output ${index}`,
+      })),
+    ]
+
+    const result = await sanitizeThreadTurnsInlinePayloads('thread/read', {
+      thread: {
+        turns: [
+          {
+            id: 'turn-1',
+            items,
+          },
+        ],
+      },
+    }) as {
+      thread: {
+        turns: Array<{
+          items: Array<{ id: string; type: string }>
+        }>
+      }
+    }
+
+    const retainedItems = result.thread.turns[0].items
+    const retainedIds = new Set(retainedItems.map((item) => item.id))
+
+    expect(retainedItems.length).toBeLessThanOrEqual(240)
+    expect(retainedItems[0].id).toBe('user-1')
+    expect(retainedIds.has('assistant-79')).toBe(true)
+    expect(retainedItems.some((item) => item.type === 'agentMessage')).toBe(true)
+    expect(retainedItems.at(-1)?.id).toBe('cmd-299')
   })
 
   it('leaves non-image data URLs untouched in image-like fields', async () => {
@@ -576,6 +794,63 @@ describe('backend queue scheduling', () => {
         threadId: 'thread-queued',
         approvalPolicy: 'never',
         sandboxPolicy: { type: 'dangerFullAccess' },
+      })
+    } finally {
+      processor.dispose()
+    }
+  })
+
+  it('uses the model and effort captured with a queued message', async () => {
+    const processor = new BackendQueueProcessor({
+      rpc: vi.fn(async (method: string) => {
+        if (method === 'config/read') {
+          return { config: { model: 'gpt-5.5', model_reasoning_effort: 'medium' } }
+        }
+        return {}
+      }),
+      getPid: () => 31337,
+      onNotification: () => () => undefined,
+    } as never)
+
+    try {
+      const params = await (processor as unknown as {
+        buildQueuedTurnParams: (turn: {
+          threadId: string
+          message: {
+            id: string
+            text: string
+            imageUrls: string[]
+            skills: Array<{ name: string; path: string }>
+            fileAttachments: Array<{ label: string; path: string; fsPath: string }>
+            collaborationMode: 'default'
+            model: string
+            effort: 'max'
+          }
+        }) => Promise<Record<string, unknown>>
+      }).buildQueuedTurnParams({
+        threadId: 'thread-queued',
+        message: {
+          id: 'queued-1',
+          text: 'continue with selected settings',
+          imageUrls: [],
+          skills: [],
+          fileAttachments: [],
+          collaborationMode: 'default',
+          model: 'gpt-5.6-sol',
+          effort: 'max',
+        },
+      })
+
+      expect(params).toMatchObject({
+        model: 'gpt-5.6-sol',
+        effort: 'max',
+        collaborationMode: {
+          mode: 'default',
+          settings: {
+            model: 'gpt-5.6-sol',
+            reasoning_effort: 'max',
+          },
+        },
       })
     } finally {
       processor.dispose()

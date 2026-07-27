@@ -81,6 +81,27 @@ function formatModelLabel(modelId: string): string {
   return modelId.trim().replace(/^gpt/iu, 'GPT')
 }
 
+function formatClientModelTriggerLabel(modelId: string): string {
+  const normalized = modelId.trim()
+  if (!normalized) return ''
+  const withoutPrefix = normalized.replace(/^gpt-?/iu, '')
+  return withoutPrefix.replace(
+    /^(5\.\d+)-([a-z]+)(?:-.+)?$/iu,
+    (_match, version: string, variant: string) => (
+      `${version} ${variant.charAt(0).toUpperCase()}${variant.slice(1).toLowerCase()}`
+    ),
+  )
+}
+
+export function formatComposerModelEffortTriggerLabel(
+  modelId: string,
+  effort: ReasoningEffort | '',
+): string {
+  const modelLabel = formatClientModelTriggerLabel(modelId)
+  const effortLabel = effort ? EFFORT_LABELS[effort] : ''
+  return [modelLabel, effortLabel].filter(Boolean).join(' ')
+}
+
 export function deriveComposerControlState(
   input: ComposerControlStateInput,
 ) {

@@ -18,10 +18,11 @@ describe('selected thread header desktop parity wiring', () => {
     expect(appSource).toContain('@rename="onRenameSelectedThread"')
   })
 
-  it('retains sidebar, terminal, and branch actions with their state guards', () => {
+  it('retains sidebar and branch actions without exposing the terminal control', () => {
     expect(appSource).toContain('@toggle-sidebar="setSidebarCollapsed(!isSidebarCollapsed)"')
-    expect(appSource).toContain('v-if="canShowTerminalToggle"')
-    expect(appSource).toContain(':disabled="isComposerTerminalControlDisabled"')
+    expect(appSource).not.toContain('content-header-terminal-command')
+    expect(appSource).not.toContain('<ThreadTerminalPanel')
+    expect(appSource).not.toContain('onSelectHeaderTerminalCommand')
     expect(appSource).toContain('v-if="canShowContentHeaderBranchDropdown"')
     expect(appSource).toContain(':busy="isSwitchingThreadBranch"')
     expect(appSource).toContain(':key="selectedThreadId"')

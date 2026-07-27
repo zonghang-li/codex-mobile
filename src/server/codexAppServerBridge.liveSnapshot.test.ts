@@ -1,8 +1,14 @@
+import { appendFile, mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { describe, expect, it, vi } from 'vitest'
 import {
   applySessionSkillEnrichmentForRpc,
   buildThreadLiveStateReadFailureFallback,
+  mergeSessionModelSettingsIntoThreadResult,
   prepareRpcProxyRequest,
+  readSessionModelSettingsFromFile,
+  readSessionModelSettingsFromLog,
   shouldStoreThreadReadSnapshotForRpc,
   trimLiveThreadTurnsInRpcResult,
   trimThreadTurnsInRpcResult,
@@ -61,6 +67,127 @@ describe('external live snapshot RPC preparation', () => {
     expect(shouldStoreThreadReadSnapshotForRpc('thread/read', true)).toBe(false)
     expect(shouldStoreThreadReadSnapshotForRpc('thread/read', false)).toBe(true)
     expect(shouldStoreThreadReadSnapshotForRpc('thread/start', false)).toBe(true)
+  })
+
+  it('reads the latest session model and effort from turn_context metadata', () => {
+    const raw = [
+      JSON.stringify({
+        type: 'session_meta',
+        payload: {
+          model: 'gpt-5.6-sol',
+          model_provider: 'openai',
+        },
+      }),
+      JSON.stringify({
+        type: 'turn_context',
+        payload: {
+          model: 'gpt-5.5',
+          effort: 'xhigh',
+          collaboration_mode: {
+            settings: {
+              model: 'gpt-5.5',
+              reasoning_effort: 'xhigh',
+            },
+          },
+        },
+      }),
+    ].join('\n')
+
+    expect(readSessionModelSettingsFromLog(raw)).toEqual({
+      model: 'gpt-5.5',
+      modelProvider: 'openai',
+      reasoningEffort: 'xhigh',
+    })
+  })
+
+  it('recovers the latest model and effort when later output exceeds the fixed tail window', async () => {
+    const tempDir = await mkdtemp(join(tmpdir(), 'codex-mobile-session-model-'))
+    const sessionPath = join(tempDir, 'rollout.jsonl')
+    try {
+      await writeFile(sessionPath, [
+        JSON.stringify({
+          type: 'session_meta',
+          payload: {
+            model: 'gpt-5.6-sol',
+            model_provider: 'openai',
+          },
+        }),
+        JSON.stringify({
+          type: 'turn_context',
+          payload: {
+            model: 'gpt-5.5',
+            effort: 'xhigh',
+          },
+        }),
+        JSON.stringify({
+          type: 'response_item',
+          payload: {
+            output: 'x'.repeat(768 * 1024),
+          },
+        }),
+      ].join('\n'), 'utf8')
+
+      await expect(readSessionModelSettingsFromFile(sessionPath)).resolves.toEqual({
+        model: 'gpt-5.5',
+        modelProvider: 'openai',
+        reasoningEffort: 'xhigh',
+      })
+
+      await appendFile(sessionPath, `\n${JSON.stringify({
+        type: 'turn_context',
+        payload: {
+          model: 'gpt-5.6-sol',
+          effort: 'max',
+        },
+      })}\n${JSON.stringify({
+        type: 'response_item',
+        payload: {
+          output: 'y'.repeat(768 * 1024),
+        },
+      })}`, 'utf8')
+
+      await expect(readSessionModelSettingsFromFile(sessionPath)).resolves.toEqual({
+        model: 'gpt-5.6-sol',
+        modelProvider: 'openai',
+        reasoningEffort: 'max',
+      })
+    } finally {
+      await rm(tempDir, { recursive: true, force: true })
+    }
+  })
+
+  it('treats latest session model settings as authoritative over stale app-server thread fields', () => {
+    const result = {
+      model: 'gpt-5.6-sol',
+      modelProvider: 'openai',
+      reasoningEffort: 'max',
+      reasoning_effort: 'max',
+      thread: {
+        id: 'thread-1',
+        model: 'gpt-5.6-sol',
+        modelProvider: 'openai',
+        reasoningEffort: 'max',
+        reasoning_effort: 'max',
+        turns: [],
+      },
+    }
+
+    expect(mergeSessionModelSettingsIntoThreadResult(result, {
+      model: 'gpt-5.5',
+      modelProvider: 'openai',
+      reasoningEffort: 'xhigh',
+    })).toMatchObject({
+      model: 'gpt-5.5',
+      modelProvider: 'openai',
+      reasoningEffort: 'xhigh',
+      reasoning_effort: 'xhigh',
+      thread: {
+        model: 'gpt-5.5',
+        modelProvider: 'openai',
+        reasoningEffort: 'xhigh',
+        reasoning_effort: 'xhigh',
+      },
+    })
   })
 
   it('limits an initial thread detail response to the newest five turns', () => {

@@ -69,6 +69,7 @@ const props = defineProps<{
   modelValue: string
   options: DropdownOption[]
   placeholder?: string
+  selectedLabel?: string
   disabled?: boolean
   selectedPrefixIcon?: Component | null
   iconOnly?: boolean
@@ -93,6 +94,8 @@ const menuWrapStyle = ref<Record<string, string>>({})
 let isLayoutListenerAttached = false
 
 const selectedLabel = computed(() => {
+  const override = props.selectedLabel?.trim()
+  if (override) return override
   const selected = props.options.find((option) => option.value === props.modelValue)
   if (selected) return selected.label
   return props.placeholder?.trim() || ''

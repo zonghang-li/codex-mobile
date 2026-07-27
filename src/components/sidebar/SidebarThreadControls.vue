@@ -9,6 +9,11 @@
     >
       <IconTablerLayoutSidebarFilled v-if="isSidebarCollapsed" class="sidebar-thread-controls-icon" />
       <IconTablerLayoutSidebar v-else class="sidebar-thread-controls-icon" />
+      <span
+        v-if="hasUnreadThreads"
+        class="sidebar-thread-controls-unread-dot"
+        aria-hidden="true"
+      />
     </button>
 
     <slot />
@@ -35,6 +40,7 @@ import IconTablerLayoutSidebarFilled from '../icons/IconTablerLayoutSidebarFille
 defineProps<{
   isSidebarCollapsed: boolean
   showNewThreadButton?: boolean
+  hasUnreadThreads?: boolean
 }>()
 
 defineEmits<{
@@ -53,10 +59,14 @@ const { t } = useUiLanguage()
 }
 
 .sidebar-thread-controls-button {
-  @apply h-6.75 w-6.75 rounded-md border border-transparent bg-transparent text-zinc-600 flex items-center justify-center transition hover:border-zinc-200 hover:bg-zinc-50;
+  @apply relative h-6.75 w-6.75 rounded-md border border-transparent bg-transparent text-zinc-600 flex items-center justify-center transition hover:border-zinc-200 hover:bg-zinc-50;
 }
 
 .sidebar-thread-controls-icon {
   @apply w-4 h-4;
+}
+
+.sidebar-thread-controls-unread-dot {
+  @apply absolute right-0.5 top-0.5 h-2 w-2 rounded-full bg-blue-500 ring-2 ring-white dark:ring-zinc-950;
 }
 </style>
