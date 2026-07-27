@@ -1743,6 +1743,7 @@ export function useDesktopState() {
   const loadedMessagesByThreadId = ref<Record<string, boolean>>({})
   const hasMoreOlderMessagesByThreadId = ref<Record<string, boolean>>({})
   const olderTurnCursorByThreadId = ref<Record<string, string | null>>({})
+  const consumedOlderTurnCursorsByThreadId = new Map<string, Set<string>>()
   const loadingOlderMessagesByThreadId = ref<Record<string, boolean>>({})
   const resumedThreadById = ref<Record<string, boolean>>({})
   const turnIndexByTurnIdByThreadId = ref<Record<string, Record<string, number>>>({})
@@ -2946,6 +2947,7 @@ export function useDesktopState() {
     loadedMessagesByThreadId.value = omitKey(loadedMessagesByThreadId.value, normalizedThreadId)
     loadedVersionByThreadId.value = omitKey(loadedVersionByThreadId.value, normalizedThreadId)
     olderTurnCursorByThreadId.value = omitKey(olderTurnCursorByThreadId.value, normalizedThreadId)
+    consumedOlderTurnCursorsByThreadId.delete(normalizedThreadId)
     resumedThreadById.value = omitKey(resumedThreadById.value, normalizedThreadId)
     turnIndexByTurnIdByThreadId.value = omitKey(turnIndexByTurnIdByThreadId.value, normalizedThreadId)
     turnSummaryByThreadId.value = omitKey(turnSummaryByThreadId.value, normalizedThreadId)
@@ -3027,6 +3029,9 @@ export function useDesktopState() {
     loadedMessagesByThreadId.value = pruneThreadStateMap(loadedMessagesByThreadId.value, activeThreadIds)
     loadedVersionByThreadId.value = pruneThreadStateMap(loadedVersionByThreadId.value, activeThreadIds)
     olderTurnCursorByThreadId.value = pruneThreadStateMap(olderTurnCursorByThreadId.value, activeThreadIds)
+    for (const threadId of consumedOlderTurnCursorsByThreadId.keys()) {
+      if (!activeThreadIds.has(threadId)) consumedOlderTurnCursorsByThreadId.delete(threadId)
+    }
     resumedThreadById.value = pruneThreadStateMap(resumedThreadById.value, activeThreadIds)
     turnIndexByTurnIdByThreadId.value = pruneThreadStateMap(turnIndexByTurnIdByThreadId.value, activeThreadIds)
     persistedMessagesByThreadId.value = pruneThreadStateMap(persistedMessagesByThreadId.value, activeThreadIds)
@@ -6057,9 +6062,12 @@ export function useDesktopState() {
       turnIndexByTurnId: detailTurnIndexByTurnId,
     } = detail
     const isLiveProjection = detail.isLiveProjection === true
+    const isPagedProjection = detail.isPagedProjection === true
+    const isIncrementalProjection = isLiveProjection || isPagedProjection
+    const hadLoadedMessages = loadedMessagesByThreadId.value[threadId] === true
     let reconciledTurnIndexByTurnId = detailTurnIndexByTurnId
     let reconciledDetailMessages = detailMessages
-    if (isLiveProjection) {
+    if (isIncrementalProjection) {
       const existingLookup = turnIndexByTurnIdByThreadId.value[threadId] ?? {}
       const nextLookup = { ...existingLookup }
       let nextTurnIndex = Object.values(existingLookup).reduce(
@@ -6145,23 +6153,23 @@ export function useDesktopState() {
       }
       return
     }
-    hasMoreOlderMessagesByThreadId.value = {
-      ...hasMoreOlderMessagesByThreadId.value,
-      [threadId]: detail.hasMoreOlder === true,
-    }
-    if (!isLiveProjection || detail.olderCursor !== undefined) {
+    if (!isIncrementalProjection || !hadLoadedMessages) {
+      hasMoreOlderMessagesByThreadId.value = {
+        ...hasMoreOlderMessagesByThreadId.value,
+        [threadId]: detail.hasMoreOlder === true,
+      }
       olderTurnCursorByThreadId.value = {
         ...olderTurnCursorByThreadId.value,
         [threadId]: detail.olderCursor ?? null,
       }
     }
     markThreadMessagesPersisted(threadId, nextMessages)
-    replaceTurnIndexLookupForThread(threadId, isLiveProjection
+    replaceTurnIndexLookupForThread(threadId, isIncrementalProjection
       ? reconciledTurnIndexByTurnId
       : detailTurnIndexByTurnId)
     rebindLiveFileChangeTurnIndices(threadId)
     const previousPersisted = persistedMessagesByThreadId.value[threadId] ?? []
-    const mergedMessages = isLiveProjection
+    const mergedMessages = isIncrementalProjection
       ? mergeLiveProjectionMessages(previousPersisted, nextMessages)
       : mergeMessages(previousPersisted, nextMessages, {
           preserveMissing: options.preserveMissing || hasOptimisticUserMessages(previousPersisted),
@@ -6332,6 +6340,23 @@ export function useDesktopState() {
 
     try {
       const page = await getOlderThreadMessages(threadId, cursor)
+      const consumedCursors = consumedOlderTurnCursorsByThreadId.get(threadId) ?? new Set<string>()
+      if (
+        page.nextCursor !== null
+        && (page.nextCursor === cursor || consumedCursors.has(page.nextCursor))
+      ) {
+        consumedCursors.add(cursor)
+        consumedOlderTurnCursorsByThreadId.set(threadId, consumedCursors)
+        olderTurnCursorByThreadId.value = {
+          ...olderTurnCursorByThreadId.value,
+          [threadId]: null,
+        }
+        hasMoreOlderMessagesByThreadId.value = {
+          ...hasMoreOlderMessagesByThreadId.value,
+          [threadId]: false,
+        }
+        return
+      }
       const currentLookup = turnIndexByTurnIdByThreadId.value[threadId] ?? {}
       const newTurnIds = page.turnIds.filter((turnId) => !(turnId in currentLookup))
       const shift = newTurnIds.length
@@ -6371,21 +6396,31 @@ export function useDesktopState() {
           [threadId]: shiftMessages(liveFileChangeMessagesByThreadId.value[threadId] ?? []),
         }
       }
-      const pageMessages = insertTurnSummaryMessages(
-        page.messages,
-        mergeTurnSummariesWithPersistedDurations(threadId, page.completionSummaries),
-      )
-      const mergedMessages = mergeMessages(pageMessages, previousPersisted, { preserveMissing: true })
-      setPersistedMessagesForThread(threadId, mergedMessages)
       const shiftedLookup = Object.fromEntries(
         Object.entries(currentLookup).map(([turnId, turnIndex]) => [turnId, turnIndex + shift]),
       )
       const prependedLookup = Object.fromEntries(newTurnIds.map((turnId, index) => [turnId, index]))
-      replaceTurnIndexLookupForThread(threadId, {
+      const reconciledLookup = {
         ...shiftedLookup,
         ...prependedLookup,
+      }
+      const reconciledPageMessages = page.messages.map((message) => {
+        if (!message.turnId) return message
+        const turnIndex = reconciledLookup[message.turnId]
+        return typeof turnIndex === 'number' && message.turnIndex !== turnIndex
+          ? { ...message, turnIndex }
+          : message
       })
+      const pageMessages = insertTurnSummaryMessages(
+        reconciledPageMessages,
+        mergeTurnSummariesWithPersistedDurations(threadId, page.completionSummaries),
+      )
+      const mergedMessages = mergeMessages(pageMessages, previousPersisted, { preserveMissing: true })
+      setPersistedMessagesForThread(threadId, mergedMessages)
+      replaceTurnIndexLookupForThread(threadId, reconciledLookup)
       rebindLiveFileChangeTurnIndices(threadId)
+      consumedCursors.add(cursor)
+      consumedOlderTurnCursorsByThreadId.set(threadId, consumedCursors)
       olderTurnCursorByThreadId.value = {
         ...olderTurnCursorByThreadId.value,
         [threadId]: page.nextCursor,
@@ -7749,6 +7784,7 @@ export function useDesktopState() {
     liveFileChangeMessagesByThreadId.value = {}
     turnIndexByTurnIdByThreadId.value = {}
     olderTurnCursorByThreadId.value = {}
+    consumedOlderTurnCursorsByThreadId.clear()
     turnActivityByThreadId.value = {}
     turnSummaryByThreadId.value = {}
     turnErrorByThreadId.value = {}

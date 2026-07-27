@@ -10109,16 +10109,22 @@ export function createCodexBridgeMiddleware(options: {
             }
           } catch (paginationError) {
             const paginationMessage = getErrorMessage(paginationError, '')
-            if (
-              !isThreadTurnsListMethodNotFoundError(paginationError)
-              && !paginationMessage.includes('returned an invalid response')
+            if (isThreadTurnsListMethodNotFoundError(paginationError)) {
+              rawThreadReadResult = await appServer.rpc('thread/read', {
+                threadId,
+                includeTurns: true,
+              })
+            } else if (
+              paginationMessage.includes('returned an invalid response')
+              && Array.isArray(metadataThread?.turns)
+              && metadataThread.turns.length > 0
             ) {
+              // Some older test doubles and app-server builds ignore includeTurns:false.
+              // Reuse those already-returned turns without issuing an expensive second read.
+              rawThreadReadResult = rawThreadMetadataResult
+            } else {
               throw paginationError
             }
-            rawThreadReadResult = await appServer.rpc('thread/read', {
-              threadId,
-              includeTurns: true,
-            })
           }
           const threadReadResult = mergeStreamTurnErrorsIntoThreadResult(appServer, rawThreadReadResult)
           const sanitized = await sanitizeThreadTurnsInlinePayloads('thread/read', threadReadResult)

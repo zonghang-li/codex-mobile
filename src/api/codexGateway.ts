@@ -1033,6 +1033,7 @@ async function getThreadDetailV2(
   signal?: AbortSignal,
 ): Promise<{
   isLiveProjection?: boolean
+  isPagedProjection?: true
   model: string
   modelProvider: string
   reasoningEffort: ReasoningEffort | ''
@@ -1065,6 +1066,7 @@ async function getThreadDetailV2(
     } as ThreadReadResponse
     const runtime = readThreadDetailRuntime(payload)
     return {
+      isPagedProjection: true,
       model: normalizeThreadModelFromPayload(metadata),
       modelProvider: normalizeThreadModelProviderFromPayload(metadata),
       reasoningEffort: normalizeThreadReasoningEffortFromPayload(metadata),
@@ -1277,6 +1279,7 @@ export async function getThreadSummary(threadId: string): Promise<UiThread> {
 
 export async function getThreadDetail(threadId: string, signal?: AbortSignal): Promise<{
   isLiveProjection?: boolean
+  isPagedProjection?: true
   model: string
   modelProvider: string
   reasoningEffort: ReasoningEffort | ''

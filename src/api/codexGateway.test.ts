@@ -674,6 +674,7 @@ describe('getThreadDetail', () => {
     }))
 
     await expect(getThreadDetail('thread-paged', controller.signal)).resolves.toMatchObject({
+      isPagedProjection: true,
       model: 'gpt-5.5',
       reasoningEffort: 'xhigh',
       olderCursor: 'opaque-older',

@@ -342,6 +342,7 @@ describe('existing thread loading', () => {
     installTestWindow()
     gatewayMocks.getThreadDetail.mockResolvedValue({
       ...idleDetail(),
+      isPagedProjection: true,
       olderCursor: 'opaque-page-1',
       hasMoreOlder: true,
       turnIndexByTurnId: {
@@ -420,6 +421,101 @@ describe('existing thread loading', () => {
       'thread-1',
       'opaque-page-2',
     )
+  })
+
+  it('preserves loaded older turns and their absolute indices across a forced paged refresh', async () => {
+    installTestWindow()
+    const newestDetail = {
+      ...idleDetail(),
+      isPagedProjection: true,
+      olderCursor: 'opaque-page-1',
+      hasMoreOlder: true,
+      turnIndexByTurnId: { 'turn-2': 0 },
+      messages: [{
+        id: 'agent-2',
+        role: 'assistant' as const,
+        text: 'two',
+        messageType: 'agentMessage',
+        turnId: 'turn-2',
+        turnIndex: 0,
+      }],
+    }
+    gatewayMocks.getThreadDetail.mockResolvedValue(newestDetail)
+    gatewayMocks.getOlderThreadMessages.mockResolvedValue({
+      messages: [{
+        id: 'agent-1',
+        role: 'assistant',
+        text: 'one',
+        messageType: 'agentMessage',
+        turnId: 'turn-1',
+        turnIndex: 0,
+      }],
+      completionSummaries: [],
+      inProgress: false,
+      activeTurnId: '',
+      hasMoreOlder: false,
+      nextCursor: null,
+      turnIds: ['turn-1'],
+      startTurnIndex: 0,
+      turnIndexByTurnId: { 'turn-1': 0 },
+    })
+
+    const state = useDesktopState()
+    state.primeSelectedThread('thread-1')
+    await state.loadMessages('thread-1')
+    await state.loadOlderMessages('thread-1')
+    await state.loadMessages('thread-1', { force: true })
+
+    expect(state.messages.value.map((message) => [message.id, message.turnIndex])).toEqual([
+      ['agent-1', 0],
+      ['agent-2', 1],
+    ])
+  })
+
+  it('stops older pagination when the server repeats a consumed cursor without mutating messages', async () => {
+    installTestWindow()
+    gatewayMocks.getThreadDetail.mockResolvedValue({
+      ...idleDetail(),
+      isPagedProjection: true,
+      olderCursor: 'opaque-loop',
+      hasMoreOlder: true,
+      turnIndexByTurnId: { 'turn-2': 0 },
+      messages: [{
+        id: 'agent-2',
+        role: 'assistant',
+        text: 'two',
+        messageType: 'agentMessage',
+        turnId: 'turn-2',
+        turnIndex: 0,
+      }],
+    })
+    gatewayMocks.getOlderThreadMessages.mockResolvedValue({
+      messages: [{
+        id: 'agent-1',
+        role: 'assistant',
+        text: 'one',
+        messageType: 'agentMessage',
+        turnId: 'turn-1',
+        turnIndex: 0,
+      }],
+      completionSummaries: [],
+      inProgress: false,
+      activeTurnId: '',
+      hasMoreOlder: true,
+      nextCursor: 'opaque-loop',
+      turnIds: ['turn-1'],
+      startTurnIndex: 0,
+      turnIndexByTurnId: { 'turn-1': 0 },
+    })
+
+    const state = useDesktopState()
+    state.primeSelectedThread('thread-1')
+    await state.loadMessages('thread-1')
+    await state.loadOlderMessages('thread-1')
+    await state.loadOlderMessages('thread-1')
+
+    expect(gatewayMocks.getOlderThreadMessages).toHaveBeenCalledTimes(1)
+    expect(state.messages.value.map((message) => message.id)).toEqual(['agent-2'])
   })
 
   it('keeps the user-selected model and effort when the first follow-up resumes the thread', async () => {
@@ -3870,6 +3966,7 @@ describe('external runtime ownership', () => {
     const state = await setupBackgroundRuntimeState()
     gatewayMocks.getThreadDetail.mockResolvedValue({
       ...externalDetail('turn-2'),
+      olderCursor: 'opaque-deep',
       hasMoreOlder: true,
       turnIndexByTurnId: {
         'turn-0': 2,
@@ -3906,6 +4003,7 @@ describe('external runtime ownership', () => {
     gatewayMocks.getExternalThreadLiveSnapshot.mockResolvedValue({
       ...externalDetail('turn-2'),
       isLiveProjection: true,
+      olderCursor: 'opaque-newest',
       hasMoreOlder: true,
       turnIndexByTurnId: { 'turn-2': 0 },
       messages: [{
@@ -3916,6 +4014,17 @@ describe('external runtime ownership', () => {
         turnId: 'turn-2',
         turnIndex: 0,
       }],
+    })
+    gatewayMocks.getOlderThreadMessages.mockResolvedValue({
+      messages: [],
+      completionSummaries: [],
+      inProgress: false,
+      activeTurnId: '',
+      hasMoreOlder: false,
+      nextCursor: null,
+      turnIds: [],
+      startTurnIndex: 0,
+      turnIndexByTurnId: {},
     })
 
     await state.loadMessages('thread-selected')
@@ -3930,6 +4039,11 @@ describe('external runtime ownership', () => {
       'fresh-current-agent',
     ])
     expect(state.messages.value.map((message) => message.turnIndex)).toEqual([2, 3, 4])
+    await state.loadOlderMessages('thread-selected')
+    expect(gatewayMocks.getOlderThreadMessages).toHaveBeenCalledWith(
+      'thread-selected',
+      'opaque-deep',
+    )
   })
 
   it('pauses selected live projection polling while hidden and resumes immediately when visible', async () => {

@@ -1710,6 +1710,49 @@ describe('GET /codex-api/thread-live-state external runtime parity', () => {
     )
   })
 
+  it('does not fall back to a full history read when the native live page is malformed', async () => {
+    const middleware = createCodexBridgeMiddleware()
+    const shared = sharedBridgeForTest() as ReturnType<typeof sharedBridgeForTest> & {
+      appServer: ReturnType<typeof sharedBridgeForTest>['appServer'] & {
+        rpc: (method: string, params: unknown) => Promise<unknown>
+      }
+    }
+    vi.spyOn(shared.appServer, 'getPid').mockReturnValue(4242)
+    const rpc = vi.spyOn(shared.appServer, 'rpc').mockImplementation(async (method, params) => {
+      if (method === 'thread/read' && (params as { includeTurns?: boolean }).includeTurns === true) {
+        throw new Error('full history read forbidden')
+      }
+      if (method === 'thread/read') {
+        return {
+          thread: {
+            id: 'thread-malformed-page',
+            path: '/sessions/thread-malformed-page.jsonl',
+            turns: [],
+          },
+        }
+      }
+      if (method === 'thread/turns/list') return {}
+      throw new Error(`Unexpected RPC method: ${method}`)
+    })
+    vi.spyOn(shared.runtimeProbe, 'inspect').mockResolvedValue({ state: 'idle' })
+    const port = await listenWithMiddleware(middleware)
+
+    const response = await fetch(
+      `http://127.0.0.1:${port}/codex-api/thread-live-state?threadId=thread-malformed-page`,
+    )
+
+    expect(response.status).toBe(200)
+    await expect(response.json()).resolves.toMatchObject({
+      threadId: 'thread-malformed-page',
+      conversationState: null,
+      liveStateError: { kind: 'readFailed' },
+    })
+    expect(rpc).not.toHaveBeenCalledWith(
+      'thread/read',
+      expect.objectContaining({ includeTurns: true }),
+    )
+  })
+
   it('preserves canonical item order when recovering command items from the session log', async () => {
     const dir = await mkdtemp(join(tmpdir(), 'codex-mobile-session-order-'))
     disposers.push(() => {
