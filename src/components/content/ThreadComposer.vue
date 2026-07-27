@@ -206,30 +206,6 @@
               @remove="onRemovePrompt"
             />
             <div class="thread-composer-attach-separator" />
-            <div class="thread-composer-attach-mode">
-              <span class="thread-composer-attach-mode-label">{{ t('In-progress send') }}</span>
-              <div class="thread-composer-attach-mode-buttons">
-                <button
-                  class="thread-composer-attach-mode-button"
-                  :class="{ 'is-active': activeInProgressMode === 'steer' }"
-                  type="button"
-                  :disabled="isInteractionDisabled"
-                  @click="setActiveInProgressMode('steer')"
-                >
-                  {{ t('Steer') }}
-                </button>
-                <button
-                  class="thread-composer-attach-mode-button"
-                  :class="{ 'is-active': activeInProgressMode === 'queue' }"
-                  type="button"
-                  :disabled="isInteractionDisabled"
-                  @click="setActiveInProgressMode('queue')"
-                >
-                  {{ t('Queue') }}
-                </button>
-              </div>
-            </div>
-            <div class="thread-composer-attach-separator" />
             <button
               v-if="isFastModeSupported"
               class="thread-composer-attach-setting"
@@ -758,10 +734,6 @@ const speedModeDescription = computed(() => {
     ? t('About 1.5x faster, with credits used at 2x')
     : t('Default speed with normal credit usage')
 })
-const inProgressMode = computed<'steer' | 'queue'>(() =>
-  props.inProgressSubmitMode === 'steer' ? 'steer' : 'queue',
-)
-const activeInProgressMode = ref<'steer' | 'queue'>(inProgressMode.value)
 const submitMode = computed<'steer' | 'queue'>(() =>
   props.isTurnInProgress ? 'queue' : 'steer',
 )
@@ -1067,11 +1039,6 @@ function onSubmit(mode: 'steer' | 'queue' = 'steer'): void {
     return
   }
   nextTick(() => inputRef.value?.focus())
-}
-
-function setActiveInProgressMode(mode: 'steer' | 'queue'): void {
-  if (isInteractionDisabled.value) return
-  activeInProgressMode.value = mode
 }
 
 function replaceDraftState(payload: ComposerDraftPayload): void {
@@ -2116,14 +2083,6 @@ watch(
   },
 )
 
-watch(
-  inProgressMode,
-  (nextMode) => {
-    activeInProgressMode.value = nextMode
-  },
-)
-
-
 </script>
 
 <style scoped>
@@ -2419,26 +2378,6 @@ watch(
 
 .thread-composer-attach-separator {
   @apply my-1 h-px bg-zinc-100;
-}
-
-.thread-composer-attach-mode {
-  @apply px-3 py-2 flex items-center justify-between gap-2;
-}
-
-.thread-composer-attach-mode-label {
-  @apply text-sm text-zinc-800;
-}
-
-.thread-composer-attach-mode-buttons {
-  @apply inline-flex items-center rounded-full border border-zinc-200 bg-white p-0.5;
-}
-
-.thread-composer-attach-mode-button {
-  @apply rounded-full border-0 bg-transparent px-2 py-1 text-xs text-zinc-600 transition hover:text-zinc-800 disabled:cursor-not-allowed disabled:text-zinc-400;
-}
-
-.thread-composer-attach-mode-button.is-active {
-  @apply bg-zinc-900 text-white hover:text-white;
 }
 
 .thread-composer-attach-setting {

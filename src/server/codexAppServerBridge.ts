@@ -6676,7 +6676,7 @@ type StoredQueuedMessage = {
   text: string
   imageUrls: string[]
   skills: Array<{ name: string; path: string }>
-  fileAttachments: Array<{ label: string; path: string; fsPath: string }>
+  fileAttachments: Array<{ label: string; path: string; fsPath: string; uploadHandle?: string }>
   collaborationMode: 'default' | 'plan'
   model: string
   effort: ReasoningEffort | ''
@@ -6717,7 +6717,7 @@ function normalizeStoredQueuedMessage(value: unknown): StoredQueuedMessage | nul
     })
   }
 
-  const normalizeFileAttachments = (items: unknown): Array<{ label: string; path: string; fsPath: string }> => {
+  const normalizeFileAttachments = (items: unknown): Array<{ label: string; path: string; fsPath: string; uploadHandle?: string }> => {
     if (!Array.isArray(items)) return []
     return items.flatMap((item) => {
       const itemRecord = asRecord(item)
@@ -6725,7 +6725,10 @@ function normalizeStoredQueuedMessage(value: unknown): StoredQueuedMessage | nul
       const label = typeof itemRecord.label === 'string' ? itemRecord.label.trim() : ''
       const path = typeof itemRecord.path === 'string' ? itemRecord.path.trim() : ''
       const fsPath = typeof itemRecord.fsPath === 'string' ? itemRecord.fsPath.trim() : ''
-      return label && path && fsPath ? [{ label, path, fsPath }] : []
+      const uploadHandle = typeof itemRecord.uploadHandle === 'string'
+        ? itemRecord.uploadHandle.trim()
+        : ''
+      return label && path && fsPath ? [{ label, path, fsPath, ...(uploadHandle ? { uploadHandle } : {}) }] : []
     })
   }
 
@@ -6760,6 +6763,64 @@ function normalizeThreadQueueState(value: unknown): ThreadQueueState {
   return state
 }
 
+function isManagedQueuedImageUrl(value: string): boolean {
+  try {
+    const parsed = new URL(value, 'http://localhost')
+    const path = parsed.searchParams.get('path')?.replace(/\\/gu, '/') ?? ''
+    return parsed.pathname === '/codex-local-image' && (
+      Boolean(parsed.searchParams.get('uploadHandle')?.trim())
+      || path.includes('/codex-web-uploads/')
+    )
+  } catch {
+    return false
+  }
+}
+
+function hasManagedQueuedCapabilities(message: StoredQueuedMessage): boolean {
+  return message.imageUrls.some(isManagedQueuedImageUrl)
+    || message.fileAttachments.some((attachment) => (
+      Boolean(attachment.uploadHandle?.trim())
+      || attachment.path.replace(/\\/gu, '/').includes('/codex-web-uploads/')
+      || attachment.fsPath.replace(/\\/gu, '/').includes('/codex-web-uploads/')
+    ))
+}
+
+function sanitizeThreadQueueStateForPersistence(state: ThreadQueueState): ThreadQueueState {
+  const sanitized: ThreadQueueState = {}
+  for (const [threadId, messages] of Object.entries(state)) {
+    sanitized[threadId] = messages.map((message) => ({
+      ...message,
+      imageUrls: message.imageUrls.filter((imageUrl) => !isManagedQueuedImageUrl(imageUrl)),
+      fileAttachments: message.fileAttachments
+        .filter((attachment) => !(
+          attachment.uploadHandle?.trim()
+          || attachment.path.replace(/\\/gu, '/').includes('/codex-web-uploads/')
+          || attachment.fsPath.replace(/\\/gu, '/').includes('/codex-web-uploads/')
+        ))
+        .map(({ label, path, fsPath }) => ({ label, path, fsPath })),
+    }))
+  }
+  return sanitized
+}
+
+function managedQueuedUploadHandles(message: StoredQueuedMessage): string[] {
+  const handles = new Set<string>()
+  for (const imageUrl of message.imageUrls) {
+    try {
+      const parsed = new URL(imageUrl, 'http://localhost')
+      const handle = parsed.searchParams.get('uploadHandle')?.trim() ?? ''
+      if (handle) handles.add(handle)
+    } catch {
+      // Ignore malformed image URLs.
+    }
+  }
+  for (const attachment of message.fileAttachments) {
+    const handle = attachment.uploadHandle?.trim() ?? ''
+    if (handle) handles.add(handle)
+  }
+  return [...handles]
+}
+
 let threadQueueMutationChain: Promise<unknown> = Promise.resolve()
 
 async function readThreadQueueState(): Promise<ThreadQueueState> {
@@ -6782,7 +6843,7 @@ async function writeThreadQueueStateUnlocked(nextState: ThreadQueueState): Promi
   } catch {
     payload = {}
   }
-  const normalized = normalizeThreadQueueState(nextState)
+  const normalized = sanitizeThreadQueueStateForPersistence(normalizeThreadQueueState(nextState))
   if (Object.keys(normalized).length > 0) {
     payload[THREAD_QUEUE_STATE_KEY] = normalized
   } else {
@@ -8488,6 +8549,8 @@ export class BackendQueueProcessor {
   private readonly processingThreadIds = new Set<string>()
   private readonly queueDrainTimersByThreadId = new Map<string, ReturnType<typeof setTimeout>>()
   private readonly queueDrainDueAtByThreadId = new Map<string, number>()
+  private readonly runtimeQueuedMessages = new Map<string, StoredQueuedMessage>()
+  private readonly activeManagedMessagesByThreadId = new Map<string, StoredQueuedMessage>()
   private readonly unsubscribe: () => void
 
   constructor(
@@ -8498,6 +8561,7 @@ export class BackendQueueProcessor {
       if (!isTurnCompletedNotification(notification)) return
       const threadId = extractThreadIdFromNotificationParams(notification.params)
       if (!threadId) return
+      this.releaseActiveManagedMessage(threadId)
       void this.processThreadQueue(threadId)
     })
     void this.scheduleAllQueuedThreads(1000)
@@ -8511,6 +8575,36 @@ export class BackendQueueProcessor {
     this.queueDrainTimersByThreadId.clear()
     this.queueDrainDueAtByThreadId.clear()
     this.processingThreadIds.clear()
+    for (const message of this.runtimeQueuedMessages.values()) {
+      this.releaseManagedMessage(message)
+    }
+    for (const message of this.activeManagedMessagesByThreadId.values()) {
+      this.releaseManagedMessage(message)
+    }
+    this.runtimeQueuedMessages.clear()
+    this.activeManagedMessagesByThreadId.clear()
+  }
+
+  replaceRuntimeQueueState(
+    state: ThreadQueueState,
+    transferManagedMessageIds: Set<string> = new Set(),
+  ): void {
+    const incomingKeys = new Set<string>()
+    for (const [threadId, messages] of Object.entries(state)) {
+      for (const message of messages) {
+        const key = this.runtimeQueueKey(threadId, message.id)
+        incomingKeys.add(key)
+        if (hasManagedQueuedCapabilities(message)) {
+          this.runtimeQueuedMessages.set(key, message)
+        }
+      }
+    }
+    for (const [key, message] of this.runtimeQueuedMessages) {
+      if (incomingKeys.has(key)) continue
+      this.runtimeQueuedMessages.delete(key)
+      if (transferManagedMessageIds.has(message.id)) continue
+      this.releaseManagedMessage(message)
+    }
   }
 
   async scheduleAllQueuedThreads(delayMs = 0): Promise<void> {
@@ -8559,12 +8653,23 @@ export class BackendQueueProcessor {
       }
       const next = await this.popNextQueuedTurn(threadId)
       if (!next) return
+      const runtimeKey = this.runtimeQueueKey(threadId, next.message.id)
+      const managedMessage = this.runtimeQueuedMessages.get(runtimeKey)
+      if (managedMessage) {
+        this.activeManagedMessagesByThreadId.set(threadId, managedMessage)
+      }
       try {
         await this.startQueuedTurn(next)
+        if (managedMessage) {
+          this.runtimeQueuedMessages.delete(runtimeKey)
+        }
         if (await this.hasQueuedTurns(threadId)) {
           this.scheduleThreadQueueDrain(threadId)
         }
       } catch {
+        if (managedMessage && this.activeManagedMessagesByThreadId.get(threadId) === managedMessage) {
+          this.activeManagedMessagesByThreadId.delete(threadId)
+        }
         await this.restoreQueuedTurn(next)
         this.scheduleThreadQueueDrain(threadId)
       }
@@ -8610,8 +8715,26 @@ export class BackendQueueProcessor {
       } else {
         delete nextState[threadId]
       }
-      return { nextState, result: { threadId, message } }
+      const runtimeMessage = this.runtimeQueuedMessages.get(this.runtimeQueueKey(threadId, message.id))
+      return { nextState, result: { threadId, message: runtimeMessage ?? message } }
     })
+  }
+
+  private runtimeQueueKey(threadId: string, messageId: string): string {
+    return `${threadId}\u0000${messageId}`
+  }
+
+  private releaseManagedMessage(message: StoredQueuedMessage): void {
+    for (const uploadHandle of managedQueuedUploadHandles(message)) {
+      void deleteManagedUpload(uploadHandle)
+    }
+  }
+
+  private releaseActiveManagedMessage(threadId: string): void {
+    const message = this.activeManagedMessagesByThreadId.get(threadId)
+    if (!message) return
+    this.activeManagedMessagesByThreadId.delete(threadId)
+    this.releaseManagedMessage(message)
   }
 
   private async restoreQueuedTurn(turn: BackendQueuedTurn): Promise<void> {
@@ -11026,7 +11149,11 @@ export function createCodexBridgeMiddleware(options: {
           setJson(res, 400, { error: 'Invalid body: expected object' })
           return
         }
-        await writeThreadQueueState(normalizeThreadQueueState(record))
+        const queueStateRecord = asRecord(record.queueState) ?? record
+        const runtimeState = normalizeThreadQueueState(queueStateRecord)
+        const transferManagedMessageIds = new Set(normalizeStringArray(record.transferManagedMessageIds))
+        backendQueueProcessor.replaceRuntimeQueueState(runtimeState, transferManagedMessageIds)
+        await writeThreadQueueState(runtimeState)
         void backendQueueProcessor.scheduleAllQueuedThreads()
         setJson(res, 200, { ok: true })
         return

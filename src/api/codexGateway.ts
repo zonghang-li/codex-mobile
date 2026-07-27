@@ -298,7 +298,7 @@ export type StoredQueuedMessage = {
   text: string
   imageUrls: string[]
   skills: Array<{ name: string; path: string }>
-  fileAttachments: Array<{ label: string; path: string; fsPath: string }>
+  fileAttachments: Array<{ label: string; path: string; fsPath: string; uploadHandle?: string }>
   collaborationMode: CollaborationModeKind
   model: string
   effort: ReasoningEffort | ''
@@ -3097,11 +3097,17 @@ export async function getThreadQueueState(): Promise<ThreadQueueState> {
   return normalizeThreadQueueState(envelope.data)
 }
 
-export async function setThreadQueueState(nextState: ThreadQueueState): Promise<void> {
+export async function setThreadQueueState(
+  nextState: ThreadQueueState,
+  options: { transferManagedMessageIds?: string[] } = {},
+): Promise<void> {
   const response = await fetch('/codex-api/thread-queue-state', {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(normalizeThreadQueueState(nextState)),
+    body: JSON.stringify({
+      queueState: nextState,
+      transferManagedMessageIds: options.transferManagedMessageIds ?? [],
+    }),
   })
   if (!response.ok) {
     throw new Error('Failed to save thread queue state')

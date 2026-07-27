@@ -1883,11 +1883,11 @@ describe('turn completion lifecycle', () => {
       [],
       'default',
     )
+    const stop = state.interruptSelectedThreadTurn()
+    expect(gatewayMocks.interruptThreadTurn).not.toHaveBeenCalled()
     resolveFallbackStart?.('turn-fallback')
     await fallbackStartSettled
-    await flushMicrotasks()
-
-    await state.interruptSelectedThreadTurn()
+    await Promise.all([stop, flushMicrotasks()])
     expect(gatewayMocks.interruptThreadTurn).toHaveBeenCalledWith('thread-1', 'turn-fallback')
     expect(state.projectGroups.value[0]?.threads[0]).toMatchObject({
       inProgress: true,
@@ -1942,28 +1942,81 @@ describe('turn completion lifecycle', () => {
     })
   })
 
-  it('sends managed queue attachments immediately instead of persisting capabilities', async () => {
+  it('keeps the submitted user row visible while an unsupported-model fallback is starting', async () => {
+    const { state, emit } = await setupTurnLifecycleNotificationState('thread-1')
+    const fallbackTurn = deferred<string>()
+    gatewayMocks.rollbackThread.mockResolvedValue([])
+    gatewayMocks.startThreadTurn
+      .mockResolvedValueOnce('turn-primary')
+      .mockReturnValueOnce(fallbackTurn.promise)
+
+    await state.sendMessageToSelectedThread('keep me visible')
+    gatewayMocks.getThreadDetail.mockResolvedValue({
+      ...localDetail('turn-primary'),
+      model: 'gpt-5.5',
+      modelProvider: 'openai',
+      messages: [{
+        id: 'persisted-primary-user',
+        role: 'user',
+        text: 'keep me visible',
+        messageType: 'userMessage',
+        turnId: 'turn-primary',
+      }],
+    })
+    await state.loadMessages('thread-1', { force: true })
+    expect(state.messages.value.filter((message) => message.text === 'keep me visible'))
+      .toHaveLength(1)
+
+    emit({ method: 'turn/started', params: { threadId: 'thread-1', turn: { id: 'turn-primary' } } })
+    emit({
+      method: 'turn/completed',
+      params: {
+        threadId: 'thread-1',
+        turn: {
+          id: 'turn-primary',
+          status: 'failed',
+          error: { message: 'model is not supported' },
+        },
+      },
+    })
+    await vi.waitFor(() => {
+      expect(gatewayMocks.startThreadTurn).toHaveBeenCalledTimes(2)
+    })
+
+    expect(state.messages.value.some((message) => (
+      message.text === 'keep me visible'
+      && message.messageType === 'userMessage.optimistic'
+    ))).toBe(true)
+  })
+
+  it('queues managed attachments without starting another turn immediately', async () => {
     const { state, emit } = await setupTurnLifecycleNotificationState('thread-1')
     gatewayMocks.startThreadTurn.mockResolvedValue('turn-steer')
     emit({ method: 'turn/started', params: { threadId: 'thread-1', turn: { id: 'turn-active' } } })
     const persistenceCalls = gatewayMocks.setThreadQueueState.mock.calls.length
     const managedImageUrl = '/codex-local-image?path=%2Ftmp%2Fcodex-web-uploads%2Fupload%2Fphoto.png&uploadHandle=queue-handle'
 
-    await state.sendMessageToSelectedThread('send now', [managedImageUrl], [], 'queue')
-    await vi.waitFor(() => {
-      expect(gatewayMocks.startThreadTurn).toHaveBeenCalledWith(
-        'thread-1',
-        'send now',
-        [managedImageUrl],
-        undefined,
-        'medium',
-        undefined,
-        [],
-        'default',
-      )
+    await state.sendMessageToSelectedThread('send later', [managedImageUrl], [], 'queue')
+
+    expect(gatewayMocks.startThreadTurn).not.toHaveBeenCalled()
+    expect(gatewayMocks.setThreadQueueState).toHaveBeenCalledTimes(persistenceCalls + 1)
+    expect(gatewayMocks.setThreadQueueState).toHaveBeenLastCalledWith({
+      'thread-1': [expect.objectContaining({
+        text: 'send later',
+        imageUrls: [managedImageUrl],
+      })],
     })
-    expect(gatewayMocks.setThreadQueueState).toHaveBeenCalledTimes(persistenceCalls)
-    expect(state.selectedThreadQueuedMessages.value).toEqual([])
+    expect(state.selectedThreadQueuedMessages.value).toEqual([
+      expect.objectContaining({ text: 'send later', imageUrls: [managedImageUrl] }),
+    ])
+
+    const queuedId = state.selectedThreadQueuedMessages.value[0]!.id
+    state.steerQueuedMessage(queuedId)
+    await flushMicrotasks()
+    expect(gatewayMocks.setThreadQueueState).toHaveBeenLastCalledWith(
+      {},
+      { transferManagedMessageIds: [queuedId] },
+    )
   })
 
   it('marks a successful background completion unread', async () => {
@@ -5463,6 +5516,118 @@ describe('provider model selection', () => {
     expect(state.selectedLiveOverlay.value?.activityLabel).toBe('Thinking')
   })
 
+  it('reconciles optimistic rows by attachment identity instead of attachment count', async () => {
+    installTestWindow()
+    gatewayMocks.startThreadTurn
+      .mockResolvedValueOnce('turn-a')
+      .mockResolvedValueOnce('turn-b')
+    const state = useDesktopState()
+    state.primeSelectedThread('thread-1')
+    await state.loadMessages('thread-1')
+
+    const firstFile = { label: 'first.txt', path: '/tmp/first.txt', fsPath: '/tmp/first.txt' }
+    const secondFile = { label: 'second.txt', path: '/tmp/second.txt', fsPath: '/tmp/second.txt' }
+    await state.sendMessageToSelectedThread('same prompt', [], [], 'steer', [firstFile])
+    await state.sendMessageToSelectedThread('same prompt', [], [], 'steer', [secondFile])
+
+    gatewayMocks.getThreadDetail.mockResolvedValue({
+      ...localDetail('turn-b'),
+      messages: [{
+        id: 'persisted-first',
+        role: 'user',
+        text: 'same prompt',
+        messageType: 'userMessage',
+        fileAttachments: [{ label: firstFile.label, path: firstFile.path }],
+      }],
+    })
+    await state.loadMessages('thread-1', { force: true })
+
+    const matchingRows = state.messages.value.filter((message) => (
+      message.role === 'user' && message.text === 'same prompt'
+    ))
+    expect(matchingRows).toHaveLength(2)
+    expect(matchingRows).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        messageType: 'userMessage.optimistic',
+        fileAttachments: [expect.objectContaining({ path: secondFile.path })],
+      }),
+    ]))
+  })
+
+  it('does not reconcile a repeated optimistic prompt against an older identical row', async () => {
+    installTestWindow()
+    gatewayMocks.getThreadDetail.mockResolvedValue({
+      ...idleDetail(),
+      messages: [{
+        id: 'persisted-old',
+        role: 'user',
+        text: 'continue',
+        messageType: 'userMessage',
+      }],
+    })
+    gatewayMocks.startThreadTurn.mockResolvedValue('turn-new')
+    const state = useDesktopState()
+    state.primeSelectedThread('thread-1')
+    await state.loadMessages('thread-1')
+
+    await state.sendMessageToSelectedThread('continue')
+    await state.loadMessages('thread-1', { force: true })
+
+    expect(state.messages.value.filter((message) => (
+      message.role === 'user' && message.text === 'continue'
+    ))).toHaveLength(2)
+    expect(state.messages.value.some((message) => (
+      message.text === 'continue' && message.messageType === 'userMessage.optimistic'
+    ))).toBe(true)
+  })
+
+  it('uses one persisted echo to reconcile at most one identical pending submission', async () => {
+    installTestWindow()
+    gatewayMocks.getThreadDetail.mockResolvedValue({
+      ...idleDetail(),
+      messages: [{
+        id: 'persisted-old',
+        role: 'user',
+        text: 'continue',
+        messageType: 'userMessage',
+      }],
+    })
+    gatewayMocks.startThreadTurn
+      .mockResolvedValueOnce('turn-one')
+      .mockResolvedValueOnce('turn-two')
+    const state = useDesktopState()
+    state.primeSelectedThread('thread-1')
+    await state.loadMessages('thread-1')
+
+    await state.sendMessageToSelectedThread('continue')
+    await state.sendMessageToSelectedThread('continue')
+    gatewayMocks.getThreadDetail.mockResolvedValue({
+      ...localDetail('turn-two'),
+      messages: [
+        {
+          id: 'persisted-old',
+          role: 'user',
+          text: 'continue',
+          messageType: 'userMessage',
+        },
+        {
+          id: 'persisted-new',
+          role: 'user',
+          text: 'continue',
+          messageType: 'userMessage',
+        },
+      ],
+    })
+    await state.loadMessages('thread-1', { force: true })
+
+    const identicalRows = state.messages.value.filter((message) => (
+      message.role === 'user' && message.text === 'continue'
+    ))
+    expect(identicalRows).toHaveLength(3)
+    expect(identicalRows.filter((message) => message.messageType === 'userMessage.optimistic'))
+      .toHaveLength(1)
+  })
+
   it('interrupts exactly once when Stop is requested before turn/start returns an id', async () => {
     installTestWindow()
     const pendingTurn = deferred<string>()
@@ -5505,6 +5670,28 @@ describe('provider model selection', () => {
     expect(gatewayMocks.interruptThreadTurn).toHaveBeenCalledTimes(1)
   })
 
+  it('does not resurrect a turn that completed before turn/start returned its id', async () => {
+    const { state, emit } = await setupTurnLifecycleNotificationState('thread-1')
+    const pendingTurn = deferred<string>()
+    gatewayMocks.startThreadTurn.mockReturnValue(pendingTurn.promise)
+
+    const send = state.sendMessageToSelectedThread('finish quickly')
+    await flushMicrotasks()
+    emit({ method: 'turn/started', params: { threadId: 'thread-1', turn: { id: 'turn-fast' } } })
+    emit({
+      method: 'turn/completed',
+      params: { threadId: 'thread-1', turn: { id: 'turn-fast', status: 'completed' } },
+    })
+    expect(state.selectedThread.value?.inProgress).toBe(false)
+
+    pendingTurn.resolve('turn-fast')
+    await send
+
+    expect(state.selectedThread.value?.inProgress).toBe(false)
+    expect(state.selectedThreadRuntimeOwnership.value).toBe('idle')
+    expect(state.selectedActiveTurnId.value).toBe('')
+  })
+
   it('cancels a new-thread submission before turn/start is issued', async () => {
     installTestWindow()
     const pendingThread = deferred<{ threadId: string; model: string; modelProvider: string }>()
@@ -5514,6 +5701,9 @@ describe('provider model selection', () => {
     const send = state.sendMessageToNewThread('run this', '/tmp/project')
     await flushMicrotasks()
     expect(state.isSendingMessage.value).toBe(true)
+    expect(state.pendingNewThreadMessages.value).toEqual([
+      expect.objectContaining({ role: 'user', text: 'run this' }),
+    ])
 
     state.interruptPendingNewThreadSubmission()
     pendingThread.resolve({
@@ -5522,9 +5712,12 @@ describe('provider model selection', () => {
       modelProvider: 'openai',
     })
 
-    await expect(send).resolves.toBe('')
+    await expect(send).resolves.toBe('thread-new')
     expect(gatewayMocks.startThreadTurn).not.toHaveBeenCalled()
     expect(state.isSendingMessage.value).toBe(false)
+    expect(state.messages.value).toEqual([
+      expect.objectContaining({ role: 'user', text: 'run this' }),
+    ])
   })
 
   it('captures the active provider when creating a new thread', async () => {

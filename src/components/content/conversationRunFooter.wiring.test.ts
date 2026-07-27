@@ -29,7 +29,7 @@ const globalStyleSource = readFileSync(
 describe('ConversationRunFooter desktop parity wiring', () => {
   it('keeps the current plan and diff pill outside the scroll container above the composer', () => {
     const footerIndex = appSource.indexOf('<ConversationRunFooter')
-    const conversationIndex = appSource.indexOf('<ThreadConversation')
+    const conversationIndex = appSource.indexOf('<ThreadConversation ref="threadConversationRef"')
     const composerIndex = appSource.indexOf('<ThreadComposer', conversationIndex)
 
     expect(footerIndex).toBeGreaterThan(conversationIndex)

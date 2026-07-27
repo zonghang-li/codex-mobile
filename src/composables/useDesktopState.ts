@@ -40,7 +40,6 @@ import {
   clearThreadGoal,
   type RpcNotification,
   type SkillInfo,
-  type ThreadQueueState,
   type WorkspaceRootsState,
 } from '../api/codexGateway'
 import { CodexApiError } from '../api/codexErrors'
@@ -104,6 +103,7 @@ type ThreadDetailRequestLease = {
 type OptimisticUserSubmission = {
   message: UiMessage
   afterMessageId: string
+  expectedPersistedOccurrence: number
 }
 
 function flattenThreads(groups: UiProjectGroup[]): UiThread[] {
@@ -885,26 +885,48 @@ function hasOptimisticUserMessages(messages: UiMessage[]): boolean {
   return messages.some(isOptimisticUserMessage)
 }
 
-function hasEquivalentUserMessage(target: UiMessage, messages: UiMessage[]): boolean {
-  if (target.role !== 'user') return false
+function fileAttachmentIdentity(message: UiMessage): string[] {
+  return (message.fileAttachments ?? []).map((attachment) => (
+    `${attachment.label.trim()}\u0000${attachment.path.trim()}`
+  ))
+}
+
+function skillAttachmentIdentity(message: UiMessage): string[] {
+  return (message.skills ?? []).map((skill) => (
+    `${skill.name.trim()}\u0000${skill.path.trim()}`
+  ))
+}
+
+function areEquivalentUserMessages(target: UiMessage, message: UiMessage): boolean {
+  if (target.role !== 'user' || message.role !== 'user') return false
   const targetText = normalizeMessageText(target.text)
   const targetImages = Array.isArray(target.images) ? target.images : []
-  const targetFileCount = Array.isArray(target.fileAttachments) ? target.fileAttachments.length : 0
-  const targetSkillCount = Array.isArray(target.skills) ? target.skills.length : 0
+  const targetFiles = fileAttachmentIdentity(target)
+  const targetSkills = skillAttachmentIdentity(target)
+  const messageText = normalizeMessageText(message.text)
+  const messageImages = Array.isArray(message.images) ? message.images : []
+  const messageFiles = fileAttachmentIdentity(message)
+  const messageSkills = skillAttachmentIdentity(message)
+  return (
+    messageText === targetText &&
+    areStringArraysEqual(messageImages, targetImages) &&
+    areStringArraysEqual(messageFiles, targetFiles) &&
+    areStringArraysEqual(messageSkills, targetSkills)
+  )
+}
 
-  return messages.some((message) => {
-    if (message === target || message.role !== 'user' || isOptimisticUserMessage(message)) return false
-    const messageText = normalizeMessageText(message.text)
-    const messageImages = Array.isArray(message.images) ? message.images : []
-    const messageFileCount = Array.isArray(message.fileAttachments) ? message.fileAttachments.length : 0
-    const messageSkillCount = Array.isArray(message.skills) ? message.skills.length : 0
-    return (
-      messageText === targetText &&
-      areStringArraysEqual(messageImages, targetImages) &&
-      messageFileCount === targetFileCount &&
-      messageSkillCount === targetSkillCount
-    )
-  })
+function hasEquivalentUserMessage(target: UiMessage, messages: UiMessage[]): boolean {
+  return messages.some((message) => (
+    message !== target
+    && !isOptimisticUserMessage(message)
+    && areEquivalentUserMessages(target, message)
+  ))
+}
+
+function countEquivalentUserMessages(target: UiMessage, messages: UiMessage[]): number {
+  return messages.reduce((count, message) => (
+    hasEquivalentUserMessage(target, [message]) ? count + 1 : count
+  ), 0)
 }
 
 function removeRedundantLiveAgentMessages(previous: UiMessage[], incoming: UiMessage[]): UiMessage[] {
@@ -1641,6 +1663,10 @@ export function useDesktopState() {
   const selectedThreadId = ref(loadSelectedThreadId())
   const persistedMessagesByThreadId = ref<Record<string, UiMessage[]>>({})
   const optimisticUserMessagesByThreadId = ref<Record<string, OptimisticUserSubmission[]>>({})
+  const pendingNewThreadMessages = computed<UiMessage[]>(() => (
+    optimisticUserMessagesByThreadId.value[NEW_THREAD_COLLABORATION_MODE_CONTEXT]
+      ?.map((submission) => submission.message) ?? []
+  ))
   const livePlanMessagesByThreadId = ref<Record<string, UiMessage[]>>({})
   const liveAgentMessagesByThreadId = ref<Record<string, UiMessage[]>>({})
   const liveAgentRawTextByThreadId = new Map<string, Map<string, string>>()
@@ -2276,6 +2302,23 @@ export function useDesktopState() {
     localSubmissionByThreadId.delete(threadId)
   }
 
+  function ensureLocalSubmissionOptimisticMessage(
+    threadId: string,
+    pending: PendingTurnRequest,
+  ): void {
+    const submission = localSubmissionByThreadId.get(threadId)
+    if (!submission) return
+    const optimistic = optimisticUserMessagesByThreadId.value[threadId] ?? []
+    if (optimistic.some((entry) => entry.message.id === submission.optimisticMessageId)) return
+    submission.optimisticMessageId = appendOptimisticUserMessage(
+      threadId,
+      pending.text,
+      pending.imageUrls,
+      pending.skills,
+      pending.fileAttachments,
+    )
+  }
+
   function ensurePendingStopRequest(
     threadId: string,
     generation: number,
@@ -2460,6 +2503,7 @@ export function useDesktopState() {
       try {
         const rolledBackMessages = await rollbackThread(threadId, 1)
         setPersistedMessagesForThread(threadId, rolledBackMessages)
+        ensureLocalSubmissionOptimisticMessage(threadId, pending)
         clearLivePlansForThread(threadId)
         setLiveAgentMessagesForThread(threadId, [])
         clearLiveReasoningForThread(threadId)
@@ -2511,17 +2555,23 @@ export function useDesktopState() {
         }
         setThreadRuntimeOwnership(threadId, 'local')
         maybeUnblockInterruptForActiveTurn(threadId, fallbackTurnId)
+        void consumePendingStopForTurn(threadId, fallbackTurnId)
       }
 
       scheduleRateLimitRefresh()
       pendingThreadMessageRefresh.add(threadId)
       await syncFromNotifications()
     } catch (unknownError) {
-      releasePendingTurnRequest(threadId)
+      const ambiguousStart = isAmbiguousTurnStartError(unknownError)
+      if (!ambiguousStart) {
+        releasePendingTurnRequest(threadId)
+        clearPendingStopRequest(threadId)
+        clearLocalSubmission(threadId)
+      }
       const errorMessage = unknownError instanceof Error ? unknownError.message : 'Unknown application error'
-      setTurnErrorForThread(threadId, errorMessage)
+      setTurnErrorForThread(threadId, errorMessage, { transient: ambiguousStart })
       error.value = errorMessage
-      if (!isExternallyOwned(threadId)) {
+      if (!ambiguousStart && !isExternallyOwned(threadId)) {
         setThreadRuntimeOwnership(threadId, 'idle')
         setThreadInProgress(threadId, false)
         setTurnActivityForThread(threadId, null)
@@ -3737,7 +3787,10 @@ export function useDesktopState() {
     const pending = optimisticUserMessagesByThreadId.value[threadId] ?? []
     if (pending.length === 0) return
     const remaining = pending.filter(
-      (submission) => !hasEquivalentUserMessage(submission.message, persisted),
+      (submission) => (
+        countEquivalentUserMessages(submission.message, persisted)
+        < submission.expectedPersistedOccurrence
+      ),
     )
     if (remaining.length === pending.length) return
     optimisticUserMessagesByThreadId.value = remaining.length > 0
@@ -3788,11 +3841,48 @@ export function useDesktopState() {
       messageType: 'userMessage.optimistic',
     }
     const afterMessageId = existing.at(-1)?.message.id ?? persisted.at(-1)?.id ?? ''
+    const expectedPersistedOccurrence = countEquivalentUserMessages(nextMessage, persisted)
+      + existing.filter((submission) => areEquivalentUserMessages(nextMessage, submission.message)).length
+      + 1
     optimisticUserMessagesByThreadId.value = {
       ...optimisticUserMessagesByThreadId.value,
-      [threadId]: [...existing, { message: nextMessage, afterMessageId }],
+      [threadId]: [...existing, { message: nextMessage, afterMessageId, expectedPersistedOccurrence }],
     }
     return messageId
+  }
+
+  function moveOptimisticUserMessage(
+    fromThreadId: string,
+    toThreadId: string,
+    messageId: string,
+  ): string {
+    const source = optimisticUserMessagesByThreadId.value[fromThreadId] ?? []
+    const submission = source.find((entry) => entry.message.id === messageId)
+    if (!submission) return ''
+    const target = optimisticUserMessagesByThreadId.value[toThreadId] ?? []
+    const persisted = persistedMessagesByThreadId.value[toThreadId] ?? []
+    const movedMessageId = `optimistic-user:${toThreadId}:${Date.now()}`
+    const movedMessage = { ...submission.message, id: movedMessageId }
+    const movedSubmission: OptimisticUserSubmission = {
+      message: movedMessage,
+      afterMessageId: target.at(-1)?.message.id ?? persisted.at(-1)?.id ?? '',
+      expectedPersistedOccurrence: countEquivalentUserMessages(movedMessage, persisted)
+        + target.filter((entry) => areEquivalentUserMessages(movedMessage, entry.message)).length
+        + 1,
+    }
+    const remainingSource = source.filter((entry) => entry.message.id !== messageId)
+    optimisticUserMessagesByThreadId.value = {
+      ...optimisticUserMessagesByThreadId.value,
+      ...(remainingSource.length > 0 ? { [fromThreadId]: remainingSource } : {}),
+      [toThreadId]: [...target, movedSubmission],
+    }
+    if (remainingSource.length === 0) {
+      optimisticUserMessagesByThreadId.value = omitKey(
+        optimisticUserMessagesByThreadId.value,
+        fromThreadId,
+      )
+    }
+    return movedMessageId
   }
 
   function removeOptimisticUserMessage(threadId: string, messageId: string): void {
@@ -5324,8 +5414,10 @@ export function useDesktopState() {
       }
       persistTurnSummaryForThread(completedTurn.threadId, summary)
       if (completionDisposition.ownsActiveLease) {
-        clearPendingStopRequest(completedTurn.threadId)
-        clearLocalSubmission(completedTurn.threadId)
+        if (!shouldRetryWithFallback) {
+          clearPendingStopRequest(completedTurn.threadId)
+          clearLocalSubmission(completedTurn.threadId)
+        }
         const persistedMessages = persistedMessagesByThreadId.value[completedTurn.threadId] ?? []
         setPersistedMessagesForThread(
           completedTurn.threadId,
@@ -5335,7 +5427,9 @@ export function useDesktopState() {
         if (activeTurnIdByThreadId.value[completedTurn.threadId]) {
           activeTurnIdByThreadId.value = omitKey(activeTurnIdByThreadId.value, completedTurn.threadId)
         }
-        setThreadRuntimeOwnership(completedTurn.threadId, 'idle')
+        if (!completionDisposition.keepRunning) {
+          setThreadRuntimeOwnership(completedTurn.threadId, 'idle')
+        }
         clearDelayedTurnSync(completedTurn.threadId)
         if (!shouldRetryWithFallback && completedTurn.status !== 'completed') {
           suppressUnreadForNonSuccessCompletion(completedTurn.threadId)
@@ -5722,33 +5816,11 @@ export function useDesktopState() {
     applyThreadFlags()
   }
 
-  function normalizeQueueStateForPersistence(state: Record<string, QueuedMessage[]>): ThreadQueueState {
-    const next: ThreadQueueState = {}
-    for (const [threadId, queue] of Object.entries(state)) {
-      const normalizedThreadId = threadId.trim()
-      if (!normalizedThreadId || queue.length === 0) continue
-      next[normalizedThreadId] = queue.map((message) => ({
-        id: message.id,
-        text: message.text,
-        imageUrls: message.imageUrls.filter((imageUrl) => !isManagedUploadImageUrl(imageUrl)),
-        skills: message.skills.map((skill) => ({ name: skill.name, path: skill.path })),
-        fileAttachments: message.fileAttachments
-          .filter((attachment) => !hasManagedUploadCapabilities([], [attachment]))
-          .map((attachment) => ({
-            label: attachment.label,
-            path: attachment.path,
-            fsPath: attachment.fsPath,
-          })),
-        collaborationMode: message.collaborationMode,
-        model: message.model,
-        effort: message.effort,
-      }))
-    }
-    return next
-  }
-
-  function persistQueueState(): void {
-    void setThreadQueueState(normalizeQueueStateForPersistence(queuedMessagesByThreadId.value)).catch(() => {
+  function persistQueueState(transferManagedMessageIds: string[] = []): void {
+    const request = transferManagedMessageIds.length > 0
+      ? setThreadQueueState(queuedMessagesByThreadId.value, { transferManagedMessageIds })
+      : setThreadQueueState(queuedMessagesByThreadId.value)
+    void request.catch(() => {
       // Queue persistence is best-effort; keep the current in-memory queue usable.
     })
   }
@@ -6620,11 +6692,7 @@ export function useDesktopState() {
 
     const isInProgress = inProgressById.value[threadId] === true
 
-    if (
-      isInProgress
-      && mode === 'queue'
-      && !hasManagedUploadCapabilities(imageUrls, fileAttachments)
-    ) {
+    if (isInProgress && mode === 'queue') {
       const queue = queuedMessagesByThreadId.value[threadId] ?? []
       const id = `q-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
       const nextQueue = [...queue]
@@ -6649,6 +6717,7 @@ export function useDesktopState() {
         ...queuedMessagesByThreadId.value,
         [threadId]: nextQueue,
       }
+      uploadLease.transfer()
       persistQueueState()
       await uploadLease.release()
       return
@@ -6773,6 +6842,17 @@ export function useDesktopState() {
     }
 
     const newThreadGeneration = ++nextSubmissionGeneration
+    optimisticUserMessagesByThreadId.value = omitKey(
+      optimisticUserMessagesByThreadId.value,
+      NEW_THREAD_COLLABORATION_MODE_CONTEXT,
+    )
+    const pendingOptimisticMessageId = appendOptimisticUserMessage(
+      NEW_THREAD_COLLABORATION_MODE_CONTEXT,
+      nextText,
+      imageUrls,
+      skills,
+      fileAttachments,
+    )
     pendingNewThreadSubmission = {
       generation: newThreadGeneration,
       threadId: '',
@@ -6805,6 +6885,10 @@ export function useDesktopState() {
         }
       }
       if (!threadId) {
+        removeOptimisticUserMessage(
+          NEW_THREAD_COLLABORATION_MODE_CONTEXT,
+          pendingOptimisticMessageId,
+        )
         await uploadLease.release()
         if (pendingNewThreadSubmission?.generation === newThreadGeneration) {
           pendingNewThreadSubmission = null
@@ -6814,25 +6898,12 @@ export function useDesktopState() {
         return ''
       }
 
-      if (pendingNewThreadSubmission?.generation === newThreadGeneration) {
-        pendingNewThreadSubmission.threadId = threadId
-        if (pendingNewThreadSubmission.stopRequested) {
-          pendingNewThreadSubmission = null
-          isPendingNewThreadStop.value = false
-          isSendingMessage.value = false
-          await uploadLease.release()
-          return ''
-        }
-      }
-
       insertOptimisticThread(threadId, targetCwd, nextText || '[Image]')
       optimisticThreadInserted = true
-      const optimisticMessageId = appendOptimisticUserMessage(
+      const optimisticMessageId = moveOptimisticUserMessage(
+        NEW_THREAD_COLLABORATION_MODE_CONTEXT,
         threadId,
-        nextText,
-        imageUrls,
-        skills,
-        fileAttachments,
+        pendingOptimisticMessageId,
       )
       const submission = beginLocalSubmission(threadId, optimisticMessageId)
       blockInterruptUntilThreadIsPersisted(threadId)
@@ -6857,6 +6928,20 @@ export function useDesktopState() {
       setTurnErrorForThread(threadId, null)
       setThreadRuntimeOwnership(threadId, 'local')
       setThreadInProgress(threadId, true)
+      if (pendingNewThreadSubmission?.generation === newThreadGeneration) {
+        pendingNewThreadSubmission.threadId = threadId
+        if (pendingNewThreadSubmission.stopRequested) {
+          pendingNewThreadSubmission = null
+          isPendingNewThreadStop.value = false
+          isSendingMessage.value = false
+          clearLocalSubmission(threadId, submission.generation)
+          setThreadRuntimeOwnership(threadId, 'idle')
+          setThreadInProgress(threadId, false)
+          setTurnActivityForThread(threadId, null)
+          await uploadLease.release()
+          return threadId
+        }
+      }
       const capturedThreadId = threadId
       const capturedCwd = targetCwd || null
       const capturedPrompt = nextText
@@ -6905,6 +6990,10 @@ export function useDesktopState() {
         setThreadInProgress(threadId, false)
         setTurnActivityForThread(threadId, null)
       }
+      removeOptimisticUserMessage(
+        NEW_THREAD_COLLABORATION_MODE_CONTEXT,
+        pendingOptimisticMessageId,
+      )
       if (pendingNewThreadSubmission?.generation === newThreadGeneration) {
         pendingNewThreadSubmission = null
         isPendingNewThreadStop.value = false
@@ -7021,7 +7110,10 @@ export function useDesktopState() {
         }
       }
 
-      if (startedTurnId) {
+      const currentSubmission = localSubmissionByThreadId.get(threadId)
+      const canAdoptStartedTurn = !submission
+        || currentSubmission?.generation === submission.generation
+      if (startedTurnId && canAdoptStartedTurn) {
         activeTurnIdByThreadId.value = {
           ...activeTurnIdByThreadId.value,
           [threadId]: startedTurnId,
@@ -7605,7 +7697,7 @@ export function useDesktopState() {
     return queuedMessagesByThreadId.value[threadId] ?? []
   })
 
-  function removeQueuedMessage(messageId: string): void {
+  function removeQueuedMessage(messageId: string, transferManagedUploads = false): void {
     const threadId = selectedThreadId.value
     if (!threadId || isExternallyOwned(threadId)) return
     const queue = queuedMessagesByThreadId.value[threadId]
@@ -7614,7 +7706,7 @@ export function useDesktopState() {
     queuedMessagesByThreadId.value = next.length > 0
       ? { ...queuedMessagesByThreadId.value, [threadId]: next }
       : omitKey(queuedMessagesByThreadId.value, threadId)
-    persistQueueState()
+    persistQueueState(transferManagedUploads ? [messageId] : [])
   }
 
   function reorderQueuedMessage(draggedId: string, targetId: string): void {
@@ -7644,7 +7736,7 @@ export function useDesktopState() {
     if (!queue) return
     const msg = queue.find((m) => m.id === messageId)
     if (!msg) return
-    removeQueuedMessage(messageId)
+    removeQueuedMessage(messageId, true)
     setSelectedCollaborationMode(msg.collaborationMode)
     void sendMessageToSelectedThread(msg.text, msg.imageUrls, msg.skills, 'steer', msg.fileAttachments)
   }
@@ -7756,6 +7848,7 @@ export function useDesktopState() {
     installedSkills,
     accountRateLimitSnapshots,
     messages,
+    pendingNewThreadMessages,
     hasMoreOlderMessages,
     isLoadingThreads,
     isThreadListFullyLoaded,

@@ -10,6 +10,7 @@ import {
   getThreadRuntimeState,
   getThreadRuntimeStates,
   getThreadQueueState,
+  setThreadQueueState,
   listDirectoryComposioConnectors,
   readThreadDetailRuntime,
   resumeThread,
@@ -316,6 +317,37 @@ describe('managed uploads', () => {
         model: '',
         effort: '',
       }],
+    })
+  })
+
+  it('sends managed queue capabilities to the volatile server handoff', async () => {
+    let body = ''
+    vi.stubGlobal('fetch', vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+      body = String(init?.body ?? '')
+      return new Response(JSON.stringify({ ok: true }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      })
+    }))
+    const managedImageUrl = '/codex-local-image?path=%2Ftmp%2Fcodex-web-uploads%2Fupload%2Fphoto.png&uploadHandle=queue-handle'
+
+    await setThreadQueueState({
+      'thread-1': [{
+        id: 'managed-queue',
+        text: 'inspect later',
+        imageUrls: [managedImageUrl],
+        skills: [],
+        fileAttachments: [],
+        collaborationMode: 'default',
+        model: 'gpt-5.5',
+        effort: 'high',
+      }],
+    })
+
+    expect(JSON.parse(body)).toMatchObject({
+      queueState: {
+        'thread-1': [expect.objectContaining({ imageUrls: [managedImageUrl] })],
+      },
     })
   })
 })

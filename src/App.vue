@@ -613,7 +613,20 @@
           </template>
           <template v-else-if="isHomeRoute">
             <div class="content-grid content-grid-home">
-              <div class="new-thread-empty">
+              <div v-if="pendingNewThreadMessages.length > 0" class="content-thread home-pending-thread">
+                <ThreadConversation
+                  :messages="pendingNewThreadMessages"
+                  :pending-requests="[]"
+                  :live-overlay="isSendingMessage ? { activityLabel: 'Thinking', activityDetails: [], reasoningText: '', errorText: '' } : null"
+                  :is-loading="false"
+                  active-thread-id="__new-thread__"
+                  active-turn-id=""
+                  :is-thread-in-progress="isSendingMessage"
+                  :cwd="newThreadCwd"
+                  :read-only="true"
+                />
+              </div>
+              <div v-else class="new-thread-empty">
                 <p class="new-thread-hero">{{ t("Let's build") }}</p>
                 <ComposerDropdown class="new-thread-folder-dropdown" :model-value="newThreadCwd"
                   :options="newThreadFolderOptions" :placeholder="t('Choose folder')"
@@ -1424,6 +1437,7 @@ const {
   installedSkills,
   accountRateLimitSnapshots,
   messages,
+  pendingNewThreadMessages,
   hasMoreOlderMessages,
   isLoadingThreads,
   isThreadListFullyLoaded,
@@ -3170,7 +3184,7 @@ function onEditQueuedMessage(messageId: string): void {
     skills: message.skills.map((skill) => ({ ...skill })),
   }
   composer.hydrateDraft(payload)
-  removeQueuedMessage(messageId)
+  removeQueuedMessage(messageId, true)
 }
 
 function onRenameSelectedThread(title: string): void {
