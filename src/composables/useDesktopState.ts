@@ -3357,7 +3357,10 @@ export function useDesktopState() {
     if (typeof document === 'undefined') return
     cancelBackgroundRuntimeRequest()
     cancelExternalRuntimePolling()
-    if (document.visibilityState !== 'visible') return
+    if (document.visibilityState !== 'visible') {
+      pauseActiveTextHydration(selectedThreadId.value)
+      return
+    }
     resumeActiveTextHydration()
     scheduleBackgroundRuntimePolling(0)
     const selectedId = selectedThreadId.value
@@ -3548,7 +3551,11 @@ export function useDesktopState() {
 
   function clearPersistedExternalReasoning(threadId: string): void {
     const persisted = persistedMessagesByThreadId.value[threadId] ?? []
-    const withoutReasoning = persisted.filter((message) => message.messageType !== 'reasoning')
+    const activeTurnId = activeTurnIdByThreadId.value[threadId]?.trim()
+    const withoutReasoning = finalizeHydratedTurnText(
+      persisted,
+      activeTurnId || undefined,
+    )
     if (withoutReasoning.length === persisted.length) return
     setPersistedMessagesForThread(threadId, withoutReasoning)
   }
@@ -3819,6 +3826,17 @@ export function useDesktopState() {
     )
   }
 
+  function pauseActiveTextHydration(threadId: string): void {
+    const hydration = activeTextHydrationByThreadId.get(threadId)
+    if (!hydration?.controller) return
+    hydration.controller.abort()
+    hydration.controller = null
+    activeTextHydrationGenerationByThreadId.set(
+      threadId,
+      (activeTextHydrationGenerationByThreadId.get(threadId) ?? 0) + 1,
+    )
+  }
+
   function isActiveTextHydrationCurrent(
     threadId: string,
     hydration: ActiveTextHydration,
@@ -3925,12 +3943,24 @@ export function useDesktopState() {
     }
   }
 
+  function resumeActiveTextHydrationForTurn(threadId: string, turnId: string): void {
+    if (selectedThreadId.value !== threadId) return
+    const hydration = activeTextHydrationByThreadId.get(threadId)
+    if (
+      !hydration
+      || hydration.turnId !== turnId
+      || hydration.controller !== null
+      || !hydration.hasMoreOlder
+    ) return
+    const generation = activeTextHydrationGenerationByThreadId.get(threadId) ?? 0
+    void continueActiveTextHydration(threadId, hydration, generation)
+  }
+
   function resumeActiveTextHydration(): void {
     const threadId = selectedThreadId.value
     const hydration = activeTextHydrationByThreadId.get(threadId)
-    if (!hydration || hydration.controller !== null || !hydration.hasMoreOlder) return
-    const generation = activeTextHydrationGenerationByThreadId.get(threadId) ?? 0
-    void continueActiveTextHydration(threadId, hydration, generation)
+    if (!hydration) return
+    resumeActiveTextHydrationForTurn(threadId, hydration.turnId)
   }
 
   function reconcileOptimisticUserMessages(threadId: string, persisted: UiMessage[]): void {
@@ -6293,6 +6323,9 @@ export function useDesktopState() {
       clearThreadLiveAuthority(threadId)
     }
     if (isLiveProjection && detail.notModified === true) {
+      if (inProgress && activeTurnId) {
+        resumeActiveTextHydrationForTurn(threadId, activeTurnId)
+      }
       if (inProgress) {
         setThreadRuntimeOwnership(threadId, ownership)
         setThreadInProgress(threadId, true)
@@ -6350,7 +6383,7 @@ export function useDesktopState() {
         )
       : mergedMessages
     const finalizedMessages = !inProgress && activeTextHydration
-      ? finalizeHydratedTurnText(messagesWithHydratedText)
+      ? finalizeHydratedTurnText(messagesWithHydratedText, activeTextHydration.turnId)
       : messagesWithHydratedText
     setPersistedMessagesForThread(threadId, finalizedMessages)
 
@@ -6381,8 +6414,8 @@ export function useDesktopState() {
       setThreadRuntimeOwnership(threadId, ownership)
       setThreadInProgress(threadId, true)
     } else {
-      setThreadInProgress(threadId, false)
       setThreadRuntimeOwnership(threadId, ownership)
+      setThreadInProgress(threadId, false)
     }
     if (inProgress && activeTurnId) {
       activeTurnIdByThreadId.value = {
