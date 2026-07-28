@@ -91,6 +91,12 @@ export function mergeHydratedTurnTextIntoTranscript(
   ]
 }
 
-export function finalizeHydratedTurnText(messages: UiMessage[]): UiMessage[] {
-  return messages.filter((message) => message.messageType !== 'reasoning')
+export function finalizeHydratedTurnText(
+  messages: UiMessage[],
+  turnId?: string,
+): UiMessage[] {
+  return messages.filter((message) => (
+    message.messageType !== 'reasoning'
+    || (turnId !== undefined && message.turnId !== turnId)
+  ))
 }

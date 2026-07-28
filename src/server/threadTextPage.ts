@@ -30,6 +30,8 @@ const MAX_LIMIT = 600
 const READ_CHUNK_BYTES = 64 * 1024
 const TARGET_PAGE_BYTES = 256 * 1024
 const MAX_PAGE_BYTES = 1024 * 1024
+const MAX_SCAN_BYTES = 2 * 1024 * 1024
+const MAX_SCAN_LINES = 2_000
 const MAX_RELEVANT_LINE_BYTES = 1024 * 1024
 const OVERSIZED_CLASSIFIER_BYTES = 64 * 1024
 const THREAD_TEXT_CURSOR_KEY = randomBytes(32)
@@ -475,13 +477,27 @@ export async function readThreadTextPage(input: {
     let pageLimitReached = false
     let foundOlderVisible = false
     let cursorWouldExceedMax = false
+    let scanBudgetReached = false
+    let scannedBytes = 0
+    let scannedLines = 0
+    let lastScannedBoundary = beforeOffset
 
     for await (const line of readLinesBackwards(file, beforeOffset)) {
+      scannedBytes += lastScannedBoundary - line.startOffset
+      scannedLines += 1
+      lastScannedBoundary = line.startOffset
+      const reachedScanBudget =
+        scannedBytes >= MAX_SCAN_BYTES || scannedLines >= MAX_SCAN_LINES
+
       if (!line.bytes) {
         if (!oversizedLineIsDefinitelyIrrelevant(line.classificationPrefix ?? Buffer.alloc(0))) {
           throw new ThreadTextPageError('Relevant rollout record exceeds the size limit', 413)
         }
         nextBeforeOffset = line.startOffset
+        if (reachedScanBudget) {
+          scanBudgetReached = true
+          break
+        }
         continue
       }
       const projected = projectLine(line.bytes, line.startOffset)
@@ -493,6 +509,10 @@ export async function readThreadTextPage(input: {
       }
       if (!projected.item) {
         nextBeforeOffset = line.startOffset
+        if (reachedScanBudget) {
+          scanBudgetReached = true
+          break
+        }
         continue
       }
       if (pageLimitReached) {
@@ -547,6 +567,10 @@ export async function readThreadTextPage(input: {
 
       collected.push(projected.item)
       nextBeforeOffset = line.startOffset
+      if (reachedScanBudget) {
+        scanBudgetReached = true
+        break
+      }
       if (
         collected.length >= limit
         || candidateBytes >= MAX_PAGE_BYTES
@@ -559,7 +583,7 @@ export async function readThreadTextPage(input: {
       threadId: input.threadId,
       turnId: input.turnId,
       itemsBackwards: collected,
-      hasMoreOlder: foundOlderVisible && nextBeforeOffset > 0,
+      hasMoreOlder: (foundOlderVisible || scanBudgetReached) && nextBeforeOffset > 0,
       beforeOffset: nextBeforeOffset,
       snapshotEndOffset,
     })

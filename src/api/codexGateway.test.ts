@@ -913,6 +913,43 @@ describe('getThreadDetail', () => {
     expect(requestSignal).toBe(controller.signal)
   })
 
+  it('derives partial projection status from only the resolved active turn', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({
+      threadId: 'external-thread',
+      conversationState: {
+        turns: [
+          {
+            id: 'turn-compressed-history',
+            status: 'completed',
+            rawItemCompression: {
+              originalItemCount: 500,
+              retainedItemCount: 240,
+              omittedItemCount: 260,
+            },
+            items: [],
+          },
+          {
+            id: 'turn-external',
+            status: 'inProgress',
+            items: [{ id: 'agent-live', type: 'agentMessage', text: 'live output' }],
+          },
+        ],
+      },
+      isInProgress: true,
+      externalRuntime: {
+        state: 'running',
+        turnId: 'turn-external',
+        interruptible: false,
+        source: 'external-session-writer',
+      },
+    }), { status: 200, headers: { 'Content-Type': 'application/json' } })))
+
+    await expect(getExternalThreadLiveSnapshot('external-thread')).resolves.toMatchObject({
+      activeTurnId: 'turn-external',
+      isPartialTurnProjection: false,
+    })
+  })
+
   it('sends the known live projection key and normalizes not-modified responses', async () => {
     let requestUrl = ''
     vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {

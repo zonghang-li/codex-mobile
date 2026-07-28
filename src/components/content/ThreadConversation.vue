@@ -71,14 +71,20 @@
             >
               <li v-for="imageUrl in message.images" :key="imageUrl" class="message-image-item">
                 <a
-                  v-if="isMessageImageFailed(message.id, imageUrl)"
+                  v-if="isMessageImageFailed(message.id, imageUrl) && safeImageFallbackHref(imageUrl)"
                   class="message-image-fallback-link"
-                  :href="imageUrl"
+                  :href="safeImageFallbackHref(imageUrl)"
                   target="_blank"
                   rel="noopener noreferrer"
                 >
                   View image
                 </a>
+                <span
+                  v-else-if="isMessageImageFailed(message.id, imageUrl)"
+                  class="message-image-fallback-text"
+                >
+                  View image
+                </span>
                 <button v-else class="message-image-button" type="button" @click="openImageModal(imageUrl)">
                   <img
                     class="message-image-preview"
@@ -314,14 +320,20 @@
             >
               <li v-for="imageUrl in message.images" :key="imageUrl" class="message-image-item">
                 <a
-                  v-if="isMessageImageFailed(message.id, imageUrl)"
+                  v-if="isMessageImageFailed(message.id, imageUrl) && safeImageFallbackHref(imageUrl)"
                   class="message-image-fallback-link"
-                  :href="imageUrl"
+                  :href="safeImageFallbackHref(imageUrl)"
                   target="_blank"
                   rel="noopener noreferrer"
                 >
                   View image
                 </a>
+                <span
+                  v-else-if="isMessageImageFailed(message.id, imageUrl)"
+                  class="message-image-fallback-text"
+                >
+                  View image
+                </span>
                 <button v-else class="message-image-button" type="button" @click="openImageModal(imageUrl)">
                   <img
                     class="message-image-preview"
@@ -348,14 +360,20 @@
               >
                 <li v-for="imageUrl in message.images" :key="imageUrl" class="message-image-item">
                   <a
-                    v-if="isMessageImageFailed(message.id, imageUrl)"
+                    v-if="isMessageImageFailed(message.id, imageUrl) && safeImageFallbackHref(imageUrl)"
                     class="message-image-fallback-link"
-                    :href="imageUrl"
+                    :href="safeImageFallbackHref(imageUrl)"
                     target="_blank"
                     rel="noopener noreferrer"
                   >
                     View image
                   </a>
+                  <span
+                    v-else-if="isMessageImageFailed(message.id, imageUrl)"
+                    class="message-image-fallback-text"
+                  >
+                    View image
+                  </span>
                   <button v-else class="message-image-button" type="button" @click="openImageModal(imageUrl)">
                     <img
                       class="message-image-preview"
@@ -451,6 +469,7 @@
                   <div
                     v-if="readPlanExplanation(message)"
                     class="plan-card-explanation plan-card-markdown"
+                    @error.capture="onPlanMarkdownImageError"
                     v-html="renderMarkdownBlocksAsHtml(readPlanExplanation(message))"
                   />
                   <ol v-if="readPlanSteps(message).length > 0" class="plan-step-list">
@@ -461,10 +480,19 @@
                       :data-status="step.status"
                     >
                       <span class="plan-step-status" :data-status="step.status">{{ planStepStatusIcon(step.status) }}</span>
-                      <div class="plan-step-text plan-card-markdown" v-html="renderMarkdownBlocksAsHtml(step.step)" />
+                      <div
+                        class="plan-step-text plan-card-markdown"
+                        @error.capture="onPlanMarkdownImageError"
+                        v-html="renderMarkdownBlocksAsHtml(step.step)"
+                      />
                     </li>
                   </ol>
-                  <div v-else class="plan-card-markdown" v-html="renderMarkdownBlocksAsHtml(message.text)" />
+                  <div
+                    v-else
+                    class="plan-card-markdown"
+                    @error.capture="onPlanMarkdownImageError"
+                    v-html="renderMarkdownBlocksAsHtml(message.text)"
+                  />
                   <div v-if="showImplementPlanButton(message)" class="plan-card-actions">
                     <button
                       type="button"
@@ -758,14 +786,20 @@
                     </div>
                     <hr v-else-if="block.kind === 'thematicBreak'" class="message-divider" />
                     <a
-                      v-else-if="isMarkdownImageFailed(message.id, blockIndex)"
+                      v-else-if="isMarkdownImageFailed(message.id, blockIndex) && safeImageFallbackHref(block.url)"
                       class="message-image-fallback-link"
-                      :href="block.url"
+                      :href="safeImageFallbackHref(block.url)"
                       target="_blank"
                       rel="noopener noreferrer"
                     >
                       {{ block.alt || 'View image' }}
                     </a>
+                    <span
+                      v-else-if="isMarkdownImageFailed(message.id, blockIndex)"
+                      class="message-image-fallback-text"
+                    >
+                      {{ block.alt || 'View image' }}
+                    </span>
                     <button
                       v-else
                       class="message-image-button"
@@ -1122,6 +1156,7 @@ import {
 import { createSnapshotTextStreamer } from './snapshotTextStreaming'
 import { splitDisplayMathSpans } from './displayMath'
 import { splitInlineMathSpans } from './inlineMath'
+import { safeImageFallbackHref } from './imageUrlPolicy'
 import {
   tryRenderDisplayMathToHtml,
   tryRenderMathToHtml,
@@ -4231,7 +4266,7 @@ function renderMessageBlockAsHtml(block: MessageBlock): string {
   if (block.kind === 'thematicBreak') {
     return '<hr class="message-divider">'
   }
-  return `<img class="message-image-preview message-markdown-image" src="${escapeHtml(block.url)}" alt="${escapeHtml(block.alt || 'Embedded message image')}" loading="lazy">`
+  return `<img class="message-image-preview message-markdown-image" src="${escapeHtml(block.url)}" data-fallback-url="${escapeHtml(block.url)}" alt="${escapeHtml(block.alt || 'Embedded message image')}" loading="lazy">`
 }
 
 function renderMarkdownBlocksAsHtml(text: string): string {
@@ -5029,6 +5064,26 @@ function onMarkdownImageError(messageId: string, blockIndex: number): void {
   markdownImageFailureVersion.value += 1
 }
 
+function onPlanMarkdownImageError(event: Event): void {
+  const image = event.target
+  if (!(image instanceof HTMLImageElement) || !image.classList.contains('message-markdown-image')) {
+    return
+  }
+
+  const fallbackHref = safeImageFallbackHref(image.dataset.fallbackUrl ?? '')
+  const fallback = document.createElement(fallbackHref ? 'a' : 'span')
+  fallback.className = fallbackHref
+    ? 'message-image-fallback-link'
+    : 'message-image-fallback-text'
+  fallback.textContent = image.alt || 'View image'
+  if (fallback instanceof HTMLAnchorElement) {
+    fallback.href = fallbackHref
+    fallback.target = '_blank'
+    fallback.rel = 'noopener noreferrer'
+  }
+  image.replaceWith(fallback)
+}
+
 function openImageModal(imageUrl: string): void {
   modalImageUrl.value = imageUrl
 }
@@ -5312,6 +5367,10 @@ onBeforeUnmount(() => {
 
 .message-image-fallback-link {
   @apply inline-flex min-h-10 items-center text-sm text-[#0969da] no-underline hover:text-[#1f6feb] hover:underline underline-offset-2;
+}
+
+.message-image-fallback-text {
+  @apply inline-flex min-h-10 items-center text-sm text-slate-500;
 }
 
 .message-image-preview {

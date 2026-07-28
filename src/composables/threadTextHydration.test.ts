@@ -117,6 +117,7 @@ describe('thread text hydration', () => {
 
   it('removes reasoning on completion but retains commentary and final responses', () => {
     const messages = [
+      textMessage('reason-historical', 'reasoning', 'turn-previous', 50),
       textMessage('reason-1', 'reasoning', 'turn-active', 100),
       {
         ...textMessage('agent-commentary', 'agentMessage', 'turn-active', 200),
@@ -128,7 +129,8 @@ describe('thread text hydration', () => {
       },
     ]
 
-    expect(finalizeHydratedTurnText(messages).map((message) => message.id)).toEqual([
+    expect(finalizeHydratedTurnText(messages, 'turn-active').map((message) => message.id)).toEqual([
+      'reason-historical',
       'agent-commentary',
       'agent-final',
     ])

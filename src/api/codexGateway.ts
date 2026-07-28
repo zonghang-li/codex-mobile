@@ -1146,10 +1146,6 @@ async function getExternalThreadLiveStateSnapshotV2(
   ))
   const conversationState = asRecord(payload?.conversationState)
   const turns = Array.isArray(conversationState?.turns) ? conversationState.turns : []
-  const isPartialTurnProjection = turns.some((turn) => {
-    const compression = asRecord(asRecord(turn)?.rawItemCompression)
-    return typeof compression?.omittedItemCount === 'number' && compression.omittedItemCount > 0
-  })
   const result = {
     threadTurnStartIndex,
     thread: {
@@ -1160,6 +1156,13 @@ async function getExternalThreadLiveStateSnapshotV2(
   } as unknown as ThreadReadResponse
   const normalized = normalizeThreadMessagesV2(result, threadTurnStartIndex)
   const runtime = readThreadDetailRuntime(result)
+  const activeTurn = turns.find((turn) => (
+    readString(asRecord(turn)?.id) === runtime.activeTurnId
+  ))
+  const activeTurnCompression = asRecord(asRecord(activeTurn)?.rawItemCompression)
+  const isPartialTurnProjection =
+    typeof activeTurnCompression?.omittedItemCount === 'number'
+    && activeTurnCompression.omittedItemCount > 0
   const rawAuthority = readLiveAuthority(payload?.liveAuthority)
   const rawSnapshot = readLiveSnapshot(payload?.liveSnapshot)
   const liveAuthority = rawAuthority === 'writer-snapshot' && rawSnapshot

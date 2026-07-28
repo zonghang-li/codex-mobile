@@ -3854,7 +3854,6 @@ export function useDesktopState() {
         : hydration.nextOlderCursor ?? undefined
       const cursorKey = cursor ?? ''
       if (hydration.consumedCursors.has(cursorKey)) return
-      hydration.consumedCursors.add(cursorKey)
 
       const controller = new AbortController()
       hydration.controller = controller
@@ -3868,11 +3867,21 @@ export function useDesktopState() {
         )
         if (!isActiveTextHydrationCurrent(threadId, hydration, generation)) return
 
+        hydration.consumedCursors.add(cursorKey)
         hydration.messages = mergeThreadTextPage(hydration.messages, page.messages)
         hydration.nextOlderCursor = page.nextOlderCursor
         hydration.hasMoreOlder = page.hasMoreOlder
         publishActiveTextHydration(threadId, hydration)
-      } catch {
+      } catch (error) {
+        if (
+          isActiveTextHydrationCurrent(threadId, hydration, generation)
+          && error instanceof CodexApiError
+          && (error.status === 400 || error.status === 409)
+        ) {
+          hydration.nextOlderCursor = null
+          hydration.hasMoreOlder = true
+          hydration.consumedCursors.clear()
+        }
         return
       } finally {
         if (hydration.controller === controller) {
@@ -5571,6 +5580,21 @@ export function useDesktopState() {
       persistTurnSummaryForThread(completedTurn.threadId, summary)
       if (completionDisposition.ownsActiveLease) {
         if (!shouldRetryWithFallback) {
+          const activeTextHydration = activeTextHydrationByThreadId.get(completedTurn.threadId)
+          if (activeTextHydration?.turnId === completedTurn.turnId) {
+            const persistedMessages =
+              persistedMessagesByThreadId.value[completedTurn.threadId] ?? []
+            const messagesWithHydratedText = mergeHydratedTurnTextIntoTranscript(
+              persistedMessages,
+              activeTextHydration.messages,
+              activeTextHydration.turnId,
+            )
+            setPersistedMessagesForThread(
+              completedTurn.threadId,
+              finalizeHydratedTurnText(messagesWithHydratedText, completedTurn.turnId),
+            )
+            cancelActiveTextHydration(completedTurn.threadId)
+          }
           clearPendingStopRequest(completedTurn.threadId)
           clearLocalSubmission(completedTurn.threadId)
         }

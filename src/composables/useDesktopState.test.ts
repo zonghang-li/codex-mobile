@@ -5464,7 +5464,7 @@ describe('active turn text hydration', () => {
     ])
   })
 
-  it('keeps hydrated rows without replaying cursors after a page error', async () => {
+  it('retries a transient page failure without dropping hydrated rows', async () => {
     installTestWindow()
     vi.stubGlobal('document', {
       visibilityState: 'visible',
@@ -5483,6 +5483,13 @@ describe('active turn text hydration', () => {
         hasMoreOlder: true,
       })
       .mockRejectedValueOnce(new Error('temporary page failure'))
+      .mockResolvedValueOnce({
+        threadId: 'thread-external',
+        turnId: 'turn-external',
+        messages: [activeText('agent-1', 'agentMessage', 200)],
+        nextOlderCursor: null,
+        hasMoreOlder: false,
+      })
 
     const state = useDesktopState()
     state.primeSelectedThread('thread-external')
@@ -5491,8 +5498,76 @@ describe('active turn text hydration', () => {
     await state.loadMessages('thread-external', { silent: true, force: true })
     await flushMicrotasks()
 
-    expect(gatewayMocks.getThreadTextPage).toHaveBeenCalledTimes(2)
+    expect(gatewayMocks.getThreadTextPage).toHaveBeenCalledTimes(3)
+    expect(gatewayMocks.getThreadTextPage.mock.calls.map((call) => call[2])).toEqual([
+      undefined,
+      'older-fails',
+      'older-fails',
+    ])
     expect(state.messages.value.map((message) => message.id)).toEqual([
+      'agent-1',
+      'agent-2',
+      'agent-live',
+      'agent-new',
+    ])
+  })
+
+  it.each([
+    [400, 'expired server cursor'],
+    [409, 'recoverable rollout snapshot conflict'],
+  ])('restarts from the newest page after a %i %s', async (status, message) => {
+    installTestWindow()
+    vi.stubGlobal('document', {
+      visibilityState: 'visible',
+      addEventListener: vi.fn(),
+      removeEventListener: vi.fn(),
+    })
+    gatewayMocks.getThreadDetail
+      .mockResolvedValueOnce(partialExternalDetail([activeText('agent-live', 'agentMessage')]))
+      .mockResolvedValueOnce(partialExternalDetail([activeText('agent-new', 'agentMessage')]))
+    gatewayMocks.getThreadTextPage
+      .mockResolvedValueOnce({
+        threadId: 'thread-external',
+        turnId: 'turn-external',
+        messages: [activeText('agent-2', 'agentMessage', 400)],
+        nextOlderCursor: 'cursor-from-previous-server',
+        hasMoreOlder: true,
+      })
+      .mockRejectedValueOnce(new CodexApiError(message, {
+        code: 'http_error',
+        method: 'thread-text-page',
+        status,
+      }))
+      .mockResolvedValueOnce({
+        threadId: 'thread-external',
+        turnId: 'turn-external',
+        messages: [activeText('agent-2', 'agentMessage', 400)],
+        nextOlderCursor: 'fresh-older-cursor',
+        hasMoreOlder: true,
+      })
+      .mockResolvedValueOnce({
+        threadId: 'thread-external',
+        turnId: 'turn-external',
+        messages: [activeText('agent-1', 'agentMessage', 200)],
+        nextOlderCursor: null,
+        hasMoreOlder: false,
+      })
+
+    const state = useDesktopState()
+    state.primeSelectedThread('thread-external')
+    await state.loadMessages('thread-external')
+    await flushMicrotasks()
+    await state.loadMessages('thread-external', { silent: true, force: true })
+    await flushMicrotasks()
+
+    expect(gatewayMocks.getThreadTextPage.mock.calls.map((call) => call[2])).toEqual([
+      undefined,
+      'cursor-from-previous-server',
+      undefined,
+      'fresh-older-cursor',
+    ])
+    expect(state.messages.value.map((item) => item.id)).toEqual([
+      'agent-1',
       'agent-2',
       'agent-live',
       'agent-new',
@@ -5641,6 +5716,80 @@ describe('active turn text hydration', () => {
       'agent-live',
       'agent-final',
     ])
+  })
+
+  it('immediately finalizes matching hydrated reasoning when completion refresh fails', async () => {
+    const { state, emit } = await setupExternalRuntimeState()
+    vi.stubGlobal('document', {
+      visibilityState: 'visible',
+      addEventListener: vi.fn(),
+      removeEventListener: vi.fn(),
+    })
+    const pendingOlderPage = deferred<{
+      threadId: string
+      turnId: string
+      messages: UiMessage[]
+      nextOlderCursor: string | null
+      hasMoreOlder: boolean
+    }>()
+    let pendingSignal: AbortSignal | undefined
+    gatewayMocks.getThreadDetail.mockResolvedValueOnce(partialExternalDetail([
+      activeText('agent-live', 'agentMessage', 300),
+    ]))
+    gatewayMocks.getThreadTextPage
+      .mockResolvedValueOnce({
+        threadId: 'thread-external',
+        turnId: 'turn-external',
+        messages: [
+          activeText('reason-1', 'reasoning', 100),
+          activeText('agent-commentary', 'agentMessage', 200),
+        ],
+        nextOlderCursor: 'older-pending',
+        hasMoreOlder: true,
+      })
+      .mockImplementationOnce((
+        _threadId: string,
+        _turnId: string,
+        _cursor?: string,
+        _limit?: number,
+        signal?: AbortSignal,
+      ) => {
+        pendingSignal = signal
+        return pendingOlderPage.promise
+      })
+
+    state.primeSelectedThread('thread-external')
+    await state.loadMessages('thread-external')
+    await flushMicrotasks()
+    expect(state.messages.value.map((message) => message.id)).toEqual([
+      'reason-1',
+      'agent-commentary',
+      'agent-live',
+    ])
+
+    gatewayMocks.getThreadDetail.mockRejectedValue(new Error('detail refresh failed'))
+    emit({
+      method: 'turn/completed',
+      params: {
+        threadId: 'thread-external',
+        turn: { id: 'turn-external', status: 'completed' },
+      },
+    })
+
+    expect(pendingSignal?.aborted).toBe(true)
+    expect(state.messages.value.map((message) => message.id)).toEqual(expect.arrayContaining([
+      'agent-commentary',
+      'agent-live',
+    ]))
+    expect(state.messages.value.map((message) => message.id)).not.toContain('reason-1')
+
+    await vi.advanceTimersByTimeAsync(220)
+    await flushMicrotasks()
+    expect(state.messages.value.map((message) => message.id)).toEqual(expect.arrayContaining([
+      'agent-commentary',
+      'agent-live',
+    ]))
+    expect(state.messages.value.map((message) => message.id)).not.toContain('reason-1')
   })
 
   it('finalizes the previous hydration when the active turn changes without going idle', async () => {

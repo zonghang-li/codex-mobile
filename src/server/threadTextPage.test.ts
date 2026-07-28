@@ -163,6 +163,49 @@ describe('readThreadTextPage', () => {
     expect(result.hasMoreOlder).toBe(false)
   })
 
+  it('bounds sparse newest-page scans across large irrelevant regions', async () => {
+    const irrelevantRows = Array.from({ length: 2_500 }, (_, index) => (
+      functionCall('exec_command', JSON.stringify({ index, output: 'x'.repeat(2_048) }), `call-${index}`)
+    ))
+    const rows = [
+      event('task_started', { turn_id: 'turn-active' }),
+      assistant('Visible update behind the sparse region', 'agent-visible'),
+      ...irrelevantRows,
+    ]
+    const sessionPath = await writeRollout(rows)
+
+    const result = await readThreadTextPage({
+      sessionPath,
+      threadId: 'thread-1',
+      turnId: 'turn-active',
+    }, {
+      trustedActiveTurn: true,
+    })
+
+    expect(result.items).toEqual([])
+    expect(result.hasMoreOlder).toBe(true)
+    expect(result.nextOlderCursor).toEqual(expect.any(String))
+
+    const [payload] = result.nextOlderCursor!.split('.')
+    const cursor = JSON.parse(Buffer.from(payload!, 'base64url').toString('utf8')) as {
+      beforeOffset: number
+      snapshotEndOffset: number
+    }
+    const serializedRows = rows.map((row) => `${JSON.stringify(row)}\n`)
+    let cursorRowIndex = serializedRows.length
+    let offset = cursor.snapshotEndOffset
+    while (cursorRowIndex > 0 && offset > cursor.beforeOffset) {
+      cursorRowIndex -= 1
+      offset -= Buffer.byteLength(serializedRows[cursorRowIndex]!, 'utf8')
+    }
+
+    expect(offset).toBe(cursor.beforeOffset)
+    expect(serializedRows.length - cursorRowIndex).toBeLessThanOrEqual(2_000)
+    const largestRowBytes = Math.max(...serializedRows.map((row) => Buffer.byteLength(row, 'utf8')))
+    expect(cursor.snapshotEndOffset - cursor.beforeOffset)
+      .toBeLessThanOrEqual((2 * 1024 * 1024) + largestRowBytes)
+  })
+
   it('rejects a cursor used with a different thread identity', async () => {
     const sessionPath = await writeRollout([
       event('task_started', { turn_id: 'turn-active' }),
