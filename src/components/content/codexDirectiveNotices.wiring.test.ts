@@ -17,7 +17,7 @@ describe('Codex directive notice wiring', () => {
     expect(noticeSource).toContain('codex-directive-attributes')
     expect(conversationSource).toContain('<CodexDirectiveNotices')
     expect(conversationSource).toContain(':directives="message.directives"')
-    expect(conversationSource).toMatch(/message\.text\.length > 0 \|\| .*directives/u)
+    expect(conversationSource).toMatch(/messageHasDisplayContent\(message\) \|\| .*directives/u)
     expect(styleSource).toMatch(
       /\.codex-directive-attributes\s*\{[^}]*grid-template-columns:\s*fit-content\(40%\)\s+minmax\(0,\s*1fr\)/su,
     )

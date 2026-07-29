@@ -80,7 +80,7 @@ function readFooter(value: unknown): ThreadLiveFooter | null | undefined {
 
 export function parseThreadLiveSnapshot(
   value: unknown,
-  options: { threadId: string; activeTurnId: string; nowMs: number; minRevision?: number },
+  options: { threadId: string; activeTurnId?: string; nowMs: number; minRevision?: number },
 ): ThreadLiveSnapshot | null {
   const record = asRecord(value)
   if (!record || record.schemaVersion !== 1) return null
@@ -89,7 +89,7 @@ export function parseThreadLiveSnapshot(
   if (threadId !== options.threadId) return null
 
   const activeTurnId = record.activeTurnId === null ? null : readString(record.activeTurnId)
-  if (activeTurnId !== options.activeTurnId) return null
+  if (options.activeTurnId !== undefined && activeTurnId !== options.activeTurnId) return null
 
   const revision = typeof record.revision === 'number' && Number.isSafeInteger(record.revision)
     ? record.revision
@@ -155,6 +155,25 @@ export async function readThreadLiveSnapshotFile(
     return parseThreadLiveSnapshot(JSON.parse(raw), {
       threadId,
       activeTurnId: options.activeTurnId,
+      nowMs: options.nowMs,
+      minRevision: options.minRevision,
+    })
+  } catch {
+    return null
+  }
+}
+
+export async function readThreadLiveSnapshotFileForThread(
+  liveStateDir: string,
+  threadId: string,
+  options: { nowMs: number; minRevision?: number },
+): Promise<ThreadLiveSnapshot | null> {
+  if (!isSnapshotFileThreadId(threadId)) return null
+
+  try {
+    const raw = await readFile(join(liveStateDir, `${threadId}.json`), 'utf8')
+    return parseThreadLiveSnapshot(JSON.parse(raw), {
+      threadId,
       nowMs: options.nowMs,
       minRevision: options.minRevision,
     })

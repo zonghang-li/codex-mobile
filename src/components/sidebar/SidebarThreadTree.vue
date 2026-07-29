@@ -901,6 +901,7 @@ import ComposerDropdown from '../content/ComposerDropdown.vue'
 import SidebarMenuRow from './SidebarMenuRow.vue'
 import { reconcilePinnedThreadIds } from './pinnedThreadUtils'
 import { dispatchThreadRowInteraction } from './threadRowInteraction'
+import { getSidebarThreadState } from './threadSidebarState'
 
 const props = defineProps<{
   groups: UiProjectGroup[]
@@ -2920,7 +2921,7 @@ function hasThreads(group: UiProjectGroup): boolean {
 }
 
 function shouldShowThreadIndicator(thread: UiThread): boolean {
-  return Boolean(thread.pendingRequestState) || thread.inProgress || thread.unread
+  return getSidebarThreadState(thread) !== 'idle'
 }
 
 function threadRequestLabel(thread: UiThread): string {
@@ -2928,11 +2929,7 @@ function threadRequestLabel(thread: UiThread): string {
 }
 
 function getThreadState(thread: UiThread): 'awaiting-approval' | 'awaiting-response' | 'working' | 'unread' | 'idle' {
-  if (thread.pendingRequestState === 'approval') return 'awaiting-approval'
-  if (thread.pendingRequestState === 'response') return 'awaiting-response'
-  if (thread.inProgress) return 'working'
-  if (thread.unread) return 'unread'
-  return 'idle'
+  return getSidebarThreadState(thread)
 }
 
 watch(

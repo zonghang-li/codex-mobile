@@ -16,8 +16,8 @@ describe('external thread runtime read-only wiring', () => {
     const pendingRequestSource = await readFile(new URL('./ThreadPendingRequestPanel.vue', import.meta.url), 'utf8')
 
     expect(conversationSource).toContain('readOnly?: boolean')
-    expect(conversationSource).toMatch(/function showEditMessageButton\(message: UiMessage\): boolean \{\n  if \(props\.readOnly\) return false/u)
-    expect(conversationSource).toMatch(/async function runFileChangeAction\(summary: TurnFileChangeSummary \| null, action: 'undo' \| 'redo'\): Promise<void> \{\n  if \(props\.readOnly\) return/u)
+    expect(conversationSource).not.toContain('showEditMessageButton')
+    expect(conversationSource).toMatch(/const isSnapshotTextStreamingEnabled = computed\(\(\) =>\n  props\.readOnly === true/u)
     expect(conversationSource).toMatch(/function implementPlan\(message: UiMessage\): void \{\n  if \(props\.readOnly\) return/u)
     expect(pendingRequestSource).toContain('disabled?: boolean')
     expect(pendingRequestSource).toContain('<fieldset')

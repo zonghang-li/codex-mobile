@@ -12,7 +12,7 @@
             class="sidebar-thread-controls-host"
             :is-sidebar-collapsed="isSidebarCollapsed"
             :show-new-thread-button="true"
-            :has-unread-threads="hasUnreadSidebarThreads"
+            :has-attention="hasSidebarAttentionIndicator"
             @toggle-sidebar="setSidebarCollapsed(!isSidebarCollapsed)"
             @start-new-thread="onStartNewThreadFromToolbar"
           >
@@ -534,7 +534,7 @@
               class="sidebar-thread-controls-header-host"
               :is-sidebar-collapsed="isSidebarCollapsed"
               :show-new-thread-button="true"
-              :has-unread-threads="hasUnreadSidebarThreads"
+              :has-attention="hasSidebarAttentionIndicator"
               @toggle-sidebar="setSidebarCollapsed(!isSidebarCollapsed)"
               @start-new-thread="onStartNewThreadFromToolbar"
             />
@@ -613,7 +613,20 @@
           </template>
           <template v-else-if="isHomeRoute">
             <div class="content-grid content-grid-home">
-              <div class="new-thread-empty">
+              <div v-if="pendingNewThreadMessages.length > 0" class="content-thread home-pending-thread">
+                <ThreadConversation
+                  :messages="pendingNewThreadMessages"
+                  :pending-requests="[]"
+                  :live-overlay="isSendingMessage ? { activityLabel: 'Thinking', activityDetails: [], reasoningText: '', errorText: '' } : null"
+                  :is-loading="false"
+                  active-thread-id="__new-thread__"
+                  active-turn-id=""
+                  :is-thread-in-progress="isSendingMessage"
+                  :cwd="newThreadCwd"
+                  :read-only="true"
+                />
+              </div>
+              <div v-else class="new-thread-empty">
                 <p class="new-thread-hero">{{ t("Let's build") }}</p>
                 <ComposerDropdown class="new-thread-folder-dropdown" :model-value="newThreadCwd"
                   :options="newThreadFolderOptions" :placeholder="t('Choose folder')"
@@ -947,12 +960,13 @@
                   :skills="installedSkills"
                   :thread-token-usage="selectedThreadTokenUsage"
                   :codex-quota="codexQuota"
-                  :is-turn-in-progress="false"
-                  :is-stop-pending="false"
-                  :is-interrupting-turn="false" :send-with-enter="sendWithEnter" :in-progress-submit-mode="inProgressSendMode"
+                  :is-turn-in-progress="isSendingMessage"
+                  :is-stop-pending="isPendingNewThreadStop"
+                  :is-interrupting-turn="isInterruptingTurn" :send-with-enter="sendWithEnter" :in-progress-submit-mode="inProgressSendMode"
                   :dictation-click-to-toggle="dictationClickToToggle" :dictation-auto-send="dictationAutoSend"
                   :dictation-language="dictationLanguage"
                   @submit="onSubmitThreadMessage"
+                  @interrupt="onInterruptTurn"
                   @update:selected-collaboration-mode="onSelectCollaborationMode"
                   @update:selected-model="onSelectModel"
                   @update:selected-reasoning-effort="onSelectReasoningEffort"
@@ -985,7 +999,6 @@
                     :is-loading-persisted-above="isLoadingOlderMessages"
                     :load-earlier-messages="loadOlderMessages"
                     @fork-thread="onForkThreadFromMessage"
-                    @rollback="onRollback"
                     @implement-plan="onImplementPlan"
                     @respond-server-request="onRespondServerRequest" />
                 </div>
@@ -1005,7 +1018,6 @@
                   />
                   <ConversationRunFooter
                     :thread-id="selectedThreadId"
-                    :footer-state="selectedConversationFooterState"
                     :goal="selectedThreadGoal"
                     :goal-supported="selectedThreadGoalSupported"
                     :is-updating-goal="isUpdatingThreadGoal"
@@ -1187,6 +1199,7 @@ import ComposerDropdown from './components/content/ComposerDropdown.vue'
 import HeaderGitBranchDropdown from './components/content/HeaderGitBranchDropdown.vue'
 import ComposerRuntimeDropdown from './components/content/ComposerRuntimeDropdown.vue'
 import SidebarThreadControls from './components/sidebar/SidebarThreadControls.vue'
+import { hasSidebarAttention } from './components/sidebar/threadSidebarState'
 import IconTablerBolt from './components/icons/IconTablerBolt.vue'
 import IconTablerMoon from './components/icons/IconTablerMoon.vue'
 import IconTablerSearch from './components/icons/IconTablerSearch.vue'
@@ -1198,7 +1211,6 @@ import { useMobile } from './composables/useMobile'
 import { useUiLanguage } from './composables/useUiLanguage'
 import { useFeedbackDiagnostics } from './composables/useFeedbackDiagnostics'
 import { createManagedUploadLease } from './composables/managedUploadLease'
-import { deriveConversationFooterState } from './components/content/conversationFooterState'
 import {
   checkoutGitBranch,
   cloneGithubRepository,
@@ -1424,6 +1436,7 @@ const {
   installedSkills,
   accountRateLimitSnapshots,
   messages,
+  pendingNewThreadMessages,
   hasMoreOlderMessages,
   isLoadingThreads,
   isThreadListFullyLoaded,
@@ -1431,6 +1444,7 @@ const {
   isLoadingOlderMessages,
   isSendingMessage,
   isInterruptingTurn,
+  isPendingNewThreadStop,
   isSelectedThreadInterruptPending,
   selectedThreadRuntimeOwnership,
   isUpdatingSpeedMode,
@@ -1448,6 +1462,7 @@ const {
   sendMessageToSelectedThread,
   sendMessageToNewThread,
   interruptSelectedThreadTurn,
+  interruptPendingNewThreadSubmission,
   selectedThreadQueuedMessages,
   removeQueuedMessage,
   reorderQueuedMessage,
@@ -1468,7 +1483,6 @@ const {
   startPolling,
   stopPolling,
   primeSelectedThread,
-  rollbackSelectedThread,
 } = useDesktopState()
 
 const route = useRoute()
@@ -1769,20 +1783,7 @@ const isVirtualKeyboardOpen = computed(() => {
 })
 const directoryCwd = computed(() => selectedThread.value?.cwd?.trim() ?? newThreadCwd.value.trim())
 const isSelectedThreadInProgress = computed(() => !isHomeRoute.value && selectedThread.value?.inProgress === true)
-const hasUnreadSidebarThreads = computed(() =>
-  projectGroups.value.some((group) => group.threads.some((thread) => thread.unread === true)),
-)
-const selectedConversationFooterState = computed(() => deriveConversationFooterState({
-  messages: filteredMessages.value,
-  turnId: selectedActiveTurnId.value,
-  isTurnInProgress: isSelectedThreadInProgress.value,
-  externalLiveAuthority: selectedThreadRuntimeOwnership.value === 'external'
-    ? selectedLiveAuthority.value ?? 'missing'
-    : null,
-  authoritativeFooter: selectedThreadRuntimeOwnership.value === 'external'
-    ? selectedLiveSnapshot.value?.footer ?? null
-    : null,
-}))
+const hasSidebarAttentionIndicator = computed(() => hasSidebarAttention(projectGroups.value))
 const showThreadContextBadge = computed(() => !isHomeRoute.value && !isSkillsRoute.value && !isAutomationsRoute.value && selectedThreadId.value.trim().length > 0)
 const isAccountSwitchBlocked = computed(() =>
   isSendingMessage.value ||
@@ -3169,7 +3170,7 @@ function onEditQueuedMessage(messageId: string): void {
     skills: message.skills.map((skill) => ({ ...skill })),
   }
   composer.hydrateDraft(payload)
-  removeQueuedMessage(messageId)
+  removeQueuedMessage(messageId, true)
 }
 
 function onRenameSelectedThread(title: string): void {
@@ -3896,24 +3897,11 @@ function onSelectSpeedMode(mode: SpeedMode): void {
 }
 
 function onInterruptTurn(): void {
-  void interruptSelectedThreadTurn()
-}
-
-function onRollback(payload: { turnId: string }): void {
-  const targetTurnId = payload.turnId.trim()
-  if (targetTurnId.length > 0) {
-    const rollbackUserMessage = [...filteredMessages.value]
-      .reverse()
-      .find((message) => (
-        message.role === 'user'
-        && (message.turnId?.trim() ?? '') === targetTurnId
-        && message.text.trim().length > 0
-      ))
-    if (rollbackUserMessage?.text && threadComposerRef.value) {
-      threadComposerRef.value.appendTextToDraft(rollbackUserMessage.text)
-    }
+  if (isHomeRoute.value) {
+    interruptPendingNewThreadSubmission()
+    return
   }
-  void rollbackSelectedThread(payload.turnId)
+  void interruptSelectedThreadTurn()
 }
 
 function onImplementPlan(payload: { turnId: string }): void {
@@ -4722,6 +4710,7 @@ async function loadWorktreeBranches(sourceCwd: string): Promise<void> {
 
 .sidebar-scrollable {
   @apply flex-1 min-h-0 overflow-y-auto py-4 px-2 flex flex-col gap-2;
+  scrollbar-gutter: stable;
 }
 
 .content-root {
@@ -4835,6 +4824,7 @@ async function loadWorktreeBranches(sourceCwd: string): Promise<void> {
 
 .content-body {
   @apply flex-1 min-h-0 min-w-0 w-full flex flex-col gap-2 sm:gap-3 pt-1 pb-2 sm:pb-4 overflow-x-hidden;
+  scrollbar-gutter: stable;
 }
 
 .content-root.is-virtual-keyboard-open .content-body {

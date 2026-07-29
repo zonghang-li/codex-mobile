@@ -30,7 +30,7 @@ describe('current conversation page desktop parity wiring', () => {
     expect(appSource).toMatch(/\.content-root\s*\{[^}]*overflow-x:\s*hidden/su)
     expect(appSource).toMatch(/\.content-grid\s*\{[^}]*min-width:\s*0/su)
     expect(appSource).toMatch(/\.composer-with-queue\s*\{[^}]*min-width:\s*0[^}]*max-width:\s*100%/su)
-    expect(footerSource).toMatch(/\.conversation-run-footer-pill\s*\{[^}]*min-width:\s*0[^}]*max-width:\s*100%/su)
+    expect(footerSource).not.toContain('conversation-run-footer-pill')
     expect(footerSource).toMatch(/\.conversation-goal-strip\s*\{[^}]*min-width:\s*0[^}]*max-width:\s*100%/su)
     expect(footerSource).toMatch(/\.conversation-goal-objective\s*\{[^}]*text-overflow:\s*ellipsis/su)
     expect(composerSource).toMatch(/\.thread-composer-controls\s*\{[^}]*min-width:\s*0[^}]*max-width:\s*100%/su)
@@ -55,5 +55,18 @@ describe('current conversation page desktop parity wiring', () => {
     expect(globalStyleSource).toMatch(
       /@media \(max-width: 360px\)[\s\S]*\.mobile-theme-toggle\s*\{[^}]*display:\s*none/su,
     )
+  })
+
+  it('keeps loading transitions from replacing scroll containers or changing scroll gutters', () => {
+    expect(conversationSource).not.toContain('<p v-if="isLoading" class="conversation-loading">')
+    expect(conversationSource).toMatch(/<ul[\s\S]*class="conversation-list"[\s\S]*<li v-if="isLoading && !hasRenderableConversationContent" class="conversation-state-row"/u)
+    expect(conversationSource).toMatch(/\.conversation-list\s*\{[^}]*scrollbar-gutter:\s*stable/su)
+    expect(appSource).toMatch(/\.sidebar-scrollable\s*\{[^}]*scrollbar-gutter:\s*stable/su)
+    expect(appSource).toMatch(/\.content-body\s*\{[^}]*scrollbar-gutter:\s*stable/su)
+  })
+
+  it('keeps user message stacks right-aligned across running and completed turns', () => {
+    expect(conversationSource).toMatch(/\.message-stack\[data-role='user'\]\s*\{[^}]*items-end/su)
+    expect(conversationSource).toMatch(/\.message-card\[data-role='user'\]\s*\{[^}]*margin-left:\s*auto/su)
   })
 })

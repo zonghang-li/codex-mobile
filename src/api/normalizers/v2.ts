@@ -230,6 +230,21 @@ function parseHeartbeatEnvelope(value: string): { automationId: string; currentT
   }
 }
 
+function imageAttachmentLabel(value: string): string {
+  const normalized = value.trim()
+  if (!normalized) return 'image'
+  try {
+    const parsed = new URL(normalized, 'http://codex-mobile.local')
+    const localPath = parsed.pathname === '/codex-local-image'
+      ? parsed.searchParams.get('path')?.trim() ?? ''
+      : decodeURIComponent(parsed.pathname)
+    const label = localPath.replace(/\\/gu, '/').split('/').at(-1)?.trim() ?? ''
+    return label || 'image'
+  } catch {
+    return normalized.replace(/\\/gu, '/').split('/').at(-1)?.trim() || 'image'
+  }
+}
+
 function parseUserMessageContent(
   itemId: string,
   content: UserInput[] | undefined,
@@ -247,8 +262,7 @@ function parseUserMessageContent(
   }
 
   const textChunks: string[] = []
-  const images: string[] = []
-  const localImageLabels: string[] = []
+  const imageLabels: string[] = []
   const skills: Array<{ name: string; path: string }> = []
   const rawBlocks: UiMessage[] = []
 
@@ -257,12 +271,12 @@ function parseUserMessageContent(
       textChunks.push(block.text)
     }
     if (block.type === 'image' && typeof block.url === 'string' && block.url.trim().length > 0) {
-      images.push(block.url.trim())
+      const label = imageAttachmentLabel(block.url)
+      if (!imageLabels.includes(label)) imageLabels.push(label)
     }
     if (block.type === 'localImage' && typeof block.path === 'string' && block.path.trim().length > 0) {
-      const normalizedPath = block.path.trim().replace(/\\/gu, '/')
-      const label = normalizedPath.split('/').at(-1)?.trim() ?? ''
-      if (label && !localImageLabels.includes(label)) localImageLabels.push(label)
+      const label = imageAttachmentLabel(block.path)
+      if (!imageLabels.includes(label)) imageLabels.push(label)
     }
     if (block.type === 'skill') {
       const name = typeof block.name === 'string' ? block.name.trim() : ''
@@ -288,7 +302,7 @@ function parseUserMessageContent(
   const fileAttachments = extractFileAttachments(fullText)
   const heartbeat = parseHeartbeatEnvelope(fullText)
   const requestText = heartbeat?.instructions ?? extractCodexUserRequestText(fullText)
-  const missingImageTokens = localImageLabels
+  const missingImageTokens = imageLabels
     .map((label) => `@${label}`)
     .filter((token) => !requestText.includes(token))
   const text = missingImageTokens.length > 0
@@ -297,7 +311,7 @@ function parseUserMessageContent(
 
   return {
     text,
-    images,
+    images: [],
     skills,
     fileAttachments,
     rawBlocks,
@@ -580,6 +594,7 @@ function toUiMessages(item: ThreadItem): UiMessage[] {
 
   if (item.type === 'agentMessage') {
     const parsed = parseCodexDirectiveText(typeof item.text === 'string' ? item.text : '')
+    const phase = readString(rawItem.phase)
     return [
       {
         id: item.id,
@@ -587,6 +602,7 @@ function toUiMessages(item: ThreadItem): UiMessage[] {
         text: parsed.text,
         directives: parsed.directives.length > 0 ? parsed.directives : undefined,
         messageType: item.type,
+        phase: phase || undefined,
       },
     ]
   }
@@ -718,26 +734,7 @@ function toUiMessages(item: ThreadItem): UiMessage[] {
   }
 
   if (item.type === 'fileChange') {
-    const fileChanges = toUiFileChanges(item.changes)
-    const fileChangeStatus = normalizeFileChangeStatus(item.status)
-    if (fileChanges.length === 0 || fileChangeStatus !== 'completed') {
-      return []
-    }
-    return [
-      {
-        id: item.id,
-        role: 'system',
-        text: '',
-        messageType: 'fileChange',
-        fileChangeStatus,
-        fileChanges,
-        activity: {
-          kind: 'fileChange',
-          label: 'Edited files',
-          status: fileChangeStatus,
-        },
-      },
-    ]
+    return []
   }
 
   if (item.type === 'contextCompaction') {
@@ -901,7 +898,41 @@ function toThreadTitle(summary: Thread): string {
 }
 
 function isTurnInProgress(turn: Turn | null | undefined): boolean {
-  return turn?.status === 'inProgress'
+  const rawTurn = turn as unknown as Record<string, unknown> | null | undefined
+  const status = typeof rawTurn?.status === 'string' ? rawTurn.status : ''
+  if (status === 'inProgress' || status === 'active' || status === 'running') return true
+  const rawStatus = rawTurn?.status
+  if (rawStatus && typeof rawStatus === 'object') {
+    const statusType = (rawStatus as Record<string, unknown>).type
+    return statusType === 'inProgress' || statusType === 'active' || statusType === 'running'
+  }
+  return false
+}
+
+function isAgentMessageItem(item: ThreadItem | null | undefined): boolean {
+  return item?.type === 'agentMessage'
+}
+
+function hasRetainedCompressedItems(turn: Turn): boolean {
+  const compression = asRecord((turn as unknown as Record<string, unknown>).rawItemCompression)
+  const omittedItemCount = compression?.omittedItemCount
+  return typeof omittedItemCount === 'number' && omittedItemCount > 0
+}
+
+function displayItemsForTurn(turn: Turn, preserveAgentProgress = false): ThreadItem[] {
+  const items = Array.isArray(turn.items) ? turn.items : []
+  if (preserveAgentProgress || isTurnInProgress(turn) || hasRetainedCompressedItems(turn)) return items
+
+  let finalAgentMessageIndex = -1
+  for (let index = items.length - 1; index >= 0; index -= 1) {
+    if (isAgentMessageItem(items[index])) {
+      finalAgentMessageIndex = index
+      break
+    }
+  }
+  if (finalAgentMessageIndex < 0) return items
+
+  return items.filter((item, index) => !isAgentMessageItem(item) || index === finalAgentMessageIndex)
 }
 
 function readThreadLocalInProgress(summary: Thread): boolean {
@@ -926,8 +957,27 @@ function readExternalRuntimeInProgress(summary: Thread): boolean {
   return (externalRuntime as Record<string, unknown>).state === 'running'
 }
 
+function readExternalRuntimeActiveTurnId(summary: Thread): string {
+  const rawSummary = summary as Record<string, unknown>
+  const externalRuntime = asRecord(rawSummary.externalRuntime)
+  if (!externalRuntime) return ''
+  if (readString(externalRuntime.state) !== 'running') return ''
+  return readString(externalRuntime.turnId)
+}
+
 function readThreadInProgress(summary: Thread): boolean {
   return readThreadLocalInProgress(summary) || readExternalRuntimeInProgress(summary)
+}
+
+function readDesktopHasUserEvent(summary: Thread): boolean | undefined {
+  const rawSummary = summary as Record<string, unknown>
+  if (rawSummary.desktopHasUserEvent === true || rawSummary.desktopHasUserEvent === false) {
+    return rawSummary.desktopHasUserEvent
+  }
+  if (rawSummary.hasUserEvent === true || rawSummary.hasUserEvent === false) {
+    return rawSummary.hasUserEvent
+  }
+  return undefined
 }
 
 function toUiThread(summary: Thread): UiThread {
@@ -952,6 +1002,7 @@ function toUiThread(summary: Thread): UiThread {
     updatedAtIso: toIso(summary.updatedAt),
     preview: summary.preview,
     unread: false,
+    desktopHasUserEvent: readDesktopHasUserEvent(summary),
     inProgress: readThreadInProgress(summary),
   }
 }
@@ -989,16 +1040,28 @@ export function normalizeThreadGroupsV2(payload: ThreadListResponse): UiProjectG
 
 export function normalizeThreadMessagesV2(payload: ThreadReadResponse, baseTurnIndex = 0): UiMessage[] {
   const turns = Array.isArray(payload.thread.turns) ? payload.thread.turns : []
+  const threadLevelInProgress = readThreadLocalInProgress(payload.thread)
+  const externalRuntimeActiveTurnId = readExternalRuntimeActiveTurnId(payload.thread)
   const messages: UiMessage[] = []
   for (let turnOffset = 0; turnOffset < turns.length; turnOffset++) {
     const turnIndex = baseTurnIndex + turnOffset
     const turn = turns[turnOffset]
     const rawTurnId = typeof turn?.id === 'string' ? turn.id.trim() : ''
     const turnId = rawTurnId.length > 0 ? rawTurnId : undefined
-    const items = Array.isArray(turn.items) ? turn.items : []
+    const items = displayItemsForTurn(
+      turn,
+      (threadLevelInProgress && turnOffset === turns.length - 1) ||
+        (turnId !== undefined && turnId === externalRuntimeActiveTurnId),
+    )
     for (const item of items) {
+      const rawItem = item as unknown as Record<string, unknown>
+      const sessionOrder = typeof rawItem.sessionOrder === 'number'
+        && Number.isFinite(rawItem.sessionOrder)
+        && rawItem.sessionOrder >= 0
+        ? rawItem.sessionOrder
+        : undefined
       for (const msg of toUiMessages(item)) {
-        messages.push({ ...msg, turnId, turnIndex })
+        messages.push({ ...msg, turnId, turnIndex, sessionOrder })
       }
     }
     const errorText = readTurnErrorText(turn)
@@ -1018,12 +1081,15 @@ export function normalizeThreadMessagesV2(payload: ThreadReadResponse, baseTurnI
 }
 
 export function readThreadInProgressFromResponse(payload: ThreadReadResponse): boolean {
+  if (readExternalRuntimeInProgress(payload.thread)) return true
   if (readThreadLocalInProgress(payload.thread)) return true
   const turns = Array.isArray(payload.thread.turns) ? payload.thread.turns : []
   return isTurnInProgress(turns.at(-1))
 }
 
 export function readActiveTurnIdFromResponse(payload: ThreadReadResponse): string {
+  const externalRuntimeActiveTurnId = readExternalRuntimeActiveTurnId(payload.thread)
+  if (externalRuntimeActiveTurnId) return externalRuntimeActiveTurnId
   const turns = Array.isArray(payload.thread.turns) ? payload.thread.turns : []
   for (let index = turns.length - 1; index >= 0; index -= 1) {
     const turn = turns[index]

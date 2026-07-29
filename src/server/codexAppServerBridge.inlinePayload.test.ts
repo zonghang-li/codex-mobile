@@ -856,6 +856,90 @@ describe('backend queue scheduling', () => {
       processor.dispose()
     }
   })
+
+  it('hydrates a persisted queue row from volatile managed upload capabilities', async () => {
+    const originalCodexHome = process.env.CODEX_HOME
+    const codexHome = await mkdtemp(join(tmpdir(), 'codex-mobile-managed-queue-'))
+    process.env.CODEX_HOME = codexHome
+    const managedImageUrl = '/codex-local-image?path=%2Ftmp%2Fcodex-web-uploads%2Fupload%2Fphoto.png&uploadHandle=managed-queue'
+    await writeFile(join(codexHome, '.codex-global-state.json'), JSON.stringify({
+      'thread-queue-state': {
+        'thread-queued': [{
+          id: 'queued-managed',
+          text: 'inspect later',
+          imageUrls: [],
+          skills: [],
+          fileAttachments: [],
+          collaborationMode: 'default',
+          model: 'gpt-5.5',
+          effort: 'high',
+        }],
+      },
+    }))
+    const processor = new BackendQueueProcessor({
+      rpc: vi.fn(async (method: string) => {
+        if (method === 'config/read') return { config: { model: 'gpt-5.5' } }
+        return {}
+      }),
+      getPid: () => 31337,
+      onNotification: () => () => undefined,
+    } as never)
+
+    try {
+      processor.replaceRuntimeQueueState({
+        'thread-queued': [{
+          id: 'queued-managed',
+          text: 'inspect later',
+          imageUrls: [managedImageUrl],
+          skills: [],
+          fileAttachments: [],
+          collaborationMode: 'default',
+          model: 'gpt-5.5',
+          effort: 'high',
+        }],
+      })
+      const turn = await (processor as unknown as {
+        popNextQueuedTurn: (threadId: string) => Promise<{
+          threadId: string
+          message: {
+            id: string
+            text: string
+            imageUrls: string[]
+            skills: Array<{ name: string; path: string }>
+            fileAttachments: Array<{ label: string; path: string; fsPath: string }>
+            collaborationMode: 'default' | 'plan'
+            model: string
+            effort: 'high'
+          }
+        } | null>
+      }).popNextQueuedTurn('thread-queued')
+
+      expect(turn?.message.imageUrls).toEqual([managedImageUrl])
+      const params = await (processor as unknown as {
+        buildQueuedTurnParams: (queuedTurn: {
+          threadId: string
+          message: {
+            id: string
+            text: string
+            imageUrls: string[]
+            skills: Array<{ name: string; path: string }>
+            fileAttachments: Array<{ label: string; path: string; fsPath: string }>
+            collaborationMode: 'default' | 'plan'
+            model: string
+            effort: 'high'
+          }
+        }) => Promise<Record<string, unknown>>
+      }).buildQueuedTurnParams(turn!)
+      expect(params.input).toEqual(expect.arrayContaining([
+        expect.objectContaining({ type: 'localImage', path: '/tmp/codex-web-uploads/upload/photo.png' }),
+      ]))
+    } finally {
+      processor.dispose()
+      if (originalCodexHome === undefined) delete process.env.CODEX_HOME
+      else process.env.CODEX_HOME = originalCodexHome
+      await rm(codexHome, { recursive: true, force: true })
+    }
+  })
 })
 
 describe('automation TOML handling', () => {

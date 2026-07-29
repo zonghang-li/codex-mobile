@@ -9,6 +9,17 @@ export type ListeningServer = {
 }
 
 export function listenWithFallback(server: Server, startPort: number, host: string): Promise<ListeningServer> {
+  let closePromise: Promise<void> | null = null
+  const close = () => {
+    if (closePromise) return closePromise
+    closePromise = new Promise<void>((closeResolve, closeReject) => {
+      server.close((error) => error ? closeReject(error) : closeResolve())
+      server.closeIdleConnections()
+      server.closeAllConnections()
+    })
+    return closePromise
+  }
+
   return new Promise((resolve, reject) => {
     const attempt = (port: number) => {
       const onError = (error: NodeJS.ErrnoException) => {
@@ -27,9 +38,7 @@ export function listenWithFallback(server: Server, startPort: number, host: stri
           server,
           port: actualPort,
           host,
-          close: () => new Promise<void>((closeResolve, closeReject) => {
-            server.close((error) => error ? closeReject(error) : closeResolve())
-          }),
+          close,
         })
       }
       server.once('error', onError)

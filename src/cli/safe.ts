@@ -30,6 +30,7 @@ import {
 } from '../safe/state.js'
 import { spawnSyncCommand } from '../utils/commandInvocation.js'
 import { listenWithFallback, openBrowser } from './shared/launcher.js'
+import { createSharedShutdown, runBestEffortShutdown } from './shared/shutdown.js'
 
 const program = new Command()
   .name('codex-mobile-safe')
@@ -178,7 +179,7 @@ program.command('start')
         : {}),
     })
     const server = createHttpServer(app)
-    attachWebSocket(server)
+    const closeWebSocket = attachWebSocket(server)
     const listening = await listenWithFallback(server, requestedPort, runtimeConfig.bindHost)
     process.env.CODEXUI_SERVER_PORT = String(listening.port)
 
@@ -213,16 +214,22 @@ program.command('start')
     console.log(lines.join('\n'))
     if (options.open) openBrowser(`http://127.0.0.1:${String(listening.port)}`)
 
-    let shuttingDown = false
-    const shutdown = async () => {
-      if (shuttingDown) return
-      shuttingDown = true
-      await clearManagedState().catch(() => {})
-      await listening.close().catch(() => {})
-      dispose()
+    const shutdown = createSharedShutdown(() => runBestEffortShutdown(
+      () => listening.close(),
+      [
+        () => clearManagedState(),
+        closeWebSocket,
+        dispose,
+      ],
+    ))
+    const handleShutdownSignal = () => {
+      void shutdown().then(
+        () => process.exit(0),
+        () => process.exit(1),
+      )
     }
-    process.once('SIGINT', () => void shutdown().finally(() => process.exit(0)))
-    process.once('SIGTERM', () => void shutdown().finally(() => process.exit(0)))
+    process.on('SIGINT', handleShutdownSignal)
+    process.on('SIGTERM', handleShutdownSignal)
   })
 
 program.command('status').description('Show managed server state').action(async () => {

@@ -1,6 +1,7 @@
 import { fileURLToPath } from 'node:url'
 import { dirname, extname, isAbsolute, join } from 'node:path'
 import type { Server as HttpServer, IncomingMessage } from 'node:http'
+import type { Duplex } from 'node:stream'
 import { existsSync } from 'node:fs'
 import { writeFile, stat } from 'node:fs/promises'
 import express, { type Express } from 'express'
@@ -36,7 +37,7 @@ export type ServerOptions = {
 export type ServerInstance = {
   app: Express
   dispose: () => void
-  attachWebSocket: (server: HttpServer) => void
+  attachWebSocket: (server: HttpServer) => () => void
 }
 
 type NtfyBridge = {
@@ -413,7 +414,7 @@ export function createServer(options: ServerOptions = {}): ServerInstance {
     attachWebSocket: (server: HttpServer) => {
       const wss = new WebSocketServer({ noServer: true })
 
-      server.on('upgrade', (req: IncomingMessage, socket, head) => {
+      const onUpgrade = (req: IncomingMessage, socket: Duplex, head: Buffer) => {
         const url = new URL(req.url ?? '', 'http://localhost')
         if (url.pathname !== '/codex-api/ws') {
           return
@@ -428,7 +429,8 @@ export function createServer(options: ServerOptions = {}): ServerInstance {
         wss.handleUpgrade(req, socket, head, (ws: WebSocket) => {
           wss.emit('connection', ws, req)
         })
-      })
+      }
+      server.on('upgrade', onUpgrade)
 
       wss.on('connection', (ws: WebSocket) => {
         ws.send(JSON.stringify({ method: 'ready', params: { ok: true }, atIso: new Date().toISOString() }))
@@ -440,6 +442,15 @@ export function createServer(options: ServerOptions = {}): ServerInstance {
         ws.on('close', unsubscribe)
         ws.on('error', unsubscribe)
       })
+
+      let websocketDisposed = false
+      return () => {
+        if (websocketDisposed) return
+        websocketDisposed = true
+        server.off('upgrade', onUpgrade)
+        for (const client of wss.clients) client.terminate()
+        wss.close(() => {})
+      }
     },
   }
 }

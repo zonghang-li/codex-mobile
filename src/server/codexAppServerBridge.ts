@@ -42,7 +42,20 @@ import { handleZenProxyRequest } from './zenProxy.js'
 import { handleCustomEndpointProxyRequest } from './customEndpointProxy.js'
 import { ExternalThreadRuntimeProbe } from './externalThreadRuntime.js'
 import { LocalThreadRuntimeLedger } from './localThreadRuntime.js'
-import { readThreadLiveSnapshotFile } from './threadLiveSnapshot.js'
+import {
+  readThreadLiveSnapshotFile,
+  readThreadLiveSnapshotFileForThread,
+  type ThreadLiveSnapshot,
+} from './threadLiveSnapshot.js'
+import {
+  isThreadTurnsListMethodNotFoundError,
+  readNativeThreadTurnPage,
+} from './threadTurnPagination.js'
+import {
+  readThreadTextPage,
+  ThreadTextPageError,
+  type ThreadTextPageItem,
+} from './threadTextPage.js'
 import { ThreadTerminalManager } from './terminalManager.js'
 import { getSpawnInvocation } from '../utils/commandInvocation.js'
 import {
@@ -81,6 +94,7 @@ type RpcProxyRequest = {
 }
 
 const CODEX_MOBILE_LIVE_SNAPSHOT_PARAM = '__codexMobileLiveSnapshot'
+const CODEX_MOBILE_FORCE_FRESH_THREAD_LIST_PARAM = '__codexMobileForceFresh'
 const SESSION_MODEL_SETTINGS_SCAN_BLOCK_BYTES = 512 * 1024
 const SESSION_TURN_CONTEXT_MARKER = Buffer.from('"type":"turn_context"', 'utf8')
 
@@ -243,11 +257,13 @@ type ComposioConnectorPage = {
 const COMPOSIO_CONNECTORS_PAGE_LIMIT_MAX = 1000
 
 const PROVIDER_MODELS_FETCH_TIMEOUT_MS = 5_000
+const EXTERNAL_RUNTIME_OBSERVATION_CACHE_TTL_MS = 5_000
 
-const THREAD_RESPONSE_TURN_LIMIT = 5
+const THREAD_TURN_PAGE_DEFAULT_LIMIT = 3
 const THREAD_TURN_PAGE_READ_CACHE_TTL_MS = 30_000
 const THREAD_LIST_RPC_CACHE_TTL_MS = 2_000
 const THREAD_LIST_PERSISTED_CACHE_MAX_AGE_MS = 6 * 60 * 60 * 1000
+const THREAD_LIST_PREWARM_DELAY_MS = 50
 const THREAD_METHODS_WITH_TURNS = new Set(['thread/read', 'thread/resume', 'thread/fork', 'thread/rollback'])
 const THREAD_METHODS_WITH_THREAD_SNAPSHOT = new Set([...THREAD_METHODS_WITH_TURNS, 'thread/start'])
 const THREAD_SEARCH_FULL_TEXT_THREAD_LIMIT = 100
@@ -264,11 +280,17 @@ const DEFAULT_API_PERF_BODY_MB_THRESHOLD = 1
 const MB_DIVISOR = 1024 * 1024
 const COMPOSIO_USER_DATA_PATH = join(homedir(), '.composio', 'user_data.json')
 const MANAGED_UPLOAD_ROOT = join(tmpdir(), 'codex-web-uploads')
-const managedUploads = new Map<string, { root: string; directory: string; expiresAt: number }>()
+const managedUploads = new Map<string, {
+  root: string
+  directory: string
+  expiresAt: number
+  deleteAfter?: number
+}>()
 const managedUploadDeletions = new Map<string, Promise<boolean>>()
 const managedUploadCapabilityKeys = new Map<string, Promise<Buffer>>()
 const managedUploadReaperCursorByRoot = new Map<string, string>()
 const MANAGED_UPLOAD_TTL_MS = 60 * 60 * 1000
+const MANAGED_UPLOAD_MIN_RETENTION_MS = 5 * 60 * 1000
 const MANAGED_UPLOAD_REAPER_MAX_ENTRIES = 512
 const MANAGED_UPLOAD_REAPER_INTERVAL_MS = 60 * 1000
 const MANAGED_UPLOAD_REAPER_BATCHES_PER_TICK = 4
@@ -283,12 +305,6 @@ type SessionRecoveredFileChange = {
   diff: string
   addedLineCount: number
   removedLineCount: number
-}
-
-type SessionRecoveredTurnFileChanges = {
-  turnId: string
-  turnIndex: number
-  fileChanges: SessionRecoveredFileChange[]
 }
 
 type SessionRecoveredSkillInput = {
@@ -647,19 +663,31 @@ function asRecord(value: unknown): Record<string, unknown> | null {
 export function prepareRpcProxyRequest(
   method: string,
   params: unknown,
-): { params: unknown; skipSessionSkillEnrichment: boolean } {
+): { params: unknown; skipSessionSkillEnrichment: boolean; forceFreshThreadList: boolean } {
   const record = asRecord(params)
   const isLiveSnapshot = method === 'thread/read'
     && record?.[CODEX_MOBILE_LIVE_SNAPSHOT_PARAM] === true
-  if (!isLiveSnapshot || !record) {
-    return { params: params ?? null, skipSessionSkillEnrichment: false }
+  const isForceFreshThreadList = method === 'thread/list'
+    && record?.[CODEX_MOBILE_FORCE_FRESH_THREAD_LIST_PARAM] === true
+  if ((!isLiveSnapshot && !isForceFreshThreadList) || !record) {
+    return {
+      params: params ?? null,
+      skipSessionSkillEnrichment: false,
+      forceFreshThreadList: false,
+    }
   }
 
   const forwardedParams = { ...record }
-  delete forwardedParams[CODEX_MOBILE_LIVE_SNAPSHOT_PARAM]
+  if (isLiveSnapshot) {
+    delete forwardedParams[CODEX_MOBILE_LIVE_SNAPSHOT_PARAM]
+  }
+  if (isForceFreshThreadList) {
+    delete forwardedParams[CODEX_MOBILE_FORCE_FRESH_THREAD_LIST_PARAM]
+  }
   return {
     params: forwardedParams,
-    skipSessionSkillEnrichment: true,
+    skipSessionSkillEnrichment: isLiveSnapshot,
+    forceFreshThreadList: isForceFreshThreadList,
   }
 }
 
@@ -1266,35 +1294,121 @@ async function guardThreadResumeAgainstExternalWriter(
   return { blocked: true, readResult: inspection.readResult }
 }
 
+function isThreadTurnRunning(turn: unknown): boolean {
+  const turnRecord = asRecord(turn)
+  if (!turnRecord) return false
+  const status = readNonEmptyString(turnRecord.status)
+  if (status === 'inProgress' || status === 'active' || status === 'running') return true
+  const statusType = readNonEmptyString(asRecord(turnRecord.status)?.type)
+  return statusType === 'inProgress' || statusType === 'active' || statusType === 'running'
+}
+
+function isReasoningTurnItem(item: unknown): boolean {
+  const itemRecord = asRecord(item)
+  return readNonEmptyString(itemRecord?.type) === 'reasoning'
+}
+
+function isLiveStateActiveTurnAnchorItem(item: unknown): boolean {
+  const itemType = readNonEmptyString(asRecord(item)?.type)
+  return itemType === 'userMessage'
+}
+
+function compactActiveTurnTextForLiveState(turns: unknown[], activeTurnId = ''): unknown[] {
+  if (!activeTurnId) return turns
+
+  let changed = false
+  const nextTurns = turns.map((turn) => {
+    const turnRecord = asRecord(turn)
+    const turnId = readNonEmptyString(turnRecord?.id)
+    const items = Array.isArray(turnRecord?.items) ? turnRecord.items : null
+    if (!turnRecord || turnId !== activeTurnId || !items || items.length === 0) return turn
+
+    const retainedItems = items.filter(isLiveStateActiveTurnAnchorItem)
+    const existingCompression = asRecord(turnRecord.rawItemCompression)
+    const existingOriginalItemCount = typeof existingCompression?.originalItemCount === 'number'
+      && Number.isFinite(existingCompression.originalItemCount)
+      ? Math.max(0, Math.floor(existingCompression.originalItemCount))
+      : 0
+    const originalItemCount = Math.max(items.length, existingOriginalItemCount)
+    const omittedItemCount = Math.max(0, originalItemCount - retainedItems.length)
+    if (omittedItemCount === 0 && retainedItems.length === items.length) return turn
+
+    changed = true
+    return {
+      ...turnRecord,
+      items: retainedItems,
+      rawItemCompression: {
+        originalItemCount,
+        retainedItemCount: retainedItems.length,
+        omittedItemCount,
+      },
+    }
+  })
+
+  return changed ? nextTurns : turns
+}
+
+function findReasoningPreservedTurnIndex(turns: unknown[], activeTurnId = ''): number {
+  if (activeTurnId) {
+    for (let index = turns.length - 1; index >= 0; index -= 1) {
+      const turnId = readNonEmptyString(asRecord(turns[index])?.id)
+      if (turnId === activeTurnId) return index
+    }
+  }
+  for (let index = turns.length - 1; index >= 0; index -= 1) {
+    if (isThreadTurnRunning(turns[index])) return index
+  }
+  return -1
+}
+
+function pruneHistoricalReasoningItemsFromTurns(turns: unknown[], activeTurnId = ''): unknown[] {
+  const preservedTurnIndex = findReasoningPreservedTurnIndex(turns, activeTurnId)
+  let changed = false
+  const nextTurns = turns.map((turn, index) => {
+    if (index === preservedTurnIndex) return turn
+    const turnRecord = asRecord(turn)
+    const items = Array.isArray(turnRecord?.items) ? turnRecord.items : null
+    if (!turnRecord || !items) return turn
+
+    const nextItems = items.filter((item) => !isReasoningTurnItem(item))
+    if (nextItems.length === items.length) return turn
+
+    changed = true
+    return {
+      ...turnRecord,
+      items: nextItems,
+    }
+  })
+
+  return changed ? nextTurns : turns
+}
+
 export function trimThreadTurnsInRpcResult(
   method: string,
   result: unknown,
-  limit = THREAD_RESPONSE_TURN_LIMIT,
+  _limit = THREAD_TURN_PAGE_DEFAULT_LIMIT,
 ): unknown {
   if (!THREAD_METHODS_WITH_TURNS.has(method)) return result
 
   const record = asRecord(result)
   const thread = asRecord(record?.thread)
   const turns = Array.isArray(thread?.turns) ? thread.turns : null
-  if (!record || !thread || !turns || turns.length <= limit) return result
-  const existingStartTurnIndex = Math.max(0, Math.floor(
-    typeof record.threadTurnStartIndex === 'number' ? record.threadTurnStartIndex : 0,
-  ))
-  const relativeStartTurnIndex = Math.max(0, turns.length - limit)
-  const startTurnIndex = existingStartTurnIndex + relativeStartTurnIndex
+  if (!record || !thread || !turns || turns.length === 0) return result
+
+  const nextTurns = pruneHistoricalReasoningItemsFromTurns(turns)
+  if (nextTurns === turns) return result
 
   return {
     ...record,
-    threadTurnStartIndex: startTurnIndex,
     thread: {
       ...thread,
-      turns: turns.slice(relativeStartTurnIndex),
+      turns: nextTurns,
     },
   }
 }
 
 export function trimLiveThreadTurnsInRpcResult(result: unknown): unknown {
-  return trimThreadTurnsInRpcResult('thread/read', result, 1)
+  return trimThreadTurnsInRpcResult('thread/read', result)
 }
 
 export function buildThreadLiveStateReadFailureFallback(
@@ -1313,7 +1427,14 @@ export function buildThreadLiveStateReadFailureFallback(
   const record = asRecord(liveSnapshot)
   const thread = asRecord(record?.thread)
   const rawTurns = Array.isArray(thread?.turns) ? thread.turns : []
-  const turns = mergeItemsIntoTurns(threadId, rawTurns)
+  const activeTurnId = readNonEmptyString(asRecord(options.externalRuntime)?.turnId)
+  const turns = compactActiveTurnTextForLiveState(
+    pruneHistoricalReasoningItemsFromTurns(
+      mergeItemsIntoTurns(threadId, rawTurns),
+      activeTurnId,
+    ),
+    activeTurnId,
+  )
   const threadTurnStartIndex = Math.max(0, Math.floor(
     typeof record?.threadTurnStartIndex === 'number' ? record.threadTurnStartIndex : 0,
   ))
@@ -1329,7 +1450,7 @@ export function buildThreadLiveStateReadFailureFallback(
     },
     isInProgress: options.isInProgress ?? false,
     liveAuthority: options.liveAuthority ?? 'missing',
-    liveSnapshot: options.liveSnapshot ?? null,
+    liveSnapshot: sanitizeThreadLiveSnapshotForClient(options.liveSnapshot ?? null),
   }
   if (options.externalRuntime !== undefined) {
     responseData.externalRuntime = options.externalRuntime
@@ -1337,26 +1458,81 @@ export function buildThreadLiveStateReadFailureFallback(
   return responseData
 }
 
+function hashThreadTextPageItemForProjection(item: ThreadTextPageItem): string {
+  return createHash('sha256')
+    .update(JSON.stringify({
+      id: item.id,
+      type: item.type,
+      text: item.text ?? null,
+      summary: item.summary ?? null,
+      content: item.content ?? null,
+      command: item.command ?? null,
+      cwd: item.cwd ?? null,
+      status: item.status ?? null,
+      exitCode: item.exitCode ?? null,
+      sessionOrder: item.sessionOrder,
+    }))
+    .digest('hex')
+    .slice(0, 32)
+}
+
+async function readThreadLiveStateActiveTextSignature(input: {
+  sessionPath: string
+  threadId: string
+  turnId: string
+  snapshotEndOffset: number
+}): Promise<string | null> {
+  if (
+    !input.sessionPath
+    || !isAbsolute(input.sessionPath)
+    || !input.turnId
+    || input.snapshotEndOffset <= 0
+  ) {
+    return null
+  }
+
+  try {
+    const page = await readThreadTextPage({
+      sessionPath: input.sessionPath,
+      threadId: input.threadId,
+      turnId: input.turnId,
+      limit: 1,
+    }, {
+      trustedActiveTurn: true,
+      trustedSnapshotEndOffset: input.snapshotEndOffset,
+    })
+    const latestVisibleItem = page.items[0]
+    return latestVisibleItem
+      ? hashThreadTextPageItemForProjection(latestVisibleItem)
+      : 'empty'
+  } catch {
+    return null
+  }
+}
+
 function buildThreadLiveStateProjectionKey(input: {
   threadId: string
   threadTurnStartIndex: number
   turnCount: number
+  olderCursor?: string | null
   sessionSize: number
   isInProgress: boolean
+  activeTextSignature?: string | null
   externalRuntime: unknown
   liveAuthority: 'writer-snapshot' | 'local-stream' | 'persisted' | 'missing'
   liveSnapshot: unknown | null
 }): string {
   const runtime = asRecord(input.externalRuntime)
   const liveSnapshot = asRecord(input.liveSnapshot)
-  const footer = asRecord(liveSnapshot?.footer)
   const sidebar = asRecord(liveSnapshot?.sidebar)
   const payload = {
     threadId: input.threadId,
     threadTurnStartIndex: input.threadTurnStartIndex,
     turnCount: input.turnCount,
-    sessionSize: input.sessionSize,
+    olderCursor: input.olderCursor ?? null,
+    sessionSize: input.isInProgress ? 0 : input.sessionSize,
     isInProgress: input.isInProgress,
+    activeTextSignature: input.isInProgress ? input.activeTextSignature ?? null : null,
     runtime: {
       state: readNonEmptyString(runtime?.state),
       turnId: readNonEmptyString(runtime?.turnId),
@@ -1366,22 +1542,8 @@ function buildThreadLiveStateProjectionKey(input: {
     liveAuthority: input.liveAuthority,
     liveSnapshot: liveSnapshot
       ? {
-          revision: typeof liveSnapshot.revision === 'number' ? liveSnapshot.revision : null,
           activeTurnId: readNonEmptyString(liveSnapshot.activeTurnId),
           state: readNonEmptyString(liveSnapshot.state),
-          generatedAt: readNonEmptyString(liveSnapshot.generatedAt),
-          expiresAt: readNonEmptyString(liveSnapshot.expiresAt),
-          footer: footer
-            ? {
-                stepCurrent: footer.stepCurrent,
-                stepTotal: footer.stepTotal,
-                completedPercent: footer.completedPercent,
-                fileCount: footer.fileCount,
-                additions: footer.additions,
-                deletions: footer.deletions,
-                label: readNonEmptyString(footer.label),
-              }
-            : null,
           sidebar: sidebar
             ? { indicator: readNonEmptyString(sidebar.indicator) }
             : null,
@@ -1389,6 +1551,25 @@ function buildThreadLiveStateProjectionKey(input: {
       : null,
   }
   return createHash('sha256').update(JSON.stringify(payload)).digest('hex').slice(0, 32)
+}
+
+function sanitizeThreadLiveSnapshotForClient(snapshot: unknown | null): unknown | null {
+  const record = asRecord(snapshot)
+  if (!record) return snapshot
+  return {
+    ...record,
+    footer: null,
+  }
+}
+
+function sanitizeThreadLiveStateResponseForClient(payload: unknown): unknown {
+  const record = asRecord(payload)
+  if (!record) return payload
+  if (!Object.prototype.hasOwnProperty.call(record, 'liveSnapshot')) return payload
+  return {
+    ...record,
+    liveSnapshot: sanitizeThreadLiveSnapshotForClient(record.liveSnapshot ?? null),
+  }
 }
 
 function buildThreadLiveStateNotModifiedResponse(input: {
@@ -1408,7 +1589,26 @@ function buildThreadLiveStateNotModifiedResponse(input: {
     isInProgress: input.isInProgress,
     externalRuntime: input.externalRuntime,
     liveAuthority: input.liveAuthority,
-    liveSnapshot: input.liveSnapshot,
+    liveSnapshot: sanitizeThreadLiveSnapshotForClient(input.liveSnapshot),
+  }
+}
+
+function externalRuntimeObservationFromLiveSnapshot(
+  snapshot: ThreadLiveSnapshot | null,
+): ThreadRuntimeObservation | null {
+  if (
+    !snapshot ||
+    snapshot.source !== 'desktop-writer' ||
+    snapshot.state !== 'running' ||
+    !snapshot.activeTurnId
+  ) {
+    return null
+  }
+  return {
+    state: 'running',
+    turnId: snapshot.activeTurnId,
+    interruptible: false,
+    source: 'external-session-writer',
   }
 }
 
@@ -1658,6 +1858,10 @@ const sessionModelSettingsCache = new Map<string, SessionModelSettingsCacheEntry
 type ExportedThreadMetadata = {
   title: string
   updatedAtMs: number
+}
+
+type StateDbThreadReadMetadata = {
+  hasUserEvent?: boolean
 }
 
 const ZIP_CRC_TABLE = new Uint32Array(256)
@@ -2515,6 +2719,45 @@ ${archivedPredicate};
             : 0
       if (!title && updatedAtMs <= 0) continue
       metadata.set(id, { title, updatedAtMs })
+    }
+    return metadata
+  } catch {
+    return new Map()
+  }
+}
+
+function readStateDbThreadReadMetadata(threadIds: string[]): Map<string, StateDbThreadReadMetadata> {
+  const uniqueThreadIds = Array.from(new Set(threadIds.filter((id) => id.trim().length > 0)))
+  if (uniqueThreadIds.length === 0) return new Map()
+  const stateDbPath = join(getCodexHomeDir(), 'state_5.sqlite')
+  if (!existsSync(stateDbPath)) return new Map()
+  const columnsResult = spawnSync('sqlite3', [stateDbPath, 'PRAGMA table_info(threads);'], { encoding: 'utf8' })
+  if (columnsResult.status !== 0) return new Map()
+  const availableColumns = new Set(columnsResult.stdout
+    .split(/\r?\n/u)
+    .map((line) => line.split('|')[1])
+    .filter((value): value is string => Boolean(value)))
+  if (!availableColumns.has('id') || !availableColumns.has('has_user_event')) return new Map()
+
+  const sql = `
+SELECT id, has_user_event
+FROM threads
+WHERE id IN (${uniqueThreadIds.map(sqlString).join(', ')});
+`
+  const result = spawnSync('sqlite3', ['-json', stateDbPath, sql], { encoding: 'utf8' })
+  if (result.status !== 0 || !result.stdout.trim()) return new Map()
+  try {
+    const rows = JSON.parse(result.stdout) as unknown
+    if (!Array.isArray(rows)) return new Map()
+    const metadata = new Map<string, StateDbThreadReadMetadata>()
+    for (const row of rows) {
+      const record = asRecord(row)
+      const id = readNonEmptyString(record?.id)
+      if (!id) continue
+      const rawHasUserEvent = record?.has_user_event
+      if (typeof rawHasUserEvent === 'number') {
+        metadata.set(id, { hasUserEvent: rawHasUserEvent !== 0 })
+      }
     }
     return metadata
   } catch {
@@ -3856,29 +4099,6 @@ function countRecoveredPatchLines(value: string): { addedLineCount: number; remo
   return { addedLineCount, removedLineCount }
 }
 
-function mergeRecoveredDiff(first: string, second: string): string {
-  if (!first) return second
-  if (!second || first === second) return first
-  return `${first}\n${second}`.trim()
-}
-
-function mergeRecoveredFileChange(first: SessionRecoveredFileChange, second: SessionRecoveredFileChange): SessionRecoveredFileChange {
-  const operation = first.operation === 'add' || second.operation === 'add'
-    ? 'add'
-    : first.operation === 'delete' || second.operation === 'delete'
-      ? 'delete'
-      : 'update'
-
-  return {
-    path: second.path || first.path,
-    operation,
-    movedToPath: second.movedToPath ?? first.movedToPath ?? null,
-    diff: mergeRecoveredDiff(first.diff, second.diff),
-    addedLineCount: first.addedLineCount + second.addedLineCount,
-    removedLineCount: first.removedLineCount + second.removedLineCount,
-  }
-}
-
 function isApplyPatchSectionBoundary(value: string): boolean {
   return value.startsWith('*** Update File: ')
     || value.startsWith('*** Add File: ')
@@ -3968,84 +4188,6 @@ function parseApplyPatchInput(input: string): SessionRecoveredFileChange[] {
   }
 
   return changes
-}
-
-function buildSessionFileChangeFallback(threadReadPayload: unknown, sessionLogRaw: string): SessionRecoveredTurnFileChanges[] {
-  const payload = asRecord(threadReadPayload)
-  const thread = asRecord(payload?.thread)
-  const turns = Array.isArray(thread?.turns) ? thread.turns : []
-  const turnIndexById = new Map<string, number>()
-
-  for (let turnIndex = 0; turnIndex < turns.length; turnIndex += 1) {
-    const turnRecord = asRecord(turns[turnIndex])
-    const turnId = readNonEmptyString(turnRecord?.id)
-    if (turnId) {
-      turnIndexById.set(turnId, turnIndex)
-    }
-  }
-
-  const collectedByTurnId = new Map<string, SessionRecoveredFileChange[]>()
-  let currentTurnId = ''
-
-  for (const line of sessionLogRaw.split('\n')) {
-    if (!line.trim()) continue
-    let row: Record<string, unknown> | null = null
-    try {
-      row = JSON.parse(line) as Record<string, unknown>
-    } catch {
-      continue
-    }
-
-    if (row.type === 'turn_context') {
-      const payloadRecord = asRecord(row.payload)
-      currentTurnId = readNonEmptyString(payloadRecord?.turn_id) || currentTurnId
-      continue
-    }
-
-    if (row.type !== 'response_item' || !currentTurnId || !turnIndexById.has(currentTurnId)) {
-      continue
-    }
-
-    const payloadRecord = asRecord(row.payload)
-    if (
-      payloadRecord?.type !== 'custom_tool_call'
-      || payloadRecord.name !== 'apply_patch'
-      || payloadRecord.status !== 'completed'
-    ) {
-      continue
-    }
-
-    const input = readNonEmptyString(payloadRecord.input)
-    if (!input) continue
-
-    const parsedChanges = parseApplyPatchInput(input)
-    if (parsedChanges.length === 0) continue
-
-    const previous = collectedByTurnId.get(currentTurnId) ?? []
-    previous.push(...parsedChanges)
-    collectedByTurnId.set(currentTurnId, previous)
-  }
-
-  const recovered: SessionRecoveredTurnFileChanges[] = []
-  for (const [turnId, fileChanges] of collectedByTurnId.entries()) {
-    const turnIndex = turnIndexById.get(turnId)
-    if (typeof turnIndex !== 'number' || fileChanges.length === 0) continue
-
-    const mergedByPath = new Map<string, SessionRecoveredFileChange>()
-    for (const fileChange of fileChanges) {
-      const key = `${fileChange.path}\u0000${fileChange.movedToPath ?? ''}`
-      const previous = mergedByPath.get(key)
-      mergedByPath.set(key, previous ? mergeRecoveredFileChange(previous, fileChange) : { ...fileChange })
-    }
-
-    recovered.push({
-      turnId,
-      turnIndex,
-      fileChanges: Array.from(mergedByPath.values()),
-    })
-  }
-
-  return recovered.sort((first, second) => first.turnIndex - second.turnIndex)
 }
 
 type SessionRecoveredCommand = {
@@ -4325,6 +4467,12 @@ type SessionRecoveredCollaborationActivity = {
   sourceCallId: string
 }
 
+type SessionRecoveredUserMessage = {
+  id: string
+  type: 'userMessage'
+  content: Array<{ type: 'text'; text: string; text_elements: [] }>
+}
+
 const SESSION_COLLABORATION_KIND_BY_FUNCTION = new Map<string, SessionRecoveredCollaborationKind>([
   ['send_message', 'sendMessage'],
   ['send_message_to_thread', 'sendMessage'],
@@ -4336,6 +4484,7 @@ const SESSION_COLLABORATION_KIND_BY_FUNCTION = new Map<string, SessionRecoveredC
 
 type SessionItemSlot =
   | { type: 'agentMessage' }
+  | { type: 'userMessage'; userMessage: SessionRecoveredUserMessage }
   | { type: 'commandExecution'; command: SessionRecoveredCommand }
   | { type: 'fileChange'; fileChange: SessionRecoveredFileChangeItem }
   | { type: 'collaborationActivity'; collaborationActivity: SessionRecoveredCollaborationActivity }
@@ -4349,8 +4498,40 @@ type SessionRecoveredItemsCacheEntry = {
 
 const sessionRecoveredItemsCache = new Map<string, SessionRecoveredItemsCacheEntry>()
 
+function isInjectedSessionUserText(value: string): boolean {
+  const text = value.trimStart()
+  return text.startsWith('<environment_context>')
+    || text.startsWith('<recommended_plugins>')
+    || text.startsWith('<permissions instructions>')
+    || text.startsWith('# AGENTS.md instructions')
+    || text.startsWith('<codex_delegation>')
+    || text.startsWith('The following is the Codex agent history')
+}
+
+function readSessionUserMessageText(payload: Record<string, unknown>): string {
+  const parts = Array.isArray(payload.content) ? payload.content : []
+  return parts
+    .map(asRecord)
+    .flatMap((part) => {
+      if (part?.type === 'input_text' && typeof part.text === 'string') return [part.text]
+      if (part?.type === 'text' && typeof part.text === 'string') return [part.text]
+      return []
+    })
+    .join('\n')
+    .trim()
+}
+
+function buildSessionRecoveredUserMessage(id: string, text: string): SessionRecoveredUserMessage {
+  return {
+    id,
+    type: 'userMessage',
+    content: [{ type: 'text', text, text_elements: [] }],
+  }
+}
+
 function buildSessionItemOrder(sessionLogRaw: string, turnIds: Set<string> | null): Map<string, SessionItemSlot[]> {
   let currentTurnId = ''
+  let recoveredUserMessageIndex = 0
   const orderByTurnId = new Map<string, SessionItemSlot[]>()
   const callIdToCommand = new Map<string, SessionRecoveredCommand>()
 
@@ -4388,6 +4569,21 @@ function buildSessionItemOrder(sessionLogRaw: string, turnIds: Set<string> | nul
 
     if (payload.type === 'message' && payload.role === 'assistant') {
       slots.push({ type: 'agentMessage' })
+      continue
+    }
+
+    if (payload.type === 'message' && payload.role === 'user') {
+      const text = readSessionUserMessageText(payload)
+      if (!text || isInjectedSessionUserText(text)) continue
+      const payloadId = readNonEmptyString(payload.id)
+      recoveredUserMessageIndex += 1
+      slots.push({
+        type: 'userMessage',
+        userMessage: buildSessionRecoveredUserMessage(
+          payloadId || `session-user-${currentTurnId}-${recoveredUserMessageIndex}`,
+          text,
+        ),
+      })
       continue
     }
 
@@ -4986,14 +5182,6 @@ function mergeSessionCommandsIntoTurns(
     if (!slots || slots.length === 0) return turn
 
     const existingItems = Array.isArray(turnRecord.items) ? (turnRecord.items as Record<string, unknown>[]) : []
-    const alreadyHasRecoveredItems = existingItems.some((it) => {
-      const id = readNonEmptyString(it.id)
-      return id.startsWith('session-cmd-')
-        || id.startsWith('session-fc-')
-        || id.startsWith('session-collab-')
-    })
-    if (alreadyHasRecoveredItems) return turn
-
     const recoveredCollaborationByCallId = new Map(
       slots
         .filter((slot): slot is Extract<SessionItemSlot, { type: 'collaborationActivity' }> =>
@@ -5005,6 +5193,23 @@ function mergeSessionCommandsIntoTurns(
       existingItems
         .map((it) => readNonEmptyString(it.id))
         .filter((id): id is string => !!id),
+    )
+    const existingUserMessageTexts = new Set(
+      existingItems
+        .filter((it) => it.type === 'userMessage')
+        .map((it) => {
+          const content = Array.isArray(it.content) ? it.content : []
+          return content
+            .map(asRecord)
+            .flatMap((part) => {
+              if (part?.type === 'text' && typeof part.text === 'string') return [part.text]
+              if (part?.type === 'input_text' && typeof part.text === 'string') return [part.text]
+              return []
+            })
+            .join('\n')
+            .trim()
+        })
+        .filter((text): text is string => !!text),
     )
 
     const nextItems: Record<string, unknown>[] = []
@@ -5024,7 +5229,12 @@ function mergeSessionCommandsIntoTurns(
 
     const appendRecoveredSlot = (slot: SessionItemSlot): void => {
       let recovered: Record<string, unknown> | null = null
-      if (slot.type === 'commandExecution') {
+      if (slot.type === 'userMessage') {
+        const text = slot.userMessage.content.map((part) => part.text).join('\n').trim()
+        if (!text || existingUserMessageTexts.has(text)) return
+        existingUserMessageTexts.add(text)
+        recovered = slot.userMessage as unknown as Record<string, unknown>
+      } else if (slot.type === 'commandExecution') {
         recovered = commandForTurn(slot.command) as unknown as Record<string, unknown>
       } else if (slot.type === 'fileChange') {
         recovered = slot.fileChange as unknown as Record<string, unknown>
@@ -5148,6 +5358,71 @@ function getCodexHomeDir(): string {
 function getThreadLiveStateDir(): string {
   const configured = process.env.CODEX_MOBILE_LIVE_STATE_DIR?.trim()
   return configured || join(getCodexHomeDir(), 'live-state')
+}
+
+function isSafeThreadIdForLocalRolloutPath(threadId: string): boolean {
+  return /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u.test(threadId)
+    && !threadId.includes('/')
+    && !threadId.includes('\\')
+}
+
+function uuidV7TimestampMs(threadId: string): number | null {
+  const compact = threadId.replace(/-/gu, '')
+  if (!/^[0-9a-fA-F]{32}$/u.test(compact)) return null
+  const timestampMs = Number.parseInt(compact.slice(0, 12), 16)
+  return Number.isSafeInteger(timestampMs) && timestampMs > 0 ? timestampMs : null
+}
+
+function addSessionDateDir(dirs: Set<string>, sessionsRoot: string, date: Date, utc: boolean): void {
+  const year = utc ? date.getUTCFullYear() : date.getFullYear()
+  const month = (utc ? date.getUTCMonth() : date.getMonth()) + 1
+  const day = utc ? date.getUTCDate() : date.getDate()
+  dirs.add(join(
+    sessionsRoot,
+    String(year).padStart(4, '0'),
+    String(month).padStart(2, '0'),
+    String(day).padStart(2, '0'),
+  ))
+}
+
+function localSessionCandidateDirsForThreadId(threadId: string): string[] {
+  const sessionsRoot = join(getCodexHomeDir(), 'sessions')
+  const dirs = new Set<string>([sessionsRoot])
+  const timestampMs = uuidV7TimestampMs(threadId)
+  if (timestampMs !== null) {
+    for (const offsetDays of [-1, 0, 1]) {
+      const date = new Date(timestampMs + offsetDays * 24 * 60 * 60 * 1000)
+      addSessionDateDir(dirs, sessionsRoot, date, false)
+      addSessionDateDir(dirs, sessionsRoot, date, true)
+    }
+  }
+  return [...dirs]
+}
+
+async function findLocalRolloutPathForThreadId(threadId: string): Promise<string> {
+  if (!isSafeThreadIdForLocalRolloutPath(threadId)) return ''
+  let best: { path: string; mtimeMs: number } | null = null
+  for (const directory of localSessionCandidateDirsForThreadId(threadId)) {
+    try {
+      const entries = await readdir(directory, { withFileTypes: true })
+      for (const entry of entries) {
+        if (!entry.isFile() || !entry.name.endsWith('.jsonl') || !entry.name.includes(threadId)) continue
+        const candidate = join(directory, entry.name)
+        try {
+          const s = await stat(candidate)
+          if (!s.isFile()) continue
+          if (!best || s.mtimeMs > best.mtimeMs) {
+            best = { path: candidate, mtimeMs: s.mtimeMs }
+          }
+        } catch {
+          // Ignore files that disappear while scanning.
+        }
+      }
+    } catch {
+      continue
+    }
+  }
+  return best?.path ?? ''
 }
 
 function getSkillsInstallDir(): string {
@@ -6535,6 +6810,79 @@ function normalizeSessionIndexThreadTitle(value: unknown): SessionIndexThreadTit
   }
 }
 
+async function readSessionIndexThreadListFallback(params: unknown): Promise<unknown | null> {
+  const record = asRecord(params)
+  if (!record) return null
+  if (record.archived !== false) return null
+  if (record.cursor !== null && record.cursor !== undefined) return null
+  if (record.sortKey !== 'updated_at') return null
+  const limit = typeof record.limit === 'number' && Number.isInteger(record.limit)
+    ? record.limit
+    : null
+  if (limit === null || limit < 1 || limit > 10) return null
+  const modelProviders = Array.isArray(record.modelProviders)
+    ? record.modelProviders.filter((value): value is string => typeof value === 'string')
+    : []
+  if (modelProviders.length > 0) return null
+
+  const sessionIndexPath = getCodexSessionIndexPath()
+  const latestById = new Map<string, SessionIndexThreadTitle>()
+  let input: ReturnType<typeof createReadStream> | null = null
+  let lines: ReturnType<typeof createInterface> | null = null
+
+  try {
+    input = createReadStream(sessionIndexPath, { encoding: 'utf8' })
+    lines = createInterface({
+      input,
+      crlfDelay: Infinity,
+    })
+
+    for await (const line of lines) {
+      const trimmed = line.trim()
+      if (!trimmed) continue
+
+      try {
+        const entry = normalizeSessionIndexThreadTitle(JSON.parse(trimmed) as unknown)
+        if (!entry) continue
+
+        const previous = latestById.get(entry.id)
+        if (!previous || entry.updatedAtMs >= previous.updatedAtMs) {
+          latestById.set(entry.id, entry)
+        }
+      } catch {
+        // Skip malformed lines and keep scanning the rest of the lightweight index.
+      }
+    }
+  } catch {
+    return null
+  } finally {
+    lines?.close()
+    input?.close()
+  }
+
+  const entries = Array.from(latestById.values())
+    .sort((first, second) => second.updatedAtMs - first.updatedAtMs)
+    .slice(0, limit)
+  if (entries.length === 0) return null
+
+  return {
+    data: entries.map((entry) => {
+      const updatedAtSeconds = Math.max(0, entry.updatedAtMs / 1000)
+      return {
+        id: entry.id,
+        title: entry.title,
+        name: entry.title,
+        cwd: '',
+        preview: '',
+        createdAt: updatedAtSeconds,
+        updatedAt: updatedAtSeconds,
+        source: { type: 'session-index' },
+      }
+    }),
+    nextCursor: null,
+  }
+}
+
 function trimThreadTitleCache(cache: ThreadTitleCache): ThreadTitleCache {
   const titles = { ...cache.titles }
   const order = cache.order.filter((id) => {
@@ -6626,7 +6974,7 @@ type StoredQueuedMessage = {
   text: string
   imageUrls: string[]
   skills: Array<{ name: string; path: string }>
-  fileAttachments: Array<{ label: string; path: string; fsPath: string }>
+  fileAttachments: Array<{ label: string; path: string; fsPath: string; uploadHandle?: string }>
   collaborationMode: 'default' | 'plan'
   model: string
   effort: ReasoningEffort | ''
@@ -6667,7 +7015,7 @@ function normalizeStoredQueuedMessage(value: unknown): StoredQueuedMessage | nul
     })
   }
 
-  const normalizeFileAttachments = (items: unknown): Array<{ label: string; path: string; fsPath: string }> => {
+  const normalizeFileAttachments = (items: unknown): Array<{ label: string; path: string; fsPath: string; uploadHandle?: string }> => {
     if (!Array.isArray(items)) return []
     return items.flatMap((item) => {
       const itemRecord = asRecord(item)
@@ -6675,7 +7023,10 @@ function normalizeStoredQueuedMessage(value: unknown): StoredQueuedMessage | nul
       const label = typeof itemRecord.label === 'string' ? itemRecord.label.trim() : ''
       const path = typeof itemRecord.path === 'string' ? itemRecord.path.trim() : ''
       const fsPath = typeof itemRecord.fsPath === 'string' ? itemRecord.fsPath.trim() : ''
-      return label && path && fsPath ? [{ label, path, fsPath }] : []
+      const uploadHandle = typeof itemRecord.uploadHandle === 'string'
+        ? itemRecord.uploadHandle.trim()
+        : ''
+      return label && path && fsPath ? [{ label, path, fsPath, ...(uploadHandle ? { uploadHandle } : {}) }] : []
     })
   }
 
@@ -6710,6 +7061,64 @@ function normalizeThreadQueueState(value: unknown): ThreadQueueState {
   return state
 }
 
+function isManagedQueuedImageUrl(value: string): boolean {
+  try {
+    const parsed = new URL(value, 'http://localhost')
+    const path = parsed.searchParams.get('path')?.replace(/\\/gu, '/') ?? ''
+    return parsed.pathname === '/codex-local-image' && (
+      Boolean(parsed.searchParams.get('uploadHandle')?.trim())
+      || path.includes('/codex-web-uploads/')
+    )
+  } catch {
+    return false
+  }
+}
+
+function hasManagedQueuedCapabilities(message: StoredQueuedMessage): boolean {
+  return message.imageUrls.some(isManagedQueuedImageUrl)
+    || message.fileAttachments.some((attachment) => (
+      Boolean(attachment.uploadHandle?.trim())
+      || attachment.path.replace(/\\/gu, '/').includes('/codex-web-uploads/')
+      || attachment.fsPath.replace(/\\/gu, '/').includes('/codex-web-uploads/')
+    ))
+}
+
+function sanitizeThreadQueueStateForPersistence(state: ThreadQueueState): ThreadQueueState {
+  const sanitized: ThreadQueueState = {}
+  for (const [threadId, messages] of Object.entries(state)) {
+    sanitized[threadId] = messages.map((message) => ({
+      ...message,
+      imageUrls: message.imageUrls.filter((imageUrl) => !isManagedQueuedImageUrl(imageUrl)),
+      fileAttachments: message.fileAttachments
+        .filter((attachment) => !(
+          attachment.uploadHandle?.trim()
+          || attachment.path.replace(/\\/gu, '/').includes('/codex-web-uploads/')
+          || attachment.fsPath.replace(/\\/gu, '/').includes('/codex-web-uploads/')
+        ))
+        .map(({ label, path, fsPath }) => ({ label, path, fsPath })),
+    }))
+  }
+  return sanitized
+}
+
+function managedQueuedUploadHandles(message: StoredQueuedMessage): string[] {
+  const handles = new Set<string>()
+  for (const imageUrl of message.imageUrls) {
+    try {
+      const parsed = new URL(imageUrl, 'http://localhost')
+      const handle = parsed.searchParams.get('uploadHandle')?.trim() ?? ''
+      if (handle) handles.add(handle)
+    } catch {
+      // Ignore malformed image URLs.
+    }
+  }
+  for (const attachment of message.fileAttachments) {
+    const handle = attachment.uploadHandle?.trim() ?? ''
+    if (handle) handles.add(handle)
+  }
+  return [...handles]
+}
+
 let threadQueueMutationChain: Promise<unknown> = Promise.resolve()
 
 async function readThreadQueueState(): Promise<ThreadQueueState> {
@@ -6732,7 +7141,7 @@ async function writeThreadQueueStateUnlocked(nextState: ThreadQueueState): Promi
   } catch {
     payload = {}
   }
-  const normalized = normalizeThreadQueueState(nextState)
+  const normalized = sanitizeThreadQueueStateForPersistence(normalizeThreadQueueState(nextState))
   if (Object.keys(normalized).length > 0) {
     payload[THREAD_QUEUE_STATE_KEY] = normalized
   } else {
@@ -6919,14 +7328,30 @@ function buildThreadListRpcCacheKey(params: unknown): string | null {
   })
 }
 
+function firstPageThreadListRpcParams(): {
+  archived: false
+  cursor: null
+  limit: 5
+  sortKey: 'updated_at'
+  modelProviders: string[]
+} {
+  return {
+    archived: false,
+    cursor: null,
+    limit: 5,
+    sortKey: 'updated_at',
+    modelProviders: [],
+  }
+}
+
 async function readThreadListRpcCacheSignature(): Promise<string> {
   try {
     const stats = await stat(getCodexSessionIndexPath())
-    return `index:${getSessionIndexFileSignature(stats)}`
+      return `index:${getCodexHomeDir()}:${getSessionIndexFileSignature(stats)}`
   } catch {
     try {
       const stats = await stat(join(getCodexHomeDir(), 'sessions'))
-      return `sessions:${getSessionIndexFileSignature(stats)}`
+      return `sessions:${getCodexHomeDir()}:${getSessionIndexFileSignature(stats)}`
     } catch {
       return 'missing'
     }
@@ -6970,6 +7395,36 @@ async function writePersistedThreadListRpcCache(key: string, result: unknown): P
     await rm(tempPath, { force: true }).catch(() => {})
     throw error
   }
+}
+
+async function prewarmFirstPageThreadListRpcCache(shared: SharedBridgeState): Promise<void> {
+  const params = firstPageThreadListRpcParams()
+  const key = buildThreadListRpcCacheKey(params)
+  if (!key) return
+
+  const signature = await readThreadListRpcCacheSignature()
+  if (shared.appServer.getCachedThreadListRpcResult(key, signature)) return
+  if (await readPersistedThreadListRpcCache(key)) return
+
+  await shared.appServer.getOrStartThreadListRpcRefresh(key, async () => {
+    const freshResult = await callRpcWithArchiveRecovery(
+      shared.appServer,
+      'thread/list',
+      params,
+      shared.runtimeProbe,
+      shared.appServer.getPid(),
+    )
+    shared.appServer.cacheThreadListRpcResult(key, signature, freshResult)
+    await writePersistedThreadListRpcCache(key, freshResult)
+    return freshResult
+  })
+}
+
+function scheduleFirstPageThreadListRpcCachePrewarm(shared: SharedBridgeState): void {
+  const timer = setTimeout(() => {
+    void prewarmFirstPageThreadListRpcCache(shared).catch(() => {})
+  }, THREAD_LIST_PREWARM_DELAY_MS)
+  timer.unref?.()
 }
 
 async function parseThreadTitlesFromSessionIndex(sessionIndexPath: string): Promise<ThreadTitleCache> {
@@ -7130,6 +7585,10 @@ export async function canonicalizeThreadListResponseForRead(
 ): Promise<unknown> {
   const record = asRecord(payload)
   if (!record || !Array.isArray(record.data)) return payload
+  const threadIds = record.data
+    .map((item) => readNonEmptyString(asRecord(item)?.id))
+    .filter((id) => id.length > 0)
+  const readMetadataByThreadId = readStateDbThreadReadMetadata(threadIds)
   const cwdCanonicalizationByValue = new Map<string, Promise<string>>()
   const canonicalizeCwd = (cwd: string): Promise<string> => {
     let canonicalized = cwdCanonicalizationByValue.get(cwd)
@@ -7141,8 +7600,40 @@ export async function canonicalizeThreadListResponseForRead(
   }
   return {
     ...record,
-    data: await Promise.all(record.data.map((item) => canonicalizeThreadCwdRecord(item, canonicalizeCwd))),
+    data: await Promise.all(record.data.map(async (item) => {
+      const canonicalItem = await canonicalizeThreadCwdRecord(item, canonicalizeCwd)
+      const canonicalRecord = asRecord(canonicalItem)
+      const threadId = readNonEmptyString(canonicalRecord?.id)
+      const readMetadata = threadId ? readMetadataByThreadId.get(threadId) : undefined
+      const lightRecord = stripThreadListRowHeavyPayload(canonicalRecord ?? canonicalItem)
+      const lightRecordObject = asRecord(lightRecord)
+      if (!lightRecordObject || readMetadata?.hasUserEvent === undefined) return lightRecord
+      return {
+        ...lightRecordObject,
+        desktopHasUserEvent: readMetadata.hasUserEvent,
+      }
+    })),
   }
+}
+
+function stripThreadListRowHeavyPayload(value: unknown): unknown {
+  const record = asRecord(value)
+  if (!record) return value
+  const stripped: Record<string, unknown> = { ...record }
+  if (
+    Array.isArray(record.turns)
+    && stripped.inProgress === undefined
+    && stripped.status === undefined
+    && readThreadResultInProgress(record)
+  ) {
+    stripped.inProgress = readThreadResultInProgress(record)
+  }
+  delete stripped.turns
+  delete stripped.items
+  delete stripped.messages
+  delete stripped.conversation
+  delete stripped.transcript
+  return stripped
 }
 
 async function readWorkspaceRootsState(): Promise<WorkspaceRootsState> {
@@ -7413,7 +7904,7 @@ async function verifyManagedUploadCapability(
   root: string,
   uploadHandle: string,
   options: { nowMs: number; ttlMs: number },
-): Promise<{ uploadId: string } | null> {
+): Promise<{ uploadId: string; issuedAtMs: number } | null> {
   const match = uploadHandle.match(
     /^v1\.([0-9a-z]+)\.([0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})\.([A-Za-z0-9_-]{43})$/u,
   )
@@ -7442,7 +7933,7 @@ async function verifyManagedUploadCapability(
   ) {
     return null
   }
-  return { uploadId }
+  return { uploadId, issuedAtMs }
 }
 
 export async function createManagedUpload(
@@ -7478,6 +7969,7 @@ export async function deleteManagedUpload(
     uploadRoot?: string
     nowMs?: number
     ttlMs?: number
+    minimumRetentionMs?: number
   } = {},
 ): Promise<boolean> {
   const normalizedHandle = uploadHandle.trim()
@@ -7507,6 +7999,18 @@ export async function deleteManagedUpload(
       if (!directoryInfo.isDirectory() || directoryInfo.isSymbolicLink()) return false
       const canonicalDirectory = await realpath(directory)
       if (!isPathInsideRoot(canonicalRoot, canonicalDirectory)) return false
+      const nowMs = options.nowMs ?? Date.now()
+      const deleteAfter = capability.issuedAtMs
+        + Math.max(0, options.minimumRetentionMs ?? MANAGED_UPLOAD_MIN_RETENTION_MS)
+      if (nowMs < deleteAfter) {
+        if (registeredUpload) {
+          registeredUpload.deleteAfter = Math.min(
+            registeredUpload.deleteAfter ?? deleteAfter,
+            deleteAfter,
+          )
+        }
+        return true
+      }
       await rm(canonicalDirectory, { recursive: true, force: false })
       return true
     } catch {
@@ -7532,7 +8036,24 @@ export async function reapExpiredManagedUploads(options: {
   const ttlMs = Math.max(0, options.ttlMs ?? MANAGED_UPLOAD_TTL_MS)
   const maxEntries = Math.max(0, Math.floor(options.maxEntries ?? MANAGED_UPLOAD_REAPER_MAX_ENTRIES))
   if (maxEntries === 0) return 0
+  let removed = 0
   for (const [handle, upload] of managedUploads) {
+    if (
+      resolve(upload.root) === root
+      && upload.deleteAfter !== undefined
+      && upload.deleteAfter <= nowMs
+      && await deleteManagedUpload(handle, {
+        uploadRoot: root,
+        nowMs,
+        ttlMs,
+        minimumRetentionMs: 0,
+      })
+    ) {
+      managedUploads.delete(handle)
+      removed += 1
+      if (removed >= maxEntries) return removed
+      continue
+    }
     if (upload.expiresAt <= nowMs) managedUploads.delete(handle)
   }
 
@@ -7556,8 +8077,8 @@ export async function reapExpiredManagedUploads(options: {
     } else {
       managedUploadReaperCursorByRoot.delete(canonicalRoot)
     }
-    let removed = 0
     for (const entry of orderedEntries) {
+      if (removed >= maxEntries) break
       if (
         !entry.isDirectory()
         || entry.isSymbolicLink()
@@ -7812,6 +8333,10 @@ class AppServerProcess {
   private readonly threadTurnPageReadPromiseByThreadId = new Map<string, Promise<unknown>>()
   private readonly capturedItemsByThreadId = new Map<string, Map<string, CapturedItem>>()
   private readonly liveStateCache = new Map<string, { data: unknown; turnCount: number; sessionSize: number }>()
+  private readonly externalRuntimeObservationCacheByThreadId = new Map<string, {
+    observation: ThreadRuntimeObservation
+    expiresAt: number
+  }>()
   private readonly threadListRpcCacheByKey = new Map<string, { signature: string; result: unknown; expiresAt: number }>()
   private readonly threadListRpcRefreshByKey = new Map<string, Promise<unknown>>()
   private chatgptAuthRefreshPromise: Promise<ChatgptAuthTokensRefreshResponse> | null = null
@@ -7970,6 +8495,7 @@ class AppServerProcess {
     const nThreadId = this.extractThreadIdFromParams(notification.params)
     if (nThreadId) {
       this.invalidateLiveStateCache(nThreadId)
+      this.invalidateExternalRuntimeObservationCache(nThreadId)
       this.threadTurnPageReadCacheByThreadId.delete(nThreadId)
     }
     for (const listener of this.notificationListeners) {
@@ -8065,12 +8591,42 @@ class AppServerProcess {
   getCachedLiveState(threadId: string, turnCount: number, sessionSize: number): unknown | null {
     const cached = this.liveStateCache.get(threadId)
     if (!cached) return null
-    if (cached.turnCount !== turnCount || cached.sessionSize !== sessionSize) return null
+    const cachedData = asRecord(cached.data)
+    if (cached.turnCount !== turnCount) return null
+    if (cachedData?.isInProgress !== true && cached.sessionSize !== sessionSize) return null
     return cached.data
   }
 
   invalidateLiveStateCache(threadId: string): void {
     this.liveStateCache.delete(threadId)
+  }
+
+  cacheExternalRuntimeObservation(threadId: string, observation: ThreadRuntimeObservation): void {
+    if (!threadId || observation.state !== 'running' || observation.source !== 'external-session-writer') return
+    this.externalRuntimeObservationCacheByThreadId.set(threadId, {
+      observation,
+      expiresAt: Date.now() + EXTERNAL_RUNTIME_OBSERVATION_CACHE_TTL_MS,
+    })
+  }
+
+  cacheExternalRuntimeObservations(observations: Record<string, ThreadRuntimeObservation>): void {
+    for (const [threadId, observation] of Object.entries(observations)) {
+      this.cacheExternalRuntimeObservation(threadId, observation)
+    }
+  }
+
+  getCachedExternalRuntimeObservation(threadId: string): ThreadRuntimeObservation | null {
+    const cached = this.externalRuntimeObservationCacheByThreadId.get(threadId)
+    if (!cached) return null
+    if (cached.expiresAt <= Date.now()) {
+      this.externalRuntimeObservationCacheByThreadId.delete(threadId)
+      return null
+    }
+    return cached.observation
+  }
+
+  invalidateExternalRuntimeObservationCache(threadId: string): void {
+    this.externalRuntimeObservationCacheByThreadId.delete(threadId)
   }
 
   getCachedThreadListRpcResult(key: string, signature: string): unknown | null {
@@ -8438,6 +8994,8 @@ export class BackendQueueProcessor {
   private readonly processingThreadIds = new Set<string>()
   private readonly queueDrainTimersByThreadId = new Map<string, ReturnType<typeof setTimeout>>()
   private readonly queueDrainDueAtByThreadId = new Map<string, number>()
+  private readonly runtimeQueuedMessages = new Map<string, StoredQueuedMessage>()
+  private readonly activeManagedMessagesByThreadId = new Map<string, StoredQueuedMessage>()
   private readonly unsubscribe: () => void
 
   constructor(
@@ -8448,6 +9006,7 @@ export class BackendQueueProcessor {
       if (!isTurnCompletedNotification(notification)) return
       const threadId = extractThreadIdFromNotificationParams(notification.params)
       if (!threadId) return
+      this.releaseActiveManagedMessage(threadId)
       void this.processThreadQueue(threadId)
     })
     void this.scheduleAllQueuedThreads(1000)
@@ -8461,6 +9020,36 @@ export class BackendQueueProcessor {
     this.queueDrainTimersByThreadId.clear()
     this.queueDrainDueAtByThreadId.clear()
     this.processingThreadIds.clear()
+    for (const message of this.runtimeQueuedMessages.values()) {
+      this.releaseManagedMessage(message)
+    }
+    for (const message of this.activeManagedMessagesByThreadId.values()) {
+      this.releaseManagedMessage(message)
+    }
+    this.runtimeQueuedMessages.clear()
+    this.activeManagedMessagesByThreadId.clear()
+  }
+
+  replaceRuntimeQueueState(
+    state: ThreadQueueState,
+    transferManagedMessageIds: Set<string> = new Set(),
+  ): void {
+    const incomingKeys = new Set<string>()
+    for (const [threadId, messages] of Object.entries(state)) {
+      for (const message of messages) {
+        const key = this.runtimeQueueKey(threadId, message.id)
+        incomingKeys.add(key)
+        if (hasManagedQueuedCapabilities(message)) {
+          this.runtimeQueuedMessages.set(key, message)
+        }
+      }
+    }
+    for (const [key, message] of this.runtimeQueuedMessages) {
+      if (incomingKeys.has(key)) continue
+      this.runtimeQueuedMessages.delete(key)
+      if (transferManagedMessageIds.has(message.id)) continue
+      this.releaseManagedMessage(message)
+    }
   }
 
   async scheduleAllQueuedThreads(delayMs = 0): Promise<void> {
@@ -8509,12 +9098,23 @@ export class BackendQueueProcessor {
       }
       const next = await this.popNextQueuedTurn(threadId)
       if (!next) return
+      const runtimeKey = this.runtimeQueueKey(threadId, next.message.id)
+      const managedMessage = this.runtimeQueuedMessages.get(runtimeKey)
+      if (managedMessage) {
+        this.activeManagedMessagesByThreadId.set(threadId, managedMessage)
+      }
       try {
         await this.startQueuedTurn(next)
+        if (managedMessage) {
+          this.runtimeQueuedMessages.delete(runtimeKey)
+        }
         if (await this.hasQueuedTurns(threadId)) {
           this.scheduleThreadQueueDrain(threadId)
         }
       } catch {
+        if (managedMessage && this.activeManagedMessagesByThreadId.get(threadId) === managedMessage) {
+          this.activeManagedMessagesByThreadId.delete(threadId)
+        }
         await this.restoreQueuedTurn(next)
         this.scheduleThreadQueueDrain(threadId)
       }
@@ -8560,8 +9160,26 @@ export class BackendQueueProcessor {
       } else {
         delete nextState[threadId]
       }
-      return { nextState, result: { threadId, message } }
+      const runtimeMessage = this.runtimeQueuedMessages.get(this.runtimeQueueKey(threadId, message.id))
+      return { nextState, result: { threadId, message: runtimeMessage ?? message } }
     })
+  }
+
+  private runtimeQueueKey(threadId: string, messageId: string): string {
+    return `${threadId}\u0000${messageId}`
+  }
+
+  private releaseManagedMessage(message: StoredQueuedMessage): void {
+    for (const uploadHandle of managedQueuedUploadHandles(message)) {
+      void deleteManagedUpload(uploadHandle)
+    }
+  }
+
+  private releaseActiveManagedMessage(threadId: string): void {
+    const message = this.activeManagedMessagesByThreadId.get(threadId)
+    if (!message) return
+    this.activeManagedMessagesByThreadId.delete(threadId)
+    this.releaseManagedMessage(message)
   }
 
   private async restoreQueuedTurn(turn: BackendQueuedTurn): Promise<void> {
@@ -8952,6 +9570,7 @@ async function buildThreadSearchIndex(appServer: AppServerProcess): Promise<Thre
 }
 
 export function createCodexBridgeMiddleware(options: {
+  prewarmThreadListCache?: boolean
   securityPolicy?: ServerSecurityPolicy
   managedUploadReaper?: {
     uploadRoot?: string
@@ -8989,6 +9608,7 @@ export function createCodexBridgeMiddleware(options: {
   )))
   managedUploadReaperTimer.unref?.()
   const securityPolicy = options.securityPolicy ?? PERMISSIVE_SECURITY_POLICY
+  const sharedBridgeState = getSharedBridgeState()
   const {
     appServer,
     terminalManager,
@@ -8997,7 +9617,12 @@ export function createCodexBridgeMiddleware(options: {
     backendQueueProcessor,
     runtimeProbe,
     localRuntimeLedger,
-  } = getSharedBridgeState()
+  } = sharedBridgeState
+  const shouldPrewarmThreadListCache = options.prewarmThreadListCache
+    ?? process.env.NODE_ENV !== 'test'
+  if (shouldPrewarmThreadListCache) {
+    scheduleFirstPageThreadListRpcCachePrewarm(sharedBridgeState)
+  }
   let threadSearchIndex: ThreadSearchIndex | null = null
   let threadSearchIndexPromise: Promise<ThreadSearchIndex> | null = null
   const pendingFirstTurnByThreadId = new Map<string, number>()
@@ -9109,7 +9734,9 @@ export function createCodexBridgeMiddleware(options: {
           setJson(res, 400, { error: 'Missing threadId' })
           return
         }
-        setJson(res, 200, await runtimeProbe.inspect(threadId, appServer.getPid()))
+        const state = await runtimeProbe.inspect(threadId, appServer.getPid())
+        appServer.cacheExternalRuntimeObservation(threadId, state)
+        setJson(res, 200, state)
         return
       }
 
@@ -9132,6 +9759,7 @@ export function createCodexBridgeMiddleware(options: {
           localRuntimeLedger,
           appServer.getPid(),
         )
+        appServer.cacheExternalRuntimeObservations(states)
         setJson(res, 200, { states })
         return
       }
@@ -9593,6 +10221,8 @@ export function createCodexBridgeMiddleware(options: {
           const threadListCacheKey = body.method === 'thread/list'
             ? buildThreadListRpcCacheKey(preparedRpcRequest.params)
             : null
+          const shouldBypassThreadListCache = body.method === 'thread/list'
+            && preparedRpcRequest.forceFreshThreadList === true
           const threadListCacheSignature = threadListCacheKey
             ? await readThreadListRpcCacheSignature()
             : ''
@@ -9613,7 +10243,7 @@ export function createCodexBridgeMiddleware(options: {
               throw new Error('Cannot start a turn because task writer ownership is not idle.')
             }
           }
-          const cachedThreadListResult = threadListCacheKey
+          const cachedThreadListResult = threadListCacheKey && !shouldBypassThreadListCache
             ? appServer.getCachedThreadListRpcResult(threadListCacheKey, threadListCacheSignature)
             : null
           if (cachedThreadListResult) {
@@ -9639,7 +10269,17 @@ export function createCodexBridgeMiddleware(options: {
               }, 0)
               rpcResult = persistedThreadListResult
             } else {
-              rpcResult = await startThreadListRefresh()
+              const sessionIndexThreadListResult = await readSessionIndexThreadListFallback(
+                preparedRpcRequest.params,
+              )
+              if (sessionIndexThreadListResult) {
+                setTimeout(() => {
+                  startThreadListRefresh().catch(() => {})
+                }, 0)
+                rpcResult = sessionIndexThreadListResult
+              } else {
+                rpcResult = await startThreadListRefresh()
+              }
             }
           } else {
             rpcResult = await callRpcWithArchiveRecovery(
@@ -9715,12 +10355,14 @@ export function createCodexBridgeMiddleware(options: {
           }
         }
 
-        const resultWithExternalRuntime = await augmentThreadResultWithExternalRuntime(
-          body.method,
-          result,
-          runtimeProbe,
-          appServer.getPid(),
-        )
+        const resultWithExternalRuntime = body.method === 'thread/list'
+          ? result
+          : await augmentThreadResultWithExternalRuntime(
+            body.method,
+            result,
+            runtimeProbe,
+            appServer.getPid(),
+          )
 
         setJson(res, 200, { result: resultWithExternalRuntime })
         return
@@ -9729,88 +10371,132 @@ export function createCodexBridgeMiddleware(options: {
       if (req.method === 'GET' && url.pathname === '/codex-api/thread-turn-page') {
         try {
           const threadId = url.searchParams.get('threadId')?.trim() ?? ''
-          const beforeTurnId = url.searchParams.get('beforeTurnId')?.trim() ?? ''
-          const limitRaw = url.searchParams.get('limit')?.trim() ?? String(THREAD_RESPONSE_TURN_LIMIT)
-          const limit = Math.max(1, Math.min(50, Number.parseInt(limitRaw, 10) || THREAD_RESPONSE_TURN_LIMIT))
+          const cursor = url.searchParams.get('cursor')?.trim() ?? ''
+          const limitRaw = url.searchParams.get('limit')?.trim() ?? String(THREAD_TURN_PAGE_DEFAULT_LIMIT)
+          const limit = Math.max(1, Math.min(50, Number.parseInt(limitRaw, 10) || THREAD_TURN_PAGE_DEFAULT_LIMIT))
           if (!threadId) {
             setJson(res, 400, { error: 'Missing threadId' })
             return
           }
 
-          const threadReadResult = mergeStreamTurnErrorsIntoThreadResult(appServer, await appServer.readThreadForTurnPage(threadId))
-          const record = asRecord(threadReadResult)
-          const thread = asRecord(record?.thread)
-          if (!record || !thread) {
-            setJson(res, 502, { error: 'thread/read returned an invalid thread response' })
-            return
-          }
-
-          const turns = Array.isArray(thread.turns) ? thread.turns : []
-          const beforeIndex = beforeTurnId
-            ? turns.findIndex((turn) => asRecord(turn)?.id === beforeTurnId)
-            : turns.length
-          if (beforeTurnId && beforeIndex < 0) {
-            setJson(res, 200, {
-              result: {
-                ...record,
-                thread: {
-                  ...thread,
-                  turns: [],
-                },
-              },
-              startTurnIndex: 0,
-              hasMoreOlder: false,
-            })
-            return
-          }
-
-          const endIndex = beforeIndex
-          const startIndex = Math.max(0, endIndex - limit)
-          const pageTurns = turns.slice(startIndex, endIndex)
-          const pagedResult = {
-            ...record,
-            thread: {
-              ...thread,
-              turns: pageTurns,
+          const page = await readNativeThreadTurnPage(
+            (method, params) => appServer.rpc(method, params),
+            {
+              threadId,
+              cursor: cursor || undefined,
+              limit,
             },
-          }
-          const result = await prepareThreadRpcResultForClient('thread/read', pagedResult, false)
+          )
+          const pagedResult = mergeStreamTurnErrorsIntoThreadResult(appServer, {
+            thread: {
+              id: threadId,
+              turns: pruneHistoricalReasoningItemsFromTurns(page.turns),
+            },
+          })
+          const result = await prepareThreadRpcResultForClient('thread/read', pagedResult, true)
 
           setJson(res, 200, {
             result,
-            startTurnIndex: startIndex,
-            hasMoreOlder: startIndex > 0,
+            nextCursor: page.nextCursor,
+            backwardsCursor: page.backwardsCursor,
+            startTurnIndex: 0,
+            hasMoreOlder: page.nextCursor !== null,
           })
         } catch (error) {
+          if (isThreadTurnsListMethodNotFoundError(error)) {
+            setJson(res, 501, {
+              error: 'thread/turns/list is not supported by this Codex app-server',
+              fallback: 'thread/read',
+            })
+            return
+          }
           setJson(res, 500, { error: getErrorMessage(error, 'Failed to load earlier thread messages') })
         }
         return
       }
 
-      if (req.method === 'GET' && url.pathname === '/codex-api/thread-file-change-fallback') {
+      if (req.method === 'GET' && url.pathname === '/codex-api/thread-text-page') {
         const threadId = url.searchParams.get('threadId')?.trim() ?? ''
-        if (!threadId) {
-          setJson(res, 400, { error: 'Missing threadId' })
-          return
-        }
-
-        const threadReadResult = await appServer.rpc('thread/read', {
-          threadId,
-          includeTurns: true,
-        })
-        const threadReadRecord = asRecord(threadReadResult)
-        const threadRecord = asRecord(threadReadRecord?.thread)
-        const sessionPath = readNonEmptyString(threadRecord?.path)
-        if (!sessionPath || !isAbsolute(sessionPath)) {
-          setJson(res, 200, { data: [] })
+        const turnId = url.searchParams.get('turnId')?.trim() ?? ''
+        const cursor = url.searchParams.get('cursor')?.trim() ?? ''
+        const limitRaw = url.searchParams.get('limit')?.trim() ?? ''
+        if (!threadId || !turnId) {
+          setJson(res, 400, { error: 'Missing threadId or turnId' })
           return
         }
 
         try {
-          const sessionLogRaw = await readFile(sessionPath, 'utf8')
-          setJson(res, 200, { data: buildSessionFileChangeFallback(threadReadResult, sessionLogRaw) })
-        } catch {
-          setJson(res, 200, { data: [] })
+          const cachedSnapshotThread = asRecord(asRecord(appServer.getLastThreadReadSnapshot(threadId))?.thread)
+          let sessionPath = readNonEmptyString(cachedSnapshotThread?.path)
+          let sessionStats: Awaited<ReturnType<typeof stat>> | null = null
+          if (sessionPath && isAbsolute(sessionPath)) {
+            try {
+              const stats = await stat(sessionPath)
+              if (stats.isFile()) sessionStats = stats
+            } catch { /* fall back to thread/read */ }
+          }
+          if (!sessionStats) {
+            const localSessionPath = await findLocalRolloutPathForThreadId(threadId)
+            if (localSessionPath) {
+              try {
+                const stats = await stat(localSessionPath)
+                if (stats.isFile()) {
+                  sessionPath = localSessionPath
+                  sessionStats = stats
+                }
+              } catch { /* fall back to thread/read */ }
+            }
+          }
+          if (!sessionStats) {
+            const threadRead = await appServer.rpc('thread/read', {
+              threadId,
+              includeTurns: false,
+            })
+            const thread = asRecord(asRecord(threadRead)?.thread)
+            sessionPath = readNonEmptyString(thread?.path)
+            if (!sessionPath || !isAbsolute(sessionPath)) {
+              setJson(res, 404, { error: 'No rollout available for thread' })
+              return
+            }
+            sessionStats = await stat(sessionPath)
+          }
+          if (!sessionStats.isFile()) {
+            setJson(res, 404, { error: 'No rollout available for thread' })
+            return
+          }
+          runtimeProbe.registerThread(threadId, sessionPath)
+          const runtime = await observeThreadRuntimeState(
+            threadId,
+            runtimeProbe,
+            localRuntimeLedger,
+            appServer.getPid(),
+          )
+          if (
+            asRecord(runtime)?.state !== 'running'
+            || readNonEmptyString(asRecord(runtime)?.turnId) !== turnId
+          ) {
+            setJson(res, 409, { error: 'Requested turn is not active' })
+            return
+          }
+          const page = await readThreadTextPage({
+            sessionPath,
+            threadId,
+            turnId,
+            cursor: cursor || undefined,
+            limit: limitRaw ? Number.parseInt(limitRaw, 10) : undefined,
+          }, {
+            trustedActiveTurn: true,
+            trustedSnapshotEndOffset: sessionStats.size,
+          })
+          setJson(res, 200, page)
+        } catch (error) {
+          if (error instanceof ThreadTextPageError) {
+            setJson(res, error.statusCode, { error: error.message })
+          } else if (getErrorCode(error) === 'ENOENT') {
+            setJson(res, 404, { error: 'No rollout available for thread' })
+          } else {
+            setJson(res, 500, { error: 'Failed to load thread text page' })
+          }
         }
         return
       }
@@ -9837,6 +10523,7 @@ export function createCodexBridgeMiddleware(options: {
         const knownProjectionKey = url.searchParams.get('knownProjectionKey')?.trim() ?? ''
 
         let precheckedExternalRuntime: unknown | null = null
+        let precheckedThreadLiveSnapshot: ThreadLiveSnapshot | null = null
         try {
           const lastSnapshot = appServer.getLastThreadReadSnapshot(threadId)
           if (lastSnapshot) {
@@ -9852,25 +10539,39 @@ export function createCodexBridgeMiddleware(options: {
                 snapshotSessionSize = s.size
               } catch { /* missing */ }
             }
-            const externalRuntime = await observeThreadRuntimeState(
-              threadId,
-              runtimeProbe,
-              localRuntimeLedger,
-              appServer.getPid(),
-            )
-            precheckedExternalRuntime = externalRuntime
             const cached = asRecord(appServer.getCachedLiveState(
               threadId,
               snapshotTurns.length,
               snapshotSessionSize,
             ))
             const cachedExternalRuntime = asRecord(cached?.externalRuntime)
+            if (knownProjectionKey && cached?.isInProgress === false) {
+              const cachedProjectionKey = readNonEmptyString(cached.projectionKey)
+              if (cachedProjectionKey && knownProjectionKey === cachedProjectionKey) {
+                const rawLiveAuthority = readNonEmptyString(cached.liveAuthority)
+                const liveAuthority = rawLiveAuthority === 'writer-snapshot' ||
+                  rawLiveAuthority === 'local-stream' ||
+                  rawLiveAuthority === 'persisted' ||
+                  rawLiveAuthority === 'missing'
+                  ? rawLiveAuthority
+                  : 'persisted'
+                setJson(res, 200, buildThreadLiveStateNotModifiedResponse({
+                  threadId,
+                  projectionKey: cachedProjectionKey,
+                  isInProgress: false,
+                  externalRuntime: cached.externalRuntime ?? { state: 'unknown' },
+                  liveAuthority,
+                  liveSnapshot: cached.liveSnapshot ?? null,
+                }))
+                return
+              }
+            }
             if (
-              asRecord(externalRuntime)?.state === 'running'
+              knownProjectionKey
               && cached?.isInProgress === true
               && cachedExternalRuntime?.state === 'running'
             ) {
-              const activeExternalTurnId = readNonEmptyString(asRecord(externalRuntime)?.turnId)
+              const activeExternalTurnId = readNonEmptyString(cachedExternalRuntime.turnId)
               const liveSnapshot = activeExternalTurnId
                 ? await readThreadLiveSnapshotFile(getThreadLiveStateDir(), threadId, {
                     activeTurnId: activeExternalTurnId,
@@ -9879,18 +10580,122 @@ export function createCodexBridgeMiddleware(options: {
                 : null
               const liveAuthority = liveSnapshot ? 'writer-snapshot' : 'missing'
               const cachedThreadTurnStartIndex = Math.max(0, Math.floor(
-                typeof cached.threadTurnStartIndex === 'number' ? cached.threadTurnStartIndex : 0,
+                typeof cached?.threadTurnStartIndex === 'number' ? cached.threadTurnStartIndex : 0,
               ))
+              const cachedOlderCursor = readNonEmptyString(cached.olderCursor) || null
+              const activeTextSignature = await readThreadLiveStateActiveTextSignature({
+                sessionPath: snapshotSessionPath,
+                threadId,
+                turnId: activeExternalTurnId,
+                snapshotEndOffset: snapshotSessionSize,
+              })
               const projectionKey = buildThreadLiveStateProjectionKey({
                 threadId,
                 threadTurnStartIndex: cachedThreadTurnStartIndex,
                 turnCount: snapshotTurns.length,
+                olderCursor: cachedOlderCursor,
                 sessionSize: snapshotSessionSize,
                 isInProgress: true,
+                activeTextSignature,
+                externalRuntime: cachedExternalRuntime,
+                liveAuthority,
+                liveSnapshot,
+              })
+              if (knownProjectionKey === projectionKey) {
+                setJson(res, 200, buildThreadLiveStateNotModifiedResponse({
+                  threadId,
+                  projectionKey,
+                  isInProgress: true,
+                  externalRuntime: cachedExternalRuntime,
+                  liveAuthority,
+                  liveSnapshot,
+                }))
+                return
+              }
+              setJson(res, 200, buildThreadLiveStateNotModifiedResponse({
+                threadId,
+                projectionKey,
+                isInProgress: true,
+                externalRuntime: cachedExternalRuntime,
+                liveAuthority,
+                liveSnapshot,
+              }))
+              return
+            }
+            precheckedThreadLiveSnapshot = await readThreadLiveSnapshotFileForThread(
+              getThreadLiveStateDir(),
+              threadId,
+              { nowMs: Date.now() },
+            )
+            const snapshotExternalRuntime = cached
+              ? null
+              : externalRuntimeObservationFromLiveSnapshot(precheckedThreadLiveSnapshot)
+            const externalRuntime = appServer.getCachedExternalRuntimeObservation(threadId)
+              ?? snapshotExternalRuntime
+              ?? await observeThreadRuntimeState(
+                threadId,
+                runtimeProbe,
+                localRuntimeLedger,
+                appServer.getPid(),
+              )
+            precheckedExternalRuntime = externalRuntime
+            if (asRecord(externalRuntime)?.state === 'running') {
+              const activeExternalTurnId = readNonEmptyString(asRecord(externalRuntime)?.turnId)
+              const liveSnapshot = activeExternalTurnId
+                ? (
+                    precheckedThreadLiveSnapshot?.activeTurnId === activeExternalTurnId
+                      ? precheckedThreadLiveSnapshot
+                      : await readThreadLiveSnapshotFile(getThreadLiveStateDir(), threadId, {
+                          activeTurnId: activeExternalTurnId,
+                          nowMs: Date.now(),
+                        })
+                  )
+                : null
+              const liveAuthority = liveSnapshot ? 'writer-snapshot' : 'missing'
+              const cachedThreadTurnStartIndexRaw = cached?.threadTurnStartIndex
+              const cachedThreadTurnStartIndex = Math.max(0, Math.floor(
+                typeof cachedThreadTurnStartIndexRaw === 'number' ? cachedThreadTurnStartIndexRaw : 0,
+              ))
+              const activeTextSignature = await readThreadLiveStateActiveTextSignature({
+                sessionPath: snapshotSessionPath,
+                threadId,
+                turnId: activeExternalTurnId,
+                snapshotEndOffset: snapshotSessionSize,
+              })
+              const projectedTurns = compactActiveTurnTextForLiveState(
+                pruneHistoricalReasoningItemsFromTurns(snapshotTurns, activeExternalTurnId),
+                activeExternalTurnId,
+              )
+              const projectionKey = buildThreadLiveStateProjectionKey({
+                threadId,
+                threadTurnStartIndex: cachedThreadTurnStartIndex,
+                turnCount: projectedTurns.length,
+                olderCursor: readNonEmptyString(cached?.olderCursor) || null,
+                sessionSize: snapshotSessionSize,
+                isInProgress: true,
+                activeTextSignature,
                 externalRuntime,
                 liveAuthority,
                 liveSnapshot,
               })
+              const responseData = {
+                ...(asRecord(cached) ?? {}),
+                threadId,
+                projectionKey,
+                threadTurnStartIndex: cachedThreadTurnStartIndex,
+                olderCursor: readNonEmptyString(cached?.olderCursor) || null,
+                hasMoreOlder: Boolean(readNonEmptyString(cached?.olderCursor)) || cachedThreadTurnStartIndex > 0,
+                conversationState: {
+                  turns: projectedTurns,
+                },
+                ownerClientId: null,
+                liveStateError: null,
+                isInProgress: true,
+                externalRuntime,
+                liveAuthority,
+                liveSnapshot: sanitizeThreadLiveSnapshotForClient(liveSnapshot),
+              }
+              appServer.cacheLiveState(threadId, responseData, projectedTurns.length, snapshotSessionSize)
               if (knownProjectionKey && knownProjectionKey === projectionKey) {
                 setJson(res, 200, buildThreadLiveStateNotModifiedResponse({
                   threadId,
@@ -9902,31 +10707,134 @@ export function createCodexBridgeMiddleware(options: {
                 }))
                 return
               }
-              setJson(res, 200, {
-                ...(asRecord(cached) ?? {}),
-                projectionKey,
-                isInProgress: true,
-                externalRuntime,
-                liveAuthority,
-                liveSnapshot,
-              })
+              if (knownProjectionKey) {
+                setJson(res, 200, buildThreadLiveStateNotModifiedResponse({
+                  threadId,
+                  projectionKey,
+                  isInProgress: true,
+                  externalRuntime,
+                  liveAuthority,
+                  liveSnapshot,
+                }))
+                return
+              }
+              setJson(res, 200, responseData)
               return
             }
           }
 
-          const rawThreadReadResult = await appServer.rpc('thread/read', {
+          if (knownProjectionKey) {
+            const localSessionPath = await findLocalRolloutPathForThreadId(threadId)
+            if (localSessionPath) {
+              try {
+                const localSessionStats = await stat(localSessionPath)
+                if (localSessionStats.isFile()) {
+                  runtimeProbe.registerThread(threadId, localSessionPath)
+                  const externalRuntime = appServer.getCachedExternalRuntimeObservation(threadId)
+                    ?? await observeThreadRuntimeState(
+                      threadId,
+                      runtimeProbe,
+                      localRuntimeLedger,
+                      appServer.getPid(),
+                    )
+                  precheckedExternalRuntime = externalRuntime
+                  if (asRecord(externalRuntime)?.state === 'running') {
+                    const activeExternalTurnId = readNonEmptyString(asRecord(externalRuntime)?.turnId)
+                    const liveSnapshot = activeExternalTurnId
+                      ? await readThreadLiveSnapshotFile(getThreadLiveStateDir(), threadId, {
+                          activeTurnId: activeExternalTurnId,
+                          nowMs: Date.now(),
+                        })
+                      : null
+                    const liveAuthority = liveSnapshot ? 'writer-snapshot' : 'missing'
+                    const activeTextSignature = await readThreadLiveStateActiveTextSignature({
+                      sessionPath: localSessionPath,
+                      threadId,
+                      turnId: activeExternalTurnId,
+                      snapshotEndOffset: localSessionStats.size,
+                    })
+                    const projectionKey = buildThreadLiveStateProjectionKey({
+                      threadId,
+                      threadTurnStartIndex: 0,
+                      turnCount: 0,
+                      olderCursor: null,
+                      sessionSize: localSessionStats.size,
+                      isInProgress: true,
+                      activeTextSignature,
+                      externalRuntime,
+                      liveAuthority,
+                      liveSnapshot,
+                    })
+                    setJson(res, 200, buildThreadLiveStateNotModifiedResponse({
+                      threadId,
+                      projectionKey,
+                      isInProgress: true,
+                      externalRuntime,
+                      liveAuthority,
+                      liveSnapshot,
+                    }))
+                    return
+                  }
+                }
+              } catch {
+                // Fall back to thread/read below if the local path disappears.
+              }
+            }
+          }
+
+          const rawThreadMetadataResult = await appServer.rpc('thread/read', {
             threadId,
-            includeTurns: true,
+            includeTurns: false,
           })
-          const trimmedThreadReadResult = trimLiveThreadTurnsInRpcResult(rawThreadReadResult)
-          const threadReadResult = mergeStreamTurnErrorsIntoThreadResult(appServer, trimmedThreadReadResult)
+          const metadataRecord = asRecord(rawThreadMetadataResult)
+          const metadataThread = asRecord(metadataRecord?.thread)
+          let rawThreadReadResult: unknown
+          let olderCursor: string | null = null
+          let usedNativeTurnPagination = false
+          try {
+            const page = await readNativeThreadTurnPage(
+              (method, params) => appServer.rpc(method, params),
+              {
+                threadId,
+                limit: THREAD_TURN_PAGE_DEFAULT_LIMIT,
+              },
+            )
+            olderCursor = page.nextCursor
+            usedNativeTurnPagination = true
+            rawThreadReadResult = {
+              ...(metadataRecord ?? {}),
+              thread: {
+                ...(metadataThread ?? {}),
+                id: readNonEmptyString(metadataThread?.id) || threadId,
+                turns: page.turns,
+              },
+            }
+          } catch (paginationError) {
+            const paginationMessage = getErrorMessage(paginationError, '')
+            if (isThreadTurnsListMethodNotFoundError(paginationError)) {
+              rawThreadReadResult = await appServer.rpc('thread/read', {
+                threadId,
+                includeTurns: true,
+              })
+            } else if (
+              paginationMessage.includes('returned an invalid response')
+              && Array.isArray(metadataThread?.turns)
+              && metadataThread.turns.length > 0
+            ) {
+              // Some older test doubles and app-server builds ignore includeTurns:false.
+              // Reuse those already-returned turns without issuing an expensive second read.
+              rawThreadReadResult = rawThreadMetadataResult
+            } else {
+              throw paginationError
+            }
+          }
+          const threadReadResult = mergeStreamTurnErrorsIntoThreadResult(appServer, rawThreadReadResult)
           const sanitized = await sanitizeThreadTurnsInlinePayloads('thread/read', threadReadResult)
-          appServer.storeThreadReadSnapshot(threadId, sanitized)
 
           const record = asRecord(sanitized)
           const thread = asRecord(record?.thread)
           const rawTurns = Array.isArray(thread?.turns) ? thread.turns : []
-          const threadTurnStartIndexRaw = record?.threadTurnStartIndex
+          const threadTurnStartIndexRaw = usedNativeTurnPagination ? 0 : record?.threadTurnStartIndex
           const threadTurnStartIndex = Math.max(0, Math.floor(
             typeof threadTurnStartIndexRaw === 'number' ? threadTurnStartIndexRaw : 0,
           ))
@@ -9944,7 +10852,7 @@ export function createCodexBridgeMiddleware(options: {
 
           let turns = appServer.mergeItemsIntoTurns(threadId, rawTurns)
 
-          if (sessionPath && isAbsolute(sessionPath) && sessionSize > 0) {
+          if (!usedNativeTurnPagination && sessionPath && isAbsolute(sessionPath) && sessionSize > 0) {
             try {
               const recoveredItems = await readCachedSessionRecoveredItems(sessionPath)
               turns = mergeSessionCommandsIntoTurns(turns, '', recoveredItems.orderByTurnId)
@@ -9956,12 +10864,26 @@ export function createCodexBridgeMiddleware(options: {
 
           const lastTurn = turns.length > 0 ? asRecord(turns[turns.length - 1]) : null
           const rawLocallyInProgress = lastTurn?.status === 'inProgress'
-          const externalRuntime = precheckedExternalRuntime ?? await observeThreadRuntimeState(
-            threadId,
-            runtimeProbe,
-            localRuntimeLedger,
-            appServer.getPid(),
-          )
+          if (precheckedThreadLiveSnapshot === null) {
+            precheckedThreadLiveSnapshot = await readThreadLiveSnapshotFileForThread(
+              getThreadLiveStateDir(),
+              threadId,
+              { nowMs: Date.now() },
+            )
+          }
+          const cachedLiveState = appServer.getCachedLiveState(threadId, rawTurns.length, sessionSize)
+          const snapshotExternalRuntime = cachedLiveState
+            ? null
+            : externalRuntimeObservationFromLiveSnapshot(precheckedThreadLiveSnapshot)
+          const externalRuntime = precheckedExternalRuntime
+            ?? appServer.getCachedExternalRuntimeObservation(threadId)
+            ?? snapshotExternalRuntime
+            ?? await observeThreadRuntimeState(
+              threadId,
+              runtimeProbe,
+              localRuntimeLedger,
+              appServer.getPid(),
+            )
           const externalRuntimeState = readNonEmptyString(asRecord(externalRuntime)?.state)
           const isExternalInProgress = asRecord(externalRuntime)?.state === 'running'
           const isOrphanedLocalInProgress = rawLocallyInProgress && externalRuntimeState === 'idle'
@@ -9971,20 +10893,58 @@ export function createCodexBridgeMiddleware(options: {
           const isLocallyInProgress = rawLocallyInProgress && !isOrphanedLocalInProgress
           const cached = isExternalInProgress
             ? null
-            : appServer.getCachedLiveState(threadId, rawTurns.length, sessionSize)
+            : cachedLiveState
           if (cached && asRecord(cached)?.isInProgress === false) {
-            setJson(res, 200, cached)
+            const cachedRecord = asRecord(cached)
+            const cachedProjectionKey = readNonEmptyString(cachedRecord?.projectionKey)
+            if (knownProjectionKey && cachedProjectionKey && knownProjectionKey === cachedProjectionKey) {
+              const rawLiveAuthority = readNonEmptyString(cachedRecord?.liveAuthority)
+              const liveAuthority = rawLiveAuthority === 'writer-snapshot' ||
+                rawLiveAuthority === 'local-stream' ||
+                rawLiveAuthority === 'persisted' ||
+                rawLiveAuthority === 'missing'
+                ? rawLiveAuthority
+                : 'persisted'
+              setJson(res, 200, buildThreadLiveStateNotModifiedResponse({
+                threadId,
+                projectionKey: cachedProjectionKey,
+                isInProgress: false,
+                externalRuntime: cachedRecord?.externalRuntime ?? { state: 'unknown' },
+                liveAuthority,
+                liveSnapshot: cachedRecord?.liveSnapshot ?? null,
+              }))
+              return
+            }
+            setJson(res, 200, sanitizeThreadLiveStateResponseForClient(cached))
             return
           }
           const isInProgress = isLocallyInProgress || isExternalInProgress
           const activeExternalTurnId = isExternalInProgress
             ? readNonEmptyString(asRecord(externalRuntime)?.turnId)
             : ''
+          const activeTextTurnId = activeExternalTurnId || (isLocallyInProgress
+            ? readNonEmptyString(lastTurn?.id)
+            : '')
+          turns = pruneHistoricalReasoningItemsFromTurns(turns, activeExternalTurnId)
+          const responseTurns = isExternalInProgress && activeExternalTurnId
+            ? compactActiveTurnTextForLiveState(turns, activeExternalTurnId)
+            : turns
+          appServer.storeThreadReadSnapshot(threadId, {
+            ...record,
+            thread: {
+              ...thread,
+              turns,
+            },
+          })
           const liveSnapshot = activeExternalTurnId
-            ? await readThreadLiveSnapshotFile(getThreadLiveStateDir(), threadId, {
-                activeTurnId: activeExternalTurnId,
-                nowMs: Date.now(),
-              })
+            ? (
+                precheckedThreadLiveSnapshot?.activeTurnId === activeExternalTurnId
+                  ? precheckedThreadLiveSnapshot
+                  : await readThreadLiveSnapshotFile(getThreadLiveStateDir(), threadId, {
+                      activeTurnId: activeExternalTurnId,
+                      nowMs: Date.now(),
+                    })
+              )
             : null
           const liveAuthority = liveSnapshot
             ? 'writer-snapshot'
@@ -9993,15 +10953,23 @@ export function createCodexBridgeMiddleware(options: {
               : isLocallyInProgress
                 ? 'local-stream'
                 : 'persisted'
+          const activeTextSignature = await readThreadLiveStateActiveTextSignature({
+            sessionPath,
+            threadId,
+            turnId: activeTextTurnId,
+            snapshotEndOffset: sessionSize,
+          })
           const projectionKey = buildThreadLiveStateProjectionKey({
             threadId,
             threadTurnStartIndex,
             turnCount: rawTurns.length,
+            olderCursor,
             sessionSize,
             isInProgress,
+            activeTextSignature,
             externalRuntime,
             liveAuthority,
-            liveSnapshot,
+            liveSnapshot: sanitizeThreadLiveSnapshotForClient(liveSnapshot),
           })
           if (knownProjectionKey && knownProjectionKey === projectionKey) {
             setJson(res, 200, buildThreadLiveStateNotModifiedResponse({
@@ -10027,16 +10995,17 @@ export function createCodexBridgeMiddleware(options: {
               : {}),
             projectionKey,
             threadTurnStartIndex,
-            hasMoreOlder: threadTurnStartIndex > 0,
+            olderCursor,
+            hasMoreOlder: olderCursor !== null || threadTurnStartIndex > 0,
             conversationState: {
-              turns,
+              turns: responseTurns,
             },
             ownerClientId: null,
             liveStateError: null,
             isInProgress,
             externalRuntime,
             liveAuthority,
-            liveSnapshot,
+            liveSnapshot: sanitizeThreadLiveSnapshotForClient(liveSnapshot),
           }
 
           if (!isLocallyInProgress) {
@@ -10970,7 +11939,11 @@ export function createCodexBridgeMiddleware(options: {
           setJson(res, 400, { error: 'Invalid body: expected object' })
           return
         }
-        await writeThreadQueueState(normalizeThreadQueueState(record))
+        const queueStateRecord = asRecord(record.queueState) ?? record
+        const runtimeState = normalizeThreadQueueState(queueStateRecord)
+        const transferManagedMessageIds = new Set(normalizeStringArray(record.transferManagedMessageIds))
+        backendQueueProcessor.replaceRuntimeQueueState(runtimeState, transferManagedMessageIds)
+        await writeThreadQueueState(runtimeState)
         void backendQueueProcessor.scheduleAllQueuedThreads()
         setJson(res, 200, { ok: true })
         return

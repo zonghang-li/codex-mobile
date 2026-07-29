@@ -18,6 +18,7 @@ Return to the [manual test index](../../tests.md).
 | [Feature: Sandbox approval requests recognize newer Codex payloads](sandbox-approval-requests-recognize-newer-codex-payloads.md) |
 | [Feature: MCP elicitation requests and thread status labels](mcp-elicitation-requests-and-thread-status-labels.md) |
 | [Feature: Stop button interrupts active turn without missing turnId](stop-button-interrupts-active-turn-without-missing-turnid.md) |
+| [Immutable submit, immediate Stop, and running-turn queue](immutable-submit-immediate-stop-and-queue.md) |
 | [Feature: Backticked HTTP(S) URL renders as clickable link](backticked-http-s-url-renders-as-clickable-link.md) |
 | [Feature: Chat file-link context menu (open/copy/edit)](chat-file-link-context-menu-open-copy-edit.md) |
 | [Feature: Restore composer drag-and-drop file attach on input field](restore-composer-drag-and-drop-file-attach-on-input-field.md) |
@@ -29,7 +30,7 @@ Return to the [manual test index](../../tests.md).
 | [Feature: Markdown file links with spaces and parentheses in path](markdown-file-links-with-spaces-and-parentheses-in-path.md) |
 | [Feature: Markdown link with backticked label renders as file link](markdown-link-with-backticked-label-renders-as-file-link.md) |
 | [Feature: Backticked bare filenames render as file links](backticked-bare-filenames-render-as-file-links.md) |
-| [Feature: Lazy message rendering (windowed conversation)](lazy-message-rendering-windowed-conversation.md) |
+| [Feature: Full loaded history rendering](lazy-message-rendering-windowed-conversation.md) |
 | [Feature: Mobile thread single tap and terminal status](mobile-thread-single-tap-and-terminal-status.md) |
 | [Selected idle desktop turn live sync](selected-idle-desktop-turn-live-sync.md) |
 | [Codex desktop activity parity and mobile typography](codex-desktop-activity-parity-and-mobile-typography.md) |

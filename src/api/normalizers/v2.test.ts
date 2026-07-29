@@ -26,6 +26,81 @@ function threadReadResponseWithContent(content: unknown[]): ThreadReadResponse {
 }
 
 describe('normalizeThreadMessagesV2', () => {
+  it('preserves active external runtime progress when persisted turn status is stale interrupted', () => {
+    const response = threadReadResponseWithContent([
+      {
+        type: 'reasoning',
+        id: 'reason-1',
+        summary: ['First reasoning'],
+        content: [],
+      },
+      {
+        type: 'agentMessage',
+        id: 'agent-1',
+        text: 'First progress update',
+      },
+      {
+        type: 'mcpToolCall',
+        id: 'tool-1',
+        server: 'codegraph',
+        tool: 'codegraph_explore',
+      },
+      {
+        type: 'agentMessage',
+        id: 'agent-2',
+        text: 'Second progress update',
+      },
+    ])
+    response.thread.turns[0].status = 'interrupted'
+    ;(response.thread as unknown as Record<string, unknown>).externalRuntime = {
+      state: 'running',
+      turnId: 'turn-1',
+    }
+
+    expect(normalizeThreadMessagesV2(response).map((message) => ({
+      id: message.id,
+      type: message.messageType,
+      text: message.text,
+    }))).toEqual([
+      { id: 'reason-1', type: 'reasoning', text: 'First reasoning' },
+      { id: 'agent-1', type: 'agentMessage', text: 'First progress update' },
+      { id: 'tool-1', type: 'mcpToolCall', text: 'Called codegraph.codegraph_explore' },
+      { id: 'agent-2', type: 'agentMessage', text: 'Second progress update' },
+    ])
+  })
+
+  it('propagates only finite non-negative session order values', () => {
+    const response = threadReadResponseWithContent([
+      {
+        type: 'agentMessage',
+        id: 'assistant-ordered',
+        text: 'Ordered',
+        sessionOrder: 120,
+      },
+      {
+        type: 'agentMessage',
+        id: 'assistant-negative',
+        text: 'Negative',
+        sessionOrder: -1,
+      },
+      {
+        type: 'agentMessage',
+        id: 'assistant-infinite',
+        text: 'Infinite',
+        sessionOrder: Number.POSITIVE_INFINITY,
+      },
+    ])
+    response.thread.turns[0].status = 'inProgress'
+    const messages = normalizeThreadMessagesV2(response)
+
+    expect(messages[0]).toMatchObject({
+      id: 'assistant-ordered',
+      sessionOrder: 120,
+    })
+    expect(messages[1]?.sessionOrder).toBeUndefined()
+    expect(messages[2]?.sessionOrder).toBeUndefined()
+  })
+
   it.each([
     '/tmp/codex-web-uploads/f-legacy/photo.png',
     '/private/var/folders/arbitrary/camera.jpg',
@@ -41,6 +116,39 @@ describe('normalizeThreadMessagesV2', () => {
       text: `@${path.split('/').at(-1)}`,
     })
     expect(messages[0]?.images).toBeUndefined()
+  })
+
+  it('renders persisted user image inputs as attachment text without transcript images', () => {
+    const messages = normalizeThreadMessagesV2(threadReadResponseWithContent([{
+      type: 'userMessage',
+      id: 'user-image',
+      content: [
+        {
+          type: 'image',
+          url: '/codex-local-image?path=%2Ftmp%2Fuploads%2FIMG_2912.png&uploadHandle=managed-1',
+        },
+        { type: 'text', text: 'What is shown here?' },
+      ],
+    }]))
+
+    expect(messages).toEqual([
+      expect.objectContaining({
+        id: 'user-image',
+        role: 'user',
+        text: '@IMG_2912.png\n\nWhat is shown here?',
+      }),
+    ])
+    expect(messages[0]?.images).toBeUndefined()
+  })
+
+  it('keeps imageView and generated image URLs renderable', () => {
+    const messages = normalizeThreadMessagesV2(threadReadResponseWithContent([
+      { type: 'imageView', id: 'view-1', path: '/tmp/view.png' },
+      { type: 'imageGeneration', id: 'generated-1', result: 'data:image/png;base64,AAAA' },
+    ]))
+
+    expect(messages[0]?.images).toEqual(['/codex-local-image?path=%2Ftmp%2Fview.png'])
+    expect(messages[1]?.images).toEqual(['data:image/png;base64,AAAA'])
   })
 
   it('extracts persisted Codex directives from assistant messages only', () => {
@@ -70,6 +178,27 @@ describe('normalizeThreadMessagesV2', () => {
       text: '::git-push{cwd="/tmp/repo" branch="user-content"}',
     })
     expect(messages[1].directives).toBeUndefined()
+  })
+
+  it('preserves assistant message phase metadata for response actions', () => {
+    const messages = normalizeThreadMessagesV2(threadReadResponseWithContent([
+      {
+        type: 'agentMessage',
+        id: 'assistant-commentary',
+        text: 'Intermediate progress.',
+        phase: 'commentary',
+      },
+      {
+        type: 'agentMessage',
+        id: 'assistant-final',
+        text: 'Final answer.',
+        phase: 'final',
+      },
+    ]))
+
+    expect(messages).toEqual([
+      expect.objectContaining({ id: 'assistant-final', phase: 'final' }),
+    ])
   })
 
   it('normalizes official typed pull-request and code-comment literals', () => {
@@ -241,6 +370,145 @@ Reply with &lt;/instructions&gt; and A &amp; B
       turnIndex: 0,
     })])
     expect(messages[0]?.text).not.toContain('hidden chain-of-thought')
+  })
+
+  it('hides intermediate assistant progress messages from completed historical turns', () => {
+    const messages = normalizeThreadMessagesV2(threadReadResponseWithContent([
+      {
+        type: 'userMessage',
+        id: 'user-history',
+        content: [{ type: 'text', text: 'Continue the Kimi plan', text_elements: [] }],
+      },
+      {
+        type: 'agentMessage',
+        id: 'assistant-progress-1',
+        text: 'I will inspect the branch and then write the plan.',
+      },
+      {
+        type: 'commandExecution',
+        id: 'cmd-history',
+        command: 'git status --short',
+        status: 'completed',
+        aggregatedOutput: '',
+        exitCode: 0,
+      },
+      {
+        type: 'agentMessage',
+        id: 'assistant-progress-2',
+        text: 'The spec is written. I am running verification now.',
+      },
+      {
+        type: 'agentMessage',
+        id: 'assistant-final',
+        text: 'Done. The Kimi K3 text-only plan is ready.',
+      },
+    ]))
+
+    expect(messages.map((message) => message.id)).toEqual([
+      'user-history',
+      'cmd-history',
+      'assistant-final',
+    ])
+    expect(messages.map((message) => message.text).join('\n')).not.toContain('I will inspect')
+    expect(messages.map((message) => message.text).join('\n')).not.toContain('running verification')
+  })
+
+  it('preserves retained assistant progress from compressed terminal turn windows', () => {
+    const response = threadReadResponseWithContent([
+      {
+        type: 'userMessage',
+        id: 'user-compressed',
+        content: [{ type: 'text', text: 'Continue the long task', text_elements: [] }],
+      },
+      {
+        type: 'agentMessage',
+        id: 'assistant-retained-1',
+        text: 'First retained update from the compressed window.',
+      },
+      {
+        type: 'agentMessage',
+        id: 'assistant-retained-2',
+        text: 'Second retained update from the compressed window.',
+      },
+      {
+        type: 'agentMessage',
+        id: 'assistant-retained-3',
+        text: 'Latest retained update from the compressed window.',
+      },
+    ])
+    response.thread.turns[0].status = 'interrupted'
+    ;(response.thread.turns[0] as unknown as Record<string, unknown>).rawItemCompression = {
+      originalItemCount: 400,
+      retainedItemCount: 240,
+      omittedItemCount: 160,
+    }
+
+    const messages = normalizeThreadMessagesV2(response)
+
+    expect(messages.map((message) => message.id)).toEqual([
+      'user-compressed',
+      'assistant-retained-1',
+      'assistant-retained-2',
+      'assistant-retained-3',
+    ])
+  })
+
+  it('keeps intermediate assistant progress messages for the active running turn', () => {
+    const response = threadReadResponseWithContent([
+      {
+        type: 'userMessage',
+        id: 'user-running',
+        content: [{ type: 'text', text: 'Continue', text_elements: [] }],
+      },
+      {
+        type: 'agentMessage',
+        id: 'assistant-running-progress',
+        text: 'I am checking the current files.',
+      },
+      {
+        type: 'agentMessage',
+        id: 'assistant-running-latest',
+        text: 'Still running.',
+      },
+    ])
+    response.thread.turns[0].status = 'inProgress'
+
+    const messages = normalizeThreadMessagesV2(response)
+
+    expect(messages.map((message) => message.id)).toEqual([
+      'user-running',
+      'assistant-running-progress',
+      'assistant-running-latest',
+    ])
+  })
+
+  it('keeps intermediate assistant progress for the last turn when thread-level state is running', () => {
+    const response = threadReadResponseWithContent([
+      {
+        type: 'userMessage',
+        id: 'user-thread-running',
+        content: [{ type: 'text', text: 'Continue externally running thread', text_elements: [] }],
+      },
+      {
+        type: 'agentMessage',
+        id: 'assistant-thread-running-progress',
+        text: 'I am still working from another client.',
+      },
+      {
+        type: 'agentMessage',
+        id: 'assistant-thread-running-latest',
+        text: 'Waiting for tool output.',
+      },
+    ])
+    ;(response.thread as unknown as Record<string, unknown>).inProgress = true
+
+    const messages = normalizeThreadMessagesV2(response)
+
+    expect(messages.map((message) => message.id)).toEqual([
+      'user-thread-running',
+      'assistant-thread-running-progress',
+      'assistant-thread-running-latest',
+    ])
   })
 
   it('renders failed turn errors as chat system messages', () => {
@@ -586,6 +854,32 @@ describe('normalizeThreadGroupsV2', () => {
       id: 'thread-external',
       inProgress: true,
       unread: false,
+    })
+  })
+
+  it('carries desktop has-user-event read metadata from thread list rows', () => {
+    const response: ThreadListResponse = {
+      data: [{
+        id: 'thread-read-on-desktop',
+        preview: 'Desktop read task',
+        modelProvider: 'openai',
+        createdAt: 1,
+        updatedAt: 2,
+        path: '/sessions/thread-read-on-desktop.jsonl',
+        cwd: '/tmp/project',
+        cliVersion: 'test',
+        source: 'vscode',
+        gitInfo: null,
+        turns: [],
+        desktopHasUserEvent: false,
+      } as ThreadListResponse['data'][number],
+      ],
+      nextCursor: null,
+    }
+
+    expect(normalizeThreadGroupsV2(response)[0]?.threads[0]).toMatchObject({
+      id: 'thread-read-on-desktop',
+      desktopHasUserEvent: false,
     })
   })
 })

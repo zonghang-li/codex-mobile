@@ -26,6 +26,7 @@ import { createServer as createApp } from '../server/httpServer.js'
 import { generatePassword } from '../server/password.js'
 import { spawnSyncCommand } from '../utils/commandInvocation.js'
 import { listenWithFallback, openBrowser } from './shared/launcher.js'
+import { createSharedShutdown, runBestEffortShutdown } from './shared/shutdown.js'
 
 const program = new Command().name('codexui').description('Web interface for Codex app-server')
 const __dirname = dirname(fileURLToPath(import.meta.url))
@@ -500,7 +501,7 @@ async function startServer(options: {
     : null
   const { app, dispose, attachWebSocket } = createApp({ password })
   const server = createServer(app)
-  attachWebSocket(server)
+  const closeWebSocket = attachWebSocket(server)
   const listening = await listenWithFallback(server, requestedPort, '0.0.0.0')
   const port = listening.port
   process.env.CODEXUI_SERVER_PORT = String(port)
@@ -564,24 +565,27 @@ async function startServer(options: {
   }
   if (options.open) openBrowser(`http://localhost:${String(port)}`)
 
-  function shutdown() {
-    console.log('\nShutting down...')
-    if (tunnelChild && !tunnelChild.killed) {
-      tunnelChild.kill('SIGTERM')
-    }
-    server.close(() => {
-      dispose()
-      process.exit(0)
-    })
-    // Force exit after timeout
-    setTimeout(() => {
-      dispose()
-      process.exit(1)
-    }, 5000).unref()
+  const shutdown = createSharedShutdown(() => runBestEffortShutdown(
+    () => listening.close(),
+    [
+      () => {
+        console.log('\nShutting down...')
+        if (tunnelChild && !tunnelChild.killed) {
+          tunnelChild.kill('SIGTERM')
+        }
+      },
+      closeWebSocket,
+      dispose,
+    ],
+  ))
+  const handleShutdownSignal = () => {
+    void shutdown().then(
+      () => process.exit(0),
+      () => process.exit(1),
+    )
   }
-
-  process.on('SIGINT', shutdown)
-  process.on('SIGTERM', shutdown)
+  process.on('SIGINT', handleShutdownSignal)
+  process.on('SIGTERM', handleShutdownSignal)
 }
 
 async function runLogin() {

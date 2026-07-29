@@ -6,7 +6,7 @@ Make the mobile conversation page remain responsive and accurate while a Codex D
 
 The change covers:
 
-- bounded live synchronization during automatic context compaction;
+- full-history live synchronization with server-side historical reasoning pruning during automatic context compaction;
 - read-only observation of Desktop-owned tasks without importing Desktop-only dynamic tools;
 - image attachments rendered as `@filename` text rather than previews;
 - a single active-turn file-change footer;
@@ -19,7 +19,7 @@ The change covers:
 
 ### Full-turn polling stalls the browser
 
-The external-runtime poll currently requests a complete ten-turn snapshot every second. A captured production request reached 21.2 MB during automatic compaction. The mobile browser repeatedly parses, normalizes, diffs, and renders the same large completed turns even though only the newest turn can change.
+The external-runtime poll previously requested a complete multi-turn snapshot every second. A captured production request reached 21.2 MB during automatic compaction. The mobile browser repeatedly parsed, normalized, diffed, and rendered large completed turns even though only the active turn can change.
 
 ### Read operations resume Desktop-owned tasks
 
@@ -43,17 +43,21 @@ The subagent chip currently has a gray fill. The composer always renders `Approv
 
 ## Design
 
-### 1. Bounded external live synchronization
+### 1. Full-history external live synchronization with historical reasoning/progress pruning
 
-- Initial thread detail contains the newest five turns.
-- External live-state responses contain only the newest turn, its absolute turn index, runtime ownership, active turn ID, and completion metadata.
-- The client reconciles that newest turn into the already-loaded five-turn window with `preserveMissing: true`; older visible turns are not removed.
+- Initial thread detail contains every turn, not only a recent window.
+- Server responses remove `reasoning` items from every non-running turn so historical loads keep user/assistant body content without replaying old thinking summaries.
+- Completed historical turns render only their final assistant reply by default; earlier assistant progress messages from the same turn are treated as process output, not user-visible final body.
+- The latest running turn keeps its reasoning items; when an external writer owns the thread, the runtime active turn ID is authoritative for that exception.
+- If thread-level state says the task is still running, the last turn keeps intermediate assistant progress even when its per-turn status is stale.
+- External live-state responses use the same full-history/pruned-reasoning shape plus absolute turn index, runtime ownership, active turn ID, and completion metadata.
+- The client reconciles live-state into the already-loaded history with `preserveMissing: true`; older visible turns are not removed.
 - Polling remains approximately one second while the page is visible so new output remains timely.
 - Polling pauses while the document is hidden and resumes immediately when visible.
-- A context-compaction item is treated as ordinary newest-turn activity; it does not trigger a full-history reload.
-- Completion performs one terminal newest-turn reconciliation, releases the external runtime lease, and re-enables local controls without a manual refresh.
+- A context-compaction item is treated as ordinary active-turn activity; it does not trigger an extra full-history reload.
+- Completion performs one terminal reconciliation, releases the external runtime lease, and re-enables local controls without a manual refresh.
 
-This keeps the mobile payload proportional to the active turn instead of total visible history.
+This preserves full conversation context while keeping expensive reasoning/progress presentation proportional to the active turn. Repeated live-state polls still rely on projection keys and cached not-modified responses to avoid resending unchanged history.
 
 ### 2. Read without ownership takeover
 
@@ -135,9 +139,9 @@ All production changes follow red-green-refactor.
 
 ### Live sync and ownership
 
-- Initial detail is limited to five turns.
-- External live state contains exactly the newest turn and correct absolute index.
-- Existing visible turns survive newest-turn reconciliation.
+- Initial detail includes all turns with historical reasoning pruned and completed-turn assistant progress hidden from the default transcript.
+- External live state includes all turns with historical reasoning pruned and the correct absolute index.
+- Existing visible turns survive active-turn reconciliation.
 - Context compaction does not trigger a full history request.
 - Existing-thread selection performs zero `thread/resume` calls.
 - An idle user send performs the required resume/start path.

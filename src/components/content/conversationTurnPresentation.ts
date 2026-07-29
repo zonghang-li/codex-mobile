@@ -8,6 +8,7 @@ export type ConversationTurnSection = {
   finalMessageId: string | null
   completionMessageId: string | null
   completionLabel: string | null
+  completionCreatedAtMs: number | null
   isCollapsed: boolean
 }
 
@@ -22,9 +23,56 @@ export type ResponseActionVisibilityInput = {
   runtimeActive: boolean
 }
 
+export type SimplifiedTranscriptVisibilityInput = {
+  messages: readonly UiMessage[]
+  activeTurnId: string | null
+  isThreadInProgress: boolean
+}
+
 type MutableTurnSection = ConversationTurnSection & {
   seenMessageIds: Set<string>
 }
+
+const TITLE_ONLY_REASONING_PREFIXES = [
+  'Adding',
+  'Analyzing',
+  'Assessing',
+  'Asserting',
+  'Allowing',
+  'Checking',
+  'Choosing',
+  'Clarifying',
+  'Confirming',
+  'Defining',
+  'Designing',
+  'Diagnosing',
+  'Evaluating',
+  'Examining',
+  'Identifying',
+  'Implementing',
+  'Inspecting',
+  'Investigating',
+  'Linking',
+  'Locating',
+  'Parsing',
+  'Planning',
+  'Preventing',
+  'Preparing',
+  'Proposing',
+  'Reading',
+  'Refining',
+  'Reviewing',
+  'Testing',
+  'Tracing',
+  'Updating',
+  'Validating',
+  'Verifying',
+  'Weighing',
+]
+
+const TITLE_ONLY_REASONING_EXACT_TEXTS = new Set([
+  'Existing tests',
+])
 
 export function suppressResponseActions(input: ResponseActionVisibilityInput): boolean {
   const activeTurnId = input.activeTurnId.trim()
@@ -43,8 +91,14 @@ function explicitTurnKey(message: UiMessage): string {
   return ''
 }
 
+function isFinalPhaseMessage(message: UiMessage): boolean {
+  const phase = message.phase?.trim().toLowerCase() ?? ''
+  return !phase || phase === 'final'
+}
+
 function isFinalAssistantResponse(message: UiMessage): boolean {
   if (message.role !== 'assistant' || !message.text.trim()) return false
+  if (!isFinalPhaseMessage(message)) return false
   if (isThreadActivityMessage(message)) return false
   if (message.activity?.kind === 'subAgent') return false
   const messageType = message.messageType ?? ''
@@ -61,9 +115,21 @@ function createSection(turnId: string, activeTurnId: string | null): MutableTurn
     finalMessageId: null,
     completionMessageId: null,
     completionLabel: null,
+    completionCreatedAtMs: null,
     isCollapsed: turnId !== activeTurnId,
     seenMessageIds: new Set<string>(),
   }
+}
+
+export function formatCompletionClockTime(value: number | null | undefined): string {
+  if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0) return ''
+  const date = new Date(value)
+  const year = date.getFullYear()
+  const month = String(date.getMonth() + 1).padStart(2, '0')
+  const day = String(date.getDate()).padStart(2, '0')
+  const hour = String(date.getHours()).padStart(2, '0')
+  const minute = String(date.getMinutes()).padStart(2, '0')
+  return `${year}-${month}-${day} ${hour}:${minute}`
 }
 
 export function projectConversationTurns(
@@ -107,6 +173,7 @@ export function projectConversationTurns(
     if (message.messageType === 'worked') {
       section.completionMessageId = message.id
       section.completionLabel = message.text.trim() || null
+      section.completionCreatedAtMs = typeof message.createdAtMs === 'number' ? message.createdAtMs : null
       section.isCollapsed = section.turnId !== input.activeTurnId
       continue
     }
@@ -122,4 +189,85 @@ export function projectConversationTurns(
   }
 
   return sections.map(({ seenMessageIds: _seenMessageIds, ...section }) => section)
+}
+
+function normalizePotentialReasoningStatusTitle(text: string): string {
+  return text
+    .replace(/\s+/gu, ' ')
+    .trim()
+    .replace(/^#{1,6}\s+/u, '')
+    .replace(/^\*\*([\s\S]+)\*\*$/u, '$1')
+    .replace(/^__([\s\S]+)__$/u, '$1')
+    .trim()
+}
+
+function isTitleOnlyReasoningStatusText(value: string): boolean {
+  const text = normalizePotentialReasoningStatusTitle(value)
+  if (!text || text.length > 128) return false
+  if (/[\p{Script=Han}]/u.test(text)) return false
+  if (TITLE_ONLY_REASONING_EXACT_TEXTS.has(text)) return true
+  if (TITLE_ONLY_REASONING_PREFIXES.some((prefix) => text.startsWith(`${prefix} `))) {
+    return true
+  }
+  if (/[。！？.!?:；;，,]/u.test(text)) return false
+  if (/^(?:I|I'm|I'll|I’ll|We|The|This|That|It|They|There)\b/u.test(text)) {
+    return false
+  }
+  return /^[A-Z][\p{L}\p{N}_./'()+-]*(?:\s+[\p{L}\p{N}_./'()+-]+){1,14}$/u.test(text)
+    && /\b[\p{L}\p{N}_./'()+-]*ing\b/u.test(text)
+}
+
+function isTitleOnlyReasoningStatusLine(message: UiMessage): boolean {
+  return isTitleOnlyReasoningStatusText(message.text)
+}
+
+export function stripTitleOnlyReasoningStatusLines(text: string): string {
+  const lines = text.replace(/\r\n/gu, '\n').split('\n')
+  const filtered = lines.filter((line) => !isTitleOnlyReasoningStatusText(line))
+  return filtered.join('\n').replace(/\n{3,}/gu, '\n\n').trim()
+}
+
+export function hiddenSimplifiedTranscriptMessageIds(
+  input: SimplifiedTranscriptVisibilityInput,
+): Set<string> {
+  const hidden = new Set<string>()
+  const activeTurnId = input.isThreadInProgress ? input.activeTurnId?.trim() ?? '' : ''
+
+  for (const message of input.messages) {
+    if (message.role === 'user') continue
+
+    if (
+      (message.role === 'assistant' || message.role === 'system')
+      && message.text.trim()
+      && !stripTitleOnlyReasoningStatusLines(message.text)
+    ) {
+      hidden.add(message.id)
+      continue
+    }
+
+    if (message.messageType === 'reasoning') {
+      if (isTitleOnlyReasoningStatusLine(message)) {
+        hidden.add(message.id)
+        continue
+      }
+      if (
+        input.isThreadInProgress
+        && (!activeTurnId || message.turnId === activeTurnId)
+      ) {
+        continue
+      }
+      hidden.add(message.id)
+      continue
+    }
+
+    if (
+      message.messageType === 'worked'
+      || isThreadActivityMessage(message)
+      || message.activity?.kind === 'subAgent'
+    ) {
+      hidden.add(message.id)
+    }
+  }
+
+  return hidden
 }

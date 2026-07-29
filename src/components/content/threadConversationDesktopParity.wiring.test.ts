@@ -101,6 +101,19 @@ describe('ThreadConversation Codex desktop activity parity wiring', () => {
     expect(source).toContain('if (isSnapshotTextStreamTargetMessage(message)) return null')
   })
 
+  it('renders every active external reasoning item through the full transcript body', () => {
+    expect(source).toContain('function isActiveTurnReasoningTranscript(message: UiMessage): boolean')
+    expect(source).toContain('if (isActiveTurnReasoningTranscript(message)) return null')
+    expect(source).toMatch(/function isActivityMessage[\s\S]*if \(isActiveTurnReasoningTranscript\(message\)\) return false/u)
+    expect(source).toContain('shouldRenderReasoningAsTranscript(message, {')
+  })
+
+  it('does not blank active reasoning rows while snapshot streaming catches up', () => {
+    expect(source).toMatch(
+      /function isSnapshotTextStreamRenderableMessage\(message: UiMessage\): boolean \{[\s\S]*message\.messageType !== 'reasoning'/u,
+    )
+  })
+
   it('does not auto-expand command output at the end of a running transcript', () => {
     expect(source).toContain('isCommandOutputExpanded(')
     expect(source).toContain('toggleCommandOutputExpanded(')
@@ -122,5 +135,39 @@ describe('ThreadConversation Codex desktop activity parity wiring', () => {
     expect(source).toContain('section.isCollapsed && section.completionMessageId !== null')
     expect(source).toContain('projectedActivityMessageIds.value.has(message.id)')
     expect(source).toContain(':data-turn-final-response="isProjectedFinalResponse(message)')
+  })
+
+  it('applies the simplified mobile transcript filter before rendering messages', () => {
+    expect(source).toContain('hiddenSimplifiedTranscriptMessageIds')
+    expect(source).toContain('const hiddenSimplifiedTranscriptIds = computed(() => hiddenSimplifiedTranscriptMessageIds({')
+    expect(source).toMatch(/filterRenderableThreadMessages\([\s\S]*hiddenSimplifiedTranscriptIds\.value/u)
+  })
+
+  it('renders Codex delegation user prompts as collapsed user messages instead of raw transport XML', () => {
+    expect(source).toContain("from './userMessagePresentation'")
+    expect(source).toContain('deriveUserMessagePresentation(message')
+    expect(source).toContain('data-user-delegation')
+    expect(source).toContain('displayMessageText(message)')
+    expect(source).toContain('message-show-more-button')
+    expect(source).toMatch(/function getMessageBlocks\(message: UiMessage\): MessageBlock\[\] \{\s*const text = displayMessageText\(message\)/u)
+  })
+
+  it('does not render response actions for messages whose body is hidden', () => {
+    expect(source).toMatch(
+      /v-if="messageHasDisplayContent\(message\) && \(showCopyResponseButton\(message\) \|\| showForkResponseButton\(message\)\)"/u,
+    )
+    expect(source).toMatch(/function isCopyableAssistantMessage\(message: UiMessage\): boolean \{[\s\S]*isProjectedFinalResponse\(message\)/u)
+  })
+
+  it('does not let the loading placeholder hide optimistic submitted user messages', () => {
+    expect(source).toContain('v-if="isLoading && !hasRenderableConversationContent"')
+    expect(source).toContain('const hasRenderableConversationContent = computed(() =>')
+    expect(source).toMatch(/if \(props\.isLoading && next\.length === 0\) return/u)
+  })
+
+  it('strips embedded title-only reasoning status lines from assistant display text', () => {
+    expect(source).toContain('stripTitleOnlyReasoningStatusLines')
+    expect(source).toMatch(/function displayMessageText\(message: UiMessage\): string \{[\s\S]*message\.role === 'assistant'[\s\S]*return stripTitleOnlyReasoningStatusLines\(presentationText\)/u)
+    expect(source).not.toContain('message.turnId === activeTurnId')
   })
 })

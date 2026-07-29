@@ -14,7 +14,7 @@ Return to the [manual test index](../../tests.md).
 | [Feature: Deferred ancillary startup refreshes](deferred-ancillary-startup-refreshes.md) |
 | [Feature: No automatic restore of last active thread on startup](no-automatic-restore-of-last-active-thread-on-startup.md) |
 | [Feature: Disable auto-restore to last thread when opening home URL](disable-auto-restore-to-last-thread-when-opening-home-url.md) |
-| [Feature: Thread load capped to latest 10 turns](thread-load-capped-to-latest-10-turns.md) |
+| [Feature: Thread loads full history with pruned historical reasoning](thread-loads-full-history-with-pruned-reasoning.md) |
 | [Feature: Pinned threads persist across reload and prune removed threads](pinned-threads-persist-across-reload-and-prune-removed-threads.md) |
 | [Feature: Keep manual chat scroll position during streaming](keep-manual-chat-scroll-position-during-streaming.md) |
 | [Feature: Rapid thread switching during active load](rapid-thread-switching-during-active-load.md) |
@@ -32,6 +32,7 @@ Return to the [manual test index](../../tests.md).
 | [Active thread switches after delete](active-thread-switches-after-delete.md) |
 | [Thread open always autoscrolls to latest](thread-open-always-autoscrolls-to-latest.md) |
 | [Thread conversation loads earlier turns on demand](thread-conversation-loads-earlier-turns-on-demand.md) |
+| [Native turn pagination load performance](native-turn-pagination-load-performance.md) |
 | [Missing thread route errors render in chat](missing-thread-route-errors-render-in-chat.md) |
 | [Non-thread startup selection priming](non-thread-startup-selection-priming.md) |
 | [Feature: External client running state after refresh](external-client-running-state-after-refresh.md) |

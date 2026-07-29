@@ -14,6 +14,11 @@ type SnapshotTextStreamEntry = {
   streamable: boolean
 }
 
+type SnapshotTextStreamCarry = Pick<
+  SnapshotTextStreamEntry,
+  'displayText' | 'displayCommandOutput'
+>
+
 export type SnapshotTextStreamerOptions = {
   textChunkSize?: number
   outputChunkSize?: number
@@ -44,6 +49,28 @@ export function createSnapshotTextStreamer(options: SnapshotTextStreamerOptions 
   const outputChunkSize = Math.max(1, Math.floor(options.outputChunkSize ?? 96))
   const entries = new Map<string, SnapshotTextStreamEntry>()
 
+  const findCarryFor = (targetText: string, targetCommandOutput: string): SnapshotTextStreamCarry | null => {
+    let best: SnapshotTextStreamCarry | null = null
+    let bestScore = -1
+
+    for (const entry of entries.values()) {
+      if (!entry.streamable) continue
+      if (!targetText.startsWith(entry.displayText)) continue
+      if (!targetCommandOutput.startsWith(entry.displayCommandOutput)) continue
+
+      const score = entry.displayText.length + entry.displayCommandOutput.length
+      if (score <= bestScore) continue
+
+      best = {
+        displayText: entry.displayText,
+        displayCommandOutput: entry.displayCommandOutput,
+      }
+      bestScore = score
+    }
+
+    return best
+  }
+
   const hasPending = (): boolean => {
     for (const entry of entries.values()) {
       if (!entry.streamable) continue
@@ -72,8 +99,17 @@ export function createSnapshotTextStreamer(options: SnapshotTextStreamerOptions 
         const previous = entries.get(input.id)
 
         if (!previous) {
-          const displayText = streamable && targetCommandOutput.length === 0 ? '' : input.text
-          const displayCommandOutput = streamable ? '' : targetCommandOutput
+          const carry = streamable ? findCarryFor(input.text, targetCommandOutput) : null
+          const displayText = carry
+            ? carry.displayText
+            : streamable && targetCommandOutput.length === 0
+              ? ''
+              : input.text
+          const displayCommandOutput = carry
+            ? carry.displayCommandOutput
+            : streamable
+              ? ''
+              : targetCommandOutput
           entries.set(input.id, {
             displayText,
             targetText: input.text,

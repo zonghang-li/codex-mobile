@@ -1,36 +1,5 @@
 <template>
-  <div v-if="footerState || goal" class="conversation-run-footer" aria-live="polite">
-    <div v-if="footerState" class="conversation-run-footer-pill">
-      <ConversationProgressDonut
-        v-if="footerState.stepNumber !== null"
-        :value="footerState.completedPercent"
-      />
-      <span v-if="footerState.stepNumber !== null" class="conversation-run-footer-step">
-        {{
-          t('Step {step} / {count}', {
-            step: footerState.stepNumber,
-            count: footerState.stepCount,
-          })
-        }}
-      </span>
-      <span
-        v-if="footerState.stepNumber !== null && footerState.fileCount > 0"
-        class="conversation-run-footer-separator"
-        aria-hidden="true"
-      >
-        ·
-      </span>
-      <span v-if="footerState.fileCount > 0" class="conversation-run-footer-files">
-        {{ formatFileCount(footerState.fileCount) }}
-      </span>
-      <span v-if="footerState.additions > 0" class="conversation-run-footer-delta is-added">
-        +{{ footerState.additions }}
-      </span>
-      <span v-if="footerState.deletions > 0" class="conversation-run-footer-delta is-deleted">
-        -{{ footerState.deletions }}
-      </span>
-    </div>
-
+  <div v-if="goal" class="conversation-run-footer" aria-live="polite">
     <section v-if="goalSupported && goal && goalPresentation" class="conversation-goal-strip">
       <div class="conversation-goal-row">
         <button
@@ -188,7 +157,7 @@
 
 <script setup lang="ts">
 import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
-import type { ConversationFooterState, UiThreadGoal, UiThreadGoalStatus } from '../../types/codex'
+import type { UiThreadGoal, UiThreadGoalStatus } from '../../types/codex'
 import { useUiLanguage } from '../../composables/useUiLanguage'
 import IconTablerChevronRight from '../icons/IconTablerChevronRight.vue'
 import IconTablerFilePencil from '../icons/IconTablerFilePencil.vue'
@@ -197,13 +166,11 @@ import IconTablerPlayerPlay from '../icons/IconTablerPlayerPlay.vue'
 import IconTablerTargetArrow from '../icons/IconTablerTargetArrow.vue'
 import IconTablerTrash from '../icons/IconTablerTrash.vue'
 import IconTablerX from '../icons/IconTablerX.vue'
-import ConversationProgressDonut from './ConversationProgressDonut.vue'
 import { useConversationGoalEditorState } from './composerControlState'
 import { deriveThreadGoalPresentation } from './threadGoalPresentation'
 
 const props = defineProps<{
   threadId: string
-  footerState: ConversationFooterState | null
   goal: UiThreadGoal | null
   goalSupported: boolean
   isUpdatingGoal: boolean
@@ -252,10 +219,6 @@ onUnmounted(() => {
   if (timer) clearInterval(timer)
   clearGoalConfirmationTimerIfNeeded()
 })
-
-function formatFileCount(count: number): string {
-  return count === 1 ? t('1 file changed') : t('{count} files changed', { count })
-}
 
 function beginGoalEdit(): void {
   cancelGoalClear(false)
@@ -319,13 +282,6 @@ function requestGoalClear(): void {
 .conversation-run-footer {
   @apply flex w-full min-w-0 flex-col items-center gap-2;
   max-width: 100%;
-}
-
-.conversation-run-footer-pill {
-  @apply inline-flex min-w-0 max-w-full items-center gap-1.5 rounded-2xl border border-zinc-300 bg-zinc-100/95 px-3 py-1.5 text-sm leading-5 text-zinc-600 shadow-sm backdrop-blur;
-  min-width: 0;
-  max-width: 100%;
-  overflow: hidden;
 }
 
 .conversation-goal-strip {
@@ -403,27 +359,6 @@ function requestGoalClear(): void {
 
 .conversation-goal-editor-actions button {
   @apply rounded-full border border-zinc-300 bg-white px-3 py-1.5 text-xs font-medium text-zinc-700 hover:bg-zinc-50 disabled:cursor-default disabled:opacity-40;
-}
-
-.conversation-run-footer-step,
-.conversation-run-footer-files {
-  @apply min-w-0 truncate tabular-nums;
-}
-
-.conversation-run-footer-separator {
-  @apply shrink-0 text-zinc-400;
-}
-
-.conversation-run-footer-delta {
-  @apply shrink-0 font-medium tabular-nums;
-}
-
-.conversation-run-footer-delta.is-added {
-  @apply text-emerald-500;
-}
-
-.conversation-run-footer-delta.is-deleted {
-  @apply text-rose-500;
 }
 
 @media (max-width: 640px) {

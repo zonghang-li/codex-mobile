@@ -1,5 +1,5 @@
 <template>
-  <form class="thread-composer" @submit.prevent="onSubmit(isTurnInProgress ? activeInProgressMode : 'steer')">
+  <form class="thread-composer" @submit.prevent="onSubmit(submitMode)">
     <p v-if="dictationErrorText" class="thread-composer-dictation-error">
       {{ dictationErrorText }}
     </p>
@@ -161,7 +161,7 @@
             :disabled="isInteractionDisabled"
             @click="toggleAttachMenu"
           >
-            +
+            <span class="thread-composer-attach-plus">+</span>
           </button>
 
           <div v-if="isAttachMenuOpen" class="thread-composer-attach-menu">
@@ -205,30 +205,6 @@
               @create="onCreatePrompt"
               @remove="onRemovePrompt"
             />
-            <div class="thread-composer-attach-separator" />
-            <div class="thread-composer-attach-mode">
-              <span class="thread-composer-attach-mode-label">{{ t('In-progress send') }}</span>
-              <div class="thread-composer-attach-mode-buttons">
-                <button
-                  class="thread-composer-attach-mode-button"
-                  :class="{ 'is-active': activeInProgressMode === 'steer' }"
-                  type="button"
-                  :disabled="isInteractionDisabled"
-                  @click="setActiveInProgressMode('steer')"
-                >
-                  {{ t('Steer') }}
-                </button>
-                <button
-                  class="thread-composer-attach-mode-button"
-                  :class="{ 'is-active': activeInProgressMode === 'queue' }"
-                  type="button"
-                  :disabled="isInteractionDisabled"
-                  @click="setActiveInProgressMode('queue')"
-                >
-                  {{ t('Queue') }}
-                </button>
-              </div>
-            </div>
             <div class="thread-composer-attach-separator" />
             <button
               v-if="isFastModeSupported"
@@ -382,12 +358,12 @@
           <button
             v-else
             class="thread-composer-submit"
-            :class="{ 'thread-composer-submit--queue': isTurnInProgress && activeInProgressMode === 'queue' }"
+            :class="{ 'thread-composer-submit--queue': submitMode === 'queue' }"
             type="button"
-            :aria-label="isTurnInProgress && activeInProgressMode === 'queue' ? t('Queue message') : t('Send message')"
-            :title="isTurnInProgress ? `${t('Send')} ${activeInProgressMode === 'queue' ? t('Queue') : t('Steer')}` : t('Send')"
+            :aria-label="submitMode === 'queue' ? t('Queue message') : t('Send message')"
+            :title="submitMode === 'queue' ? `${t('Send')} ${t('Queue')}` : t('Send')"
             :disabled="!canSubmit"
-            @click="onSubmit(isTurnInProgress ? activeInProgressMode : 'steer')"
+            @click="onSubmit(submitMode)"
           >
             <IconTablerArrowUp class="thread-composer-submit-icon" />
           </button>
@@ -596,8 +572,7 @@ const {
     draft.value = draft.value ? `${draft.value}\n${text}` : text
     dictationFeedback.value = ''
     if (props.dictationAutoSend !== false) {
-      const mode = props.isTurnInProgress ? activeInProgressMode.value : 'steer'
-      onSubmit(mode)
+      onSubmit(submitMode.value)
       return
     }
     nextTick(() => inputRef.value?.focus())
@@ -759,10 +734,9 @@ const speedModeDescription = computed(() => {
     ? t('About 1.5x faster, with credits used at 2x')
     : t('Default speed with normal credit usage')
 })
-const inProgressMode = computed<'steer' | 'queue'>(() =>
-  props.inProgressSubmitMode === 'steer' ? 'steer' : 'queue',
+const submitMode = computed<'steer' | 'queue'>(() =>
+  props.isTurnInProgress ? 'queue' : 'steer',
 )
-const activeInProgressMode = ref<'steer' | 'queue'>(inProgressMode.value)
 const isDictationRecording = computed(() => dictationState.value === 'recording')
 const dictationButtonLabel = computed(() => {
   if (dictationState.value === 'recording') return t('Stop dictation')
@@ -1065,11 +1039,6 @@ function onSubmit(mode: 'steer' | 'queue' = 'steer'): void {
     return
   }
   nextTick(() => inputRef.value?.focus())
-}
-
-function setActiveInProgressMode(mode: 'steer' | 'queue'): void {
-  if (isInteractionDisabled.value) return
-  activeInProgressMode.value = mode
 }
 
 function replaceDraftState(payload: ComposerDraftPayload): void {
@@ -1797,7 +1766,7 @@ function onInputKeydown(event: KeyboardEvent): void {
     : event.key === 'Enter' && (event.metaKey || event.ctrlKey)
   if (shouldSend) {
     event.preventDefault()
-    onSubmit(props.isTurnInProgress ? activeInProgressMode.value : 'steer')
+    onSubmit(submitMode.value)
     return
   }
 }
@@ -2114,14 +2083,6 @@ watch(
   },
 )
 
-watch(
-  inProgressMode,
-  (nextMode) => {
-    activeInProgressMode.value = nextMode
-  },
-)
-
-
 </script>
 
 <style scoped>
@@ -2392,7 +2353,12 @@ watch(
 }
 
 .thread-composer-attach-trigger {
-  @apply inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-none border-0 bg-transparent pb-px text-xl leading-tight text-zinc-700 transition hover:text-zinc-900 disabled:cursor-not-allowed disabled:text-zinc-400;
+  @apply inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-none border-0 bg-transparent text-xl leading-none text-zinc-700 transition hover:text-zinc-900 disabled:cursor-not-allowed disabled:text-zinc-400;
+}
+
+.thread-composer-attach-plus {
+  @apply inline-flex items-center justify-center leading-none;
+  transform: translateY(-1px);
 }
 
 :global(.dark) .thread-composer-attach-trigger {
@@ -2417,26 +2383,6 @@ watch(
 
 .thread-composer-attach-separator {
   @apply my-1 h-px bg-zinc-100;
-}
-
-.thread-composer-attach-mode {
-  @apply px-3 py-2 flex items-center justify-between gap-2;
-}
-
-.thread-composer-attach-mode-label {
-  @apply text-sm text-zinc-800;
-}
-
-.thread-composer-attach-mode-buttons {
-  @apply inline-flex items-center rounded-full border border-zinc-200 bg-white p-0.5;
-}
-
-.thread-composer-attach-mode-button {
-  @apply rounded-full border-0 bg-transparent px-2 py-1 text-xs text-zinc-600 transition hover:text-zinc-800 disabled:cursor-not-allowed disabled:text-zinc-400;
-}
-
-.thread-composer-attach-mode-button.is-active {
-  @apply bg-zinc-900 text-white hover:text-white;
 }
 
 .thread-composer-attach-setting {

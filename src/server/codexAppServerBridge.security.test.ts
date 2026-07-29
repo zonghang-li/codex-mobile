@@ -31,9 +31,38 @@ describe('Codex bridge security-policy wiring', () => {
     cleanupRoots.push(root)
     const upload = await createManagedUpload('photo.png', Buffer.from('image'), root)
 
-    await expect(deleteManagedUpload(upload.uploadHandle)).resolves.toBe(true)
+    await expect(deleteManagedUpload(upload.uploadHandle, {
+      minimumRetentionMs: 0,
+    })).resolves.toBe(true)
     await expect(lstat(dirname(upload.path))).rejects.toThrow()
+    await expect(deleteManagedUpload(upload.uploadHandle, {
+      minimumRetentionMs: 0,
+    })).resolves.toBe(true)
+  })
+
+  it('retains a fresh managed upload when cleanup races its first consumer', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'codex-managed-upload-retention-'))
+    cleanupRoots.push(root)
+    const upload = await createManagedUpload('photo.png', Buffer.from('image'), root)
+
     await expect(deleteManagedUpload(upload.uploadHandle)).resolves.toBe(true)
+    await expect(readFile(upload.path, 'utf8')).resolves.toBe('image')
+  })
+
+  it('reaps a released managed upload after its minimum retention window', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'codex-managed-upload-release-'))
+    cleanupRoots.push(root)
+    const upload = await createManagedUpload('photo.png', Buffer.from('image'), root)
+    const issuedAtMs = Number.parseInt(upload.uploadHandle.split('.')[1] ?? '', 36)
+
+    await expect(deleteManagedUpload(upload.uploadHandle, {
+      nowMs: issuedAtMs,
+    })).resolves.toBe(true)
+    await expect(reapExpiredManagedUploads({
+      uploadRoot: root,
+      nowMs: issuedAtMs + (5 * 60 * 1000) + 1,
+    })).resolves.toBe(1)
+    await expect(lstat(dirname(upload.path))).rejects.toThrow()
   })
 
   it.each([
@@ -63,7 +92,9 @@ describe('Codex bridge security-policy wiring', () => {
     await rm(uploadDir)
     await mkdir(uploadDir)
     await writeFile(join(uploadDir, 'photo.png'), 'image')
-    await expect(deleteManagedUpload(upload.uploadHandle)).resolves.toBe(true)
+    await expect(deleteManagedUpload(upload.uploadHandle, {
+      minimumRetentionMs: 0,
+    })).resolves.toBe(true)
   })
 
   it('coalesces concurrent cleanup of the same issued handle', async () => {
@@ -72,8 +103,8 @@ describe('Codex bridge security-policy wiring', () => {
     const upload = await createManagedUpload('photo.png', Buffer.from('image'), root)
 
     await expect(Promise.all([
-      deleteManagedUpload(upload.uploadHandle),
-      deleteManagedUpload(upload.uploadHandle),
+      deleteManagedUpload(upload.uploadHandle, { minimumRetentionMs: 0 }),
+      deleteManagedUpload(upload.uploadHandle, { minimumRetentionMs: 0 }),
     ])).resolves.toEqual([true, true])
   })
 
@@ -87,10 +118,12 @@ describe('Codex bridge security-policy wiring', () => {
 
     await expect(restartedBridge.deleteManagedUpload(upload.uploadHandle, {
       uploadRoot: root,
+      minimumRetentionMs: 0,
     })).resolves.toBe(true)
     await expect(lstat(dirname(upload.path))).rejects.toThrow()
     await expect(restartedBridge.deleteManagedUpload(upload.uploadHandle, {
       uploadRoot: root,
+      minimumRetentionMs: 0,
     })).resolves.toBe(true)
   })
 

@@ -241,6 +241,33 @@ describe('writeWorkspaceRootsState', () => {
 })
 
 describe('canonicalizeThreadListResponseForRead', () => {
+  it('removes heavy conversation payloads from thread-list rows', async () => {
+    const payload = await canonicalizeThreadListResponseForRead({
+      data: [
+        {
+          id: 'thread-with-heavy-data',
+          cwd: '/workspace/project',
+          title: 'Heavy thread',
+          turns: [{ id: 'turn-1', items: [{ id: 'item-1', text: 'large transcript' }] }],
+          items: [{ id: 'item-at-thread-level' }],
+          messages: [{ role: 'assistant', text: 'large message' }],
+        },
+      ],
+      nextCursor: null,
+    }, async (value) => value)
+
+    expect(payload).toEqual({
+      data: [
+        {
+          id: 'thread-with-heavy-data',
+          cwd: '/workspace/project',
+          title: 'Heavy thread',
+        },
+      ],
+      nextCursor: null,
+    })
+  })
+
   it('realpaths thread cwd values to match canonicalized workspace roots', async () => {
     const payload = await canonicalizeThreadListResponseForRead({
       data: [
