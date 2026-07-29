@@ -64,6 +64,17 @@ function userMessage(text: string, id: string): Record<string, unknown> {
   }
 }
 
+function userMessageWithoutId(text: string): Record<string, unknown> {
+  return {
+    type: 'response_item',
+    payload: {
+      type: 'message',
+      role: 'user',
+      content: [{ type: 'input_text', text }],
+    },
+  }
+}
+
 function functionCall(
   name: string,
   argumentsJson: string,
@@ -93,7 +104,58 @@ async function writeRollout(lines: Array<Record<string, unknown> | string>): Pro
 }
 
 describe('readThreadTextPage', () => {
-  it('pages active-turn text chronologically without exposing tool payloads', async () => {
+  it('does not project agent_reasoning event messages into visible text pages', async () => {
+    const sessionPath = await writeRollout([
+      event('task_started', { turn_id: 'turn-active' }),
+      {
+        type: 'event_msg',
+        payload: { type: 'agent_reasoning', text: '**Planning precise source line extraction**' },
+      },
+      assistant('Visible update', 'agent-1'),
+    ])
+
+    const result = await readThreadTextPage({
+      sessionPath,
+      threadId: 'thread-1',
+      turnId: 'turn-active',
+    })
+
+    expect(result.items.map((item) => ({ type: item.type, text: item.text }))).toEqual([
+      { type: 'agentMessage', text: 'Visible update' },
+    ])
+  })
+
+  it('drops empty and title-only response reasoning records from active-turn text pages', async () => {
+    const sessionPath = await writeRollout([
+      event('task_started', { turn_id: 'turn-active' }),
+      {
+        type: 'response_item',
+        payload: {
+          type: 'reasoning',
+          id: 'reason-empty',
+          summary: [],
+          content: null,
+          encrypted_content: null,
+        },
+      },
+      reasoning('Weighing struct replication versus public inclusion', 'reason-title-1'),
+      reasoning('Preventing shell injection in rg command', 'reason-title-2'),
+      reasoning('Defining serialization fields for layer counts', 'reason-title-3'),
+      reasoning('Comparing current and expected transaction shape', 'reason-title-4'),
+      reasoning('Existing tests', 'reason-title-5'),
+      reasoning('Visible summary', 'reason-visible'),
+    ])
+
+    const result = await readThreadTextPage({
+      sessionPath,
+      threadId: 'thread-1',
+      turnId: 'turn-active',
+    })
+
+    expect(result.items.map((item) => item.id)).toEqual(['reason-visible'])
+  })
+
+  it('pages active-turn text chronologically without exposing hidden activity payloads', async () => {
     const rows = [
       event('task_started', { turn_id: 'turn-old' }),
       assistant('old text', 'old-agent'),
@@ -101,10 +163,10 @@ describe('readThreadTextPage', () => {
       event('task_started', { turn_id: 'turn-active' }),
       reasoning('First thought', 'reason-1'),
       functionCall('exec_command', '{"cmd":"secret output must not escape"}', 'call-1'),
-      assistant('First update', 'agent-1', 'commentary'),
+      assistant('First update', 'agent-1'),
       event('context_compacted', {}),
       reasoning('Second thought', 'reason-2'),
-      assistant('Second update', 'agent-2', 'commentary'),
+      assistant('Second update', 'agent-2'),
     ]
     const sessionPath = await writeRollout(rows)
 
@@ -112,16 +174,14 @@ describe('readThreadTextPage', () => {
       sessionPath,
       threadId: 'thread-1',
       turnId: 'turn-active',
-      limit: 3,
+      limit: 2,
     })
 
     expect(first.items.map((item) => item.type)).toEqual([
-      'contextCompaction',
       'reasoning',
       'agentMessage',
     ])
-    expect(first.items[0]?.id).toMatch(/^rollout:contextCompaction:\d+$/u)
-    expect(first.items.slice(1).map((item) => item.id)).toEqual(['reason-2', 'agent-2'])
+    expect(first.items.map((item) => item.id)).toEqual(['reason-2', 'agent-2'])
     expect(JSON.stringify(first)).not.toContain('secret output')
     expect(first.hasMoreOlder).toBe(true)
     expect(first.nextOlderCursor).toEqual(expect.any(String))
@@ -131,12 +191,120 @@ describe('readThreadTextPage', () => {
       threadId: 'thread-1',
       turnId: 'turn-active',
       cursor: first.nextOlderCursor!,
-      limit: 3,
+      limit: 2,
     })
 
     expect(second.items.map((item) => item.id)).toEqual(['reason-1', 'agent-1'])
     expect(second.hasMoreOlder).toBe(false)
     expect(second.nextOlderCursor).toBeNull()
+  })
+
+  it('projects assistant commentary phase messages as visible active-turn text', async () => {
+    const sessionPath = await writeRollout([
+      event('task_started', { turn_id: 'turn-active' }),
+      assistant('I will inspect this first', 'agent-commentary', 'commentary'),
+      reasoning('可见推理摘要。', 'reason-visible'),
+      assistant('Final answer text', 'agent-final'),
+    ])
+
+    const result = await readThreadTextPage({
+      sessionPath,
+      threadId: 'thread-1',
+      turnId: 'turn-active',
+    })
+
+    expect(result.items.map((item) => ({ id: item.id, type: item.type, text: item.text }))).toEqual([
+      { id: 'agent-commentary', type: 'agentMessage', text: 'I will inspect this first' },
+      { id: 'reason-visible', type: 'reasoning', text: undefined },
+      { id: 'agent-final', type: 'agentMessage', text: 'Final answer text' },
+    ])
+  })
+
+  it('drops command activity and command output from active-turn text pages', async () => {
+    const sessionPath = await writeRollout([
+      event('task_started', { turn_id: 'turn-active' }),
+      assistant('Before command', 'agent-before'),
+      functionCall('exec_command', JSON.stringify({
+        cmd: 'cmake --build build --target test-log-observer-run-identity',
+        cwd: '/tmp/project',
+        output: 'argument payload must not be exposed',
+      }), 'call-build'),
+      {
+        type: 'response_item',
+        payload: {
+          type: 'function_call_output',
+          call_id: 'call-build',
+          output: 'stdout must not be exposed',
+        },
+      },
+      assistant('After command', 'agent-after'),
+    ])
+
+    const result = await readThreadTextPage({
+      sessionPath,
+      threadId: 'thread-1',
+      turnId: 'turn-active',
+    })
+
+    expect(result.items.map((item) => ({ id: item.id, type: item.type }))).toEqual([
+      { id: 'agent-before', type: 'agentMessage' },
+      { id: 'agent-after', type: 'agentMessage' },
+    ])
+    expect(JSON.stringify(result)).not.toContain('cmake --build')
+    expect(JSON.stringify(result)).not.toContain('argument payload must not be exposed')
+    expect(JSON.stringify(result)).not.toContain('stdout must not be exposed')
+  })
+
+  it('projects active-turn steer user messages from text pages', async () => {
+    const sessionPath = await writeRollout([
+      event('task_started', { turn_id: 'turn-active' }),
+      assistant('Before steer', 'agent-before'),
+      userMessage('继续', 'user-steer'),
+      assistant('After steer', 'agent-after'),
+    ])
+
+    const result = await readThreadTextPage({
+      sessionPath,
+      threadId: 'thread-1',
+      turnId: 'turn-active',
+    })
+
+    expect(result.items.map((item) => ({ id: item.id, type: item.type }))).toEqual([
+      { id: 'agent-before', type: 'agentMessage' },
+      { id: 'user-steer', type: 'userMessage' },
+      { id: 'agent-after', type: 'agentMessage' },
+    ])
+    expect(result.items[1]).toMatchObject({
+      content: [{ type: 'input_text', text: '继续' }],
+    })
+  })
+
+  it('projects visible user messages without ids while dropping injected user context', async () => {
+    const sessionPath = await writeRollout([
+      event('task_started', { turn_id: 'turn-active' }),
+      userMessageWithoutId('<environment_context>\n  <current_date>2026-07-28</current_date>\n</environment_context>'),
+      assistant('Before user', 'agent-before'),
+      userMessageWithoutId('这两个设备之间网络互通吗，设备间的带宽和RTT是多少'),
+      assistant('After user', 'agent-after'),
+    ])
+
+    const result = await readThreadTextPage({
+      sessionPath,
+      threadId: 'thread-1',
+      turnId: 'turn-active',
+    })
+
+    expect(result.items.map((item) => item.type)).toEqual([
+      'agentMessage',
+      'userMessage',
+      'agentMessage',
+    ])
+    expect(result.items[1]).toMatchObject({
+      type: 'userMessage',
+      content: [{ type: 'input_text', text: '这两个设备之间网络互通吗，设备间的带宽和RTT是多少' }],
+    })
+    expect(result.items[1]?.id).toMatch(/^rollout:userMessage:\d+$/u)
+    expect(JSON.stringify(result)).not.toContain('environment_context')
   })
 
   it('skips malformed lines and oversized irrelevant tool records', async () => {

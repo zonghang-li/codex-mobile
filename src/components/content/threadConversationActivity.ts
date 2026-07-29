@@ -13,7 +13,6 @@ const TURN_ACTIVITY_MESSAGE_TYPES = new Set([
   'webSearch',
   'imageView',
   'contextCompaction',
-  'fileChange',
   'plan',
   'subAgentActivity',
   'dynamicToolCall',
@@ -57,6 +56,21 @@ export type ThreadActivityIconKind =
   | 'agent'
   | 'status'
 
+export function shouldRenderReasoningAsTranscript(
+  message: Pick<UiMessage, 'messageType' | 'turnId'>,
+  context: {
+    activeTurnId: string
+    isThreadInProgress: boolean
+    readOnly: boolean
+  },
+): boolean {
+  const activeTurnId = context.activeTurnId.trim()
+  return context.isThreadInProgress
+    && activeTurnId.length > 0
+    && message.messageType === 'reasoning'
+    && message.turnId === activeTurnId
+}
+
 type ActionSummaryState = {
   sourceMessageIds: string[]
   latestMessage: UiMessage | null
@@ -77,6 +91,11 @@ function compactActivityText(value: string): string {
     .trim()
 }
 
+function isFallbackRanCommandLabel(command: string, label: string): boolean {
+  const compactCommand = compactActivityText(command)
+  return label === 'Ran a command' || (compactCommand.length > 0 && label === `Ran ${compactCommand}`)
+}
+
 function commandActivityIconKind(message: UiMessage): ThreadActivityIconKind {
   const categories = message.commandExecution?.activityCategories ?? ['unknown']
   if (categories.includes('unknown')) return 'terminal'
@@ -87,37 +106,23 @@ function commandActivityIconKind(message: UiMessage): ThreadActivityIconKind {
 
 function commandActivityLabel(message: UiMessage): string {
   const label = compactActivityText(message.commandExecution?.displayLabel ?? '')
-  if (label) return label
   const command = compactActivityText(message.commandExecution?.command ?? message.text)
+  const categories = message.commandExecution?.activityCategories ?? ['unknown']
+  if (label && !isFallbackRanCommandLabel(command, label)) return label
+  if (categories.includes('search')) return 'Searched files'
+  if (categories.includes('read')) return 'Read files'
+  if (categories.includes('listFiles')) return 'Listed files'
+  if (label) return label
   return command ? `Ran ${command}` : 'Ran a command'
-}
-
-function fileChangeActivityLabel(message: UiMessage): string {
-  const changes = message.fileChanges ?? []
-  if (changes.length !== 1) {
-    return changes.length > 0 ? `${changes.length} files changed` : 'Files changed'
-  }
-  const change = changes[0]
-  const path = compactActivityText(change.movedToPath || change.path)
-  const operation = change.movedToPath
-    ? 'Moved'
-    : change.operation === 'add'
-      ? 'Added'
-      : change.operation === 'delete'
-        ? 'Deleted'
-        : 'Edited'
-  return path ? `${operation} ${path}` : `${operation} a file`
 }
 
 function actionDetailLabel(message: UiMessage): string {
   if (message.messageType === 'commandExecution') return commandActivityLabel(message)
-  if (message.messageType === 'fileChange') return fileChangeActivityLabel(message)
   return activityLabel(message)
 }
 
 function actionDetailIconKind(message: UiMessage): ThreadActivityIconKind {
   if (message.messageType === 'commandExecution') return commandActivityIconKind(message)
-  if (message.messageType === 'fileChange') return 'edit'
   return activityMessageIconKind(message)
 }
 
@@ -168,36 +173,26 @@ export function buildThreadActivitySegments(
   options: { parentTurnCompleted?: boolean } = {},
 ): ThreadActivitySegment[] {
   const segments: ThreadActivitySegment[] = []
-  let actions = emptyActionSummary()
-
-  const flushActions = (): void => {
-    if (actions.sourceMessageIds.length === 0 || !actions.latestMessage) return
-    segments.push({
-      kind: 'event',
-      id: actions.latestMessage.id,
-      label: actionDetailLabel(actions.latestMessage),
-      iconKind: actionDetailIconKind(actions.latestMessage),
-      sourceMessageIds: [...actions.sourceMessageIds],
-    })
-    actions = emptyActionSummary()
-  }
 
   for (let index = 0; index < messages.length;) {
     const message = messages[index]
     if (!isThreadActivityMessage(message)) {
-      flushActions()
       index += 1
       continue
     }
 
-    if (message.messageType === 'commandExecution' || message.messageType === 'fileChange') {
-      actions.sourceMessageIds.push(message.id)
-      actions.latestMessage = message
+    if (message.messageType === 'commandExecution') {
+      segments.push({
+        kind: 'event',
+        id: message.id,
+        label: actionDetailLabel(message),
+        iconKind: actionDetailIconKind(message),
+        sourceMessageIds: [message.id],
+      })
       index += 1
       continue
     }
 
-    flushActions()
     if (isCollaborationActivity(message)) {
       const sourceMessageIds: string[] = []
       const parts: string[] = []
@@ -265,7 +260,6 @@ export function buildThreadActivitySegments(
     index += 1
   }
 
-  flushActions()
   return segments
 }
 

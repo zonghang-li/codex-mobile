@@ -51,6 +51,28 @@ describe('ThreadComposer desktop parity wiring', () => {
     expect(source).not.toContain('@apply max-w-[8.75rem]')
   })
 
+  it('centers the attach plus on the same visual axis as Goal and Model/Effort labels', () => {
+    const attachRuleStart = source.indexOf('.thread-composer-attach-trigger {')
+    const attachRuleEnd = source.indexOf('}', attachRuleStart)
+    const attachRule = source.slice(attachRuleStart, attachRuleEnd)
+    const goalRuleStart = source.indexOf('.thread-composer-goal-trigger {')
+    const goalRuleEnd = source.indexOf('}', goalRuleStart)
+    const goalRule = source.slice(goalRuleStart, goalRuleEnd)
+    const modelRuleStart = source.indexOf('.thread-composer-model-effort :deep(.composer-dropdown-trigger) {')
+    const modelRuleEnd = source.indexOf('}', modelRuleStart)
+    const modelRule = source.slice(modelRuleStart, modelRuleEnd)
+
+    expect(attachRule).toContain('items-center')
+    expect(attachRule).toContain('justify-center')
+    expect(attachRule).toContain('leading-none')
+    expect(attachRule).not.toContain('pb-px')
+    expect(source).toContain('class="thread-composer-attach-plus"')
+    expect(source).toContain('.thread-composer-attach-plus {')
+    expect(source).toContain('transform: translateY(-1px)')
+    expect(goalRule).toContain('items-center')
+    expect(modelRule).toContain('items-center')
+  })
+
   it('lets the desktop-style Model/Effort label use available bottom bar space before truncating', () => {
     const modelRuleStart = source.indexOf('.thread-composer-model-effort {')
     const modelRuleEnd = source.indexOf('}', modelRuleStart)

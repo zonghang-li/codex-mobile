@@ -26,6 +26,7 @@ describe('external live snapshot RPC preparation', () => {
         includeTurns: true,
       },
       skipSessionSkillEnrichment: true,
+      forceFreshThreadList: false,
     })
   })
 

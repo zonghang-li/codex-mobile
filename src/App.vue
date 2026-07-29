@@ -12,7 +12,7 @@
             class="sidebar-thread-controls-host"
             :is-sidebar-collapsed="isSidebarCollapsed"
             :show-new-thread-button="true"
-            :has-unread-threads="hasUnreadSidebarThreads"
+            :has-attention="hasSidebarAttentionIndicator"
             @toggle-sidebar="setSidebarCollapsed(!isSidebarCollapsed)"
             @start-new-thread="onStartNewThreadFromToolbar"
           >
@@ -534,7 +534,7 @@
               class="sidebar-thread-controls-header-host"
               :is-sidebar-collapsed="isSidebarCollapsed"
               :show-new-thread-button="true"
-              :has-unread-threads="hasUnreadSidebarThreads"
+              :has-attention="hasSidebarAttentionIndicator"
               @toggle-sidebar="setSidebarCollapsed(!isSidebarCollapsed)"
               @start-new-thread="onStartNewThreadFromToolbar"
             />
@@ -1018,7 +1018,6 @@
                   />
                   <ConversationRunFooter
                     :thread-id="selectedThreadId"
-                    :footer-state="selectedConversationFooterState"
                     :goal="selectedThreadGoal"
                     :goal-supported="selectedThreadGoalSupported"
                     :is-updating-goal="isUpdatingThreadGoal"
@@ -1200,6 +1199,7 @@ import ComposerDropdown from './components/content/ComposerDropdown.vue'
 import HeaderGitBranchDropdown from './components/content/HeaderGitBranchDropdown.vue'
 import ComposerRuntimeDropdown from './components/content/ComposerRuntimeDropdown.vue'
 import SidebarThreadControls from './components/sidebar/SidebarThreadControls.vue'
+import { hasSidebarAttention } from './components/sidebar/threadSidebarState'
 import IconTablerBolt from './components/icons/IconTablerBolt.vue'
 import IconTablerMoon from './components/icons/IconTablerMoon.vue'
 import IconTablerSearch from './components/icons/IconTablerSearch.vue'
@@ -1211,7 +1211,6 @@ import { useMobile } from './composables/useMobile'
 import { useUiLanguage } from './composables/useUiLanguage'
 import { useFeedbackDiagnostics } from './composables/useFeedbackDiagnostics'
 import { createManagedUploadLease } from './composables/managedUploadLease'
-import { deriveConversationFooterState } from './components/content/conversationFooterState'
 import {
   checkoutGitBranch,
   cloneGithubRepository,
@@ -1784,20 +1783,7 @@ const isVirtualKeyboardOpen = computed(() => {
 })
 const directoryCwd = computed(() => selectedThread.value?.cwd?.trim() ?? newThreadCwd.value.trim())
 const isSelectedThreadInProgress = computed(() => !isHomeRoute.value && selectedThread.value?.inProgress === true)
-const hasUnreadSidebarThreads = computed(() =>
-  projectGroups.value.some((group) => group.threads.some((thread) => thread.unread === true)),
-)
-const selectedConversationFooterState = computed(() => deriveConversationFooterState({
-  messages: filteredMessages.value,
-  turnId: selectedActiveTurnId.value,
-  isTurnInProgress: isSelectedThreadInProgress.value,
-  externalLiveAuthority: selectedThreadRuntimeOwnership.value === 'external'
-    ? selectedLiveAuthority.value ?? 'missing'
-    : null,
-  authoritativeFooter: selectedThreadRuntimeOwnership.value === 'external'
-    ? selectedLiveSnapshot.value?.footer ?? null
-    : null,
-}))
+const hasSidebarAttentionIndicator = computed(() => hasSidebarAttention(projectGroups.value))
 const showThreadContextBadge = computed(() => !isHomeRoute.value && !isSkillsRoute.value && !isAutomationsRoute.value && selectedThreadId.value.trim().length > 0)
 const isAccountSwitchBlocked = computed(() =>
   isSendingMessage.value ||
@@ -4724,6 +4710,7 @@ async function loadWorktreeBranches(sourceCwd: string): Promise<void> {
 
 .sidebar-scrollable {
   @apply flex-1 min-h-0 overflow-y-auto py-4 px-2 flex flex-col gap-2;
+  scrollbar-gutter: stable;
 }
 
 .content-root {
@@ -4837,6 +4824,7 @@ async function loadWorktreeBranches(sourceCwd: string): Promise<void> {
 
 .content-body {
   @apply flex-1 min-h-0 min-w-0 w-full flex flex-col gap-2 sm:gap-3 pt-1 pb-2 sm:pb-4 overflow-x-hidden;
+  scrollbar-gutter: stable;
 }
 
 .content-root.is-virtual-keyboard-open .content-body {

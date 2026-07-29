@@ -431,8 +431,6 @@ const zhCN: Record<string, string> = {
   'Wide': '宽',
   'Extra wide': '超宽',
   'Step {step} / {count}': '步骤 {step} / {count}',
-  '1 file changed': '1 个文件已更改',
-  '{count} files changed': '{count} 个文件已更改',
   'Pursuing goal': '正在追求目标',
   'Paused goal': '目标已暂停',
   'Goal blocked': '目标受阻',

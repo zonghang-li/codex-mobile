@@ -6,6 +6,7 @@ import {
   getTurnActivityMessagesForWorked,
   getTurnActivitySegmentsForWorked,
   isThreadActivityMessage,
+  shouldRenderReasoningAsTranscript,
 } from './threadConversationActivity'
 
 function message(
@@ -18,6 +19,53 @@ function message(
 }
 
 describe('thread conversation completed activity grouping', () => {
+  it('renders every reasoning item from an externally running active turn as transcript text', () => {
+    const activeReasoning = message(
+      'reasoning-active',
+      'assistant',
+      '**First line**\n\n**Second line**',
+      'reasoning',
+    )
+    activeReasoning.turnId = 'turn-active'
+
+    expect(shouldRenderReasoningAsTranscript(activeReasoning, {
+      activeTurnId: 'turn-active',
+      isThreadInProgress: true,
+      readOnly: true,
+    })).toBe(true)
+    expect(shouldRenderReasoningAsTranscript(activeReasoning, {
+      activeTurnId: 'turn-other',
+      isThreadInProgress: true,
+      readOnly: true,
+    })).toBe(false)
+    expect(shouldRenderReasoningAsTranscript(activeReasoning, {
+      activeTurnId: 'turn-active',
+      isThreadInProgress: false,
+      readOnly: true,
+    })).toBe(false)
+  })
+
+  it('renders every reasoning item from a locally running active turn as transcript text', () => {
+    const activeReasoning = message(
+      'reasoning-local-active',
+      'assistant',
+      '**Inspecting local runtime**',
+      'reasoning',
+    )
+    activeReasoning.turnId = 'turn-local-active'
+
+    expect(shouldRenderReasoningAsTranscript(activeReasoning, {
+      activeTurnId: 'turn-local-active',
+      isThreadInProgress: true,
+      readOnly: false,
+    })).toBe(true)
+    expect(shouldRenderReasoningAsTranscript(activeReasoning, {
+      activeTurnId: 'turn-other',
+      isThreadInProgress: true,
+      readOnly: false,
+    })).toBe(false)
+  })
+
   it('treats reasoning, commands, tool events, images, and compaction as turn activity', () => {
     const activityTypes = [
       'reasoning',
@@ -27,7 +75,6 @@ describe('thread conversation completed activity grouping', () => {
       'webSearch',
       'imageView',
       'contextCompaction',
-      'fileChange',
       'plan',
       'subAgentActivity',
       'dynamicToolCall',
@@ -42,6 +89,7 @@ describe('thread conversation completed activity grouping', () => {
 
     expect(isThreadActivityMessage(message('assistant', 'assistant', 'final answer', 'agentMessage'))).toBe(false)
     expect(isThreadActivityMessage(message('user', 'user', 'prompt', 'userMessage'))).toBe(false)
+    expect(isThreadActivityMessage(message('fileChange', 'system', '', 'fileChange'))).toBe(false)
   })
 
   it('derives ordered desktop-style reasoning, concrete action rows, and agent chips', () => {
@@ -103,10 +151,17 @@ describe('thread conversation completed activity grouping', () => {
       },
       {
         kind: 'event',
+        id: 'read-1',
+        label: 'Read files',
+        iconKind: 'book',
+        sourceMessageIds: ['read-1'],
+      },
+      {
+        kind: 'event',
         id: 'run-1',
         label: 'Ran pnpm test',
         iconKind: 'terminal',
-        sourceMessageIds: ['file-1', 'read-1', 'run-1'],
+        sourceMessageIds: ['run-1'],
       },
       {
         kind: 'subAgent',
@@ -123,7 +178,7 @@ describe('thread conversation completed activity grouping', () => {
     ])
   })
 
-  it('shows only the latest concrete action detail for adjacent file and command activity', () => {
+  it('shows every concrete command action detail and ignores file-change metadata', () => {
     const messages: UiMessage[] = [
       {
         ...message('file-1', 'system', '', 'fileChange'),
@@ -161,13 +216,22 @@ describe('thread conversation completed activity grouping', () => {
       },
     ]
 
-    expect(buildThreadActivitySegments(messages)).toEqual([{
-      kind: 'event',
-      id: 'run-1',
-      label: 'Ran pnpm exec vitest run src/App.test.ts',
-      iconKind: 'terminal',
-      sourceMessageIds: ['file-1', 'read-1', 'run-1'],
-    }])
+    expect(buildThreadActivitySegments(messages)).toEqual([
+      {
+        kind: 'event',
+        id: 'read-1',
+        label: 'Read App component',
+        iconKind: 'book',
+        sourceMessageIds: ['read-1'],
+      },
+      {
+        kind: 'event',
+        id: 'run-1',
+        label: 'Ran pnpm exec vitest run src/App.test.ts',
+        iconKind: 'terminal',
+        sourceMessageIds: ['run-1'],
+      },
+    ])
   })
 
   it('groups adjacent subagent events but keeps clusters separated by parent transcript content', () => {
@@ -295,16 +359,13 @@ describe('thread conversation completed activity grouping', () => {
       message('user-2', 'user', 'continue', 'userMessage'),
       command('read-3', 'read'),
     ])).toEqual([
-      expect.objectContaining({
-        id: 'run-2',
-        label: 'Ran run-2',
-        iconKind: 'terminal',
-      }),
-      expect.objectContaining({
-        id: 'read-3',
-        label: 'Ran read-3',
-        iconKind: 'book',
-      }),
+      expect.objectContaining({ id: 'read-1', label: 'Read files', iconKind: 'book' }),
+      expect.objectContaining({ id: 'read-2', label: 'Read files', iconKind: 'book' }),
+      expect.objectContaining({ id: 'list-1', label: 'Listed files', iconKind: 'book' }),
+      expect.objectContaining({ id: 'search-1', label: 'Searched files', iconKind: 'search' }),
+      expect.objectContaining({ id: 'run-1', label: 'Ran run-1', iconKind: 'terminal' }),
+      expect.objectContaining({ id: 'run-2', label: 'Ran run-2', iconKind: 'terminal' }),
+      expect.objectContaining({ id: 'read-3', label: 'Read files', iconKind: 'book' }),
     ])
   })
 

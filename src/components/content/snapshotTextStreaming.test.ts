@@ -93,6 +93,38 @@ describe('snapshot text streaming display buffer', () => {
     expect(streamer.readText('hidden-plan-footer')).toBe('hidden plan footer')
   })
 
+  it('shows non-renderable active reasoning immediately while streaming the latest assistant text', () => {
+    const streamer = createSnapshotTextStreamer({ textChunkSize: 4, outputChunkSize: 4 })
+
+    expect(streamer.update([
+      {
+        id: 'reasoning-1',
+        text: 'first reasoning summary',
+        streamable: true,
+        renderable: false,
+      },
+      {
+        id: 'assistant-1',
+        text: 'assistant final text',
+        streamable: true,
+      },
+      {
+        id: 'reasoning-2',
+        text: 'latest reasoning summary',
+        streamable: true,
+        renderable: false,
+      },
+    ])).toEqual({ changed: true, pending: true })
+
+    expect(streamer.readText('reasoning-1')).toBe('first reasoning summary')
+    expect(streamer.readText('assistant-1')).toBe('')
+    expect(streamer.readText('reasoning-2')).toBe('latest reasoning summary')
+
+    expect(streamer.advance()).toBe(true)
+    expect(streamer.readText('assistant-1')).toBe('assi')
+    expect(streamer.readText('reasoning-2')).toBe('latest reasoning summary')
+  })
+
   it('reveals command output growth without delaying the command row itself', () => {
     const streamer = createSnapshotTextStreamer({ textChunkSize: 8, outputChunkSize: 3 })
 
@@ -128,5 +160,38 @@ describe('snapshot text streaming display buffer', () => {
 
     expect(streamer.readText('assistant-1')).toBe('abcXYZ')
     expect(streamer.hasPending()).toBe(false)
+  })
+
+  it('does not replay already revealed text when the latest snapshot is rekeyed', () => {
+    const streamer = createSnapshotTextStreamer({ textChunkSize: 5, outputChunkSize: 4 })
+
+    streamer.update([{ id: 'assistant-live', text: 'stable final sentence', streamable: true }])
+    while (streamer.advance()) {
+      // reveal the first projection completely
+    }
+    expect(streamer.readText('assistant-live')).toBe('stable final sentence')
+    expect(streamer.hasPending()).toBe(false)
+
+    expect(streamer.update([{ id: 'assistant-hydrated', text: 'stable final sentence', streamable: true }]))
+      .toEqual({ changed: true, pending: false })
+
+    expect(streamer.readText('assistant-hydrated')).toBe('stable final sentence')
+    expect(streamer.hasPending()).toBe(false)
+  })
+
+  it('continues from carried text when a rekeyed latest snapshot grows by prefix', () => {
+    const streamer = createSnapshotTextStreamer({ textChunkSize: 5, outputChunkSize: 4 })
+
+    streamer.update([{ id: 'assistant-live', text: 'stable', streamable: true }])
+    while (streamer.advance()) {
+      // reveal the first projection completely
+    }
+
+    expect(streamer.update([{ id: 'assistant-hydrated', text: 'stable final sentence', streamable: true }]))
+      .toEqual({ changed: true, pending: true })
+
+    expect(streamer.readText('assistant-hydrated')).toBe('stable')
+    expect(streamer.advance()).toBe(true)
+    expect(streamer.readText('assistant-hydrated')).toBe('stable fina')
   })
 })

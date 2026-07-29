@@ -4,6 +4,7 @@ import {
   getAvailableModelIds,
   getCurrentModelConfig,
   getExternalThreadLiveSnapshot,
+  getBackgroundThreadListLimit,
   getThreadDetail,
   getThreadGroupsPage,
   getOlderThreadMessages,
@@ -510,6 +511,43 @@ describe('thread list pagination', () => {
       },
     })
   })
+
+  it('uses a small background thread-list page to avoid expensive runtime probes', () => {
+    expect(getBackgroundThreadListLimit()).toBe(10)
+  })
+
+  it('can request a fresh first page without reusing mobile thread-list cache', async () => {
+    const requests: Array<{ method: string, params: Record<string, unknown> }> = []
+    vi.stubGlobal('fetch', vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+      const body = typeof init?.body === 'string'
+        ? JSON.parse(init.body) as { method: string, params: Record<string, unknown> }
+        : { method: '', params: {} }
+      requests.push(body)
+      return new Response(JSON.stringify({
+        result: {
+          data: [],
+          nextCursor: null,
+        },
+      }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      })
+    }))
+
+    await getThreadGroupsPage(null, 5, { forceFresh: true })
+
+    expect(requests[0]).toMatchObject({
+      method: 'thread/list',
+      params: {
+        archived: false,
+        limit: 5,
+        sortKey: 'updated_at',
+        modelProviders: [],
+        cursor: null,
+        __codexMobileForceFresh: true,
+      },
+    })
+  })
 })
 
 describe('listDirectoryComposioConnectors', () => {
@@ -692,13 +730,128 @@ describe('getThreadDetail', () => {
       signal: controller.signal,
     })
     expect(requests).toContainEqual({
-      url: '/codex-api/thread-turn-page?threadId=thread-paged&limit=5',
+      url: '/codex-api/thread-turn-page?threadId=thread-paged&limit=3',
       signal: controller.signal,
     })
     expect(requests).not.toContainEqual(expect.objectContaining({
       method: 'thread/read',
       params: expect.objectContaining({ includeTurns: true }),
     }))
+  })
+
+  it('falls back to a terminal external live-state snapshot when the native turn page is empty', async () => {
+    const requests: string[] = []
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input)
+      requests.push(url)
+      if (url === '/codex-api/rpc') {
+        const body = JSON.parse(String(init?.body)) as { method: string; params: Record<string, unknown> }
+        expect(body).toMatchObject({
+          method: 'thread/read',
+          params: { threadId: 'external-terminal', includeTurns: false },
+        })
+        return new Response(JSON.stringify({
+          result: {
+            thread: {
+              id: 'external-terminal',
+              turns: [],
+              externalRuntime: { state: 'unknown' },
+            },
+          },
+        }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      if (url === '/codex-api/thread-turn-page?threadId=external-terminal&limit=3') {
+        return new Response(JSON.stringify({
+          result: { thread: { id: 'external-terminal', turns: [] } },
+          nextCursor: null,
+          hasMoreOlder: false,
+        }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      expect(url).toBe('/codex-api/thread-live-state?threadId=external-terminal')
+      return new Response(JSON.stringify({
+        threadId: 'external-terminal',
+        conversationState: {
+          turns: [{
+            id: 'turn-terminal',
+            status: 'interrupted',
+            items: [{
+              id: 'agent-terminal',
+              type: 'agentMessage',
+              text: 'terminal external transcript text',
+              phase: 'commentary',
+            }],
+          }],
+        },
+        externalRuntime: { state: 'unknown' },
+        hasMoreOlder: false,
+      }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    }))
+
+    await expect(getThreadDetail('external-terminal')).resolves.toMatchObject({
+      isLiveProjection: true,
+      ownership: 'idle',
+      inProgress: false,
+      messages: [expect.objectContaining({
+        id: 'agent-terminal',
+        text: 'terminal external transcript text',
+      })],
+    })
+    expect(requests).toEqual([
+      '/codex-api/rpc',
+      '/codex-api/thread-turn-page?threadId=external-terminal&limit=3',
+      '/codex-api/thread-live-state?threadId=external-terminal',
+    ])
+  })
+
+  it('marks a compressed locally running active turn page as partial', async () => {
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input)
+      if (url === '/codex-api/rpc') {
+        const body = JSON.parse(String(init?.body)) as { method: string }
+        expect(body.method).toBe('thread/read')
+        return new Response(JSON.stringify({
+          result: {
+            thread: {
+              id: 'thread-local',
+              externalRuntime: { state: 'idle' },
+              turns: [],
+            },
+          },
+        }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      expect(url).toBe('/codex-api/thread-turn-page?threadId=thread-local&limit=3')
+      return new Response(JSON.stringify({
+        result: {
+          thread: {
+            id: 'thread-local',
+            turns: [{
+              id: 'turn-local',
+              status: 'inProgress',
+              rawItemCompression: {
+                originalItemCount: 500,
+                retainedItemCount: 240,
+                omittedItemCount: 260,
+              },
+              items: [{
+                id: 'reasoning-latest',
+                type: 'reasoning',
+                summary: ['Latest retained reasoning'],
+              }],
+            }],
+          },
+        },
+        nextCursor: null,
+        hasMoreOlder: false,
+      }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    }))
+
+    await expect(getThreadDetail('thread-local')).resolves.toMatchObject({
+      isPagedProjection: true,
+      isPartialTurnProjection: true,
+      ownership: 'local',
+      activeTurnId: 'turn-local',
+      inProgress: true,
+    })
   })
 
   it('forwards an opaque cursor when loading older native turns', async () => {
@@ -913,6 +1066,65 @@ describe('getThreadDetail', () => {
     expect(requestSignal).toBe(controller.signal)
   })
 
+  it('preserves external live progress when the active turn status is stale interrupted', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({
+      threadId: 'external-thread',
+      conversationState: {
+        turns: [{
+          id: 'turn-external',
+          status: 'interrupted',
+          rawItemCompression: {
+            originalItemCount: 700,
+            retainedItemCount: 240,
+            omittedItemCount: 460,
+          },
+          items: [
+            {
+              id: 'reason-live',
+              type: 'reasoning',
+              summary: ['Planning live recovery'],
+              content: [],
+            },
+            {
+              id: 'agent-live-1',
+              type: 'agentMessage',
+              text: 'first live progress',
+            },
+            {
+              id: 'tool-live',
+              type: 'mcpToolCall',
+              server: 'codegraph',
+              tool: 'codegraph_explore',
+            },
+            {
+              id: 'agent-live-2',
+              type: 'agentMessage',
+              text: 'second live progress',
+            },
+          ],
+        }],
+      },
+      isInProgress: true,
+      externalRuntime: {
+        state: 'running',
+        turnId: 'turn-external',
+        interruptible: false,
+        source: 'external-session-writer',
+      },
+    }), { status: 200, headers: { 'Content-Type': 'application/json' } })))
+
+    await expect(getExternalThreadLiveSnapshot('external-thread')).resolves.toMatchObject({
+      activeTurnId: 'turn-external',
+      inProgress: true,
+      messages: [
+        expect.objectContaining({ id: 'reason-live', text: 'Planning live recovery' }),
+        expect.objectContaining({ id: 'agent-live-1', text: 'first live progress' }),
+        expect.objectContaining({ id: 'tool-live', text: 'Called codegraph.codegraph_explore' }),
+        expect.objectContaining({ id: 'agent-live-2', text: 'second live progress' }),
+      ],
+    })
+  })
+
   it('derives partial projection status from only the resolved active turn', async () => {
     vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({
       threadId: 'external-thread',
@@ -947,6 +1159,39 @@ describe('getThreadDetail', () => {
     await expect(getExternalThreadLiveSnapshot('external-thread')).resolves.toMatchObject({
       activeTurnId: 'turn-external',
       isPartialTurnProjection: false,
+    })
+  })
+
+  it('marks a compressed terminal live-state projection as partial when no active turn is known', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({
+      threadId: 'external-thread',
+      conversationState: {
+        turns: [
+          {
+            id: 'turn-terminal',
+            status: 'interrupted',
+            rawItemCompression: {
+              originalItemCount: 500,
+              retainedItemCount: 240,
+              omittedItemCount: 260,
+            },
+            items: [
+              { id: 'agent-head', type: 'agentMessage', text: 'first retained output' },
+              { id: 'agent-tail', type: 'agentMessage', text: 'latest retained output' },
+            ],
+          },
+        ],
+      },
+      isInProgress: false,
+      externalRuntime: { state: 'unknown' },
+      hasMoreOlder: false,
+    }), { status: 200, headers: { 'Content-Type': 'application/json' } })))
+
+    await expect(getExternalThreadLiveSnapshot('external-thread')).resolves.toMatchObject({
+      activeTurnId: '',
+      inProgress: false,
+      ownership: 'idle',
+      isPartialTurnProjection: true,
     })
   })
 
@@ -1070,10 +1315,12 @@ describe('getThreadDetail', () => {
       result: {
         thread: {
           id: 'thread-1',
+          updatedAt: 1_753_500_000,
           turns: [
             {
               id: 'turn-completed',
               status: 'completed',
+              completedAt: '2026-01-01T21:15:00.000Z',
               items: [],
             },
             {
@@ -1096,8 +1343,8 @@ describe('getThreadDetail', () => {
 
     await expect(getThreadDetail('thread-1')).resolves.toMatchObject({
       completionSummaries: [
-        { turnId: 'turn-completed', status: 'completed', durationMs: null },
-        { turnId: 'turn-stopped', status: 'interrupted', durationMs: null },
+        { turnId: 'turn-completed', status: 'completed', durationMs: null, completedAtMs: Date.parse('2026-01-01T21:15:00.000Z') },
+        { turnId: 'turn-stopped', status: 'interrupted', durationMs: null, completedAtMs: 1_753_500_000_000 },
       ],
     })
   })
@@ -1260,6 +1507,11 @@ describe('thread text page', () => {
           type: 'reasoning',
           summary: ['First thought'],
           sessionOrder: 120,
+        }, {
+          id: 'agent-1',
+          type: 'agentMessage',
+          text: 'Visible update',
+          sessionOrder: 140,
         }],
         nextOlderCursor: 'next-cursor',
         hasMoreOlder: true,
@@ -1282,7 +1534,15 @@ describe('thread text page', () => {
           id: 'reason-1',
           messageType: 'reasoning',
           text: 'First thought',
+          turnId: 'turn/1',
           sessionOrder: 120,
+        }),
+        expect.objectContaining({
+          id: 'agent-1',
+          messageType: 'agentMessage',
+          text: 'Visible update',
+          turnId: 'turn/1',
+          sessionOrder: 140,
         }),
       ],
     })

@@ -36,7 +36,6 @@ import type {
   CollaborationModeKind,
   CollaborationModeOption,
   UiCreditsSnapshot,
-  UiFileChange,
   UiMessage,
   UiProjectGroup,
   UiThread,
@@ -429,12 +428,6 @@ export type AccountsListResult = {
   importedStorageId?: string
 }
 
-type ThreadFileChangeFallbackEntry = {
-  turnId: string
-  turnIndex: number
-  fileChanges: UiFileChange[]
-}
-
 type ThreadTurnIndexById = Record<string, number>
 
 function asRecord(value: unknown): Record<string, unknown> | null {
@@ -449,6 +442,16 @@ function readString(value: unknown): string | null {
 
 function readNumber(value: unknown): number | null {
   return typeof value === 'number' && Number.isFinite(value) ? value : null
+}
+
+function parseIsoTimestampMs(value: unknown): number | null {
+  if (typeof value !== 'string' || value.length === 0) return null
+  const parsed = new Date(value).getTime()
+  return Number.isFinite(parsed) ? parsed : null
+}
+
+function unixSecondsToMs(value: number | null): number | null {
+  return value === null ? null : Math.max(0, value * 1000)
 }
 
 function readBoolean(value: unknown): boolean | null {
@@ -791,50 +794,6 @@ async function callRpc<T>(method: string, params?: unknown, signal?: AbortSignal
   }
 }
 
-function normalizeFallbackFileChange(value: unknown): UiFileChange | null {
-  const record = asRecord(value)
-  if (!record) return null
-
-  const path = readString(record.path)
-  const operation = readString(record.operation)
-  if (!path || (operation !== 'add' && operation !== 'delete' && operation !== 'update')) {
-    return null
-  }
-
-  return {
-    path,
-    operation,
-    movedToPath: readString(record.movedToPath) ?? null,
-    diff: readString(record.diff) ?? '',
-    addedLineCount: readNumber(record.addedLineCount) ?? 0,
-    removedLineCount: readNumber(record.removedLineCount) ?? 0,
-  }
-}
-
-function normalizeThreadFileChangeFallback(value: unknown): ThreadFileChangeFallbackEntry[] {
-  const payload = asRecord(value)
-  const rows = Array.isArray(payload?.data) ? payload.data : []
-  const normalized: ThreadFileChangeFallbackEntry[] = []
-
-  for (const row of rows) {
-    const record = asRecord(row)
-    if (!record) continue
-
-    const turnId = readString(record.turnId)
-    const turnIndex = readNumber(record.turnIndex)
-    const fileChanges = Array.isArray(record.fileChanges)
-      ? record.fileChanges
-        .map((entry) => normalizeFallbackFileChange(entry))
-        .filter((entry): entry is UiFileChange => entry !== null)
-      : []
-
-    if (!turnId || turnIndex === null || fileChanges.length === 0) continue
-    normalized.push({ turnId, turnIndex, fileChanges })
-  }
-
-  return normalized
-}
-
 function buildTurnIndexByTurnId(payload: ThreadReadResponse, baseTurnIndex = 0): ThreadTurnIndexById {
   const turns = Array.isArray(payload.thread.turns) ? payload.thread.turns : []
   const lookup: ThreadTurnIndexById = {}
@@ -855,86 +814,6 @@ function readThreadTurnStartIndex(payload: ThreadReadResponse): number {
   return Math.max(0, Math.floor(typeof raw === 'number' ? raw : 0))
 }
 
-async function fetchThreadFileChangeFallback(threadId: string): Promise<ThreadFileChangeFallbackEntry[]> {
-  const response = await fetch(`/codex-api/thread-file-change-fallback?threadId=${encodeURIComponent(threadId)}`)
-  if (!response.ok) {
-    throw new Error(`Fallback request failed with ${response.status}`)
-  }
-  return normalizeThreadFileChangeFallback(await response.json())
-}
-
-function mergeRecoveredFileChangeMessages(messages: UiMessage[], fallbackEntries: ThreadFileChangeFallbackEntry[]): UiMessage[] {
-  if (fallbackEntries.length === 0) return messages
-
-  const localTurnIndexByTurnId = new Map<string, number>()
-  const coveredTurnIds = new Set<string>()
-
-  for (const message of messages) {
-    const tid = typeof message.turnId === 'string' && message.turnId.length > 0 ? message.turnId : undefined
-    const tIdx = typeof message.turnIndex === 'number' ? message.turnIndex : undefined
-    if (tid && tIdx !== undefined) localTurnIndexByTurnId.set(tid, tIdx)
-
-    const hasFileData =
-      message.messageType === 'fileChange' ||
-      (Array.isArray(message.fileChanges) && message.fileChanges.length > 0)
-    if (hasFileData && tid) coveredTurnIds.add(tid)
-  }
-
-  const extraMessages = fallbackEntries
-    .filter((entry) => localTurnIndexByTurnId.has(entry.turnId) && !coveredTurnIds.has(entry.turnId))
-    .map<UiMessage>((entry) => ({
-      id: `session-file-change:${entry.turnId}`,
-      role: 'system',
-      text: '',
-      messageType: 'fileChange',
-      fileChangeStatus: 'completed',
-      fileChanges: entry.fileChanges,
-      turnId: entry.turnId,
-      turnIndex: localTurnIndexByTurnId.get(entry.turnId) ?? entry.turnIndex,
-    }))
-
-  if (extraMessages.length === 0) return messages
-
-  const extrasByTurnIndex = new Map<number, UiMessage[]>()
-  for (const message of extraMessages) {
-    const turnIndex = message.turnIndex
-    if (typeof turnIndex !== 'number') continue
-    const current = extrasByTurnIndex.get(turnIndex)
-    if (current) current.push(message)
-    else extrasByTurnIndex.set(turnIndex, [message])
-  }
-
-  const insertedTurnIndices = new Set<number>()
-  const merged: UiMessage[] = []
-
-  for (let index = 0; index < messages.length; index += 1) {
-    const message = messages[index]
-    merged.push(message)
-
-    const turnIndex = message.turnIndex
-    if (typeof turnIndex !== 'number' || insertedTurnIndices.has(turnIndex)) continue
-    const nextTurnIndex = messages[index + 1]?.turnIndex
-    if (nextTurnIndex === turnIndex) continue
-
-    const extras = extrasByTurnIndex.get(turnIndex)
-    if (!extras || extras.length === 0) continue
-
-    merged.push(...extras)
-    insertedTurnIndices.add(turnIndex)
-  }
-
-  return merged
-}
-
-async function enrichThreadMessagesWithFallback(threadId: string, messages: UiMessage[]): Promise<UiMessage[]> {
-  try {
-    const fallbackEntries = await fetchThreadFileChangeFallback(threadId)
-    return mergeRecoveredFileChangeMessages(messages, fallbackEntries)
-  } catch {
-    return messages
-  }
-}
-
 function normalizeReasoningEffort(value: unknown): ReasoningEffort | '' {
   const allowed: ReasoningEffort[] = ['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra']
   return typeof value === 'string' && allowed.includes(value as ReasoningEffort)
@@ -949,17 +828,23 @@ function normalizeSpeedMode(value: unknown): SpeedMode {
 }
 
 const INITIAL_THREAD_LIST_LIMIT = 5
-const BACKGROUND_THREAD_LIST_LIMIT = 5
+const BACKGROUND_THREAD_LIST_LIMIT = 10
+const CODEX_MOBILE_FORCE_FRESH_THREAD_LIST_PARAM = '__codexMobileForceFresh'
 
 export type ThreadGroupsPage = {
   groups: UiProjectGroup[]
   nextCursor: string | null
 }
 
+export type ThreadGroupsPageOptions = {
+  forceFresh?: boolean
+}
+
 export type ThreadCompletionSummary = {
   turnId: string
   status: string
   durationMs: number | null
+  completedAtMs?: number | null
 }
 
 export type ThreadTurnPage = {
@@ -991,6 +876,16 @@ class ThreadTurnPaginationUnsupportedError extends Error {
 
 function readThreadCompletionSummaries(payload: ThreadReadResponse): ThreadCompletionSummary[] {
   const turns = Array.isArray(payload.thread.turns) ? payload.thread.turns : []
+  const threadUpdatedAtMs = unixSecondsToMs(readNumber((payload.thread as unknown as Record<string, unknown>).updatedAt))
+  const terminalTurnIds = turns
+    .map((turn) => {
+      const rawTurn = asRecord(turn)
+      const turnId = (readString(rawTurn?.id) ?? '').trim()
+      const status = (readString(rawTurn?.status) ?? '').trim()
+      return turnId && status && status !== 'inProgress' ? turnId : ''
+    })
+    .filter(Boolean)
+  const lastTerminalTurnId = terminalTurnIds.at(-1) ?? ''
   return turns.flatMap((turn) => {
     const rawTurn = asRecord(turn)
     const turnId = (readString(rawTurn?.id) ?? '').trim()
@@ -1000,17 +895,30 @@ function readThreadCompletionSummaries(payload: ThreadReadResponse): ThreadCompl
       readNumber(rawTurn?.durationMs)
       ?? readNumber(rawTurn?.duration_ms)
     const durationMs = rawDurationMs === null ? null : Math.max(0, rawDurationMs)
-    return [{ turnId, status, durationMs }]
+    const completedAtMs =
+      parseIsoTimestampMs(rawTurn?.completedAt)
+      ?? parseIsoTimestampMs(rawTurn?.completed_at)
+      ?? unixSecondsToMs(readNumber(rawTurn?.completedAt))
+      ?? unixSecondsToMs(readNumber(rawTurn?.completed_at))
+      ?? (turnId === lastTerminalTurnId ? threadUpdatedAtMs : null)
+    return [{ turnId, status, durationMs, completedAtMs }]
   })
 }
 
-async function getThreadGroupsPageV2(cursor: string | null, limit: number): Promise<ThreadGroupsPage> {
+async function getThreadGroupsPageV2(
+  cursor: string | null,
+  limit: number,
+  options: ThreadGroupsPageOptions = {},
+): Promise<ThreadGroupsPage> {
   const payload = await callRpc<ThreadListResponse>('thread/list', {
     archived: false,
     limit,
     sortKey: 'updated_at',
     modelProviders: [],
     cursor,
+    ...(options.forceFresh === true && cursor === null
+      ? { [CODEX_MOBILE_FORCE_FRESH_THREAD_LIST_PARAM]: true }
+      : {}),
   })
   return {
     groups: normalizeThreadGroupsV2(payload),
@@ -1036,12 +944,27 @@ async function getThreadSummaryV2(threadId: string): Promise<UiThread> {
   return normalizeThreadSummaryV2(payload)
 }
 
+function hasRawItemCompression(rawTurn: unknown): boolean {
+  const compression = asRecord(asRecord(rawTurn)?.rawItemCompression)
+  return typeof compression?.omittedItemCount === 'number'
+    && compression.omittedItemCount > 0
+}
+
+function isCompressedActiveTurn(rawTurns: readonly unknown[], activeTurnId: string): boolean {
+  if (activeTurnId) {
+    const activeTurn = rawTurns.find((turn) => readString(asRecord(turn)?.id) === activeTurnId)
+    return hasRawItemCompression(activeTurn)
+  }
+  return rawTurns.some((turn) => hasRawItemCompression(turn))
+}
+
 async function getThreadDetailV2(
   threadId: string,
   signal?: AbortSignal,
 ): Promise<{
   isLiveProjection?: boolean
   isPagedProjection?: true
+  isPartialTurnProjection?: boolean
   model: string
   modelProvider: string
   reasoningEffort: ReasoningEffort | ''
@@ -1063,8 +986,27 @@ async function getThreadDetailV2(
   try {
     const [metadata, page] = await Promise.all([
       metadataPromise,
-      getThreadTurnPageV2(threadId, null, 5, signal),
+      getThreadTurnPageV2(threadId, null, 3, signal),
     ])
+    if (
+      page.rawTurns.length === 0
+      && page.messages.length === 0
+      && page.hasMoreOlder !== true
+    ) {
+      try {
+        const liveSnapshot = await getExternalThreadLiveStateSnapshotV2(threadId, signal)
+        if (liveSnapshot.messages.length > 0) {
+          return {
+            ...liveSnapshot,
+            model: liveSnapshot.model || normalizeThreadModelFromPayload(metadata),
+            modelProvider: liveSnapshot.modelProvider || normalizeThreadModelProviderFromPayload(metadata),
+            reasoningEffort: liveSnapshot.reasoningEffort || normalizeThreadReasoningEffortFromPayload(metadata),
+          }
+        }
+      } catch (error) {
+        if (error instanceof Error && error.name === 'AbortError') throw error
+      }
+    }
     const payload = {
       ...metadata,
       thread: {
@@ -1075,6 +1017,7 @@ async function getThreadDetailV2(
     const runtime = readThreadDetailRuntime(payload)
     return {
       isPagedProjection: true,
+      isPartialTurnProjection: isCompressedActiveTurn(page.rawTurns, runtime.activeTurnId),
       model: normalizeThreadModelFromPayload(metadata),
       modelProvider: normalizeThreadModelProviderFromPayload(metadata),
       reasoningEffort: normalizeThreadReasoningEffortFromPayload(metadata),
@@ -1156,13 +1099,7 @@ async function getExternalThreadLiveStateSnapshotV2(
   } as unknown as ThreadReadResponse
   const normalized = normalizeThreadMessagesV2(result, threadTurnStartIndex)
   const runtime = readThreadDetailRuntime(result)
-  const activeTurn = turns.find((turn) => (
-    readString(asRecord(turn)?.id) === runtime.activeTurnId
-  ))
-  const activeTurnCompression = asRecord(asRecord(activeTurn)?.rawItemCompression)
-  const isPartialTurnProjection =
-    typeof activeTurnCompression?.omittedItemCount === 'number'
-    && activeTurnCompression.omittedItemCount > 0
+  const isPartialTurnProjection = isCompressedActiveTurn(turns, runtime.activeTurnId)
   const rawAuthority = readLiveAuthority(payload?.liveAuthority)
   const rawSnapshot = readLiveSnapshot(payload?.liveSnapshot)
   const liveAuthority = rawAuthority === 'writer-snapshot' && rawSnapshot
@@ -1266,9 +1203,10 @@ export async function getThreadGroups(): Promise<UiProjectGroup[]> {
 export async function getThreadGroupsPage(
   cursor: string | null = null,
   limit = INITIAL_THREAD_LIST_LIMIT,
+  options: ThreadGroupsPageOptions = {},
 ): Promise<ThreadGroupsPage> {
   try {
-    return await getThreadGroupsPageV2(cursor, limit)
+    return await getThreadGroupsPageV2(cursor, limit, options)
   } catch (error) {
     throw normalizeCodexApiError(error, 'Failed to load thread groups', 'thread/list')
   }
@@ -1297,6 +1235,7 @@ export async function getThreadSummary(threadId: string): Promise<UiThread> {
 export async function getThreadDetail(threadId: string, signal?: AbortSignal): Promise<{
   isLiveProjection?: boolean
   isPagedProjection?: true
+  isPartialTurnProjection?: boolean
   model: string
   modelProvider: string
   reasoningEffort: ReasoningEffort | ''

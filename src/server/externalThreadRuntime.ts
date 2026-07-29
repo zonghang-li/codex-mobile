@@ -7,6 +7,7 @@ export type RuntimeFileIdentity = {
   dev: string
   ino: string
   size: number
+  mtimeMs?: number
 }
 
 export type RuntimeFdSnapshot = {
@@ -83,6 +84,7 @@ export const EXTERNAL_RUNTIME_MAX_DESCRIPTORS_PER_APP_SERVER = 4_096
 export const EXTERNAL_RUNTIME_MAX_FD_SNAPSHOTS = 8_192
 export const EXTERNAL_RUNTIME_SCAN_WALL_BUDGET_MS = 5_000
 export const EXTERNAL_RUNTIME_MAX_ROLLOUT_WRITERS = 256
+export const EXTERNAL_RUNTIME_RECENT_ACTIVE_ROLLOUT_MS = 15 * 60 * 1000
 
 class InconclusiveRuntimeScanError extends Error {
   constructor(message: string) {
@@ -494,6 +496,11 @@ export function createExternalRuntimeSystem(
         dev: `${identity.dev}`,
         ino: `${identity.ino}`,
         size: Number(identity.size),
+        mtimeMs: typeof identity.mtimeMs === 'bigint'
+          ? Number(identity.mtimeMs)
+          : typeof identity.mtimeMs === 'number'
+            ? identity.mtimeMs
+            : undefined,
         regular: identity.isFile(),
       }
     },
@@ -591,6 +598,23 @@ function matchesWriter(
 function isWritableDescriptor(flags: number): boolean {
   const accessMode = flags & 0b11
   return accessMode === 1 || accessMode === 2
+}
+
+function isRecentActiveRollout(identity: RuntimeFileIdentity, nowMs = Date.now()): boolean {
+  if (typeof identity.mtimeMs !== 'number' || !Number.isFinite(identity.mtimeMs)) return false
+  const ageMs = nowMs - identity.mtimeMs
+  return ageMs >= 0 && ageMs <= EXTERNAL_RUNTIME_RECENT_ACTIVE_ROLLOUT_MS
+}
+
+function runningRuntimeFromUnmatched(
+  runtime: Extract<PreparedRuntimeInspection, { state: 'unmatched' }>,
+): ExternalThreadRuntime {
+  return {
+    state: 'running',
+    turnId: runtime.turnId,
+    interruptible: false,
+    source: 'external-session-writer',
+  }
 }
 
 function belongsToExcludedProcessTree(
@@ -708,12 +732,19 @@ export class ExternalThreadRuntimeProbe {
       if (entry.runtime.state === 'idle') states[entry.threadId] = { state: 'idle' }
       if (entry.runtime.state === 'unknown') states[entry.threadId] = { state: 'unknown' }
     }
-    if (unmatched.length === 0) return states
+    const unmatchedNeedingWriterEvidence = unmatched.filter((entry) => {
+      const runtime = entry.runtime
+      if (runtime.state !== 'unmatched') return false
+      if (!isRecentActiveRollout(runtime.identity)) return true
+      states[entry.threadId] = runningRuntimeFromUnmatched(runtime)
+      return false
+    })
+    if (unmatchedNeedingWriterEvidence.length === 0) return states
 
     try {
       const writers = new Set<string>()
       for await (const fd of this.system.listFdSnapshots()) {
-        for (const entry of unmatched) {
+        for (const entry of unmatchedNeedingWriterEvidence) {
           const runtime = entry.runtime
           if (runtime.state !== 'unmatched') continue
           if (matchesWriter(fd, runtime.identity, this.system.uid!, excludedPid)) {
@@ -721,20 +752,15 @@ export class ExternalThreadRuntimeProbe {
           }
         }
       }
-      for (const entry of unmatched) {
+      for (const entry of unmatchedNeedingWriterEvidence) {
         const runtime = entry.runtime
         if (runtime.state !== 'unmatched') continue
         states[entry.threadId] = writers.has(entry.threadId)
-          ? {
-              state: 'running',
-              turnId: runtime.turnId,
-              interruptible: false,
-              source: 'external-session-writer',
-            }
+          ? runningRuntimeFromUnmatched(runtime)
           : { state: 'unknown' }
       }
     } catch {
-      for (const entry of unmatched) states[entry.threadId] = { state: 'unknown' }
+      for (const entry of unmatchedNeedingWriterEvidence) states[entry.threadId] = { state: 'unknown' }
     }
     return states
   }
@@ -825,6 +851,7 @@ export class ExternalThreadRuntimeProbe {
           dev: revalidatedIdentity.dev,
           ino: revalidatedIdentity.ino,
           size: revalidatedIdentity.size,
+          ...(revalidatedIdentity.mtimeMs === undefined ? {} : { mtimeMs: revalidatedIdentity.mtimeMs }),
         },
       }
     } catch {

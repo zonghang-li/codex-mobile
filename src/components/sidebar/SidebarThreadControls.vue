@@ -10,7 +10,7 @@
       <IconTablerLayoutSidebarFilled v-if="isSidebarCollapsed" class="sidebar-thread-controls-icon" />
       <IconTablerLayoutSidebar v-else class="sidebar-thread-controls-icon" />
       <span
-        v-if="hasUnreadThreads"
+        v-if="hasAttention"
         class="sidebar-thread-controls-unread-dot"
         aria-hidden="true"
       />
@@ -40,7 +40,7 @@ import IconTablerLayoutSidebarFilled from '../icons/IconTablerLayoutSidebarFille
 defineProps<{
   isSidebarCollapsed: boolean
   showNewThreadButton?: boolean
-  hasUnreadThreads?: boolean
+  hasAttention?: boolean
 }>()
 
 defineEmits<{

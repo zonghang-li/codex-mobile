@@ -70,6 +70,7 @@ export type UiThread = {
   updatedAtIso: string
   preview: string
   unread: boolean
+  desktopHasUserEvent?: boolean
   inProgress: boolean
   pendingRequestState?: UiPendingRequestState | null
 }
@@ -324,6 +325,7 @@ export type UiMessage = {
   id: string
   role: 'user' | 'assistant' | 'system'
   text: string
+  createdAtMs?: number | null
   directives?: UiCodexDirective[]
   images?: string[]
   skills?: Array<{ name: string; path: string }>
@@ -331,6 +333,7 @@ export type UiMessage = {
   fileChanges?: UiFileChange[]
   fileChangeStatus?: UiFileChangeStatus
   messageType?: string
+  phase?: string
   rawPayload?: string
   isUnhandled?: boolean
   activity?: UiActivityData

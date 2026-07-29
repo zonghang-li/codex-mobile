@@ -161,7 +161,7 @@
             :disabled="isInteractionDisabled"
             @click="toggleAttachMenu"
           >
-            +
+            <span class="thread-composer-attach-plus">+</span>
           </button>
 
           <div v-if="isAttachMenuOpen" class="thread-composer-attach-menu">
@@ -2353,7 +2353,12 @@ watch(
 }
 
 .thread-composer-attach-trigger {
-  @apply inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-none border-0 bg-transparent pb-px text-xl leading-tight text-zinc-700 transition hover:text-zinc-900 disabled:cursor-not-allowed disabled:text-zinc-400;
+  @apply inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-none border-0 bg-transparent text-xl leading-none text-zinc-700 transition hover:text-zinc-900 disabled:cursor-not-allowed disabled:text-zinc-400;
+}
+
+.thread-composer-attach-plus {
+  @apply inline-flex items-center justify-center leading-none;
+  transform: translateY(-1px);
 }
 
 :global(.dark) .thread-composer-attach-trigger {

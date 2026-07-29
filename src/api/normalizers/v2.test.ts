@@ -26,6 +26,49 @@ function threadReadResponseWithContent(content: unknown[]): ThreadReadResponse {
 }
 
 describe('normalizeThreadMessagesV2', () => {
+  it('preserves active external runtime progress when persisted turn status is stale interrupted', () => {
+    const response = threadReadResponseWithContent([
+      {
+        type: 'reasoning',
+        id: 'reason-1',
+        summary: ['First reasoning'],
+        content: [],
+      },
+      {
+        type: 'agentMessage',
+        id: 'agent-1',
+        text: 'First progress update',
+      },
+      {
+        type: 'mcpToolCall',
+        id: 'tool-1',
+        server: 'codegraph',
+        tool: 'codegraph_explore',
+      },
+      {
+        type: 'agentMessage',
+        id: 'agent-2',
+        text: 'Second progress update',
+      },
+    ])
+    response.thread.turns[0].status = 'interrupted'
+    ;(response.thread as unknown as Record<string, unknown>).externalRuntime = {
+      state: 'running',
+      turnId: 'turn-1',
+    }
+
+    expect(normalizeThreadMessagesV2(response).map((message) => ({
+      id: message.id,
+      type: message.messageType,
+      text: message.text,
+    }))).toEqual([
+      { id: 'reason-1', type: 'reasoning', text: 'First reasoning' },
+      { id: 'agent-1', type: 'agentMessage', text: 'First progress update' },
+      { id: 'tool-1', type: 'mcpToolCall', text: 'Called codegraph.codegraph_explore' },
+      { id: 'agent-2', type: 'agentMessage', text: 'Second progress update' },
+    ])
+  })
+
   it('propagates only finite non-negative session order values', () => {
     const response = threadReadResponseWithContent([
       {
@@ -135,6 +178,27 @@ describe('normalizeThreadMessagesV2', () => {
       text: '::git-push{cwd="/tmp/repo" branch="user-content"}',
     })
     expect(messages[1].directives).toBeUndefined()
+  })
+
+  it('preserves assistant message phase metadata for response actions', () => {
+    const messages = normalizeThreadMessagesV2(threadReadResponseWithContent([
+      {
+        type: 'agentMessage',
+        id: 'assistant-commentary',
+        text: 'Intermediate progress.',
+        phase: 'commentary',
+      },
+      {
+        type: 'agentMessage',
+        id: 'assistant-final',
+        text: 'Final answer.',
+        phase: 'final',
+      },
+    ]))
+
+    expect(messages).toEqual([
+      expect.objectContaining({ id: 'assistant-final', phase: 'final' }),
+    ])
   })
 
   it('normalizes official typed pull-request and code-comment literals', () => {
@@ -347,6 +411,46 @@ Reply with &lt;/instructions&gt; and A &amp; B
     ])
     expect(messages.map((message) => message.text).join('\n')).not.toContain('I will inspect')
     expect(messages.map((message) => message.text).join('\n')).not.toContain('running verification')
+  })
+
+  it('preserves retained assistant progress from compressed terminal turn windows', () => {
+    const response = threadReadResponseWithContent([
+      {
+        type: 'userMessage',
+        id: 'user-compressed',
+        content: [{ type: 'text', text: 'Continue the long task', text_elements: [] }],
+      },
+      {
+        type: 'agentMessage',
+        id: 'assistant-retained-1',
+        text: 'First retained update from the compressed window.',
+      },
+      {
+        type: 'agentMessage',
+        id: 'assistant-retained-2',
+        text: 'Second retained update from the compressed window.',
+      },
+      {
+        type: 'agentMessage',
+        id: 'assistant-retained-3',
+        text: 'Latest retained update from the compressed window.',
+      },
+    ])
+    response.thread.turns[0].status = 'interrupted'
+    ;(response.thread.turns[0] as unknown as Record<string, unknown>).rawItemCompression = {
+      originalItemCount: 400,
+      retainedItemCount: 240,
+      omittedItemCount: 160,
+    }
+
+    const messages = normalizeThreadMessagesV2(response)
+
+    expect(messages.map((message) => message.id)).toEqual([
+      'user-compressed',
+      'assistant-retained-1',
+      'assistant-retained-2',
+      'assistant-retained-3',
+    ])
   })
 
   it('keeps intermediate assistant progress messages for the active running turn', () => {
@@ -750,6 +854,32 @@ describe('normalizeThreadGroupsV2', () => {
       id: 'thread-external',
       inProgress: true,
       unread: false,
+    })
+  })
+
+  it('carries desktop has-user-event read metadata from thread list rows', () => {
+    const response: ThreadListResponse = {
+      data: [{
+        id: 'thread-read-on-desktop',
+        preview: 'Desktop read task',
+        modelProvider: 'openai',
+        createdAt: 1,
+        updatedAt: 2,
+        path: '/sessions/thread-read-on-desktop.jsonl',
+        cwd: '/tmp/project',
+        cliVersion: 'test',
+        source: 'vscode',
+        gitInfo: null,
+        turns: [],
+        desktopHasUserEvent: false,
+      } as ThreadListResponse['data'][number],
+      ],
+      nextCursor: null,
+    }
+
+    expect(normalizeThreadGroupsV2(response)[0]?.threads[0]).toMatchObject({
+      id: 'thread-read-on-desktop',
+      desktopHasUserEvent: false,
     })
   })
 })

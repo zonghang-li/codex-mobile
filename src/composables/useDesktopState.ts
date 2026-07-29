@@ -83,6 +83,7 @@ import { resolveTurnCompletionDisposition, type TurnTerminalStatus } from './thr
 import { shouldRefreshMessagesForNotification } from './notificationSyncPolicy'
 import { createManagedUploadLease } from './managedUploadLease'
 import {
+  filterTitleOnlyReasoningText,
   finalizeHydratedTurnText,
   mergeHydratedTurnTextIntoTranscript,
   mergeThreadTextPage,
@@ -109,6 +110,7 @@ type ActiveTextHydration = {
   hasMoreOlder: boolean
   consumedCursors: Set<string>
   controller: AbortController | null
+  recoverableConflictProjectionKey?: string
 }
 
 type OptimisticUserSubmission = {
@@ -137,23 +139,44 @@ const SELECTED_MODEL_BY_CONTEXT_STORAGE_KEY = 'codex-web-local.selected-model-by
 const LEGACY_SELECTED_MODEL_STORAGE_KEY = 'codex-web-local.selected-model-id.v1'
 const PROJECT_ORDER_STORAGE_KEY = 'codex-web-local.project-order.v1'
 const PROJECT_DISPLAY_NAME_STORAGE_KEY = 'codex-web-local.project-display-name.v1'
+const THREAD_GROUPS_SNAPSHOT_STORAGE_KEY = 'codex-web-local.thread-groups-snapshot.v1'
 const COLLABORATION_MODE_STORAGE_KEY = 'codex-web-local.collaboration-mode-by-context.v1'
 const LEGACY_COLLABORATION_MODE_STORAGE_KEY = 'codex-web-local.collaboration-mode.v1'
 const NEW_THREAD_COLLABORATION_MODE_CONTEXT = '__new-thread__'
 const NEW_THREAD_PROVIDER_MODEL_CONTEXT_PREFIX = '__new-thread-provider__::'
+const ACTIVE_TEXT_NEWEST_REFRESH_DEBOUNCE_MS = 0
 const EVENT_SYNC_DEBOUNCE_MS = 220
-const BACKGROUND_THREAD_PAGINATION_DELAY_MS = 10_000
-const ENABLE_AUTOMATIC_BACKGROUND_THREAD_PAGINATION = false
+const BACKGROUND_THREAD_PAGINATION_DELAY_MS = 250
+const ENABLE_AUTOMATIC_BACKGROUND_THREAD_PAGINATION = true
 const RATE_LIMIT_REFRESH_DEBOUNCE_MS = 500
-const EXTERNAL_RUNTIME_POLL_MS = 1_000
+const SELECTED_EXTERNAL_LIVE_PROJECTION_POLL_MS = 150
 const BACKGROUND_RUNTIME_POLL_MS = 2_000
-const BACKGROUND_RUNTIME_BATCH_LIMIT = 50
+const SELECTED_IDLE_LIVE_PROJECTION_POLL_MS = BACKGROUND_RUNTIME_POLL_MS
+const BACKGROUND_RUNTIME_BATCH_LIMIT = 16
 const TURN_START_FOLLOW_UP_SYNC_DELAY_MS = 3000
 const RECENT_THREAD_MESSAGE_LOAD_REUSE_MS = 2000
 const RECENT_THREAD_LIST_LOAD_REUSE_MS = 2000
 const RECENT_SKILLS_LOAD_REUSE_MS = 2000
 const REASONING_EFFORT_OPTIONS: ReasoningEffort[] = ALL_REASONING_EFFORTS
 const GLOBAL_SERVER_REQUEST_SCOPE = '__global__'
+const THREAD_LIST_STRUCTURE_NOTIFICATION_METHODS = new Set([
+  'thread/archived',
+  'thread/created',
+  'thread/deleted',
+  'thread/restored',
+  'thread/unarchived',
+])
+const ACTIVE_TEXT_NEWEST_REFRESH_NOTIFICATION_METHODS = new Set([
+  'item/agentMessage/delta',
+  'item/reasoning/summaryTextDelta',
+  'item/reasoning/summaryPartAdded',
+  'item/reasoning/textDelta',
+])
+const ACTIVE_TEXT_ITEM_NOTIFICATION_TYPES = new Set([
+  'agentMessage',
+  'reasoning',
+  'contextCompaction',
+])
 const DEFAULT_CODEX_NEW_THREAD_MODEL_ID = 'gpt-5.6-sol'
 const DEFAULT_CODEX_NEW_THREAD_REASONING_EFFORT: ReasoningEffort = 'max'
 const DEFAULT_CODEX_NEW_THREAD_SPEED_MODE: SpeedMode = 'fast'
@@ -213,6 +236,54 @@ function saveReadStateMap(state: Record<string, string>): void {
   window.localStorage.setItem(READ_STATE_STORAGE_KEY, JSON.stringify(state))
 }
 
+function readThreadGroupsSnapshot(): UiProjectGroup[] {
+  if (typeof window === 'undefined') return []
+
+  try {
+    const raw = window.localStorage.getItem(THREAD_GROUPS_SNAPSHOT_STORAGE_KEY)
+    if (!raw) return []
+    const parsed = JSON.parse(raw) as unknown
+    const groupsRaw = Array.isArray(parsed)
+      ? parsed
+      : parsed && typeof parsed === 'object' && Array.isArray((parsed as { groups?: unknown }).groups)
+        ? (parsed as { groups: unknown[] }).groups
+        : []
+    const groups: UiProjectGroup[] = []
+    for (const groupRaw of groupsRaw) {
+      if (!groupRaw || typeof groupRaw !== 'object') continue
+      const group = groupRaw as { projectName?: unknown; threads?: unknown }
+      const projectName = typeof group.projectName === 'string' ? group.projectName : ''
+      if (!projectName || !Array.isArray(group.threads)) continue
+      const threads = group.threads.filter((threadRaw): threadRaw is UiThread => (
+        Boolean(threadRaw) &&
+        typeof threadRaw === 'object' &&
+        typeof (threadRaw as { id?: unknown }).id === 'string' &&
+        typeof (threadRaw as { title?: unknown }).title === 'string' &&
+        typeof (threadRaw as { projectName?: unknown }).projectName === 'string' &&
+        typeof (threadRaw as { cwd?: unknown }).cwd === 'string'
+      ))
+      if (threads.length > 0) {
+        groups.push({ projectName, threads })
+      }
+    }
+    return groups
+  } catch {
+    return []
+  }
+}
+
+function saveThreadGroupsSnapshot(groups: UiProjectGroup[]): void {
+  if (typeof window === 'undefined') return
+  try {
+    window.localStorage.setItem(THREAD_GROUPS_SNAPSHOT_STORAGE_KEY, JSON.stringify({
+      groups,
+      savedAtIso: new Date().toISOString(),
+    }))
+  } catch {
+    // Startup cache is best-effort only.
+  }
+}
+
 function loadUnreadCutoffIso(): string {
   if (typeof window === 'undefined') return ''
 
@@ -235,6 +306,14 @@ function isThreadUpdatedAfterCutoff(updatedAtIso: string, cutoffIso: string): bo
   const cutoffMs = new Date(cutoffIso).getTime()
   if (!Number.isFinite(updatedAtMs) || !Number.isFinite(cutoffMs)) return false
   return updatedAtMs > cutoffMs
+}
+
+function readThreadReadWatermarkIso(updatedAtIso: string, nowMs = Date.now()): string {
+  const updatedAtMs = updatedAtIso ? new Date(updatedAtIso).getTime() : Number.NaN
+  const watermarkMs = Number.isFinite(updatedAtMs)
+    ? Math.max(updatedAtMs, nowMs)
+    : nowMs
+  return new Date(watermarkMs).toISOString()
 }
 
 export function isThreadUnreadByLastRead(
@@ -744,6 +823,20 @@ function isAmbiguousTurnStartError(error: unknown): boolean {
     && (error.status === 408 || error.status === 502 || error.status === 503 || error.status === 504)
 }
 
+function isWriterOwnershipNotIdleError(error: unknown): boolean {
+  if (!(error instanceof Error)) return false
+  return error.message.toLowerCase().includes('task writer ownership is not idle')
+}
+
+function isThreadNotFoundInterruptError(error: unknown): boolean {
+  if (!(error instanceof Error)) return false
+  const message = error.message.toLowerCase()
+  return (
+    message.includes('turn/interrupt') &&
+    (message.includes('thread not found') || message.includes('no rollout found for thread id'))
+  )
+}
+
 function areMessageFieldsEqual(first: UiMessage, second: UiMessage): boolean {
   return (
     first.id === second.id &&
@@ -987,6 +1080,7 @@ type TurnSummaryState = {
   turnId: string
   durationMs: number | null
   status: TurnTerminalStatus
+  completedAtMs?: number | null
 }
 
 type TurnActivityState = {
@@ -1079,6 +1173,7 @@ function buildTurnSummaryMessage(summary: TurnSummaryState): UiMessage {
       : `Worked${workedSuffix}`,
     messageType: WORKED_MESSAGE_TYPE,
     turnId: summary.turnId,
+    createdAtMs: summary.completedAtMs ?? null,
   }
 }
 
@@ -1169,8 +1264,13 @@ function loadPersistedTurnSummaryMap(): Record<string, Record<string, TurnSummar
           : typeof summary.durationMs === 'number' && Number.isFinite(summary.durationMs)
             ? Math.max(0, summary.durationMs)
             : null
+        const completedAtMs = summary.completedAtMs === null
+          ? null
+          : typeof summary.completedAtMs === 'number' && Number.isFinite(summary.completedAtMs)
+            ? Math.max(0, summary.completedAtMs)
+            : null
         if (!status) continue
-        summaries[turnId] = { turnId, status, durationMs }
+        summaries[turnId] = { turnId, status, durationMs, completedAtMs }
       }
       if (Object.keys(summaries).length > 0) {
         result[threadId] = summaries
@@ -1224,6 +1324,7 @@ function areThreadFieldsEqual(first: UiThread, second: UiThread): boolean {
     first.updatedAtIso === second.updatedAtIso &&
     first.preview === second.preview &&
     first.unread === second.unread &&
+    first.desktopHasUserEvent === second.desktopHasUserEvent &&
     first.inProgress === second.inProgress &&
     first.pendingRequestState === second.pendingRequestState
   )
@@ -1833,6 +1934,7 @@ export function useDesktopState() {
     return ''
   }
   let stopNotificationStream: (() => void) | null = null
+  let activeTextNewestRefreshTimer: number | null = null
   let eventSyncTimer: number | null = null
   let rateLimitRefreshTimer: number | null = null
   let externalRuntimeTimer: number | null = null
@@ -1851,16 +1953,19 @@ export function useDesktopState() {
     generation: number
     controller: AbortController
     promise: Promise<void>
+    threadIds: string[]
   } | null = null
-  let backgroundRuntimeCursor = 0
   let backgroundRuntimePollingEnabled = false
   let runtimeVisibilityListenerInstalled = false
   const backgroundExternalThreadIds = new Set<string>()
   const localRuntimeAuthorityVersionByThreadId = new Map<string, number>()
   const selectionVersionByThreadId = new Map<string, number>()
+  const isolatedSelectedRuntimeProbeVersionByThreadId = new Map<string, number>()
   const delayedTurnSyncTimerByThreadId = new Map<string, number>()
   const activeTextHydrationByThreadId = new Map<string, ActiveTextHydration>()
   const activeTextHydrationGenerationByThreadId = new Map<string, number>()
+  const compressedLiveProjectionBackfillKeyByThreadId = new Map<string, string>()
+  const compressedLiveProjectionBackfillTimerByThreadId = new Map<string, number>()
   let loadThreadsPromise: Promise<void> | null = null
   const loadMessagePromiseByThreadId = new Map<string, Promise<void>>()
   const rollbackPromiseByThreadId = new Map<string, Promise<void>>()
@@ -1882,6 +1987,9 @@ export function useDesktopState() {
   let pendingThreadsRefresh = false
   let pendingThreadsRefreshForce = false
   const pendingThreadMessageRefresh = new Set<string>()
+  const pendingThreadRuntimeRefresh = new Set<string>()
+  const pendingActiveTextNewestRefresh = new Set<string>()
+  const pendingActiveTextNewestTurnIdByThreadId = new Map<string, string>()
   const lastMessageLoadAtByThreadId = new Map<string, number>()
   const lastMessageLoadFailureAtByThreadId = new Map<string, number>()
   let threadListNextCursor: string | null = null
@@ -1889,12 +1997,23 @@ export function useDesktopState() {
   let isLoadingRemainingThreadPages = false
   let hasLoadedAllThreadPages = false
   let loadedThreadListGroups: UiProjectGroup[] = []
+  let freshThreadListGroupsDuringSnapshotRefresh: UiProjectGroup[] | null = null
   let loadedThreadListRootsState: WorkspaceRootsState | null = null
+  let hasLoadedThreadListSnapshotOnly = false
   let hasHydratedWorkspaceRootsState = false
   let threadListMetadataEpoch = 0
   let activeReasoningItemId = ''
   let shouldAutoScrollOnNextAgentEvent = false
   const pendingTurnStartsById = new Map<string, TurnStartedInfo>()
+
+  const cachedThreadGroupsSnapshot = readThreadGroupsSnapshot()
+  if (cachedThreadGroupsSnapshot.length > 0) {
+    loadedThreadListGroups = cachedThreadGroupsSnapshot
+    sourceGroups.value = cachedThreadGroupsSnapshot
+    projectGroups.value = cachedThreadGroupsSnapshot
+    hasLoadedThreads.value = true
+    hasLoadedThreadListSnapshotOnly = true
+  }
   const completionReconciliationGenerationByThreadId = new Map<string, number>()
   const localSubmissionByThreadId = new Map<string, LocalSubmissionState>()
   const pendingStopRequestByThreadId = new Map<string, PendingStopRequest>()
@@ -1940,7 +2059,7 @@ export function useDesktopState() {
     const isInProgress = inProgressById.value[threadId] === true
     const activity = isInProgress ? turnActivityByThreadId.value[threadId] : undefined
     const reasoningText = isInProgress
-      ? (liveReasoningTextByThreadId.value[threadId] ?? '').trim()
+      ? filterTitleOnlyReasoningText(liveReasoningTextByThreadId.value[threadId] ?? '')
       : ''
     const liveErrorText = (turnErrorByThreadId.value[threadId]?.message ?? '').trim()
     let latestPersistedTurnErrorText = ''
@@ -2005,9 +2124,8 @@ export function useDesktopState() {
     const livePlan = livePlanMessagesByThreadId.value[threadId] ?? []
     const liveAgent = liveAgentMessagesByThreadId.value[threadId] ?? []
     const liveCommands = liveCommandsByThreadId.value[threadId] ?? []
-    const liveFileChanges = liveFileChangeMessagesByThreadId.value[threadId] ?? []
     const persistedWithOptimistic = mergeOptimisticSubmissionsForDisplay(persisted, optimistic)
-    const combined = [...persistedWithOptimistic, ...livePlan, ...liveCommands, ...liveFileChanges, ...liveAgent]
+    const combined = [...persistedWithOptimistic, ...livePlan, ...liveCommands, ...liveAgent]
     const ownership = runtimeOwnershipByThreadId.value[threadId] ?? 'idle'
     const isExternal = ownership === 'external'
     const isRunning = inProgressById.value[threadId] === true
@@ -2880,18 +2998,23 @@ export function useDesktopState() {
 
   function applyThreadFlags(): void {
     const withTitles = applyCachedTitlesToGroups(sourceGroups.value)
+    let nextEventUnreadByThreadId = eventUnreadByThreadId.value
     const flaggedGroups: UiProjectGroup[] = withTitles.map((group) => ({
       projectName: group.projectName,
       threads: group.threads.map((thread) => {
         const inProgress = thread.inProgress === true || inProgressById.value[thread.id] === true
         const pendingRequestState = readPendingRequestState(getThreadPendingRequests(thread.id))
         const isSelected = selectedThreadId.value === thread.id
-        const unreadByEvent = eventUnreadByThreadId.value[thread.id] === true
-        const unreadByTime = isThreadUnreadByLastRead(
-          thread.updatedAtIso,
-          readStateByThreadId.value[thread.id],
-          unreadCutoffIso.value,
-        )
+        const desktopRead = thread.desktopHasUserEvent === false
+        if (desktopRead && nextEventUnreadByThreadId[thread.id] === true) {
+          nextEventUnreadByThreadId = omitKey(nextEventUnreadByThreadId, thread.id)
+        }
+        const unreadByEvent = !desktopRead && nextEventUnreadByThreadId[thread.id] === true
+        const unreadByTime = !desktopRead && isThreadUnreadByLastRead(
+            thread.updatedAtIso,
+            readStateByThreadId.value[thread.id],
+            unreadCutoffIso.value,
+          )
         const unread = !isSelected && !inProgress && (unreadByEvent || unreadByTime)
 
         return {
@@ -2902,7 +3025,39 @@ export function useDesktopState() {
         }
       }),
     }))
+    if (nextEventUnreadByThreadId !== eventUnreadByThreadId.value) {
+      eventUnreadByThreadId.value = nextEventUnreadByThreadId
+    }
     projectGroups.value = mergeThreadGroups(projectGroups.value, flaggedGroups)
+  }
+
+  function preserveReadWatermarksForMetadataOnlyRefresh(incomingGroups: UiProjectGroup[]): void {
+    const previousThreadsById = new Map(flattenThreads(projectGroups.value).map((thread) => [thread.id, thread]))
+    if (previousThreadsById.size === 0) return
+
+    let nextReadState = readStateByThreadId.value
+    let changed = false
+    for (const thread of flattenThreads(incomingGroups)) {
+      const previousThread = previousThreadsById.get(thread.id)
+      if (!previousThread) continue
+      if (previousThread.unread === true) continue
+      if (previousThread.inProgress === true || thread.inProgress === true) continue
+      if (inProgressById.value[thread.id] === true) continue
+      if (eventUnreadByThreadId.value[thread.id] === true) continue
+      if (thread.desktopHasUserEvent === true) continue
+
+      const currentReadIso = nextReadState[thread.id] ?? unreadCutoffIso.value
+      if (!isThreadUpdatedAfterCutoff(thread.updatedAtIso, currentReadIso)) continue
+      nextReadState = {
+        ...nextReadState,
+        [thread.id]: readThreadReadWatermarkIso(thread.updatedAtIso),
+      }
+      changed = true
+    }
+
+    if (!changed) return
+    readStateByThreadId.value = nextReadState
+    saveReadStateMap(nextReadState)
   }
 
   function insertOptimisticThread(threadId: string, cwd: string, firstMessageText: string): void {
@@ -2995,6 +3150,7 @@ export function useDesktopState() {
     backgroundExternalThreadIds.delete(normalizedThreadId)
     localRuntimeAuthorityVersionByThreadId.delete(normalizedThreadId)
     selectionVersionByThreadId.delete(normalizedThreadId)
+    isolatedSelectedRuntimeProbeVersionByThreadId.delete(normalizedThreadId)
 
     if (selectedThreadId.value === normalizedThreadId) {
       setSelectedThreadId(fallbackSelectedThreadId)
@@ -3011,6 +3167,9 @@ export function useDesktopState() {
     }
     for (const threadId of selectionVersionByThreadId.keys()) {
       if (!activeThreadIds.has(threadId)) selectionVersionByThreadId.delete(threadId)
+    }
+    for (const threadId of isolatedSelectedRuntimeProbeVersionByThreadId.keys()) {
+      if (!activeThreadIds.has(threadId)) isolatedSelectedRuntimeProbeVersionByThreadId.delete(threadId)
     }
     const currentThreadId = selectedThreadId.value.trim()
     if (currentThreadId) {
@@ -3090,13 +3249,18 @@ export function useDesktopState() {
     pendingServerRequestsByThreadId.value = nextPending
   }
 
+  function pruneThreadScopedStateAfterCompleteDirectory(): void {
+    if (!hasLoadedAllThreadPages) return
+    pruneThreadScopedState(flattenThreads(projectGroups.value))
+  }
+
   function markThreadAsRead(threadId: string): void {
     const thread = flattenThreads(sourceGroups.value).find((row) => row.id === threadId)
-    if (!thread) return
+    const readWatermarkIso = readThreadReadWatermarkIso(thread?.updatedAtIso ?? '')
 
     readStateByThreadId.value = {
       ...readStateByThreadId.value,
-      [threadId]: thread.updatedAtIso,
+      [threadId]: readWatermarkIso,
     }
     saveReadStateMap(readStateByThreadId.value)
     if (eventUnreadByThreadId.value[threadId]) {
@@ -3109,9 +3273,10 @@ export function useDesktopState() {
     const thread = flattenThreads(sourceGroups.value).find((row) => row.id === threadId)
     const currentUpdatedAtIso = thread?.updatedAtIso ?? ''
     if (currentUpdatedAtIso) {
+      const readWatermarkIso = readThreadReadWatermarkIso(currentUpdatedAtIso)
       readStateByThreadId.value = {
         ...readStateByThreadId.value,
-        [threadId]: currentUpdatedAtIso,
+        [threadId]: readWatermarkIso,
       }
       saveReadStateMap(readStateByThreadId.value)
     }
@@ -3203,12 +3368,48 @@ export function useDesktopState() {
       return {
         ...summary,
         durationMs: persistedSummary.durationMs,
+        completedAtMs: summary.completedAtMs ?? persistedSummary.completedAtMs,
       }
     })
   }
 
   function isCurrentThreadDetailEpoch(threadId: string, epoch: number): boolean {
     return (detailRequestEpochByThreadId.get(threadId) ?? 0) === epoch
+  }
+
+  function isAbortLikeError(unknownError: unknown): boolean {
+    return unknownError instanceof Error && unknownError.name === 'AbortError'
+  }
+
+  function scheduleCompressedLiveProjectionBackfill(threadId: string, projectionKey: string): void {
+    if (!threadId || !projectionKey || typeof window === 'undefined') return
+    if (selectedThreadId.value !== threadId) return
+    if (compressedLiveProjectionBackfillKeyByThreadId.get(threadId) === projectionKey) return
+
+    const existingTimer = compressedLiveProjectionBackfillTimerByThreadId.get(threadId)
+    if (existingTimer !== undefined) {
+      window.clearTimeout(existingTimer)
+      compressedLiveProjectionBackfillTimerByThreadId.delete(threadId)
+    }
+
+    compressedLiveProjectionBackfillKeyByThreadId.set(threadId, projectionKey)
+    const timer = window.setTimeout(() => {
+      compressedLiveProjectionBackfillTimerByThreadId.delete(threadId)
+      if (selectedThreadId.value !== threadId) return
+      const currentProjectionKey = projectionKeyByThreadId.value[threadId] ?? ''
+      if (currentProjectionKey && currentProjectionKey !== projectionKey) return
+
+      void loadMessages(threadId, {
+        silent: true,
+        force: true,
+        bypassRecentReuse: true,
+      }).catch(() => {
+        if (compressedLiveProjectionBackfillKeyByThreadId.get(threadId) === projectionKey) {
+          compressedLiveProjectionBackfillKeyByThreadId.delete(threadId)
+        }
+      })
+    }, 0)
+    compressedLiveProjectionBackfillTimerByThreadId.set(threadId, timer)
   }
 
   function acquireThreadDetailRequest(
@@ -3229,6 +3430,14 @@ export function useDesktopState() {
     return { epoch, ownsRequest: true, promise }
   }
 
+  function invalidateThreadDetailRequest(threadId: string): void {
+    const current = detailRequestByThreadId.get(threadId)
+    if (!current) return
+    detailRequestByThreadId.delete(threadId)
+    detailRequestEpochByThreadId.set(threadId, current.epoch + 1)
+    current.controller?.abort()
+  }
+
   function releaseThreadDetailRequest(threadId: string, lease: ThreadDetailRequestLease): void {
     const current = detailRequestByThreadId.get(threadId)
     if (!current || current.epoch !== lease.epoch || current.promise !== lease.promise) return
@@ -3240,9 +3449,7 @@ export function useDesktopState() {
     if (epoch === null) return
     const current = detailRequestByThreadId.get(threadId)
     if (!current || current.epoch !== epoch) return
-    detailRequestByThreadId.delete(threadId)
-    detailRequestEpochByThreadId.set(threadId, epoch + 1)
-    current.controller?.abort()
+    invalidateThreadDetailRequest(threadId)
   }
 
   function cancelExternalRuntimePolling(): void {
@@ -3262,30 +3469,64 @@ export function useDesktopState() {
   function backgroundRuntimeCandidateIds(): string[] {
     const selectedId = selectedThreadId.value
     const ids: string[] = []
+    const addedIds = new Set<string>()
     const loadedThreads = flattenThreads(sourceGroups.value)
-    const selectedThreadLoaded = loadedThreads.some((thread) => thread.id === selectedId)
-    if (selectedId && selectedThreadLoaded && !isThreadDetailLoadActive(selectedId)) {
+    const loadedThreadsById = new Map(loadedThreads.map((thread) => [thread.id, thread]))
+    const flaggedThreadsById = new Map(
+      flattenThreads(projectGroups.value).map((thread) => [thread.id, thread]),
+    )
+
+    const addCandidate = (threadId: string): void => {
+      if (!threadId || ids.length >= BACKGROUND_RUNTIME_BATCH_LIMIT) return
+      if (addedIds.has(threadId) || !loadedThreadsById.has(threadId)) return
+      if (
+        threadId === selectedId &&
+        (runtimeOwnershipByThreadId.value[threadId] ?? 'idle') !== 'external' &&
+        isThreadDetailLoadActive(threadId)
+      ) return
+      const ownership = runtimeOwnershipByThreadId.value[threadId] ?? 'idle'
+      ids.push(threadId)
+      addedIds.add(threadId)
+      if (ownership === 'external') backgroundExternalThreadIds.add(threadId)
+    }
+
+    if (selectedId && loadedThreadsById.has(selectedId)) {
       const selectedOwnership = runtimeOwnershipByThreadId.value[selectedId] ?? 'idle'
-      if (selectedOwnership !== 'external') {
-        ids.push(selectedId)
+      if (selectedOwnership === 'external' || !isThreadDetailLoadActive(selectedId)) {
+        addCandidate(selectedId)
       }
     }
 
-    const candidates = loadedThreads.filter((thread) => thread.id && thread.id !== selectedId)
-    const availableSlots = BACKGROUND_RUNTIME_BATCH_LIMIT - ids.length
-    const takeCount = Math.min(availableSlots, candidates.length)
-    const startIndex = candidates.length > 0
-      ? backgroundRuntimeCursor % candidates.length
-      : 0
-    for (let offset = 0; offset < takeCount; offset += 1) {
-      const thread = candidates[(startIndex + offset) % candidates.length]
-      const ownership = runtimeOwnershipByThreadId.value[thread.id] ?? 'idle'
-      ids.push(thread.id)
-      if (ownership === 'external') backgroundExternalThreadIds.add(thread.id)
+    for (const thread of flaggedThreadsById.values()) {
+      if (
+        thread.unread === true ||
+        Boolean(thread.pendingRequestState) ||
+        thread.inProgress === true
+      ) {
+        addCandidate(thread.id)
+      }
     }
-    backgroundRuntimeCursor = candidates.length > 0
-      ? (startIndex + takeCount) % candidates.length
-      : 0
+
+    for (const threadId of backgroundExternalThreadIds) {
+      addCandidate(threadId)
+    }
+    for (const [threadId, ownership] of Object.entries(runtimeOwnershipByThreadId.value)) {
+      if (ownership === 'external') addCandidate(threadId)
+    }
+    for (const [threadId, inProgress] of Object.entries(inProgressById.value)) {
+      if (inProgress === true) addCandidate(threadId)
+    }
+    for (const threadId of Object.keys(activeTurnIdByThreadId.value)) {
+      addCandidate(threadId)
+    }
+
+    const visibleLimit = Math.max(
+      0,
+      Math.min(getBackgroundThreadListLimit(), BACKGROUND_RUNTIME_BATCH_LIMIT),
+    )
+    for (const thread of loadedThreads.slice(0, visibleLimit)) {
+      addCandidate(thread.id)
+    }
     return ids
   }
 
@@ -3303,6 +3544,25 @@ export function useDesktopState() {
     return detailRequestByThreadId.has(threadId) || loadMessagePromiseByThreadId.has(threadId)
   }
 
+  function isSelectedLiveProjectionPollingEligible(threadId: string): boolean {
+    if (!threadId || selectedThreadId.value !== threadId) return false
+    if (runtimeOwnershipByThreadId.value[threadId] === 'local') return false
+    return loadedMessagesByThreadId.value[threadId] === true
+  }
+
+  function canStartSelectedLiveProjectionPolling(threadId: string): boolean {
+    return isSelectedLiveProjectionPollingEligible(threadId) && !isThreadDetailLoadActive(threadId)
+  }
+
+  function isSelectedRuntimeProbeInFlight(threadId: string): boolean {
+    return Boolean(
+      threadId &&
+      selectedThreadId.value === threadId &&
+      runtimeOwnershipByThreadId.value[threadId] !== 'external' &&
+      backgroundRuntimeRequest?.threadIds.includes(threadId),
+    )
+  }
+
   function scheduleBackgroundRuntimePolling(delayMs = BACKGROUND_RUNTIME_POLL_MS): void {
     if (!backgroundRuntimePollingEnabled || typeof window === 'undefined') return
     if (typeof document !== 'undefined' && document.visibilityState === 'hidden') return
@@ -3316,10 +3576,23 @@ export function useDesktopState() {
     }
     backgroundRuntimeTimer = window.setTimeout(() => {
       backgroundRuntimeTimer = null
-      const threadIds = backgroundRuntimeCandidateIds()
-      if (threadIds.length === 0) {
+      const candidateThreadIds = backgroundRuntimeCandidateIds()
+      if (candidateThreadIds.length === 0) {
         scheduleBackgroundRuntimePolling()
         return
+      }
+      const selectedId = selectedThreadId.value
+      const selectedVersion = selectedId ? selectionVersionByThreadId.get(selectedId) ?? 0 : 0
+      const shouldIsolateSelectedProbe =
+        selectedId.length > 0
+        && candidateThreadIds.length > 1
+        && candidateThreadIds.includes(selectedId)
+        && (runtimeOwnershipByThreadId.value[selectedId] ?? 'idle') === 'idle'
+        && loadedMessagesByThreadId.value[selectedId] === true
+        && isolatedSelectedRuntimeProbeVersionByThreadId.get(selectedId) !== selectedVersion
+      const threadIds = shouldIsolateSelectedProbe ? [selectedId] : candidateThreadIds
+      if (shouldIsolateSelectedProbe) {
+        isolatedSelectedRuntimeProbeVersionByThreadId.set(selectedId, selectedVersion)
       }
       const generation = backgroundRuntimeGeneration
       const controller = new AbortController()
@@ -3344,7 +3617,7 @@ export function useDesktopState() {
         generation,
         controller.signal,
       )
-      backgroundRuntimeRequest = { generation, controller, promise }
+      backgroundRuntimeRequest = { generation, controller, promise, threadIds }
       void promise.finally(() => {
         if (backgroundRuntimeRequest?.promise !== promise) return
         backgroundRuntimeRequest = null
@@ -3358,13 +3631,24 @@ export function useDesktopState() {
     cancelBackgroundRuntimeRequest()
     cancelExternalRuntimePolling()
     if (document.visibilityState !== 'visible') {
+      if (threadListBackgroundTimer !== null && typeof window !== 'undefined') {
+        window.clearTimeout(threadListBackgroundTimer)
+        threadListBackgroundTimer = null
+      }
       pauseActiveTextHydration(selectedThreadId.value)
       return
     }
     resumeActiveTextHydration()
+    scheduleRemainingThreadPages(loadedThreadListRootsState)
     scheduleBackgroundRuntimePolling(0)
     const selectedId = selectedThreadId.value
-    if (selectedId && runtimeOwnershipByThreadId.value[selectedId] === 'external') {
+    if (
+      selectedId &&
+      (
+        runtimeOwnershipByThreadId.value[selectedId] === 'external' ||
+        canStartSelectedLiveProjectionPolling(selectedId)
+      )
+    ) {
       scheduleExternalRuntimePolling(selectedId, 0)
     }
   }
@@ -3415,6 +3699,39 @@ export function useDesktopState() {
 
       const ownership = runtimeOwnershipByThreadId.value[threadId] ?? 'idle'
       const locallyRunning = inProgressById.value[threadId] === true && ownership !== 'external'
+      if (runtime.state === 'idle' && ownership === 'external') {
+        backgroundExternalThreadIds.delete(threadId)
+        setThreadRuntimeOwnership(threadId, 'idle')
+        setThreadInProgress(threadId, false)
+        shouldRefreshThreads = true
+
+        if (isSelectedNow) {
+          const detailRequest = acquireThreadDetailRequest(
+            threadId,
+            () => getThreadDetail(threadId, signal),
+          )
+          try {
+            const detail = await detailRequest.promise
+            if (generation !== backgroundRuntimeGeneration) continue
+            if (selectedThreadId.value !== threadId) continue
+            if (!loadedIds.has(threadId)) continue
+            if (!isCurrentThreadDetailEpoch(threadId, detailRequest.epoch)) continue
+            if ((selectionVersionByThreadId.get(threadId) ?? 0) !== requestedSelectionVersion) continue
+
+            reconcileThreadDetailSnapshot(threadId, detail, {
+              preserveMissing: true,
+              markRead: true,
+              requestedVersion: '',
+              detailEpoch: detailRequest.epoch,
+            })
+          } catch {
+            // Runtime idle is authoritative for the controls; a later refresh can recover terminal text.
+          } finally {
+            releaseThreadDetailRequest(threadId, detailRequest)
+          }
+        }
+        continue
+      }
       if (runtime.state === 'idle' && ownership === 'local') {
         if (!isSelectedNow) {
           clearCompletedTurnLiveState(threadId)
@@ -3460,6 +3777,10 @@ export function useDesktopState() {
         continue
       }
       if (runtime.state === 'running') {
+        activeTurnIdByThreadId.value = {
+          ...activeTurnIdByThreadId.value,
+          [threadId]: runtime.turnId,
+        }
         if (!isSelectedNow) backgroundExternalThreadIds.add(threadId)
         setThreadRuntimeOwnership(threadId, 'external', {
           externalPollDelayMs: isSelectedNow ? 0 : undefined,
@@ -3484,16 +3805,21 @@ export function useDesktopState() {
 
   function scheduleExternalRuntimePolling(
     threadId: string,
-    delayMs = EXTERNAL_RUNTIME_POLL_MS,
+    delayMs = SELECTED_EXTERNAL_LIVE_PROJECTION_POLL_MS,
   ): void {
     if (!externalRuntimePollingEnabled || typeof window === 'undefined') return
     if (typeof document !== 'undefined' && document.visibilityState === 'hidden') return
     if (!threadId || selectedThreadId.value !== threadId) return
-    if (runtimeOwnershipByThreadId.value[threadId] !== 'external') return
+    if (
+      runtimeOwnershipByThreadId.value[threadId] !== 'external' &&
+      !canStartSelectedLiveProjectionPolling(threadId)
+    ) return
+    if (isSelectedRuntimeProbeInFlight(threadId)) return
     if (externalRuntimeTimer !== null || externalRuntimeRequest !== null) return
 
     externalRuntimeTimer = window.setTimeout(() => {
       externalRuntimeTimer = null
+      if (isSelectedRuntimeProbeInFlight(threadId)) return
       const generation = externalRuntimeGeneration
       const controller = new AbortController()
       const knownProjectionKey = projectionKeyByThreadId.value[threadId] ?? undefined
@@ -3518,8 +3844,19 @@ export function useDesktopState() {
         externalRuntimeRequest = null
         if (generation !== externalRuntimeGeneration) return
         const selectedId = selectedThreadId.value
-        if (selectedId && runtimeOwnershipByThreadId.value[selectedId] === 'external') {
-          scheduleExternalRuntimePolling(selectedId)
+        if (
+          selectedId &&
+          (
+            runtimeOwnershipByThreadId.value[selectedId] === 'external' ||
+            canStartSelectedLiveProjectionPolling(selectedId)
+          )
+        ) {
+          scheduleExternalRuntimePolling(
+            selectedId,
+            runtimeOwnershipByThreadId.value[selectedId] === 'external'
+              ? undefined
+              : SELECTED_IDLE_LIVE_PROJECTION_POLL_MS,
+          )
         }
       })
     }, delayMs)
@@ -3530,11 +3867,14 @@ export function useDesktopState() {
     generation: number,
     detailRequest: ThreadDetailRequestLease,
   ): Promise<void> {
+    let shouldRefreshThreadsAfterPoll = false
     try {
       const detail = await detailRequest.promise
       if (generation !== externalRuntimeGeneration) return
       if (selectedThreadId.value !== threadId) return
-      if (runtimeOwnershipByThreadId.value[threadId] !== 'external') return
+      const ownershipBeforePoll = runtimeOwnershipByThreadId.value[threadId] ?? 'idle'
+      if (ownershipBeforePoll !== 'external' && !isSelectedLiveProjectionPollingEligible(threadId)) return
+      shouldRefreshThreadsAfterPoll = ownershipBeforePoll === 'external' && detail.inProgress !== true
 
       reconcileThreadDetailSnapshot(threadId, detail, {
         preserveMissing: true,
@@ -3546,6 +3886,15 @@ export function useDesktopState() {
       // Abort and read failures retain the confirmed external lease, output, and summary.
     } finally {
       releaseThreadDetailRequest(threadId, detailRequest)
+    }
+    if (!shouldRefreshThreadsAfterPoll) return
+    pendingThreadsRefresh = true
+    pendingThreadsRefreshForce = true
+    if (typeof window !== 'undefined' && eventSyncTimer === null) {
+      eventSyncTimer = window.setTimeout(() => {
+        eventSyncTimer = null
+        void syncFromNotifications()
+      }, EVENT_SYNC_DEBOUNCE_MS)
     }
   }
 
@@ -3589,8 +3938,14 @@ export function useDesktopState() {
     if (selectedThreadId.value !== threadId) return
     if (ownership === 'external') {
       scheduleExternalRuntimePolling(threadId, options.externalPollDelayMs)
-    } else if (currentOwnership === 'external' || ownership === 'local') {
+    } else if (ownership === 'local') {
       cancelExternalRuntimePolling()
+    } else if (currentOwnership === 'external') {
+      if (canStartSelectedLiveProjectionPolling(threadId)) {
+        scheduleExternalRuntimePolling(threadId, options.externalPollDelayMs)
+      } else {
+        cancelExternalRuntimePolling()
+      }
     }
   }
 
@@ -3848,12 +4203,26 @@ export function useDesktopState() {
       && activeTextHydrationGenerationByThreadId.get(threadId) === generation
   }
 
+  function isActiveTextHydrationConflictBlocked(
+    threadId: string,
+    hydration: ActiveTextHydration,
+  ): boolean {
+    return hydration.recoverableConflictProjectionKey !== undefined
+      && hydration.recoverableConflictProjectionKey === (projectionKeyByThreadId.value[threadId] ?? '')
+  }
+
   function publishActiveTextHydration(threadId: string, hydration: ActiveTextHydration): void {
     const transcript = persistedMessagesByThreadId.value[threadId] ?? []
+    const nextTranscript = mergeHydratedTurnTextIntoTranscript(
+      transcript,
+      hydration.messages,
+      hydration.turnId,
+    )
     setPersistedMessagesForThread(
       threadId,
-      mergeHydratedTurnTextIntoTranscript(transcript, hydration.messages, hydration.turnId),
+      nextTranscript,
     )
+    removeLiveAgentMessagesPersistedIn(threadId, nextTranscript)
   }
 
   async function continueActiveTextHydration(
@@ -3861,55 +4230,60 @@ export function useDesktopState() {
     hydration: ActiveTextHydration,
     generation: number,
   ): Promise<void> {
-    while (
-      hydration.hasMoreOlder
-      && isActiveTextHydrationCurrent(threadId, hydration, generation)
-    ) {
-      if (typeof document !== 'undefined' && document.visibilityState === 'hidden') return
+    if (!hydration.hasMoreOlder || !isActiveTextHydrationCurrent(threadId, hydration, generation)) return
+    if (typeof document !== 'undefined' && document.visibilityState === 'hidden') return
+    if (isActiveTextHydrationConflictBlocked(threadId, hydration)) return
 
-      const cursor = hydration.consumedCursors.size === 0
-        ? undefined
-        : hydration.nextOlderCursor ?? undefined
-      const cursorKey = cursor ?? ''
-      if (hydration.consumedCursors.has(cursorKey)) return
+    const cursor = hydration.consumedCursors.size === 0
+      ? undefined
+      : hydration.nextOlderCursor ?? undefined
+    const cursorKey = cursor ?? ''
+    if (hydration.consumedCursors.has(cursorKey)) return
 
-      const controller = new AbortController()
-      hydration.controller = controller
-      try {
-        const page = await getThreadTextPage(
-          threadId,
-          hydration.turnId,
-          cursor,
-          undefined,
-          controller.signal,
-        )
-        if (!isActiveTextHydrationCurrent(threadId, hydration, generation)) return
+    const controller = new AbortController()
+    hydration.controller = controller
+    try {
+      const page = await getThreadTextPage(
+        threadId,
+        hydration.turnId,
+        cursor,
+        undefined,
+        controller.signal,
+      )
+      if (!isActiveTextHydrationCurrent(threadId, hydration, generation)) return
 
-        hydration.consumedCursors.add(cursorKey)
-        hydration.messages = mergeThreadTextPage(hydration.messages, page.messages)
-        hydration.nextOlderCursor = page.nextOlderCursor
-        hydration.hasMoreOlder = page.hasMoreOlder
-        publishActiveTextHydration(threadId, hydration)
-      } catch (error) {
-        if (
-          isActiveTextHydrationCurrent(threadId, hydration, generation)
-          && error instanceof CodexApiError
-          && (error.status === 400 || error.status === 409)
-        ) {
-          hydration.nextOlderCursor = null
-          hydration.hasMoreOlder = true
-          hydration.consumedCursors.clear()
-        }
-        return
-      } finally {
-        if (hydration.controller === controller) {
-          hydration.controller = null
-        }
+      hydration.consumedCursors.add(cursorKey)
+      hydration.messages = mergeThreadTextPage(hydration.messages, page.messages)
+      hydration.nextOlderCursor = page.nextOlderCursor
+      hydration.hasMoreOlder = false
+      publishActiveTextHydration(threadId, hydration)
+    } catch (error) {
+      if (
+        isActiveTextHydrationCurrent(threadId, hydration, generation)
+        && error instanceof CodexApiError
+        && (error.status === 400 || error.status === 409)
+      ) {
+        hydration.nextOlderCursor = null
+        hydration.hasMoreOlder = true
+        hydration.consumedCursors.clear()
+        hydration.recoverableConflictProjectionKey = projectionKeyByThreadId.value[threadId] ?? ''
+      }
+    } finally {
+      if (hydration.controller === controller) {
+        hydration.controller = null
       }
     }
   }
 
-  function ensureActiveTextHydration(threadId: string, turnId: string): void {
+  function ensureActiveTextHydration(
+    threadId: string,
+    turnId: string,
+    options: {
+      refreshExhausted?: boolean
+      forceRefreshExhausted?: boolean
+      forceRefreshNewest?: boolean
+    } = {},
+  ): void {
     if (selectedThreadId.value !== threadId || !turnId) return
 
     let hydration = activeTextHydrationByThreadId.get(threadId)
@@ -3917,6 +4291,35 @@ export function useDesktopState() {
     if (hydration && hydration.turnId !== turnId) {
       cancelActiveTextHydration(threadId)
       hydration = undefined
+    } else if (hydration && options.forceRefreshNewest === true) {
+      hydration.controller?.abort()
+      hydration.controller = null
+      hydration.nextOlderCursor = null
+      hydration.hasMoreOlder = true
+      hydration.consumedCursors.clear()
+      hydration.recoverableConflictProjectionKey = undefined
+      activeTextHydrationGenerationByThreadId.set(
+        threadId,
+        (activeTextHydrationGenerationByThreadId.get(threadId) ?? 0) + 1,
+      )
+    } else if (
+      hydration
+      && options.refreshExhausted === true
+      && hydration.controller === null
+      && hydration.hasMoreOlder === false
+      && (
+        options.forceRefreshExhausted === true
+        || hydration.messages.length === 0
+      )
+    ) {
+      hydration.nextOlderCursor = null
+      hydration.hasMoreOlder = true
+      hydration.consumedCursors.clear()
+      hydration.recoverableConflictProjectionKey = undefined
+      activeTextHydrationGenerationByThreadId.set(
+        threadId,
+        (activeTextHydrationGenerationByThreadId.get(threadId) ?? 0) + 1,
+      )
     }
     if (!hydration) {
       hydration = {
@@ -4167,17 +4570,17 @@ export function useDesktopState() {
 
   function setLiveReasoningText(threadId: string, text: string): void {
     if (!threadId) return
-    const normalized = text.trim()
+    const nextText = text.trimStart()
     const previous = liveReasoningTextByThreadId.value[threadId] ?? ''
-    if (normalized.length === 0) {
+    if (nextText.trim().length === 0) {
       if (!previous) return
       liveReasoningTextByThreadId.value = omitKey(liveReasoningTextByThreadId.value, threadId)
       return
     }
-    if (previous === normalized) return
+    if (previous === nextText) return
     liveReasoningTextByThreadId.value = {
       ...liveReasoningTextByThreadId.value,
-      [threadId]: normalized,
+      [threadId]: nextText,
     }
   }
 
@@ -4589,6 +4992,51 @@ export function useDesktopState() {
     const turnSnakeThreadId = readString(turn?.thread_id)
     if (turnSnakeThreadId) return turnSnakeThreadId
 
+    const item = asRecord(params.item)
+    const itemThreadId = readString(item?.threadId)
+    if (itemThreadId) return itemThreadId
+    const itemSnakeThreadId = readString(item?.thread_id)
+    if (itemSnakeThreadId) return itemSnakeThreadId
+
+    const itemTurn = asRecord(item?.turn)
+    const itemTurnThreadId = readString(itemTurn?.threadId)
+    if (itemTurnThreadId) return itemTurnThreadId
+    const itemTurnSnakeThreadId = readString(itemTurn?.thread_id)
+    if (itemTurnSnakeThreadId) return itemTurnSnakeThreadId
+
+    const turnId = extractTurnIdFromNotification(notification)
+    if (turnId) {
+      for (const [knownThreadId, knownTurnId] of Object.entries(activeTurnIdByThreadId.value)) {
+        if (knownTurnId === turnId) return knownThreadId
+      }
+    }
+
+    return ''
+  }
+
+  function extractTurnIdFromNotification(notification: RpcNotification): string {
+    const params = asRecord(notification.params)
+    if (!params) return ''
+
+    const directTurnId = readString(params.turnId)
+    if (directTurnId) return directTurnId
+    const snakeTurnId = readString(params.turn_id)
+    if (snakeTurnId) return snakeTurnId
+
+    const turn = asRecord(params.turn)
+    const nestedTurnId = readString(turn?.id)
+    if (nestedTurnId) return nestedTurnId
+
+    const item = asRecord(params.item)
+    const itemTurnId = readString(item?.turnId)
+    if (itemTurnId) return itemTurnId
+    const itemSnakeTurnId = readString(item?.turn_id)
+    if (itemSnakeTurnId) return itemSnakeTurnId
+
+    const itemTurn = asRecord(item?.turn)
+    const nestedItemTurnId = readString(itemTurn?.id)
+    if (nestedItemTurnId) return nestedItemTurnId
+
     return ''
   }
 
@@ -4932,16 +5380,6 @@ export function useDesktopState() {
         threadId,
         activity: {
           label: 'Running command',
-          details: [],
-        },
-      }
-    }
-
-    if (notification.method === 'item/fileChange/outputDelta') {
-      return {
-        threadId,
-        activity: {
-          label: 'Applying changes',
           details: [],
         },
       }
@@ -5358,32 +5796,8 @@ export function useDesktopState() {
   }
 
   function readCompletedFileChange(notification: RpcNotification): UiMessage | null {
-    if (notification.method !== 'item/completed') return null
-    const params = asRecord(notification.params)
-    const item = asRecord(params?.item)
-    if (!item || item.type !== 'fileChange') return null
-    const id = readString(item.id)
-    if (!id) return null
-    const threadId = readString(params?.threadId)
-    const turnId = readString(params?.turnId)
-    const turnIndex = threadId && turnId
-      ? turnIndexByTurnIdByThreadId.value[threadId]?.[turnId]
-      : undefined
-
-    const fileChanges = toUiFileChanges(item.changes)
-    const fileChangeStatus = normalizeFileChangeStatus(item.status)
-    if (fileChanges.length === 0 || fileChangeStatus !== 'completed') return null
-
-    return {
-      id,
-      role: 'system',
-      text: '',
-      messageType: 'fileChange',
-      fileChangeStatus,
-      fileChanges,
-      turnId: turnId || undefined,
-      turnIndex: typeof turnIndex === 'number' ? turnIndex : undefined,
-    }
+    void notification
+    return null
   }
 
   function upsertLiveCommand(threadId: string, msg: UiMessage): void {
@@ -5391,6 +5805,24 @@ export function useDesktopState() {
     const next = upsertMessage(previous, msg)
     if (next === previous) return
     liveCommandsByThreadId.value = { ...liveCommandsByThreadId.value, [threadId]: next }
+  }
+
+  function removeLiveAgentMessagesPersistedIn(threadId: string, persistedMessages: UiMessage[]): void {
+    const current = liveAgentMessagesByThreadId.value[threadId]
+    if (!current || current.length === 0) return
+    const next = removeRedundantLiveAgentMessages(current, persistedMessages)
+    if (next === current) return
+    const nextIds = new Set(next.map((message) => message.id))
+    for (const message of current) {
+      if (!nextIds.has(message.id)) {
+        clearLiveAgentRawText(threadId, message.id)
+      }
+    }
+    if (next.length === 0) {
+      clearLiveAgentMessagesForThread(threadId)
+    } else {
+      setLiveAgentMessagesForThread(threadId, next)
+    }
   }
 
   function removeLiveCommandsPersistedIn(threadId: string, persistedMessages: UiMessage[]): void {
@@ -5606,6 +6038,7 @@ export function useDesktopState() {
         turnId: completedTurn.turnId,
         durationMs,
         status: completedTurn.status,
+        completedAtMs: completedTurn.completedAtMs,
       }
       persistTurnSummaryForThread(completedTurn.threadId, summary)
       if (completionDisposition.ownsActiveLease) {
@@ -5764,6 +6197,14 @@ export function useDesktopState() {
 
     const startedReasoningItemId = readReasoningStartedItemId(notification)
     if (startedReasoningItemId) {
+      const current = liveReasoningTextByThreadId.value[notificationThreadId] ?? ''
+      if (
+        startedReasoningItemId !== activeReasoningItemId
+        && current.trim().length > 0
+        && !current.endsWith('\n\n')
+      ) {
+        setLiveReasoningText(notificationThreadId, `${current}\n\n`)
+      }
       activeReasoningItemId = startedReasoningItemId
     }
 
@@ -5809,14 +6250,8 @@ export function useDesktopState() {
       upsertLiveCommand(notificationThreadId, commandCompleted)
     }
 
-    const completedFileChange = readCompletedFileChange(notification)
-    if (completedFileChange) {
-      upsertLiveFileChangeMessage(notificationThreadId, completedFileChange)
-    }
-
     if (isAgentContentEvent(notification)) {
       activeReasoningItemId = ''
-      clearLiveReasoningForThread(notificationThreadId)
     }
 
     if (notification.method === 'turn/completed' && completionDisposition?.ownsActiveLease !== false) {
@@ -5830,32 +6265,148 @@ export function useDesktopState() {
 
   }
 
+  function isThreadListStructureNotification(notification: RpcNotification): boolean {
+    return THREAD_LIST_STRUCTURE_NOTIFICATION_METHODS.has(notification.method)
+  }
+
+  function shouldRefreshActiveTextNewestForNotification(notification: RpcNotification): boolean {
+    if (ACTIVE_TEXT_NEWEST_REFRESH_NOTIFICATION_METHODS.has(notification.method)) return true
+    if (
+      notification.method !== 'item/started' &&
+      notification.method !== 'item/completed' &&
+      notification.method !== 'thread/realtime/itemAdded'
+    ) {
+      return false
+    }
+    const params = asRecord(notification.params)
+    const item = asRecord(params?.item)
+    const itemType = readString(item?.type) || readString(params?.itemType) || readString(params?.item_type)
+    return ACTIVE_TEXT_ITEM_NOTIFICATION_TYPES.has(itemType)
+  }
+
+  function shouldRefreshRuntimeForNotification(notification: RpcNotification): boolean {
+    return notification.method === 'turn/started' ||
+      notification.method === 'turn/completed' ||
+      notification.method === 'error' ||
+      notification.method === 'thread/runtime/updated' ||
+      notification.method === 'thread/status/updated' ||
+      notification.method === 'thread/status/changed'
+  }
+
   function queueEventDrivenSync(notification: RpcNotification): void {
     if (notification.method === 'thread/tokenUsage/updated') return
 
     const method = notification.method
-    const shouldRefreshMessages = shouldRefreshMessagesForNotification(notification)
-    const shouldRefreshThreads =
-      method.startsWith('thread/') ||
-      method === 'turn/completed'
-
-    if (!shouldRefreshMessages && !shouldRefreshThreads) return
-
     const threadId = extractThreadIdFromNotification(notification)
+    const turnId = extractTurnIdFromNotification(notification)
+    const shouldRefreshMessages = shouldRefreshMessagesForNotification(notification)
+    const shouldRefreshRuntime = Boolean(threadId) && shouldRefreshRuntimeForNotification(notification)
+    const shouldRefreshActiveTextNewest = Boolean(threadId)
+      && threadId === selectedThreadId.value
+      && shouldRefreshActiveTextNewestForNotification(notification)
+    const shouldRefreshThreads =
+      isThreadListStructureNotification(notification) ||
+      (!threadId && (method.startsWith('thread/') || method === 'turn/completed'))
+
+    if (!shouldRefreshMessages && !shouldRefreshThreads && !shouldRefreshRuntime && !shouldRefreshActiveTextNewest) return
+
     if (threadId && shouldRefreshMessages) {
       pendingThreadMessageRefresh.add(threadId)
     }
+    if (threadId && shouldRefreshRuntime) {
+      pendingThreadRuntimeRefresh.add(threadId)
+    }
+    if (threadId && shouldRefreshActiveTextNewest) {
+      pendingActiveTextNewestRefresh.add(threadId)
+      if (turnId) {
+        pendingActiveTextNewestTurnIdByThreadId.set(threadId, turnId)
+      }
+    }
+    const scheduledSelectedActiveTextNewestRefresh = shouldRefreshActiveTextNewest
+      ? scheduleSelectedActiveTextNewestRefresh()
+      : false
 
     if (shouldRefreshThreads) {
       pendingThreadsRefresh = true
       pendingThreadsRefreshForce = true
     }
 
-    if (eventSyncTimer !== null || typeof window === 'undefined') return
+    if (
+      scheduledSelectedActiveTextNewestRefresh
+      && !shouldRefreshMessages
+      && !shouldRefreshThreads
+      && !shouldRefreshRuntime
+    ) {
+      return
+    }
+
+    if (typeof window === 'undefined') return
+    const shouldFastDrainSelectedCompletion =
+      method === 'turn/completed'
+      && threadId.length > 0
+      && threadId === selectedThreadId.value
+      && turnId.length > 0
+      && turnId === (activeTurnIdByThreadId.value[threadId] ?? '')
+    if (shouldFastDrainSelectedCompletion) {
+      cancelExternalRuntimePolling()
+      if (eventSyncTimer !== null) {
+        window.clearTimeout(eventSyncTimer)
+        eventSyncTimer = null
+      }
+    }
+    if (eventSyncTimer !== null) return
     eventSyncTimer = window.setTimeout(() => {
       eventSyncTimer = null
       void syncFromNotifications()
-    }, EVENT_SYNC_DEBOUNCE_MS)
+    }, shouldFastDrainSelectedCompletion ? 0 : EVENT_SYNC_DEBOUNCE_MS)
+  }
+
+  function refreshSelectedActiveTextNewest(
+    threadIdsToRefresh: Set<string>,
+    turnIdsByThreadId: Map<string, string>,
+  ): void {
+    const threadId = selectedThreadId.value
+    if (!threadId || !threadIdsToRefresh.has(threadId)) return
+    const turnId = activeTurnIdByThreadId.value[threadId] || turnIdsByThreadId.get(threadId) || ''
+    if (!turnId) return
+    threadIdsToRefresh.delete(threadId)
+    turnIdsByThreadId.delete(threadId)
+    ensureActiveTextHydration(threadId, turnId, {
+      refreshExhausted: true,
+      forceRefreshExhausted: true,
+      forceRefreshNewest: true,
+    })
+  }
+
+  function flushSelectedActiveTextNewestRefresh(): boolean {
+    const threadId = selectedThreadId.value
+    if (!threadId || !pendingActiveTextNewestRefresh.has(threadId)) return false
+    const turnId = activeTurnIdByThreadId.value[threadId] || pendingActiveTextNewestTurnIdByThreadId.get(threadId) || ''
+    if (!turnId) return false
+
+    pendingActiveTextNewestRefresh.delete(threadId)
+    pendingActiveTextNewestTurnIdByThreadId.delete(threadId)
+    ensureActiveTextHydration(threadId, turnId, {
+      refreshExhausted: true,
+      forceRefreshExhausted: true,
+      forceRefreshNewest: true,
+    })
+    return true
+  }
+
+  function scheduleSelectedActiveTextNewestRefresh(): boolean {
+    if (typeof window === 'undefined') return false
+    const threadId = selectedThreadId.value
+    if (!threadId || !pendingActiveTextNewestRefresh.has(threadId)) return false
+    const turnId = activeTurnIdByThreadId.value[threadId] || pendingActiveTextNewestTurnIdByThreadId.get(threadId) || ''
+    if (!turnId) return false
+    if (activeTextNewestRefreshTimer !== null) return true
+
+    activeTextNewestRefreshTimer = window.setTimeout(() => {
+      activeTextNewestRefreshTimer = null
+      flushSelectedActiveTextNewestRefresh()
+    }, ACTIVE_TEXT_NEWEST_REFRESH_DEBOUNCE_MS)
+    return true
   }
 
   async function hydrateWorkspaceRootsStateIfNeeded(
@@ -6010,6 +6561,7 @@ export function useDesktopState() {
     }
 
     const orderedGroups = orderGroupsByProjectOrder(visibleGroups, projectOrder.value)
+    preserveReadWatermarksForMetadataOnlyRefresh(orderedGroups)
     markServerListedThreads(new Set(flattenThreads(orderedGroups).map((thread) => thread.id)))
     const mergedWithInProgress = mergeIncomingWithLocalInProgressThreads(
       sourceGroups.value,
@@ -6033,6 +6585,50 @@ export function useDesktopState() {
     void request.catch(() => {
       // Queue persistence is best-effort; keep the current in-memory queue usable.
     })
+  }
+
+  function normalizeQueuedCollaborationMode(
+    collaborationModeOverride?: CollaborationModeKind,
+  ): CollaborationModeKind {
+    return collaborationModeOverride === 'plan'
+      ? 'plan'
+      : collaborationModeOverride === 'default'
+        ? 'default'
+        : selectedCollaborationMode.value
+  }
+
+  function enqueueThreadMessage(
+    threadId: string,
+    nextText: string,
+    imageUrls: string[],
+    skills: Array<{ name: string; path: string }>,
+    fileAttachments: FileAttachment[],
+    collaborationModeOverride?: CollaborationModeKind,
+    queueInsertIndex?: number,
+  ): QueuedMessage {
+    const queue = queuedMessagesByThreadId.value[threadId] ?? []
+    const id = `q-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
+    const nextQueue = [...queue]
+    const insertIndex = typeof queueInsertIndex === 'number'
+      ? Math.max(0, Math.min(queueInsertIndex, nextQueue.length))
+      : nextQueue.length
+    const queuedMessage: QueuedMessage = {
+      id,
+      text: nextText,
+      imageUrls,
+      skills,
+      fileAttachments,
+      collaborationMode: normalizeQueuedCollaborationMode(collaborationModeOverride),
+      model: readModelIdForThread(threadId),
+      effort: readReasoningEffortForThread(threadId),
+    }
+    nextQueue.splice(insertIndex, 0, queuedMessage)
+    queuedMessagesByThreadId.value = {
+      ...queuedMessagesByThreadId.value,
+      [threadId]: nextQueue,
+    }
+    persistQueueState()
+    return queuedMessage
   }
 
   async function loadPersistedQueueStateIfNeeded(): Promise<void> {
@@ -6093,9 +6689,10 @@ export function useDesktopState() {
       loadedThreadListRootsState = rootsState
       return
     }
-    if (!threadListNextCursor || isLoadingRemainingThreadPages || hasActiveInProgressThreads()) return
+    if (!threadListNextCursor || isLoadingRemainingThreadPages) return
 
     loadedThreadListRootsState = rootsState
+    if (typeof document !== 'undefined' && document.visibilityState !== 'visible') return
 
     if (typeof window === 'undefined') {
       void loadRemainingThreadPages(rootsState)
@@ -6108,13 +6705,14 @@ export function useDesktopState() {
 
     threadListBackgroundTimer = window.setTimeout(() => {
       threadListBackgroundTimer = null
-      if (!threadListNextCursor || hasActiveInProgressThreads()) return
+      if (!threadListNextCursor) return
+      if (typeof document !== 'undefined' && document.visibilityState !== 'visible') return
       void loadRemainingThreadPages(loadedThreadListRootsState)
     }, BACKGROUND_THREAD_PAGINATION_DELAY_MS)
   }
 
   async function loadRemainingThreadPages(rootsState: WorkspaceRootsState | null): Promise<void> {
-    if (isLoadingRemainingThreadPages || !threadListNextCursor || hasActiveInProgressThreads()) return
+    if (isLoadingRemainingThreadPages || !threadListNextCursor) return
     isLoadingRemainingThreadPages = true
 
     try {
@@ -6122,13 +6720,27 @@ export function useDesktopState() {
       threadListNextCursor = page.nextCursor
       hasLoadedAllThreadPages = page.nextCursor === null
       isThreadListFullyLoaded.value = hasLoadedAllThreadPages
+      if (freshThreadListGroupsDuringSnapshotRefresh) {
+        freshThreadListGroupsDuringSnapshotRefresh = mergeThreadGroupPages(
+          freshThreadListGroupsDuringSnapshotRefresh,
+          page.groups,
+        )
+      }
       loadedThreadListGroups = mergeThreadGroupPages(loadedThreadListGroups, page.groups)
+      if (hasLoadedAllThreadPages && freshThreadListGroupsDuringSnapshotRefresh) {
+        loadedThreadListGroups = freshThreadListGroupsDuringSnapshotRefresh
+        freshThreadListGroupsDuringSnapshotRefresh = null
+      }
       applyThreadGroups(loadedThreadListGroups, rootsState)
+      if (hasLoadedAllThreadPages) {
+        saveThreadGroupsSnapshot(loadedThreadListGroups)
+      }
+      pruneThreadScopedStateAfterCompleteDirectory()
     } catch {
       // Keep the first page usable; a later refresh can retry remaining pages.
     } finally {
       isLoadingRemainingThreadPages = false
-      if (threadListNextCursor && !hasActiveInProgressThreads()) {
+      if (threadListNextCursor) {
         scheduleRemainingThreadPages(rootsState)
       }
     }
@@ -6141,6 +6753,7 @@ export function useDesktopState() {
     }
     if (
       options.force !== true &&
+      !hasLoadedThreadListSnapshotOnly &&
       hasLoadedThreads.value &&
       Date.now() - lastThreadListLoadAt < RECENT_THREAD_LIST_LOAD_REUSE_MS
     ) {
@@ -6154,19 +6767,40 @@ export function useDesktopState() {
 
     try {
       const shouldAwaitMetadata = options.force === true || hasLoadedThreads.value
-      const page = await getThreadGroupsPage()
+      const replacingStartupSnapshot = hasLoadedThreadListSnapshotOnly
+      const shouldForceFreshThreadList = options.force === true && !replacingStartupSnapshot
+      const page = shouldForceFreshThreadList
+        ? await getThreadGroupsPage(
+          undefined,
+          replacingStartupSnapshot ? getBackgroundThreadListLimit() : undefined,
+          { forceFresh: true },
+        )
+        : await getThreadGroupsPage()
       const rootsState = loadedThreadListRootsState
       const groups = page.groups
-      loadedThreadListGroups = hasLoadedThreads.value
-        ? mergeThreadGroupPages(loadedThreadListGroups, groups)
-        : groups
-      threadListNextCursor = hasLoadedThreads.value && !hasLoadedAllThreadPages
+      if (replacingStartupSnapshot && page.nextCursor !== null) {
+        freshThreadListGroupsDuringSnapshotRefresh = groups
+        loadedThreadListGroups = mergeThreadGroupPages(loadedThreadListGroups, groups)
+      } else {
+        freshThreadListGroupsDuringSnapshotRefresh = null
+        loadedThreadListGroups = hasLoadedThreads.value && !replacingStartupSnapshot
+          ? mergeThreadGroupPages(loadedThreadListGroups, groups)
+          : groups
+        if (replacingStartupSnapshot) {
+          sourceGroups.value = []
+        }
+      }
+      hasLoadedThreadListSnapshotOnly = false
+      threadListNextCursor = hasLoadedThreads.value && !hasLoadedAllThreadPages && !replacingStartupSnapshot
         ? threadListNextCursor
         : page.nextCursor
       hasLoadedAllThreadPages = page.nextCursor === null
       isThreadListFullyLoaded.value = hasLoadedAllThreadPages
 
       applyThreadGroups(loadedThreadListGroups, rootsState)
+      if (hasLoadedAllThreadPages) {
+        saveThreadGroupsSnapshot(loadedThreadListGroups)
+      }
       hasLoadedThreads.value = true
       lastThreadListLoadAt = Date.now()
       if (!hasLoadedAllThreadPages) {
@@ -6180,7 +6814,7 @@ export function useDesktopState() {
       }
 
       const flatThreads = flattenThreads(projectGroups.value)
-      pruneThreadScopedState(flatThreads)
+      pruneThreadScopedStateAfterCompleteDirectory()
 
       const currentExists = flatThreads.some((thread) => thread.id === selectedThreadId.value)
 
@@ -6304,6 +6938,12 @@ export function useDesktopState() {
         ? 'external'
         : detailOwnership
     const inProgress = retainLocal || retainEstablishedExternal || detail.inProgress
+    const previousProjectionKey = projectionKeyByThreadId.value[threadId] ?? ''
+    const liveProjectionKeyChanged = isLiveProjection
+      && typeof detail.projectionKey === 'string'
+      && detail.projectionKey.length > 0
+      && previousProjectionKey.length > 0
+      && detail.projectionKey !== previousProjectionKey
     if (isLiveProjection) {
       liveAuthorityByThreadId.value = {
         ...liveAuthorityByThreadId.value,
@@ -6324,7 +6964,15 @@ export function useDesktopState() {
     }
     if (isLiveProjection && detail.notModified === true) {
       if (inProgress && activeTurnId) {
-        resumeActiveTextHydrationForTurn(threadId, activeTurnId)
+        activeTurnIdByThreadId.value = {
+          ...activeTurnIdByThreadId.value,
+          [threadId]: activeTurnId,
+        }
+        ensureActiveTextHydration(threadId, activeTurnId, {
+          refreshExhausted: true,
+          forceRefreshExhausted: liveProjectionKeyChanged,
+          forceRefreshNewest: liveProjectionKeyChanged,
+        })
       }
       if (inProgress) {
         setThreadRuntimeOwnership(threadId, ownership)
@@ -6368,7 +7016,39 @@ export function useDesktopState() {
       cancelActiveTextHydration(threadId)
       activeTextHydration = undefined
     }
-    const mergedMessages = isLiveProjection && inProgress && isPartialTurnProjection
+    const rawLiveProjectionHasAuthoritativeTurnIndices = isLiveProjection
+      && detailMessages.length > 0
+      && detailMessages.every((message) => (
+        typeof message.turnIndex === 'number'
+        && Number.isFinite(message.turnIndex)
+      ))
+    const liveProjectionHasOrderedActiveTextRows = isLiveProjection
+      && inProgress
+      && activeTurnId.length > 0
+      && detailMessages.some((message) => (
+        message.turnId === activeTurnId
+        && typeof message.sessionOrder === 'number'
+        && Number.isFinite(message.sessionOrder)
+      ))
+    // A running live projection without absolute turn indices is a bounded,
+    // append-style view of an active writer. Rollout rows with `sessionOrder`
+    // are also incremental even when the projection carries a rebased
+    // `turnIndex`; treating those as authoritative replacements can briefly
+    // erase already hydrated transcript rows until the text page catches up.
+    // Paged projections without ordered active text remain authoritative so
+    // stale rebased rows can still be dropped.
+    const shouldPreserveLiveProjection = isLiveProjection
+      && (
+        isPartialTurnProjection
+        || (
+          inProgress
+          && (
+            !rawLiveProjectionHasAuthoritativeTurnIndices
+            || liveProjectionHasOrderedActiveTextRows
+          )
+        )
+      )
+    const mergedMessages = shouldPreserveLiveProjection
       ? mergeMessages(previousPersisted, nextMessages, { preserveMissing: true })
       : isIncrementalProjection
         ? mergeLiveProjectionMessages(previousPersisted, nextMessages)
@@ -6430,20 +7110,84 @@ export function useDesktopState() {
         cancelActiveTextHydration(threadId)
       }
     }
-    if (
-      detail.isLiveProjection === true
+    const previousActiveMessageById = new Map(
+      previousPersisted
+        .filter((message) => message.turnId === activeTurnId)
+        .map((message) => [message.id, message]),
+    )
+    const previousActiveMaxSessionOrder = previousPersisted.reduce((maxOrder, message) => {
+      if (message.turnId !== activeTurnId) return maxOrder
+      if (typeof message.sessionOrder !== 'number' || !Number.isFinite(message.sessionOrder)) {
+        return maxOrder
+      }
+      return Math.max(maxOrder, message.sessionOrder)
+    }, Number.NEGATIVE_INFINITY)
+    const liveProjectionAdvancesActiveText = nextMessages.some((message) => {
+      if (message.turnId !== activeTurnId) return false
+      const previousMessage = previousActiveMessageById.get(message.id)
+      if (!previousMessage) return true
+      if (message.text !== previousMessage.text) return true
+      return (
+        typeof message.sessionOrder === 'number'
+        && Number.isFinite(message.sessionOrder)
+        && message.sessionOrder > previousActiveMaxSessionOrder
+      )
+    })
+    const shouldRefreshChangedFullLiveProjection = liveProjectionKeyChanged
+      && isLiveProjection
+      && !isPartialTurnProjection
+      && !liveProjectionAdvancesActiveText
+    const previousMessageIds = new Set(previousPersisted.map((message) => message.id))
+    const compressedLiveProjectionHasNewRows = isLiveProjection
       && isPartialTurnProjection
-      && detail.inProgress === true
-      && detail.activeTurnId.length > 0
+      && nextMessages.some((message) => !previousMessageIds.has(message.id))
+    if (
+      !inProgress
+      && hadLoadedMessages
+      && selectedThreadId.value === threadId
+      && compressedLiveProjectionHasNewRows
+      && typeof detail.projectionKey === 'string'
+      && detail.projectionKey.length > 0
     ) {
-      ensureActiveTextHydration(threadId, detail.activeTurnId)
+      scheduleCompressedLiveProjectionBackfill(threadId, detail.projectionKey)
+    }
+    if (
+      inProgress
+      && activeTurnId.length > 0
+      && (
+        isPartialTurnProjection
+        || shouldRefreshChangedFullLiveProjection
+      )
+    ) {
+      const refreshedHydration = activeTextHydrationByThreadId.get(threadId)
+      if (refreshedHydration?.turnId === activeTurnId) {
+        refreshedHydration.recoverableConflictProjectionKey = undefined
+      }
+      ensureActiveTextHydration(threadId, activeTurnId, {
+        refreshExhausted: isLiveProjection,
+        forceRefreshExhausted: shouldRefreshChangedFullLiveProjection,
+        forceRefreshNewest: shouldRefreshChangedFullLiveProjection,
+      })
     }
     if (options.markRead) {
       markThreadAsRead(threadId)
     }
+    if (
+      externalRuntimePollingEnabled &&
+      selectedThreadId.value === threadId &&
+      (
+        runtimeOwnershipByThreadId.value[threadId] === 'external' ||
+        canStartSelectedLiveProjectionPolling(threadId)
+      )
+    ) {
+      scheduleExternalRuntimePolling(threadId, runtimeOwnershipByThreadId.value[threadId] === 'external' ? undefined : 0)
+    }
   }
 
-  async function loadMessages(threadId: string, options: { silent?: boolean; force?: boolean } = {}) {
+  async function loadMessages(
+    threadId: string,
+    options: { silent?: boolean; force?: boolean; bypassRecentReuse?: boolean } = {},
+  ) {
     if (!threadId) {
       return
     }
@@ -6459,16 +7203,11 @@ export function useDesktopState() {
 
     const existingLoad = loadMessagePromiseByThreadId.get(threadId)
     if (existingLoad) {
-      try {
+      if (options.force === true) {
+        invalidateThreadDetailRequest(threadId)
+        loadMessagePromiseByThreadId.delete(threadId)
+      } else {
         await existingLoad
-      } catch (existingLoadError) {
-        if (options.force !== true) throw existingLoadError
-      }
-      if (options.force !== true) return
-
-      const replacementLoad = loadMessagePromiseByThreadId.get(threadId)
-      if (replacementLoad && replacementLoad !== existingLoad) {
-        await replacementLoad
         return
       }
     }
@@ -6479,7 +7218,8 @@ export function useDesktopState() {
       isLoadingMessages.value = true
     }
 
-    const loadPromise = (async () => {
+    let loadPromise!: Promise<void>
+    loadPromise = (async () => {
       try {
         if (!(threadId in threadGoalSupportByThreadId.value)) {
           void refreshThreadGoal(threadId)
@@ -6490,6 +7230,7 @@ export function useDesktopState() {
           Date.now() - (lastMessageLoadAtByThreadId.get(threadId) ?? 0) < RECENT_THREAD_MESSAGE_LOAD_REUSE_MS
         const canReuseLoadedMessages =
           options.force !== true &&
+          options.bypassRecentReuse !== true &&
           alreadyLoaded &&
           (
             loadedRecently ||
@@ -6504,9 +7245,11 @@ export function useDesktopState() {
           return
         }
 
+        const controller = new AbortController()
         const detailRequest = acquireThreadDetailRequest(
           threadId,
-          () => getThreadDetail(threadId),
+          () => getThreadDetail(threadId, controller.signal),
+          controller,
         )
         try {
           const detail = await detailRequest.promise
@@ -6521,6 +7264,7 @@ export function useDesktopState() {
           releaseThreadDetailRequest(threadId, detailRequest)
         }
       } catch (unknownError) {
+        if (isAbortLikeError(unknownError)) return
         const message = unknownError instanceof Error ? unknownError.message : 'Unknown application error'
         if (selectedThreadId.value === threadId) {
           setTurnErrorForThread(threadId, message, { transient: true })
@@ -6528,12 +7272,14 @@ export function useDesktopState() {
         lastMessageLoadFailureAtByThreadId.set(threadId, Date.now())
         throw unknownError
       } finally {
-        if (shouldShowLoading) {
+        if (shouldShowLoading && loadMessagePromiseByThreadId.get(threadId) === loadPromise) {
           isLoadingMessages.value = false
         }
       }
     })().finally(() => {
-      loadMessagePromiseByThreadId.delete(threadId)
+      if (loadMessagePromiseByThreadId.get(threadId) === loadPromise) {
+        loadMessagePromiseByThreadId.delete(threadId)
+      }
     })
 
     loadMessagePromiseByThreadId.set(threadId, loadPromise)
@@ -6748,7 +7494,24 @@ export function useDesktopState() {
             error.value = unknownError instanceof Error ? unknownError.message : 'Unknown application error'
           })
         : null
-      await loadThreads({ force: options.forceThreadRefresh === true })
+      const threadListLoad = loadThreads({ force: options.forceThreadRefresh === true })
+        .then(() => null)
+        .catch((unknownError: unknown) => unknownError)
+      if (selectedThreadLoad) {
+        void threadListLoad.then((threadListError) => {
+          if (!threadListError) return
+          const message = threadListError instanceof Error ? threadListError.message : 'Unknown application error'
+          error.value = message
+          codexCliMissingError.value = isCodexCliMissingError(threadListError)
+            ? CODEX_CLI_MISSING_MESSAGE
+            : ''
+        })
+      } else {
+        const threadListError = await threadListLoad
+        if (threadListError) {
+          throw threadListError
+        }
+      }
       if (selectedThreadLoad) {
         await selectedThreadLoad
         if (selectedThreadId.value === selectedThreadIdAtStart) {
@@ -6790,11 +7553,28 @@ export function useDesktopState() {
 
   async function selectThread(threadId: string): Promise<SelectThreadResult> {
     setSelectedThreadId(threadId)
+    void refreshModelPreferences({ includeProviderModels: true })
+    void refreshSkills()
+
+    const hasCachedMessages =
+      loadedMessagesByThreadId.value[threadId] === true
+      || (persistedMessagesByThreadId.value[threadId]?.length ?? 0) > 0
+
+    if (hasCachedMessages) {
+      markThreadAsRead(threadId)
+      void loadMessages(threadId, { silent: true, force: true }).catch((unknownError) => {
+        if (selectedThreadId.value !== threadId) return
+        const message = unknownError instanceof Error ? unknownError.message : 'Unknown application error'
+        error.value = message
+        if (threadId.trim()) {
+          setTurnErrorForThread(threadId, message, { transient: true })
+        }
+      })
+      return 'ok'
+    }
 
     try {
-      await loadMessages(threadId)
-      await refreshModelPreferences({ includeProviderModels: true })
-      void refreshSkills()
+      await loadMessages(threadId, { force: true })
       return 'ok'
     } catch (unknownError) {
       const message = unknownError instanceof Error ? unknownError.message : 'Unknown application error'
@@ -7001,7 +7781,7 @@ export function useDesktopState() {
 
     const threadId = selectedThreadId.value
     const nextText = text.trim()
-    if (!threadId || isExternallyOwned(threadId)) {
+    if (!threadId) {
       await uploadLease.release()
       return
     }
@@ -7009,11 +7789,39 @@ export function useDesktopState() {
       await uploadLease.release()
       return
     }
+    if (isExternallyOwned(threadId)) {
+      enqueueThreadMessage(
+        threadId,
+        nextText,
+        imageUrls,
+        skills,
+        fileAttachments,
+        collaborationModeOverride,
+        queueInsertIndex,
+      )
+      uploadLease.transfer()
+      await uploadLease.release()
+      return
+    }
 
     const pendingRollback = rollbackPromiseByThreadId.get(threadId)
     if (pendingRollback) {
       await pendingRollback
-      if (selectedThreadId.value !== threadId || isExternallyOwned(threadId)) {
+      if (selectedThreadId.value !== threadId) {
+        await uploadLease.release()
+        return
+      }
+      if (isExternallyOwned(threadId)) {
+        enqueueThreadMessage(
+          threadId,
+          nextText,
+          imageUrls,
+          skills,
+          fileAttachments,
+          collaborationModeOverride,
+          queueInsertIndex,
+        )
+        uploadLease.transfer()
         await uploadLease.release()
         return
       }
@@ -7027,32 +7835,16 @@ export function useDesktopState() {
     const isInProgress = inProgressById.value[threadId] === true
 
     if (isInProgress && mode === 'queue') {
-      const queue = queuedMessagesByThreadId.value[threadId] ?? []
-      const id = `q-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
-      const nextQueue = [...queue]
-      const insertIndex = typeof queueInsertIndex === 'number'
-        ? Math.max(0, Math.min(queueInsertIndex, nextQueue.length))
-        : nextQueue.length
-      nextQueue.splice(insertIndex, 0, {
-        id,
-        text: nextText,
+      enqueueThreadMessage(
+        threadId,
+        nextText,
         imageUrls,
         skills,
         fileAttachments,
-        collaborationMode: collaborationModeOverride === 'plan'
-          ? 'plan'
-          : collaborationModeOverride === 'default'
-            ? 'default'
-            : selectedCollaborationMode.value,
-        model: readModelIdForThread(threadId),
-        effort: readReasoningEffortForThread(threadId),
-      })
-      queuedMessagesByThreadId.value = {
-        ...queuedMessagesByThreadId.value,
-        [threadId]: nextQueue,
-      }
+        collaborationModeOverride,
+        queueInsertIndex,
+      )
       uploadLease.transfer()
-      persistQueueState()
       await uploadLease.release()
       return
     }
@@ -7077,6 +7869,26 @@ export function useDesktopState() {
         uploadLease.transfer,
         submission,
       ).catch((unknownError) => {
+        if (isWriterOwnershipNotIdleError(unknownError)) {
+          removeOptimisticUserMessage(threadId, optimisticMessageId)
+          clearPendingStopRequest(threadId, submission.generation)
+          clearLocalSubmission(threadId, submission.generation)
+          clearPendingTurnRequest(threadId)
+          enqueueThreadMessage(
+            threadId,
+            nextText,
+            imageUrls,
+            skills,
+            fileAttachments,
+            collaborationModeOverride,
+            queueInsertIndex,
+          )
+          setThreadRuntimeOwnership(threadId, 'external', { externalPollDelayMs: 0 })
+          setThreadInProgress(threadId, true)
+          setTurnErrorForThread(threadId, null)
+          error.value = ''
+          return
+        }
         if (!isAmbiguousTurnStartError(unknownError)) {
           removeOptimisticUserMessage(threadId, optimisticMessageId)
           clearPendingStopRequest(threadId, submission.generation)
@@ -7133,6 +7945,30 @@ export function useDesktopState() {
       )
       await uploadLease.release()
     } catch (unknownError) {
+      if (isWriterOwnershipNotIdleError(unknownError)) {
+        uploadLease.transfer()
+        await uploadLease.release()
+        removeOptimisticUserMessage(threadId, optimisticMessageId)
+        clearPendingStopRequest(threadId, submission.generation)
+        clearLocalSubmission(threadId, submission.generation)
+        clearPendingTurnRequest(threadId)
+        enqueueThreadMessage(
+          threadId,
+          nextText,
+          imageUrls,
+          skills,
+          fileAttachments,
+          collaborationModeOverride,
+          queueInsertIndex,
+        )
+        setThreadRuntimeOwnership(threadId, 'external', { externalPollDelayMs: 0 })
+        setThreadInProgress(threadId, true)
+        setTurnActivityForThread(threadId, null)
+        setTurnErrorForThread(threadId, null)
+        shouldAutoScrollOnNextAgentEvent = true
+        error.value = ''
+        return
+      }
       await uploadLease.release()
       const ambiguousStart = isAmbiguousTurnStartError(unknownError)
       shouldAutoScrollOnNextAgentEvent = ambiguousStart
@@ -7461,7 +8297,7 @@ export function useDesktopState() {
       await syncFromNotifications()
       scheduleDelayedTurnSync(threadId)
     } catch (unknownError) {
-      if (!isAmbiguousTurnStartError(unknownError)) {
+      if (!isAmbiguousTurnStartError(unknownError) && !isWriterOwnershipNotIdleError(unknownError)) {
         releasePendingTurnRequest(threadId)
       }
       throw unknownError
@@ -7489,6 +8325,54 @@ export function useDesktopState() {
     window.setTimeout(() => {
       void processQueuedMessages(threadId)
     }, 650)
+  }
+
+  function getInterruptibleLocalTurnIdFromDetail(detail: ThreadDetailSnapshot): string {
+    const detailTurnId = detail.activeTurnId.trim()
+    if (
+      detail.ownership !== 'local' ||
+      detail.canInterrupt !== true ||
+      detail.inProgress !== true ||
+      detailTurnId.length === 0
+    ) {
+      return ''
+    }
+    return detailTurnId
+  }
+
+  async function reconcileMissingInterruptTarget(threadId: string): Promise<{ idle: boolean; turnId: string }> {
+    const detailRequest = acquireThreadDetailRequest(threadId, () => getThreadDetail(threadId))
+    try {
+      const detail = await detailRequest.promise
+      if (
+        selectedThreadId.value !== threadId ||
+        !isCurrentThreadDetailEpoch(threadId, detailRequest.epoch)
+      ) {
+        return { idle: false, turnId: '' }
+      }
+      reconcileThreadDetailSnapshot(threadId, detail, {
+        preserveMissing: true,
+        markRead: true,
+        requestedVersion: '',
+        detailEpoch: detailRequest.epoch,
+        allowIdleLocalLeaseRelease: true,
+      })
+      const refreshedTurnId = getInterruptibleLocalTurnIdFromDetail(detail)
+      if (refreshedTurnId.length > 0) {
+        activeTurnIdByThreadId.value = {
+          ...activeTurnIdByThreadId.value,
+          [threadId]: refreshedTurnId,
+        }
+        setThreadRuntimeOwnership(threadId, 'local')
+        setThreadInProgress(threadId, true)
+        return { idle: false, turnId: refreshedTurnId }
+      }
+      return { idle: detail.inProgress !== true, turnId: '' }
+    } catch {
+      return { idle: false, turnId: '' }
+    } finally {
+      releaseThreadDetailRequest(threadId, detailRequest)
+    }
   }
 
   async function interruptSelectedThreadTurn(): Promise<void> {
@@ -7543,7 +8427,26 @@ export function useDesktopState() {
       pendingThreadsRefresh = true
       await syncFromNotifications()
     } catch (unknownError) {
-      const errorMessage = unknownError instanceof Error ? unknownError.message : 'Failed to interrupt active turn'
+      let errorToReport = unknownError
+      if (isThreadNotFoundInterruptError(unknownError)) {
+        const reconciled = await reconcileMissingInterruptTarget(threadId)
+        if (reconciled.idle) {
+          error.value = ''
+          return
+        }
+        if (reconciled.turnId && reconciled.turnId !== turnId) {
+          try {
+            await interruptThreadTurn(threadId, reconciled.turnId)
+            pendingThreadMessageRefresh.add(threadId)
+            pendingThreadsRefresh = true
+            await syncFromNotifications()
+            return
+          } catch (retryError) {
+            errorToReport = retryError
+          }
+        }
+      }
+      const errorMessage = errorToReport instanceof Error ? errorToReport.message : 'Failed to interrupt active turn'
       setTurnErrorForThread(threadId, errorMessage)
       error.value = errorMessage
     } finally {
@@ -7787,6 +8690,21 @@ export function useDesktopState() {
     isPolling.value = true
 
     try {
+      const selectedBeforeList = selectedThreadId.value
+      if (selectedBeforeList) {
+        const currentVersion = currentThreadVersion(selectedBeforeList)
+        const loadedVersion = loadedVersionByThreadId.value[selectedBeforeList] ?? ''
+        const hasVersionChange = currentVersion.length > 0 && currentVersion !== loadedVersion
+        const isInProgress = inProgressById.value[selectedBeforeList] === true
+
+        if (isInProgress || hasVersionChange) {
+          await loadMessages(selectedBeforeList, {
+            silent: true,
+            bypassRecentReuse: hasVersionChange,
+          })
+        }
+      }
+
       await loadThreads()
 
       if (!selectedThreadId.value) return
@@ -7798,12 +8716,68 @@ export function useDesktopState() {
       const isInProgress = inProgressById.value[threadId] === true
 
       if (isInProgress || hasVersionChange) {
-        await loadMessages(threadId, { silent: true })
+        await loadMessages(threadId, {
+          silent: true,
+          bypassRecentReuse: hasVersionChange,
+        })
       }
     } catch {
       // ignore poll failures and keep last known state
     } finally {
       isPolling.value = false
+    }
+  }
+
+  async function refreshRuntimeStatesForChangedThreads(threadIds: ReadonlySet<string>): Promise<void> {
+    const loadedIds = new Set(flattenThreads(sourceGroups.value).map((thread) => thread.id))
+    const requestedThreadIds = Array.from(threadIds)
+      .filter((threadId) => threadId && loadedIds.has(threadId))
+      .slice(0, BACKGROUND_RUNTIME_BATCH_LIMIT)
+    if (requestedThreadIds.length === 0) return
+
+    let states: Awaited<ReturnType<typeof getThreadRuntimeStates>>
+    try {
+      states = await getThreadRuntimeStates(requestedThreadIds)
+    } catch {
+      return
+    }
+
+    for (const threadId of requestedThreadIds) {
+      const runtime = states[threadId] ?? { state: 'unknown' }
+      if (runtime.state === 'unknown') continue
+      const isSelectedNow = selectedThreadId.value === threadId
+
+      if (runtime.state === 'running' && runtime.source === 'local-app-server') {
+        activeTurnIdByThreadId.value = {
+          ...activeTurnIdByThreadId.value,
+          [threadId]: runtime.turnId,
+        }
+        backgroundExternalThreadIds.delete(threadId)
+        setThreadRuntimeOwnership(threadId, 'local')
+        setThreadInProgress(threadId, true)
+        continue
+      }
+
+      if (runtime.state === 'running') {
+        activeTurnIdByThreadId.value = {
+          ...activeTurnIdByThreadId.value,
+          [threadId]: runtime.turnId,
+        }
+        if (!isSelectedNow) backgroundExternalThreadIds.add(threadId)
+        setThreadRuntimeOwnership(threadId, 'external', {
+          externalPollDelayMs: isSelectedNow ? 0 : undefined,
+        })
+        setThreadInProgress(threadId, true)
+        continue
+      }
+
+      if (runtime.state === 'idle') {
+        backgroundExternalThreadIds.delete(threadId)
+        if (!isSelectedNow) clearCompletedTurnLiveState(threadId)
+        setThreadRuntimeOwnership(threadId, 'idle')
+        setThreadInProgress(threadId, false)
+        setTurnActivityForThread(threadId, null)
+      }
     }
   }
 
@@ -7823,19 +8797,80 @@ export function useDesktopState() {
     const shouldRefreshThreads = pendingThreadsRefresh
     const shouldForceThreadRefresh = pendingThreadsRefreshForce
     const threadIdsToRefresh = new Set(pendingThreadMessageRefresh)
+    const runtimeThreadIdsToRefresh = new Set(pendingThreadRuntimeRefresh)
+    const activeTextNewestThreadIdsToRefresh = new Set(pendingActiveTextNewestRefresh)
+    const activeTextNewestTurnIdsByThreadId = new Map(pendingActiveTextNewestTurnIdByThreadId)
     pendingThreadsRefresh = false
     pendingThreadsRefreshForce = false
     pendingThreadMessageRefresh.clear()
+    pendingThreadRuntimeRefresh.clear()
+    pendingActiveTextNewestRefresh.clear()
+    pendingActiveTextNewestTurnIdByThreadId.clear()
+
+    let activeThreadLoadBeforeList: Promise<void> | null = null
+    let activeThreadLoadBeforeListThreadId = ''
+    let activeThreadLoadBeforeListSucceeded = false
 
     try {
+      const activeThreadIdBeforeList = selectedThreadId.value
+      if (activeThreadIdBeforeList) {
+        const isActiveDirty = threadIdsToRefresh.has(activeThreadIdBeforeList)
+        const needsActiveTextNewest = activeTextNewestThreadIdsToRefresh.has(activeThreadIdBeforeList)
+        const activeTextTurnId = activeTurnIdByThreadId.value[activeThreadIdBeforeList]
+          || activeTextNewestTurnIdsByThreadId.get(activeThreadIdBeforeList)
+          || ''
+        const isInProgress = inProgressById.value[activeThreadIdBeforeList] === true
+        const currentVersion = currentThreadVersion(activeThreadIdBeforeList)
+        const loadedVersion = loadedVersionByThreadId.value[activeThreadIdBeforeList] ?? ''
+        const hasVersionChange = currentVersion.length > 0 && currentVersion !== loadedVersion
+
+        const shouldRefreshActiveThread =
+          hasVersionChange ||
+          isActiveDirty ||
+          (needsActiveTextNewest && !activeTextTurnId) ||
+          (isInProgress && loadedMessagesByThreadId.value[activeThreadIdBeforeList] !== true) ||
+          (shouldRefreshThreads && loadedMessagesByThreadId.value[activeThreadIdBeforeList] !== true)
+
+        if (shouldRefreshActiveThread) {
+          activeThreadLoadBeforeListThreadId = activeThreadIdBeforeList
+          activeThreadLoadBeforeList = loadMessages(activeThreadIdBeforeList, {
+            silent: true,
+            bypassRecentReuse: hasVersionChange || isActiveDirty,
+          })
+            .then(() => {
+              activeThreadLoadBeforeListSucceeded = true
+            })
+            .catch(() => {
+              // Keep thread-list/event reconciliation moving even if active detail is slow or fails.
+            })
+        }
+      }
+
       if (shouldRefreshThreads) {
         await loadThreads({ force: shouldForceThreadRefresh })
       }
+
+      if (activeThreadLoadBeforeList) {
+        await activeThreadLoadBeforeList
+        if (activeThreadLoadBeforeListSucceeded && activeThreadLoadBeforeListThreadId) {
+          threadIdsToRefresh.delete(activeThreadLoadBeforeListThreadId)
+        }
+      }
+      refreshSelectedActiveTextNewest(
+        activeTextNewestThreadIdsToRefresh,
+        activeTextNewestTurnIdsByThreadId,
+      )
+
+      await refreshRuntimeStatesForChangedThreads(runtimeThreadIdsToRefresh)
 
       const activeThreadId = selectedThreadId.value
       if (!activeThreadId) return
 
       const isActiveDirty = threadIdsToRefresh.has(activeThreadId)
+      const needsActiveTextNewest = activeTextNewestThreadIdsToRefresh.has(activeThreadId)
+      const activeTextTurnId = activeTurnIdByThreadId.value[activeThreadId]
+        || activeTextNewestTurnIdsByThreadId.get(activeThreadId)
+        || ''
       const isInProgress = inProgressById.value[activeThreadId] === true
       const currentVersion = currentThreadVersion(activeThreadId)
       const loadedVersion = loadedVersionByThreadId.value[activeThreadId] ?? ''
@@ -7844,19 +8879,32 @@ export function useDesktopState() {
       const shouldRefreshActiveThread =
         hasVersionChange ||
         isActiveDirty ||
+        (needsActiveTextNewest && !activeTextTurnId) ||
         (isInProgress && loadedMessagesByThreadId.value[activeThreadId] !== true) ||
         (shouldRefreshThreads && loadedMessagesByThreadId.value[activeThreadId] !== true)
 
       if (shouldRefreshActiveThread) {
-        await loadMessages(activeThreadId, { silent: true })
+        await loadMessages(activeThreadId, {
+          silent: true,
+          bypassRecentReuse: hasVersionChange || isActiveDirty,
+        })
       }
+      refreshSelectedActiveTextNewest(
+        activeTextNewestThreadIdsToRefresh,
+        activeTextNewestTurnIdsByThreadId,
+      )
     } catch {
       // Keep UI stable on transient event sync failures.
     } finally {
       isPolling.value = false
 
       if (
-        (pendingThreadsRefresh || pendingThreadMessageRefresh.size > 0) &&
+        (
+          pendingThreadsRefresh ||
+          pendingThreadMessageRefresh.size > 0 ||
+          pendingThreadRuntimeRefresh.size > 0 ||
+          pendingActiveTextNewestRefresh.size > 0
+        ) &&
         typeof window !== 'undefined' &&
         eventSyncTimer === null
       ) {
@@ -7891,8 +8939,17 @@ export function useDesktopState() {
     }
     scheduleBackgroundRuntimePolling(0)
     const selectedId = selectedThreadId.value
-    if (selectedId && runtimeOwnershipByThreadId.value[selectedId] === 'external') {
-      scheduleExternalRuntimePolling(selectedId)
+    if (
+      selectedId &&
+      (
+        runtimeOwnershipByThreadId.value[selectedId] === 'external' ||
+        canStartSelectedLiveProjectionPolling(selectedId)
+      )
+    ) {
+      scheduleExternalRuntimePolling(
+        selectedId,
+        runtimeOwnershipByThreadId.value[selectedId] === 'external' ? undefined : 0,
+      )
     }
     if (stopNotificationStream) return
     void loadPendingServerRequestsFromBridge()
@@ -7902,8 +8959,8 @@ export function useDesktopState() {
         void recoverBridgeState()
         return
       }
-      applyRealtimeUpdates(notification)
       queueEventDrivenSync(notification)
+      applyRealtimeUpdates(notification)
     })
   }
 
@@ -7948,10 +9005,15 @@ export function useDesktopState() {
     cancelExternalRuntimePolling()
     backgroundRuntimePollingEnabled = false
     cancelBackgroundRuntimeRequest()
-    backgroundRuntimeCursor = 0
     backgroundExternalThreadIds.clear()
     localRuntimeAuthorityVersionByThreadId.clear()
     selectionVersionByThreadId.clear()
+    isolatedSelectedRuntimeProbeVersionByThreadId.clear()
+    for (const timer of compressedLiveProjectionBackfillTimerByThreadId.values()) {
+      window.clearTimeout(timer)
+    }
+    compressedLiveProjectionBackfillTimerByThreadId.clear()
+    compressedLiveProjectionBackfillKeyByThreadId.clear()
     for (const threadId of activeTextHydrationByThreadId.keys()) {
       cancelActiveTextHydration(threadId)
     }
@@ -7966,6 +9028,9 @@ export function useDesktopState() {
 
     pendingThreadsRefresh = false
     pendingThreadMessageRefresh.clear()
+    pendingThreadRuntimeRefresh.clear()
+    pendingActiveTextNewestRefresh.clear()
+    pendingActiveTextNewestTurnIdByThreadId.clear()
     pendingTurnStartsById.clear()
     completionReconciliationGenerationByThreadId.clear()
     localSubmissionByThreadId.clear()
@@ -7981,6 +9046,10 @@ export function useDesktopState() {
     if (eventSyncTimer !== null && typeof window !== 'undefined') {
       window.clearTimeout(eventSyncTimer)
       eventSyncTimer = null
+    }
+    if (activeTextNewestRefreshTimer !== null && typeof window !== 'undefined') {
+      window.clearTimeout(activeTextNewestRefreshTimer)
+      activeTextNewestRefreshTimer = null
     }
     if (rateLimitRefreshTimer !== null && typeof window !== 'undefined') {
       window.clearTimeout(rateLimitRefreshTimer)

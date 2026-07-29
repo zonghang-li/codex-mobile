@@ -1,22 +1,24 @@
 <template>
   <section class="conversation-root" @contextmenu.capture="onConversationContextMenu">
-    <p v-if="isLoading" class="conversation-loading">Loading messages...</p>
-
-    <p
-      v-else-if="messages.length === 0 && pendingRequests.length === 0 && !liveOverlay"
-      class="conversation-empty"
-    >
-      No messages in this thread yet.
-    </p>
-
     <ul
-      v-else
       ref="conversationListRef"
       class="conversation-list"
       @scroll="onConversationScroll"
       @touchstart.passive="onConversationUserScrollIntent"
       @wheel.passive="onConversationUserScrollIntent"
     >
+      <li v-if="isLoading && !hasRenderableConversationContent" class="conversation-state-row">
+        <p class="conversation-loading">Loading messages...</p>
+      </li>
+
+      <li
+        v-else-if="messages.length === 0 && pendingRequests.length === 0 && !liveOverlay"
+        class="conversation-state-row"
+      >
+        <p class="conversation-empty">No messages in this thread yet.</p>
+      </li>
+
+      <template v-else>
       <li v-if="hasMoreAbove" class="conversation-load-more">
         <button
           type="button"
@@ -206,103 +208,6 @@
         </div>
 
         <div
-          v-else-if="isFileChangeMessage(message)"
-          class="message-row"
-          :data-role="message.role"
-          :data-message-type="message.messageType || ''"
-        >
-          <div class="message-stack" :data-role="message.role">
-            <article class="message-body" :data-role="message.role">
-              <section v-if="readStandaloneFileChangeSummary(message)" class="file-change-summary-block">
-                <button
-                  type="button"
-                  class="cmd-row cmd-row-group cmd-compact file-change-summary-row"
-                  :class="{ 'cmd-expanded': isFileChangeSummaryExpanded(message) }"
-                  @click="toggleFileChangeSummary(message)"
-                >
-                  <span class="cmd-chevron" :class="{ 'cmd-chevron-open': isFileChangeSummaryExpanded(message) }">▶</span>
-                  <span class="file-change-summary-label">
-                    {{ fileChangeSummaryLabel(readStandaloneFileChangeSummary(message)) }}
-                  </span>
-                  <span class="file-change-summary-status">
-                    <span
-                      v-for="part in fileChangeSummaryStatusParts(readStandaloneFileChangeSummary(message))"
-                      :key="`summary-status:${message.id}:${part.tone}:${part.label}`"
-                      class="file-change-signed-count"
-                      :data-tone="part.tone"
-                    >
-                      {{ part.label }}
-                    </span>
-                  </span>
-                </button>
-                <div class="cmd-group-wrap" :class="{ 'cmd-group-visible': isFileChangeSummaryExpanded(message) }">
-                  <div class="file-change-panel-inner">
-                    <ul class="file-change-list">
-                      <li
-                        v-for="change in readStandaloneFileChangeSummary(message)?.changes ?? []"
-                        :key="`file-change:${message.id}:${change.path}:${change.movedToPath || ''}`"
-                        class="file-change-item"
-                      >
-                        <span class="file-change-badge" :data-operation="fileChangeOperationTone(change)">
-                          {{ fileChangeOperationLabel(change) }}
-                        </span>
-                        <button
-                          type="button"
-                          class="file-change-path-button"
-                          :title="change.path"
-                          @click="openDiffViewer(readStandaloneFileChangeSummary(message), change)"
-                        >
-                          {{ displayFileChangePath(change.path) }}
-                        </button>
-                        <span v-if="change.movedToPath" class="file-change-arrow">→</span>
-                        <button
-                          v-if="change.movedToPath"
-                          type="button"
-                          class="file-change-path-button"
-                          :title="change.movedToPath"
-                          @click="openDiffViewer(readStandaloneFileChangeSummary(message), change)"
-                        >
-                          {{ displayFileChangePath(change.movedToPath) }}
-                        </button>
-                        <span v-if="change.addedLineCount > 0 || change.removedLineCount > 0" class="file-change-delta">
-                          <span
-                            v-for="part in fileChangeDeltaParts(change)"
-                            :key="`change-delta:${message.id}:${change.path}:${part.tone}:${part.label}`"
-                            class="file-change-signed-count"
-                            :data-tone="part.tone"
-                          >
-                            {{ part.label }}
-                          </span>
-                        </span>
-                      </li>
-                    </ul>
-                    <div v-if="!readOnly && isFileChangeActionable(readStandaloneFileChangeSummary(message))" class="file-change-actions">
-                      <p v-if="fileChangeActionErrorText(readStandaloneFileChangeSummary(message))" class="file-change-action-error">
-                        {{ fileChangeActionErrorText(readStandaloneFileChangeSummary(message)) }}
-                      </p>
-                      <button
-                        type="button"
-                        class="file-change-action-button"
-                        :disabled="fileChangeActionStatus(readStandaloneFileChangeSummary(message)) === 'undoing' || fileChangeActionStatus(readStandaloneFileChangeSummary(message)) === 'redoing'"
-                        :title="fileChangeNextAction(readStandaloneFileChangeSummary(message)) === 'redo' ? 'Redo file changes from this turn' : 'Undo file changes from this turn'"
-                        :aria-label="fileChangeNextAction(readStandaloneFileChangeSummary(message)) === 'redo' ? 'Redo file changes from this turn' : 'Undo file changes from this turn'"
-                        @click="runFileChangeAction(readStandaloneFileChangeSummary(message), fileChangeNextAction(readStandaloneFileChangeSummary(message)))"
-                      >
-                        <IconTablerArrowBackUp
-                          class="icon-svg file-change-action-icon"
-                          :class="{ 'file-change-action-icon-redo': fileChangeNextAction(readStandaloneFileChangeSummary(message)) === 'redo' }"
-                        />
-                        {{ fileChangeActionLabel(readStandaloneFileChangeSummary(message)) }}
-                      </button>
-                    </div>
-                  </div>
-                </div>
-              </section>
-            </article>
-          </div>
-        </div>
-
-        <div
           v-else-if="isActivityMessage(message)"
           class="message-row"
           data-role="system"
@@ -415,10 +320,15 @@
                 </a>
               </div>
 
+              <div v-if="userMessagePresentation(message).label" class="delegation-message-label">
+                {{ userMessagePresentation(message).label }}
+              </div>
+
               <article
-                v-if="message.text.length > 0 || (message.directives?.length ?? 0) > 0"
+                v-if="messageHasDisplayContent(message) || (message.directives?.length ?? 0) > 0"
                 class="message-card"
                 :data-role="message.role"
+                :data-user-delegation="userMessagePresentation(message).isDelegation ? 'true' : undefined"
               >
                 <div v-if="message.isAutomationRun" class="automation-message-label">
                   <span>Sent via automation</span>
@@ -506,7 +416,7 @@
                 <div
                   v-else
                   class="message-text-flow"
-                  v-memo="[message.id, message.text, props.cwd, highlightCacheVersion, mathRenderVersion, markdownImageFailureVersion]"
+                  v-memo="[message.id, displayMessageText(message), props.cwd, highlightCacheVersion, mathRenderVersion, markdownImageFailureVersion]"
                 >
                   <template v-for="(block, blockIndex) in getMessageBlocks(message)" :key="`block-${blockIndex}`">
                     <p v-if="block.kind === 'paragraph'" class="message-text">
@@ -817,6 +727,15 @@
                     </button>
                   </template>
                 </div>
+                <button
+                  v-if="userMessagePresentation(message).isCollapsible"
+                  type="button"
+                  class="message-show-more-button"
+                  @click="toggleUserMessageExpanded(message)"
+                >
+                  {{ userMessagePresentation(message).isCollapsed ? 'Show more' : 'Show less' }}
+                  <span class="message-show-more-chevron" :data-expanded="userMessagePresentation(message).isCollapsed ? 'false' : 'true'">⌄</span>
+                </button>
                 <CodexDirectiveNotices
                   v-if="message.directives && message.directives.length > 0"
                   :directives="message.directives"
@@ -832,7 +751,7 @@
               </article>
 
               <div
-                v-if="showCopyResponseButton(message) || showForkResponseButton(message)"
+                v-if="messageHasDisplayContent(message) && (showCopyResponseButton(message) || showForkResponseButton(message))"
                 class="message-toolbar"
                 :data-role="message.role"
               >
@@ -857,112 +776,27 @@
                 >
                   <span class="message-fork-label">Fork</span>
                 </button>
+                <span v-if="completionTimeLabel(message)" class="message-completion-time">
+                  {{ completionTimeLabel(message) }}
+                </span>
               </div>
 
-              <section v-if="readAnchoredFileChangeSummary(message)" class="file-change-summary-block file-change-summary-block-inline">
-                <button
-                  type="button"
-                  class="cmd-row cmd-row-group cmd-compact file-change-summary-row"
-                  :class="{ 'cmd-expanded': isFileChangeSummaryExpanded(message) }"
-                  @click="toggleFileChangeSummary(message)"
-                >
-                  <span class="cmd-chevron" :class="{ 'cmd-chevron-open': isFileChangeSummaryExpanded(message) }">▶</span>
-                  <span class="file-change-summary-label">
-                    {{ fileChangeSummaryLabel(readAnchoredFileChangeSummary(message)) }}
-                  </span>
-                  <span class="file-change-summary-status">
-                    <span
-                      v-for="part in fileChangeSummaryStatusParts(readAnchoredFileChangeSummary(message))"
-                      :key="`summary-status:${message.id}:${part.tone}:${part.label}`"
-                      class="file-change-signed-count"
-                      :data-tone="part.tone"
-                    >
-                      {{ part.label }}
-                    </span>
-                  </span>
-                </button>
-                <div class="cmd-group-wrap" :class="{ 'cmd-group-visible': isFileChangeSummaryExpanded(message) }">
-                  <div class="file-change-panel-inner">
-                    <ul class="file-change-list">
-                      <li
-                        v-for="change in readAnchoredFileChangeSummary(message)?.changes ?? []"
-                        :key="`file-change:inline:${message.id}:${change.path}:${change.movedToPath || ''}`"
-                        class="file-change-item"
-                      >
-                        <span class="file-change-badge" :data-operation="fileChangeOperationTone(change)">
-                          {{ fileChangeOperationLabel(change) }}
-                        </span>
-                        <button
-                          type="button"
-                          class="file-change-path-button"
-                          :title="change.path"
-                          @click="openDiffViewer(readAnchoredFileChangeSummary(message), change)"
-                        >
-                          {{ displayFileChangePath(change.path) }}
-                        </button>
-                        <span v-if="change.movedToPath" class="file-change-arrow">→</span>
-                        <button
-                          v-if="change.movedToPath"
-                          type="button"
-                          class="file-change-path-button"
-                          :title="change.movedToPath"
-                          @click="openDiffViewer(readAnchoredFileChangeSummary(message), change)"
-                        >
-                          {{ displayFileChangePath(change.movedToPath) }}
-                        </button>
-                        <span v-if="change.addedLineCount > 0 || change.removedLineCount > 0" class="file-change-delta">
-                          <span
-                            v-for="part in fileChangeDeltaParts(change)"
-                            :key="`change-delta:inline:${message.id}:${change.path}:${part.tone}:${part.label}`"
-                            class="file-change-signed-count"
-                            :data-tone="part.tone"
-                          >
-                            {{ part.label }}
-                          </span>
-                        </span>
-                      </li>
-                    </ul>
-                    <div v-if="!readOnly && isFileChangeActionable(readAnchoredFileChangeSummary(message))" class="file-change-actions">
-                      <p v-if="fileChangeActionErrorText(readAnchoredFileChangeSummary(message))" class="file-change-action-error">
-                        {{ fileChangeActionErrorText(readAnchoredFileChangeSummary(message)) }}
-                      </p>
-                      <button
-                        type="button"
-                        class="file-change-action-button"
-                        :disabled="fileChangeActionStatus(readAnchoredFileChangeSummary(message)) === 'undoing' || fileChangeActionStatus(readAnchoredFileChangeSummary(message)) === 'redoing'"
-                        :title="fileChangeNextAction(readAnchoredFileChangeSummary(message)) === 'redo' ? 'Redo file changes from this turn' : 'Undo file changes from this turn'"
-                        :aria-label="fileChangeNextAction(readAnchoredFileChangeSummary(message)) === 'redo' ? 'Redo file changes from this turn' : 'Undo file changes from this turn'"
-                        @click="runFileChangeAction(readAnchoredFileChangeSummary(message), fileChangeNextAction(readAnchoredFileChangeSummary(message)))"
-                      >
-                        <IconTablerArrowBackUp
-                          class="icon-svg file-change-action-icon"
-                          :class="{ 'file-change-action-icon-redo': fileChangeNextAction(readAnchoredFileChangeSummary(message)) === 'redo' }"
-                        />
-                        {{ fileChangeActionLabel(readAnchoredFileChangeSummary(message)) }}
-                      </button>
-                    </div>
-                  </div>
-                </div>
-              </section>
             </article>
           </div>
         </div>
       </li>
       </template>
-      <li v-if="liveOverlay" class="conversation-item conversation-item-overlay">
+      <li v-if="liveOverlayTranscript" class="conversation-item conversation-item-overlay">
         <div class="message-row">
           <div class="message-stack">
             <article class="live-overlay-inline" aria-live="polite">
-              <p class="live-overlay-label">{{ liveOverlay.activityLabel }}</p>
-              <p v-if="liveOverlay.reasoningText" class="live-overlay-reasoning">{{ liveOverlay.reasoningText }}</p>
-              <div v-if="liveOverlay.errorText" class="live-overlay-error">
-                <span>{{ liveOverlay.errorText }}</span>
-                <a class="live-overlay-feedback" :href="feedbackMailto" @click="prepareLiveErrorFeedback($event, liveOverlay.errorText)">Send feedback</a>
-              </div>
+              <p class="live-overlay-label">{{ liveOverlayTranscript.activityLabel }}</p>
+              <p v-if="liveOverlayTranscript.reasoningText" class="live-overlay-reasoning">{{ liveOverlayTranscript.reasoningText }}</p>
             </article>
           </div>
         </div>
       </li>
+      </template>
       <li ref="bottomAnchorRef" class="conversation-bottom-anchor" />
     </ul>
 
@@ -976,6 +810,24 @@
     >
       <IconTablerArrowUp class="icon-svg jump-to-latest-icon" />
     </button>
+
+    <div
+      v-if="visibleLiveErrorText"
+      class="conversation-notification conversation-notification-error"
+      role="alert"
+      aria-live="assertive"
+    >
+      <span class="conversation-notification-text">{{ visibleLiveErrorText }}</span>
+      <a class="conversation-notification-feedback" :href="feedbackMailto" @click="prepareLiveErrorFeedback($event, visibleLiveErrorText)">Send feedback</a>
+      <button
+        type="button"
+        class="conversation-notification-dismiss"
+        aria-label="Dismiss error notification"
+        @click="dismissLiveErrorNotification"
+      >
+        ×
+      </button>
+    </div>
 
     <div v-if="modalImageUrl.length > 0" class="image-modal-backdrop" @click="closeImageModal">
       <div class="image-modal-content" @click.stop>
@@ -1009,129 +861,12 @@
       </button>
     </div>
 
-    <div v-if="activeDiffViewerChange" class="diff-viewer-backdrop" @click="closeDiffViewer">
-      <div class="diff-viewer-shell" @click.stop>
-        <aside v-if="!isMobile" class="diff-viewer-sidebar">
-          <div class="diff-viewer-sidebar-header">
-            <p class="diff-viewer-sidebar-title">Changed files</p>
-            <p class="diff-viewer-sidebar-count">{{ formatFileChangeCountLabel(diffViewerChanges.length) }}</p>
-          </div>
-          <div class="diff-viewer-sidebar-list">
-            <button
-              v-for="change in diffViewerChanges"
-              :key="`diff-viewer:${fileChangeKey(change)}`"
-              type="button"
-              class="diff-viewer-file-button"
-              :data-active="fileChangeKey(change) === fileChangeKey(activeDiffViewerChange)"
-              @click="selectDiffViewerChange(change)"
-            >
-              <span class="file-change-badge" :data-operation="fileChangeOperationTone(change)">
-                {{ fileChangeOperationLabel(change) }}
-              </span>
-              <span class="diff-viewer-file-label">
-                {{ displayFileChangePath(change.path) }}
-                <template v-if="change.movedToPath"> → {{ displayFileChangePath(change.movedToPath) }}</template>
-              </span>
-              <span v-if="formatFileChangeDelta(change)" class="diff-viewer-file-delta">{{ formatFileChangeDelta(change) }}</span>
-            </button>
-          </div>
-        </aside>
-
-        <section class="diff-viewer-main">
-          <div class="diff-viewer-toolbar">
-            <div class="diff-viewer-title-wrap">
-              <p class="diff-viewer-title">
-                {{ displayFileChangePath(activeDiffViewerChange.path) }}
-                <template v-if="activeDiffViewerChange.movedToPath"> → {{ displayFileChangePath(activeDiffViewerChange.movedToPath) }}</template>
-              </p>
-              <p class="diff-viewer-subtitle">
-                {{ fileChangeOperationLabel(activeDiffViewerChange) }}
-                <span v-if="formatFileChangeDelta(activeDiffViewerChange)"> · {{ formatFileChangeDelta(activeDiffViewerChange) }}</span>
-              </p>
-            </div>
-            <div class="diff-viewer-toolbar-actions">
-              <button
-                v-if="isMobile"
-                type="button"
-                class="diff-viewer-mobile-files-button"
-                @click="toggleDiffViewerFileList"
-              >
-                {{ formatFileChangeCountLabel(diffViewerChanges.length) }}
-              </button>
-              <button class="image-modal-close diff-viewer-close" type="button" aria-label="Close diff viewer" @click="closeDiffViewer">
-                <IconTablerX class="icon-svg" />
-              </button>
-            </div>
-          </div>
-
-          <div v-if="!hasDiffViewerContent(activeDiffViewerChange)" class="diff-viewer-empty">
-            <p class="diff-viewer-empty-title">No diff available</p>
-            <p class="diff-viewer-empty-text">This summary was restored from the final answer text, but the thread history does not include patch diff content for this file.</p>
-          </div>
-
-          <div v-else class="diff-viewer-panel">
-            <div class="diff-viewer-meta">
-              <span class="diff-viewer-language">{{ inferDiffViewerLanguage(activeDiffViewerChange) || 'diff' }}</span>
-            </div>
-            <div class="diff-viewer-lines">
-              <div
-                v-for="line in activeDiffViewerLines"
-                :key="line.key"
-                class="diff-viewer-line"
-                :data-kind="line.kind"
-              >
-                <span class="diff-viewer-line-number">{{ line.oldLine ?? '' }}</span>
-                <span class="diff-viewer-line-number">{{ line.newLine ?? '' }}</span>
-                <span class="diff-viewer-line-marker">{{ diffViewerMarker(line) }}</span>
-                <code class="diff-viewer-line-code" v-html="escapeHtml(line.text) || '&nbsp;'"></code>
-              </div>
-            </div>
-          </div>
-        </section>
-
-        <Transition name="diff-viewer-sheet">
-          <div
-            v-if="isMobile && isDiffViewerFileListOpen"
-            class="diff-viewer-mobile-sheet-backdrop"
-            @click="closeDiffViewerFileList"
-          >
-            <div class="diff-viewer-mobile-sheet" @click.stop>
-              <div class="diff-viewer-mobile-sheet-handle" aria-hidden="true"></div>
-              <div class="diff-viewer-mobile-sheet-header">
-                <p class="diff-viewer-sidebar-title">Changed files</p>
-                <p class="diff-viewer-sidebar-count">{{ formatFileChangeCountLabel(diffViewerChanges.length) }}</p>
-              </div>
-              <div class="diff-viewer-mobile-sheet-list">
-                <button
-                  v-for="change in diffViewerChanges"
-                  :key="`diff-viewer-sheet:${fileChangeKey(change)}`"
-                  type="button"
-                  class="diff-viewer-file-button"
-                  :data-active="fileChangeKey(change) === fileChangeKey(activeDiffViewerChange)"
-                  @click="selectDiffViewerChange(change)"
-                >
-                  <span class="file-change-badge" :data-operation="fileChangeOperationTone(change)">
-                    {{ fileChangeOperationLabel(change) }}
-                  </span>
-                  <span class="diff-viewer-file-label">
-                    {{ displayFileChangePath(change.path) }}
-                    <template v-if="change.movedToPath"> → {{ displayFileChangePath(change.movedToPath) }}</template>
-                  </span>
-                  <span v-if="formatFileChangeDelta(change)" class="diff-viewer-file-delta">{{ formatFileChangeDelta(change) }}</span>
-                </button>
-              </div>
-            </div>
-          </div>
-        </Transition>
-      </div>
-    </div>
   </section>
 </template>
 
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
-import type { UiFileChange, UiLiveOverlay, UiMessage, UiPlanStep, UiServerRequest } from '../../types/codex'
-import { updateThreadFileChanges } from '../../api/codexGateway'
+import type { UiLiveOverlay, UiMessage, UiPlanStep, UiServerRequest } from '../../types/codex'
 import { useFeedbackDiagnostics } from '../../composables/useFeedbackDiagnostics'
 import { useMobile } from '../../composables/useMobile'
 import { copyTextToClipboard, copyTextWithSelectionFallback } from '../../utils/clipboard'
@@ -1142,13 +877,20 @@ import {
   buildThreadActivitySegments,
   getTurnActivitySegmentsForWorked,
   isThreadActivityMessage,
+  shouldRenderReasoningAsTranscript,
   type ThreadActivityIconKind,
   type ThreadActivitySegment,
 } from './threadConversationActivity'
 import {
+  formatCompletionClockTime,
+  hiddenSimplifiedTranscriptMessageIds,
   projectConversationTurns,
+  stripTitleOnlyReasoningStatusLines,
   suppressResponseActions,
 } from './conversationTurnPresentation'
+import {
+  deriveUserMessagePresentation,
+} from './userMessagePresentation'
 import {
   isCommandOutputExpanded,
   toggleCommandOutputExpanded,
@@ -1180,10 +922,8 @@ type HighlightJsModule = (typeof import('highlight.js/lib/common'))['default']
 const expandedCommandIds = ref<Set<string>>(new Set())
 const expandedCommandGroupIds = ref<Set<string>>(new Set())
 const expandedWorkedIds = ref<Set<string>>(new Set())
-const expandedFileChangeSummaryIds = ref<Set<string>>(new Set())
-const activeDiffViewerSummary = ref<TurnFileChangeSummary | null>(null)
-const activeDiffViewerChangeKey = ref('')
-const isDiffViewerFileListOpen = ref(false)
+const expandedUserMessageIds = ref<Set<string>>(new Set())
+const dismissedLiveErrorNotificationKey = ref('')
 const fileLinkContextMenuRef = ref<HTMLElement | null>(null)
 const isFileLinkContextMenuVisible = ref(false)
 const fileLinkContextMenuX = ref(0)
@@ -1208,6 +948,32 @@ function prepareTurnErrorFeedback(event: MouseEvent, message: string): void {
   if (target instanceof HTMLAnchorElement) {
     target.href = buildFeedbackMailto()
   }
+}
+
+const liveErrorNotificationText = computed(() => props.liveOverlay?.errorText?.trim() ?? '')
+const liveErrorNotificationKey = computed(() => {
+  const text = liveErrorNotificationText.value
+  if (!text) return ''
+  return `${props.activeThreadId}:${text}`
+})
+const visibleLiveErrorText = computed(() => {
+  const key = liveErrorNotificationKey.value
+  if (!key || dismissedLiveErrorNotificationKey.value === key) return ''
+  return liveErrorNotificationText.value
+})
+const liveOverlayTranscript = computed<UiLiveOverlay | null>(() => {
+  const overlay = props.liveOverlay
+  if (!overlay) return null
+  const reasoningText = overlay.reasoningText.trim()
+  const activityLabel = overlay.activityLabel.trim()
+  if (!reasoningText && (!activityLabel || activityLabel === 'Thinking')) return null
+  return overlay
+})
+
+function dismissLiveErrorNotification(): void {
+  const key = liveErrorNotificationKey.value
+  if (!key) return
+  dismissedLiveErrorNotificationKey.value = key
 }
 
 function parsePlanFromMessageText(text: string): { explanation: string; steps: UiPlanStep[] } | null {
@@ -1298,13 +1064,16 @@ function implementPlan(message: UiMessage): void {
 
 function isFileChangeMessage(message: UiMessage): boolean {
   return message.messageType === 'fileChange'
-    && message.fileChangeStatus === 'completed'
-    && Array.isArray(message.fileChanges)
-    && message.fileChanges.length > 0
+    || (
+      message.role === 'system'
+      && Array.isArray(message.fileChanges)
+      && message.fileChanges.length > 0
+    )
 }
 
 function isActivityMessage(message: UiMessage): boolean {
   if (isCommandMessage(message) || isFileChangeMessage(message) || isPlanMessage(message)) return false
+  if (isActiveTurnReasoningTranscript(message)) return false
   return isThreadActivityMessage(message)
 }
 
@@ -1322,14 +1091,6 @@ function activityIconKind(message: UiMessage): ThreadActivityIconKind {
 }
 
 function activityMessageLabel(message: UiMessage): string {
-  if (isFileChangeMessage(message)) {
-    return fileChangeSummaryLabel({
-      changes: message.fileChanges ?? [],
-      sourceMessageIds: [message.id],
-      source: 'metadata',
-      turnId: message.turnId ?? '',
-    })
-  }
   if (isPlanMessage(message)) {
     const firstStep = readPlanSteps(message)[0]?.step.trim()
     return firstStep ? `Planning ${firstStep}` : 'Planning'
@@ -1343,6 +1104,7 @@ function activityMessageLabel(message: UiMessage): string {
 
 function isCopyableAssistantMessage(message: UiMessage): boolean {
   return message.role === 'assistant'
+    && isProjectedFinalResponse(message)
     && !isCommandMessage(message)
     && !projectedActivityMessageIds.value.has(message.id)
     && message.messageType !== 'worked'
@@ -1414,6 +1176,7 @@ function isSnapshotTextStreamableMessage(message: UiMessage): boolean {
 
 function isSnapshotTextStreamRenderableMessage(message: UiMessage): boolean {
   return message.messageType !== 'plan.live'
+    && message.messageType !== 'reasoning'
 }
 
 const snapshotTextStreamTargetMessageId = computed(() => {
@@ -1488,6 +1251,11 @@ function applySnapshotTextStreamingDisplay(message: UiMessage): UiMessage {
 }
 
 const displayMessages = computed(() => props.messages.map((message) => applySnapshotTextStreamingDisplay(message)))
+const hasRenderableConversationContent = computed(() => (
+  props.messages.length > 0
+  || props.pendingRequests.length > 0
+  || Boolean(props.liveOverlay)
+))
 
 const activitySegments = computed(() => buildThreadActivitySegments(props.messages))
 const conversationTurnSections = computed(() => projectConversationTurns({
@@ -1503,8 +1271,22 @@ const projectedFinalMessageIds = computed(() => new Set(
     .filter((messageId): messageId is string => messageId !== null),
 ))
 
+const completionTimeByFinalMessageId = computed(() => {
+  const next = new Map<string, string>()
+  for (const section of conversationTurnSections.value) {
+    if (!section.finalMessageId || !section.completionMessageId) continue
+    const label = formatCompletionClockTime(section.completionCreatedAtMs)
+    if (label) next.set(section.finalMessageId, label)
+  }
+  return next
+})
+
 function isProjectedFinalResponse(message: UiMessage): boolean {
   return projectedFinalMessageIds.value.has(message.id)
+}
+
+function completionTimeLabel(message: UiMessage): string {
+  return completionTimeByFinalMessageId.value.get(message.id) ?? ''
 }
 
 const activitySegmentByAnchorId = computed<Record<string, ThreadActivitySegment>>(() => {
@@ -1526,8 +1308,17 @@ const hiddenActivitySegmentSourceIds = computed(() => {
 })
 
 function readActivitySegment(message: UiMessage): ThreadActivitySegment | null {
+  if (isActiveTurnReasoningTranscript(message)) return null
   if (isSnapshotTextStreamTargetMessage(message)) return null
   return activitySegmentByAnchorId.value[message.id] ?? null
+}
+
+function isActiveTurnReasoningTranscript(message: UiMessage): boolean {
+  return shouldRenderReasoningAsTranscript(message, {
+    activeTurnId: activeSnapshotTextStreamTurnId.value,
+    isThreadInProgress: props.isThreadInProgress === true,
+    readOnly: props.readOnly === true,
+  })
 }
 
 function activitySegmentAgentStatus(segment: ThreadActivitySegment | null): string {
@@ -1629,6 +1420,44 @@ function isCommandGroupExpanded(message: UiMessage): boolean {
   return expandedCommandGroupIds.value.has(message.id)
 }
 
+function userMessagePresentation(message: UiMessage) {
+  return deriveUserMessagePresentation(message, {
+    expanded: expandedUserMessageIds.value.has(message.id),
+  })
+}
+
+function displayMessageText(message: UiMessage): string {
+  const presentationText = userMessagePresentation(message).text
+  if (message.role === 'assistant') {
+    return stripTitleOnlyReasoningStatusLines(presentationText)
+  }
+  return presentationText
+}
+
+function messageHasDisplayContent(message: UiMessage): boolean {
+  return displayMessageText(message).length > 0
+}
+
+function shouldRenderVisibleMessage(message: UiMessage): boolean {
+  if (readActivitySegment(message)) return true
+  if (isCommandMessage(message)) return true
+  if (isActivityMessage(message)) return true
+  if ((message.images?.length ?? 0) > 0) return true
+  if ((message.fileAttachments?.length ?? 0) > 0) return true
+  if ((message.skills?.length ?? 0) > 0) return true
+  if ((message.directives?.length ?? 0) > 0) return true
+  return messageHasDisplayContent(message)
+}
+
+function toggleUserMessageExpanded(message: UiMessage): void {
+  const presentation = userMessagePresentation(message)
+  if (!presentation.isCollapsible) return
+  const next = new Set(expandedUserMessageIds.value)
+  if (next.has(message.id)) next.delete(message.id)
+  else next.add(message.id)
+  expandedUserMessageIds.value = next
+}
+
 function commandGroupSummaryLabel(message: UiMessage): string {
   const commands = getCommandBlockForLatest(message)
   const count = commands.length
@@ -1650,49 +1479,6 @@ function toggleWorkedExpand(message: UiMessage): void {
 
 function isWorkedExpanded(message: UiMessage): boolean {
   return expandedWorkedIds.value.has(message.id)
-}
-
-function toggleFileChangeSummary(message: UiMessage): void {
-  const next = new Set(expandedFileChangeSummaryIds.value)
-  if (next.has(message.id)) next.delete(message.id)
-  else next.add(message.id)
-  expandedFileChangeSummaryIds.value = next
-}
-
-function isFileChangeSummaryExpanded(message: UiMessage): boolean {
-  return expandedFileChangeSummaryIds.value.has(message.id)
-}
-
-function fileChangeKey(change: UiFileChange): string {
-  return `${change.path}\u0000${change.movedToPath ?? ''}`
-}
-
-function openDiffViewer(summary: TurnFileChangeSummary | null, change: UiFileChange): void {
-  if (!summary) return
-  activeDiffViewerSummary.value = summary
-  activeDiffViewerChangeKey.value = fileChangeKey(change)
-  isDiffViewerFileListOpen.value = false
-}
-
-function closeDiffViewer(): void {
-  activeDiffViewerSummary.value = null
-  activeDiffViewerChangeKey.value = ''
-  isDiffViewerFileListOpen.value = false
-}
-
-function toggleDiffViewerFileList(): void {
-  isDiffViewerFileListOpen.value = !isDiffViewerFileListOpen.value
-}
-
-function closeDiffViewerFileList(): void {
-  isDiffViewerFileListOpen.value = false
-}
-
-function selectDiffViewerChange(change: UiFileChange): void {
-  activeDiffViewerChangeKey.value = fileChangeKey(change)
-  if (isMobile.value) {
-    isDiffViewerFileListOpen.value = false
-  }
 }
 
 function commandStatusLabel(message: UiMessage): string {
@@ -1750,9 +1536,6 @@ const conversationListRef = ref<HTMLElement | null>(null)
 const bottomAnchorRef = ref<HTMLElement | null>(null)
 const modalImageUrl = ref('')
 const copiedResponseAnchorId = ref('')
-const fileChangeActionState = ref<Record<string, 'idle' | 'undoing' | 'redoing' | 'undone' | 'redone'>>({})
-const fileChangeActionError = ref<Record<string, string>>({})
-const fileChangeRedoPatchIds = ref<Record<string, string[]>>({})
 const toolQuestionAnswers = ref<Record<string, string>>({})
 const toolQuestionOtherAnswers = ref<Record<string, string>>({})
 const mcpElicitationAnswers = ref<Record<string, string | number | boolean | string[]>>({})
@@ -1913,21 +1696,6 @@ type McpElicitationField = {
   options: McpElicitationFieldOption[]
   defaultValue: string | number | boolean | string[]
 }
-type TurnFileChangeSummary = {
-  changes: UiFileChange[]
-  sourceMessageIds: string[]
-  source: 'assistant' | 'metadata'
-  turnId: string
-}
-type DiffViewerLineKind = 'meta' | 'hunk' | 'add' | 'remove' | 'context'
-type DiffViewerLine = {
-  key: string
-  kind: DiffViewerLineKind
-  oldLine: number | null
-  newLine: number | null
-  text: string
-}
-
 function isFilePath(value: string): boolean {
   if (!value || /[\r\n]/u.test(value)) return false
   if (value.endsWith('/') || value.endsWith('\\')) return false
@@ -2264,13 +2032,6 @@ const copyableResponseContentByAnchorId = computed<Record<string, string>>(() =>
     next[response.anchorMessageId] = content
   }
 
-  for (const [anchorMessageId, summary] of Object.entries(anchoredFileChangeSummaryByAnchorId.value)) {
-    if (summary.source !== 'metadata') continue
-    const fileChangeCopy = buildFileChangeCopyText(summary)
-    if (!fileChangeCopy) continue
-    const existing = next[anchorMessageId]?.trim()
-    next[anchorMessageId] = existing ? `${existing}\n\n${fileChangeCopy}` : fileChangeCopy
-  }
   return next
 })
 
@@ -2319,154 +2080,29 @@ function isResponseActionSuppressed(message: UiMessage): boolean {
   })
 }
 
-function mergeFileChangeDiff(first: string, second: string): string {
-  if (!first) return second
-  if (!second || first === second) return first
-  return `${first}\n${second}`.trim()
-}
-
-function mergeFileChangeEntry(first: UiFileChange, second: UiFileChange): UiFileChange {
-  const operation = first.operation === 'add' || second.operation === 'add'
-    ? 'add'
-    : first.operation === 'delete' || second.operation === 'delete'
-      ? 'delete'
-      : 'update'
-  return {
-    path: second.path || first.path,
-    operation,
-    movedToPath: second.movedToPath ?? first.movedToPath ?? null,
-    diff: mergeFileChangeDiff(first.diff, second.diff),
-    addedLineCount: first.addedLineCount + second.addedLineCount,
-    removedLineCount: first.removedLineCount + second.removedLineCount,
-  }
-}
-
-function compareFileChanges(first: UiFileChange, second: UiFileChange): number {
-  const firstRank = first.operation === 'add' ? 0 : first.operation === 'update' ? 1 : 2
-  const secondRank = second.operation === 'add' ? 0 : second.operation === 'update' ? 1 : 2
-  if (firstRank !== secondRank) return firstRank - secondRank
-  const firstPath = `${first.path}\u0000${first.movedToPath ?? ''}`
-  const secondPath = `${second.path}\u0000${second.movedToPath ?? ''}`
-  return firstPath.localeCompare(secondPath)
-}
-
-function aggregateFileChanges(changes: UiFileChange[]): UiFileChange[] {
-  const byPath = new Map<string, UiFileChange>()
-  for (const change of changes) {
-    const key = `${change.path}\u0000${change.movedToPath ?? ''}`
-    const previous = byPath.get(key)
-    byPath.set(key, previous ? mergeFileChangeEntry(previous, change) : { ...change })
-  }
-  return Array.from(byPath.values()).sort(compareFileChanges)
-}
-
-const anchoredFileChangeSummaryByAnchorId = computed<Record<string, TurnFileChangeSummary>>(() => {
-  const assistantAnchorIdByTurnKey = new Map<string, string>()
-  const assistantSummaryByAnchorId = new Map<string, TurnFileChangeSummary>()
-  const fileChangeMessagesByTurnKey = new Map<string, UiMessage[]>()
-
-  for (const message of props.messages) {
-    if (isCopyableAssistantMessage(message) && typeof message.turnIndex === 'number') {
-      assistantAnchorIdByTurnKey.set(`turn:${message.turnIndex}`, message.id)
-      if (Array.isArray(message.fileChanges) && message.fileChanges.length > 0) {
-        assistantSummaryByAnchorId.set(message.id, {
-          changes: aggregateFileChanges(message.fileChanges),
-          sourceMessageIds: [],
-          source: 'assistant',
-          turnId: message.turnId ?? '',
-        })
-      }
-    }
-
-    if (!isFileChangeMessage(message)) continue
-    const turnKey = typeof message.turnIndex === 'number' ? `turn:${message.turnIndex}` : `message:${message.id}`
-    const current = fileChangeMessagesByTurnKey.get(turnKey)
-    if (current) current.push(message)
-    else fileChangeMessagesByTurnKey.set(turnKey, [message])
-  }
-
-  const summaries: Record<string, TurnFileChangeSummary> = {}
-  for (const [turnKey, messages] of fileChangeMessagesByTurnKey.entries()) {
-    const anchorId = assistantAnchorIdByTurnKey.get(turnKey)
-    if (!anchorId) continue
-    const assistantTurnId = assistantSummaryByAnchorId.get(anchorId)?.turnId ?? ''
-    summaries[anchorId] = {
-      changes: aggregateFileChanges(messages.flatMap((message) => message.fileChanges ?? [])),
-      sourceMessageIds: messages.map((message) => message.id),
-      source: 'metadata',
-      turnId: messages.find((message) => typeof message.turnId === 'string' && message.turnId.length > 0)?.turnId ?? assistantTurnId,
-    }
-  }
-
-  for (const [anchorId, summary] of assistantSummaryByAnchorId.entries()) {
-    if (!summaries[anchorId]) {
-      summaries[anchorId] = summary
-    }
-  }
-
-  return summaries
-})
-
-const standaloneFileChangeSummaryByMessageId = computed<Record<string, TurnFileChangeSummary>>(() => {
-  const assistantAnchorIdByTurnKey = new Map<string, string>()
-  const fileChangeMessagesByTurnKey = new Map<string, UiMessage[]>()
-
-  for (const message of props.messages) {
-    if (isCopyableAssistantMessage(message) && typeof message.turnIndex === 'number') {
-      assistantAnchorIdByTurnKey.set(`turn:${message.turnIndex}`, message.id)
-    }
-
-    if (!isFileChangeMessage(message)) continue
-    const turnKey = typeof message.turnIndex === 'number' ? `turn:${message.turnIndex}` : `message:${message.id}`
-    const current = fileChangeMessagesByTurnKey.get(turnKey)
-    if (current) current.push(message)
-    else fileChangeMessagesByTurnKey.set(turnKey, [message])
-  }
-
-  const summaries: Record<string, TurnFileChangeSummary> = {}
-  for (const [turnKey, messages] of fileChangeMessagesByTurnKey.entries()) {
-    if (assistantAnchorIdByTurnKey.has(turnKey)) continue
-    const visibleMessage = messages[messages.length - 1]
-    if (!visibleMessage) continue
-    summaries[visibleMessage.id] = {
-      changes: aggregateFileChanges(messages.flatMap((message) => message.fileChanges ?? [])),
-      sourceMessageIds: messages.map((message) => message.id),
-      source: 'metadata',
-      turnId: visibleMessage.turnId ?? messages.find((message) => typeof message.turnId === 'string' && message.turnId.length > 0)?.turnId ?? '',
-    }
-  }
-
-  return summaries
-})
-
 const hiddenFileChangeMessageIds = computed(() => {
   const next = new Set<string>()
-  for (const summary of Object.values(anchoredFileChangeSummaryByAnchorId.value)) {
-    for (const messageId of summary.sourceMessageIds) {
-      next.add(messageId)
-    }
-  }
-  for (const [messageId, summary] of Object.entries(standaloneFileChangeSummaryByMessageId.value)) {
-    for (const sourceMessageId of summary.sourceMessageIds) {
-      if (sourceMessageId !== messageId) {
-        next.add(sourceMessageId)
-      }
-    }
+  for (const message of props.messages) {
+    if (isFileChangeMessage(message)) next.add(message.id)
   }
   return next
 })
 
 const hiddenActiveFooterMessageIds = computed(() => {
+  if (props.isThreadInProgress === true) {
+    return new Set(
+      props.messages
+        .filter((message) => message.messageType === 'plan.live')
+        .map((message) => message.id),
+    )
+  }
   const turnId = props.activeTurnId?.trim() ?? ''
   if (!turnId) return new Set<string>()
   return new Set(
     props.messages
       .filter((message) =>
         message.turnId === turnId
-        && (
-          message.messageType === 'fileChange'
-          || message.messageType === 'plan.live'
-        ),
+        && message.messageType === 'plan.live',
       )
       .map((message) => message.id),
   )
@@ -2483,348 +2119,22 @@ const hiddenCompletedActivityMessageIds = computed(() => new Set(
     .flatMap((section) => section.activityMessageIds),
 ))
 
+const hiddenSimplifiedTranscriptIds = computed(() => hiddenSimplifiedTranscriptMessageIds({
+  messages: displayMessages.value,
+  activeTurnId: activeSnapshotTextStreamTurnId.value,
+  isThreadInProgress: props.isThreadInProgress === true,
+}))
+
 const renderableMessages = computed(() => filterRenderableThreadMessages(
   displayMessages.value,
   hiddenGroupedCommandIds.value,
   hiddenFileAndFooterMessageIds.value,
   hiddenCompletedActivityMessageIds.value,
   hiddenActivitySegmentSourceIds.value,
+  hiddenSimplifiedTranscriptIds.value,
 ))
-const visibleMessages = computed(() => renderableMessages.value)
+const visibleMessages = computed(() => renderableMessages.value.filter(shouldRenderVisibleMessage))
 const hasMoreAbove = computed(() => props.hasMorePersistedAbove === true)
-
-function readAnchoredFileChangeSummary(message: UiMessage): TurnFileChangeSummary | null {
-  const summary = anchoredFileChangeSummaryByAnchorId.value[message.id] ?? null
-  const activeTurnId = props.activeTurnId?.trim() ?? ''
-  if (activeTurnId && summary?.turnId === activeTurnId) return null
-  return summary
-}
-
-function readStandaloneFileChangeSummary(message: UiMessage): TurnFileChangeSummary | null {
-  return standaloneFileChangeSummaryByMessageId.value[message.id] ?? null
-}
-
-function fileChangeActionKey(summary: TurnFileChangeSummary | null): string {
-  return summary?.turnId && props.activeThreadId ? `thread:${props.activeThreadId}:turn:${summary.turnId}` : ''
-}
-
-function isFileChangeActionable(summary: TurnFileChangeSummary | null): boolean {
-  return fileChangeActionKey(summary).length > 0
-}
-
-function fileChangeActionStatus(summary: TurnFileChangeSummary | null): 'idle' | 'undoing' | 'redoing' | 'undone' | 'redone' {
-  const key = fileChangeActionKey(summary)
-  return key ? fileChangeActionState.value[key] ?? 'idle' : 'idle'
-}
-
-function fileChangeActionErrorText(summary: TurnFileChangeSummary | null): string {
-  const key = fileChangeActionKey(summary)
-  return key ? fileChangeActionError.value[key] ?? '' : ''
-}
-
-function fileChangeNextAction(summary: TurnFileChangeSummary | null): 'undo' | 'redo' {
-  const status = fileChangeActionStatus(summary)
-  return status === 'undone' || status === 'redoing' ? 'redo' : 'undo'
-}
-
-function fileChangeActionLabel(summary: TurnFileChangeSummary | null): string {
-  const status = fileChangeActionStatus(summary)
-  if (status === 'undoing') return 'Undoing'
-  if (status === 'redoing') return 'Redoing'
-  return fileChangeNextAction(summary) === 'redo' ? 'Redo' : 'Undo'
-}
-
-async function runFileChangeAction(summary: TurnFileChangeSummary | null, action: 'undo' | 'redo'): Promise<void> {
-  if (props.readOnly) return
-  const key = fileChangeActionKey(summary)
-  if (!summary || !key || !props.activeThreadId || !props.cwd) return
-  const previousState = fileChangeActionStatus(summary)
-  const pendingState = action === 'undo' ? 'undoing' : 'redoing'
-  fileChangeActionState.value = { ...fileChangeActionState.value, [key]: pendingState }
-  fileChangeActionError.value = { ...fileChangeActionError.value, [key]: '' }
-
-  let result: Awaited<ReturnType<typeof updateThreadFileChanges>>
-  try {
-    const patchIds = fileChangeRedoPatchIds.value[key] ?? []
-    result = await updateThreadFileChanges(
-      props.activeThreadId,
-      summary.turnId,
-      props.cwd,
-      action,
-      patchIds.length > 0 ? patchIds : undefined,
-      'single_turn',
-    )
-  } catch (error) {
-    fileChangeActionState.value = { ...fileChangeActionState.value, [key]: previousState }
-    fileChangeActionError.value = {
-      ...fileChangeActionError.value,
-      [key]: error instanceof Error ? error.message : 'Failed to update file changes.',
-    }
-    return
-  }
-
-  if (result.errors.length > 0) {
-    if (action === 'undo') {
-      fileChangeRedoPatchIds.value = { ...fileChangeRedoPatchIds.value, [key]: result.revertedPatchIds ?? [] }
-      fileChangeActionState.value = { ...fileChangeActionState.value, [key]: 'undone' }
-    } else {
-      if ((result.appliedPatchIds ?? []).length > 0) {
-        fileChangeRedoPatchIds.value = { ...fileChangeRedoPatchIds.value, [key]: result.appliedPatchIds ?? [] }
-      }
-      fileChangeActionState.value = { ...fileChangeActionState.value, [key]: 'undone' }
-    }
-    fileChangeActionError.value = { ...fileChangeActionError.value, [key]: result.errors.join('; ') }
-    return
-  }
-
-  if (action === 'undo') {
-    fileChangeRedoPatchIds.value = { ...fileChangeRedoPatchIds.value, [key]: result.revertedPatchIds ?? [] }
-    fileChangeActionState.value = { ...fileChangeActionState.value, [key]: 'undone' }
-  } else {
-    fileChangeRedoPatchIds.value = { ...fileChangeRedoPatchIds.value, [key]: result.appliedPatchIds ?? [] }
-    fileChangeActionState.value = { ...fileChangeActionState.value, [key]: 'redone' }
-  }
-}
-
-function fileChangeOperationLabel(change: UiFileChange): string {
-  if (change.operation === 'update' && change.movedToPath) {
-    return change.addedLineCount > 0 || change.removedLineCount > 0 ? 'Moved + edited' : 'Moved'
-  }
-  if (change.operation === 'add') return 'Added'
-  if (change.operation === 'delete') return 'Deleted'
-  return 'Edited'
-}
-
-function fileChangeOperationTone(change: UiFileChange): 'add' | 'delete' | 'update' | 'move' {
-  if (change.operation === 'update' && change.movedToPath) return 'move'
-  return change.operation
-}
-
-function formatFileChangeDelta(change: UiFileChange): string {
-  const parts: string[] = []
-  if (change.addedLineCount > 0) parts.push(`+${change.addedLineCount}`)
-  if (change.removedLineCount > 0) parts.push(`-${change.removedLineCount}`)
-  return parts.join(' ')
-}
-
-type FileChangeDeltaTone = 'add' | 'remove' | 'neutral'
-
-type FileChangeDeltaPart = {
-  tone: FileChangeDeltaTone
-  label: string
-}
-
-function buildFileChangeDeltaParts(addedCount: number, removedCount: number, fallbackLabel = ''): FileChangeDeltaPart[] {
-  const parts: FileChangeDeltaPart[] = []
-  if (addedCount > 0) parts.push({ tone: 'add', label: `+${addedCount}` })
-  if (removedCount > 0) parts.push({ tone: 'remove', label: `-${removedCount}` })
-  if (parts.length > 0) return parts
-  return fallbackLabel ? [{ tone: 'neutral', label: fallbackLabel }] : []
-}
-
-function fileChangeDeltaParts(change: UiFileChange): FileChangeDeltaPart[] {
-  return buildFileChangeDeltaParts(change.addedLineCount, change.removedLineCount)
-}
-
-function formatFileChangeCountLabel(count: number): string {
-  return count === 1 ? '1 file changed' : `${count} files changed`
-}
-
-function summarizeFileChangeKinds(summary: TurnFileChangeSummary | null): string {
-  if (!summary || summary.changes.length === 0) return ''
-  let added = 0
-  let deleted = 0
-  let edited = 0
-  let moved = 0
-
-  for (const change of summary.changes) {
-    if (change.operation === 'add') {
-      added += 1
-      continue
-    }
-    if (change.operation === 'delete') {
-      deleted += 1
-      continue
-    }
-    if (change.movedToPath) {
-      moved += 1
-      continue
-    }
-    edited += 1
-  }
-
-  const parts: string[] = []
-  if (edited > 0) parts.push(`${edited} edited`)
-  if (added > 0) parts.push(`${added} added`)
-  if (deleted > 0) parts.push(`${deleted} deleted`)
-  if (moved > 0) parts.push(`${moved} moved`)
-  return parts.join(', ')
-}
-
-function fileChangeSummaryLabel(summary: TurnFileChangeSummary | null): string {
-  if (!summary || summary.changes.length === 0) return 'Modified files'
-  const countLabel = formatFileChangeCountLabel(summary.changes.length)
-  const kindSummary = summarizeFileChangeKinds(summary)
-  return kindSummary ? `${countLabel} · ${kindSummary}` : countLabel
-}
-
-function fileChangeSummaryStatusParts(summary: TurnFileChangeSummary | null): FileChangeDeltaPart[] {
-  if (!summary || summary.changes.length === 0) return []
-  const totalAdded = summary.changes.reduce((sum, change) => sum + change.addedLineCount, 0)
-  const totalRemoved = summary.changes.reduce((sum, change) => sum + change.removedLineCount, 0)
-  const fallbackLabel = summary.changes.some((change) => change.movedToPath) ? 'Moved' : 'Ready'
-  return buildFileChangeDeltaParts(totalAdded, totalRemoved, fallbackLabel)
-}
-
-function displayFileChangePath(pathValue: string): string {
-  const resolved = resolveRelativePath(pathValue, props.cwd)
-  const normalizedCwd = normalizePathDots(normalizePathSeparators(props.cwd.trim()))
-  const normalizedResolved = normalizePathDots(normalizePathSeparators(resolved))
-  if (normalizedCwd && normalizedResolved.startsWith(`${normalizedCwd}/`)) {
-    return normalizedResolved.slice(normalizedCwd.length + 1)
-  }
-  return pathValue
-}
-
-function buildFileChangeCopyText(summary: TurnFileChangeSummary | null): string {
-  if (!summary || summary.changes.length === 0) return ''
-  const lines = summary.changes.map((change) => {
-    const pathLabel = displayFileChangePath(change.path)
-    const movedLabel = change.movedToPath ? ` -> ${displayFileChangePath(change.movedToPath)}` : ''
-    const delta = formatFileChangeDelta(change)
-    return `- ${fileChangeOperationLabel(change)}: ${pathLabel}${movedLabel}${delta ? ` (${delta})` : ''}`
-  })
-  return `Modified files:\n${lines.join('\n')}`.trim()
-}
-
-const diffViewerChanges = computed<UiFileChange[]>(() => activeDiffViewerSummary.value?.changes ?? [])
-
-const activeDiffViewerChange = computed<UiFileChange | null>(() => {
-  const changes = diffViewerChanges.value
-  if (changes.length === 0) return null
-  return changes.find((change) => fileChangeKey(change) === activeDiffViewerChangeKey.value) ?? changes[0]
-})
-
-function inferDiffViewerLanguage(change: UiFileChange): string {
-  const targetPath = change.movedToPath || change.path
-  const extension = targetPath.split('.').pop()?.toLowerCase() ?? ''
-  return CODE_LANGUAGE_ALIASES[extension] ?? extension ?? ''
-}
-
-function hasStructuredUnifiedDiff(change: UiFileChange): boolean {
-  return change.operation === 'update' && /^diff --git |^@@ |^--- |^\+\+\+ |^[ +-]|^\*\*\* (Move to:|End of File)/mu.test(change.diff)
-}
-
-function buildSyntheticDiffLines(change: UiFileChange): DiffViewerLine[] {
-  const normalized = change.diff.replace(/\r\n/g, '\n')
-  const lines = normalized.length > 0 ? normalized.split('\n') : []
-  if (lines.length > 0 && lines[lines.length - 1] === '') {
-    lines.pop()
-  }
-  return lines.map((line, index) => ({
-    key: `${fileChangeKey(change)}:synthetic:${index}`,
-    kind: change.operation === 'delete' ? 'remove' : 'add',
-    oldLine: change.operation === 'delete' ? index + 1 : null,
-    newLine: change.operation === 'delete' ? null : index + 1,
-    text: line,
-  }))
-}
-
-function buildUnifiedDiffLines(change: UiFileChange): DiffViewerLine[] {
-  const normalized = change.diff.replace(/\r\n/g, '\n')
-  const lines = normalized.length > 0 ? normalized.split('\n') : []
-  if (lines.length > 0 && lines[lines.length - 1] === '') {
-    lines.pop()
-  }
-
-  const output: DiffViewerLine[] = []
-  let oldLine = 0
-  let newLine = 0
-
-  for (const [index, line] of lines.entries()) {
-    const hunkMatch = line.match(/^@@\s+-(\d+)(?:,\d+)?\s+\+(\d+)(?:,\d+)?\s+@@/u)
-    if (hunkMatch) {
-      oldLine = Number(hunkMatch[1])
-      newLine = Number(hunkMatch[2])
-      output.push({
-        key: `${fileChangeKey(change)}:hunk:${index}`,
-        kind: 'hunk',
-        oldLine: null,
-        newLine: null,
-        text: line,
-      })
-      continue
-    }
-
-    if (line.startsWith('+') && !line.startsWith('+++')) {
-      output.push({
-        key: `${fileChangeKey(change)}:add:${index}`,
-        kind: 'add',
-        oldLine: null,
-        newLine,
-        text: line.slice(1),
-      })
-      newLine += 1
-      continue
-    }
-
-    if (line.startsWith('-') && !line.startsWith('---')) {
-      output.push({
-        key: `${fileChangeKey(change)}:remove:${index}`,
-        kind: 'remove',
-        oldLine,
-        newLine: null,
-        text: line.slice(1),
-      })
-      oldLine += 1
-      continue
-    }
-
-    if (line.startsWith(' ')) {
-      output.push({
-        key: `${fileChangeKey(change)}:context:${index}`,
-        kind: 'context',
-        oldLine,
-        newLine,
-        text: line.slice(1),
-      })
-      oldLine += 1
-      newLine += 1
-      continue
-    }
-
-    output.push({
-      key: `${fileChangeKey(change)}:meta:${index}`,
-      kind: 'meta',
-      oldLine: null,
-      newLine: null,
-      text: line,
-    })
-  }
-
-  return output
-}
-
-function buildDiffViewerLines(change: UiFileChange | null): DiffViewerLine[] {
-  if (!change || !change.diff.trim()) return []
-  if (hasStructuredUnifiedDiff(change)) {
-    return buildUnifiedDiffLines(change)
-  }
-  return buildSyntheticDiffLines(change)
-}
-
-const activeDiffViewerLines = computed<DiffViewerLine[]>(() => buildDiffViewerLines(activeDiffViewerChange.value))
-
-function hasDiffViewerContent(change: UiFileChange | null): boolean {
-  return Boolean(change?.diff.trim())
-}
-
-function diffViewerMarker(line: DiffViewerLine): string {
-  if (line.kind === 'add') return '+'
-  if (line.kind === 'remove') return '-'
-  if (line.kind === 'hunk') return '@@'
-  return ''
-}
 
 async function copyResponse(anchorMessageId: string): Promise<void> {
   const content = copyableResponseContentByAnchorId.value[anchorMessageId] ?? ''
@@ -4056,17 +3366,18 @@ function parseMessageBlocks(text: string): MessageBlock[] {
 }
 
 function getMessageBlocks(message: UiMessage): MessageBlock[] {
+  const text = displayMessageText(message)
   const cached = messageBlockCache.get(message.id)
-  if (cached && cached.text === message.text && cached.cwd === props.cwd) {
+  if (cached && cached.text === text && cached.cwd === props.cwd) {
     messageBlockCache.delete(message.id)
     messageBlockCache.set(message.id, cached)
     return cached.blocks
   }
-  const blocks = parseMessageBlocks(message.text)
+  const blocks = parseMessageBlocks(text)
   return setBoundedCacheEntry(
     messageBlockCache,
     message.id,
-    { text: message.text, cwd: props.cwd, blocks },
+    { text, cwd: props.cwd, blocks },
     MESSAGE_BLOCK_CACHE_LIMIT,
   ).blocks
 }
@@ -4916,7 +4227,7 @@ watch(
 watch(
   () => props.messages,
   async (next) => {
-    if (props.isLoading) return
+    if (props.isLoading && next.length === 0) return
 
     const commandIds = new Set(
       next
@@ -4927,13 +4238,6 @@ watch(
     expandedCommandGroupIds.value = pruneCommandIdSet(
       expandedCommandGroupIds.value,
       new Set(Object.keys(groupedCommandsByLatestId.value)),
-    )
-    expandedFileChangeSummaryIds.value = pruneCommandIdSet(
-      expandedFileChangeSummaryIds.value,
-      new Set([
-        ...Object.keys(anchoredFileChangeSummaryByAnchorId.value),
-        ...Object.keys(standaloneFileChangeSummaryByMessageId.value),
-      ]),
     )
 
     await scheduleConversationScroll()
@@ -4998,9 +4302,6 @@ watch(
     userScrollIntentUntilMs = 0
     modalImageUrl.value = ''
     isLoadingMore.value = false
-    fileChangeActionState.value = {}
-    fileChangeActionError.value = {}
-    fileChangeRedoPatchIds.value = {}
     failedMessageImages.value = new Set()
     failedMarkdownImages.value = new Set()
     markdownImageFailureVersion.value += 1
@@ -5129,15 +4430,20 @@ onBeforeUnmount(() => {
 }
 
 .conversation-loading {
-  @apply m-0 px-6 text-sm text-slate-500;
+  @apply m-0 px-4 sm:px-0 pt-2 text-sm text-slate-500;
 }
 
 .conversation-empty {
-  @apply m-0 px-6 text-sm text-slate-500;
+  @apply m-0 px-4 sm:px-0 pt-2 text-sm text-slate-500;
 }
 
 .conversation-list {
   @apply h-full min-h-0 min-w-0 max-w-full list-none m-0 px-2 sm:px-6 py-0 overflow-y-auto overflow-x-hidden flex flex-col gap-2 sm:gap-3;
+  scrollbar-gutter: stable;
+}
+
+.conversation-state-row {
+  @apply m-0 w-full min-w-0 flex;
 }
 
 .conversation-load-more {
@@ -5285,16 +4591,29 @@ onBeforeUnmount(() => {
   display: none;
 }
 
-.live-overlay-error {
-  @apply m-0 flex items-start justify-between gap-3 text-sm leading-5 text-rose-600 whitespace-pre-wrap;
+.turn-error-feedback {
+  @apply mt-3 inline-flex w-fit rounded-full border border-rose-200 bg-white px-2.5 py-1 text-xs font-semibold leading-none text-rose-700 transition hover:bg-rose-100 focus:outline-none focus:ring-2 focus:ring-rose-300;
 }
 
-.live-overlay-feedback {
+.conversation-notification {
+  @apply fixed left-1/2 z-40 flex w-[min(42rem,calc(100vw-2rem))] -translate-x-1/2 items-start gap-3 rounded-2xl border bg-white px-4 py-3 text-sm leading-5 shadow-xl;
+  bottom: calc(env(safe-area-inset-bottom, 0px) + 9rem);
+}
+
+.conversation-notification-error {
+  @apply border-rose-200 text-rose-700;
+}
+
+.conversation-notification-text {
+  @apply min-w-0 flex-1 whitespace-pre-wrap break-words;
+}
+
+.conversation-notification-feedback {
   @apply shrink-0 rounded-full border border-rose-200 bg-white px-2.5 py-1 text-xs font-semibold leading-none text-rose-700 transition hover:bg-rose-100 focus:outline-none focus:ring-2 focus:ring-rose-300;
 }
 
-.turn-error-feedback {
-  @apply mt-3 inline-flex w-fit rounded-full border border-rose-200 bg-white px-2.5 py-1 text-xs font-semibold leading-none text-rose-700 transition hover:bg-rose-100 focus:outline-none focus:ring-2 focus:ring-rose-300;
+.conversation-notification-dismiss {
+  @apply -mt-1 -mr-1 inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-full border-0 bg-transparent text-lg leading-none text-rose-500 transition hover:bg-rose-50 hover:text-rose-700 focus:outline-none focus-visible:ring-2 focus-visible:ring-rose-300;
 }
 
 .message-body {
@@ -5331,6 +4650,10 @@ onBeforeUnmount(() => {
 .message-copy-label,
 .message-fork-label {
   @apply leading-none;
+}
+
+.message-completion-time {
+  @apply ml-1 inline-flex items-center text-[11px] font-medium leading-none text-slate-400;
 }
 
 @media (hover: none), (pointer: coarse) {
@@ -5781,6 +5104,30 @@ onBeforeUnmount(() => {
   align-self: flex-end;
 }
 
+.message-card[data-role='user'][data-user-delegation='true'] {
+  @apply max-w-[min(520px,92%)] px-4 py-3;
+}
+
+.message-card[data-role='user'][data-user-delegation='true'] .message-text-flow {
+  @apply text-left;
+}
+
+.delegation-message-label {
+  @apply mb-2 text-right text-xs font-medium leading-4 text-slate-500;
+}
+
+.message-show-more-button {
+  @apply mt-3 inline-flex items-center gap-1 self-start rounded-md border-0 bg-transparent px-0 py-0 text-sm font-medium leading-5 text-slate-500 transition hover:text-slate-800;
+}
+
+.message-show-more-chevron {
+  @apply inline-block text-xs leading-none transition-transform;
+}
+
+.message-show-more-chevron[data-expanded='true'] {
+  transform: rotate(180deg);
+}
+
 .automation-message-label {
   @apply mb-2 flex flex-wrap items-center gap-2 text-[11px] font-semibold uppercase tracking-[0.12em] text-slate-500;
 }
@@ -6029,106 +5376,6 @@ onBeforeUnmount(() => {
   max-height: 9rem;
 }
 
-.file-change-summary-block {
-  @apply mt-3 flex flex-col items-center gap-0;
-}
-
-.file-change-summary-block-inline {
-  @apply mt-4;
-}
-
-.file-change-summary-row {
-  @apply w-auto max-w-full rounded-full border border-zinc-300 bg-zinc-100/80 px-4 py-2 shadow-sm;
-}
-
-.file-change-summary-label {
-  @apply flex-1 min-w-0 truncate text-sm font-medium text-zinc-600;
-}
-
-.file-change-summary-status {
-  @apply inline-flex max-w-28 items-center justify-end gap-1.5 text-right text-[11px] font-semibold text-zinc-500 flex-shrink-0;
-}
-
-.file-change-panel-inner {
-  @apply mb-1 min-h-0 overflow-hidden pl-2;
-}
-
-.file-change-list {
-  @apply m-0 flex list-none flex-col gap-0.5 rounded-xl border border-zinc-200 bg-white/80 p-1.5;
-}
-
-.file-change-item {
-  @apply flex flex-wrap items-center gap-1.5 rounded-lg px-2 py-1 text-sm text-zinc-700;
-}
-
-.file-change-badge {
-  @apply inline-flex items-center rounded-full px-2.5 py-1 text-[11px] font-semibold uppercase tracking-[0.08em];
-}
-
-.file-change-badge[data-operation='add'] {
-  @apply bg-emerald-50 text-emerald-700;
-}
-
-.file-change-badge[data-operation='update'] {
-  @apply bg-sky-50 text-sky-700;
-}
-
-.file-change-badge[data-operation='delete'] {
-  @apply bg-rose-50 text-rose-700;
-}
-
-.file-change-badge[data-operation='move'] {
-  @apply bg-amber-50 text-amber-700;
-}
-
-.file-change-path {
-  @apply min-w-0 break-all font-mono text-[13px];
-}
-
-.file-change-path-button {
-  @apply min-w-0 border-0 bg-transparent p-0 text-left font-mono text-[13px] text-[#0969da] hover:text-[#1f6feb] hover:underline underline-offset-2;
-}
-
-.file-change-arrow {
-  @apply text-zinc-400;
-}
-
-.file-change-delta {
-  @apply ml-auto inline-flex items-center gap-1.5 rounded-full bg-zinc-100 px-2 py-1 text-[11px] font-semibold text-zinc-600;
-}
-
-.file-change-actions {
-  @apply mt-2 flex flex-wrap items-center justify-end gap-2;
-}
-
-.file-change-action-button {
-  @apply inline-flex items-center gap-1 rounded-md border border-zinc-200 bg-white px-2 py-1 text-xs font-medium text-zinc-700 transition hover:border-zinc-300 hover:bg-zinc-50 hover:text-zinc-950 disabled:cursor-not-allowed disabled:opacity-60;
-}
-
-.file-change-action-icon {
-  @apply text-sm;
-}
-
-.file-change-action-icon-redo {
-  transform: scaleX(-1);
-}
-
-.file-change-action-error {
-  @apply m-0 min-w-0 flex-1 text-xs text-rose-600;
-}
-
-.file-change-signed-count {
-  @apply inline-flex items-center whitespace-nowrap;
-}
-
-.file-change-signed-count[data-tone='add'] {
-  @apply text-emerald-600;
-}
-
-.file-change-signed-count[data-tone='remove'] {
-  @apply text-rose-600;
-}
-
 :global(.dark) .message-text,
 :global(.dark) .message-heading,
 :global(.dark) .message-list,
@@ -6145,6 +5392,30 @@ onBeforeUnmount(() => {
   @apply font-mono font-medium text-zinc-100;
   border-radius: 0.45rem;
   background: rgb(63 63 70 / 0.85);
+}
+
+:global(.dark) .message-card[data-role='user'] {
+  @apply bg-zinc-800 text-zinc-100;
+}
+
+:global(.dark) .delegation-message-label {
+  @apply text-zinc-400;
+}
+
+:global(.dark) .message-show-more-button {
+  @apply text-zinc-400 hover:text-zinc-100;
+}
+
+:global(.dark) .conversation-notification {
+  @apply border-rose-500/30 bg-zinc-900 text-rose-200 shadow-black/40;
+}
+
+:global(.dark) .conversation-notification-feedback {
+  @apply border-rose-500/30 bg-zinc-900 text-rose-200 hover:bg-rose-950/40;
+}
+
+:global(.dark) .conversation-notification-dismiss {
+  @apply text-rose-300 hover:bg-rose-950/40 hover:text-rose-100;
 }
 
 :global(.dark) .cmd-row {
@@ -6194,268 +5465,4 @@ onBeforeUnmount(() => {
   @apply text-zinc-500;
 }
 
-:global(.dark) .file-change-summary-row {
-  @apply border-zinc-700 bg-zinc-800/80 text-zinc-300 shadow-none;
-}
-
-:global(.dark) .file-change-summary-label {
-  @apply text-zinc-300;
-}
-
-.diff-viewer-backdrop {
-  @apply fixed inset-0 z-50 bg-black/45 p-3 sm:p-6 flex items-center justify-center;
-}
-
-.diff-viewer-shell {
-  @apply relative grid h-[min(88vh,920px)] w-[min(96vw,1320px)] grid-cols-1 overflow-hidden rounded-3xl border border-zinc-200 bg-white shadow-2xl lg:grid-cols-[320px_minmax(0,1fr)];
-}
-
-.diff-viewer-sidebar {
-  @apply flex min-h-0 flex-col border-b border-zinc-200 bg-zinc-50 lg:border-b-0 lg:border-r;
-}
-
-.diff-viewer-sidebar-header {
-  @apply flex items-center justify-between gap-3 border-b border-zinc-200 px-4 py-4;
-}
-
-.diff-viewer-sidebar-title {
-  @apply m-0 text-sm font-semibold text-zinc-900;
-}
-
-.diff-viewer-sidebar-count {
-  @apply m-0 text-xs font-medium text-zinc-500;
-}
-
-.diff-viewer-sidebar-list {
-  @apply flex min-h-0 flex-col gap-2 overflow-y-auto p-3;
-}
-
-.diff-viewer-file-button {
-  @apply flex w-full flex-col items-start gap-2 rounded-2xl border border-transparent bg-transparent px-3 py-3 text-left transition hover:border-zinc-200 hover:bg-white;
-}
-
-.diff-viewer-file-button[data-active='true'] {
-  @apply border-sky-200 bg-white shadow-sm;
-}
-
-.diff-viewer-file-label {
-  @apply break-all font-mono text-[13px] text-zinc-700;
-}
-
-.diff-viewer-file-delta {
-  @apply inline-flex items-center rounded-full bg-zinc-100 px-2.5 py-1 text-[11px] font-medium text-zinc-600;
-}
-
-.diff-viewer-main {
-  @apply flex min-h-0 flex-col bg-white;
-}
-
-.diff-viewer-toolbar {
-  @apply flex items-start justify-between gap-4 border-b border-zinc-200 px-5 py-4;
-}
-
-.diff-viewer-toolbar-actions {
-  @apply flex items-center gap-2 shrink-0;
-}
-
-.diff-viewer-title-wrap {
-  @apply min-w-0;
-}
-
-.diff-viewer-title {
-  @apply m-0 break-all text-base font-semibold text-zinc-900;
-}
-
-.diff-viewer-subtitle {
-  @apply mt-1 mb-0 text-sm text-zinc-500;
-}
-
-.diff-viewer-close {
-  @apply static shrink-0 border-zinc-200 bg-zinc-100 text-zinc-700;
-}
-
-.diff-viewer-mobile-files-button {
-  @apply inline-flex items-center rounded-full border border-zinc-200 bg-zinc-100 px-3 py-1.5 text-xs font-medium text-zinc-700;
-}
-
-.diff-viewer-empty {
-  @apply flex min-h-0 flex-1 flex-col items-center justify-center px-6 text-center;
-}
-
-.diff-viewer-empty-title {
-  @apply m-0 text-base font-semibold text-zinc-900;
-}
-
-.diff-viewer-empty-text {
-  @apply mt-2 max-w-2xl text-sm leading-relaxed text-zinc-500;
-}
-
-.diff-viewer-panel {
-  @apply flex min-h-0 flex-1 flex-col;
-}
-
-.diff-viewer-meta {
-  @apply border-b border-zinc-200 bg-zinc-50 px-5 py-2;
-}
-
-.diff-viewer-language {
-  @apply inline-flex items-center rounded-full bg-zinc-200 px-2.5 py-1 text-[11px] font-semibold uppercase tracking-[0.08em] text-zinc-700;
-}
-
-.diff-viewer-lines {
-  @apply min-h-0 flex-1 overflow-auto bg-zinc-950;
-}
-
-.diff-viewer-line {
-  display: grid;
-  grid-template-columns: 4rem 4rem 2rem minmax(0, 1fr);
-  align-items: stretch;
-  min-width: fit-content;
-}
-
-.diff-viewer-line-number {
-  @apply border-r border-zinc-800 px-3 py-1.5 text-right font-mono text-xs text-zinc-500 select-none;
-}
-
-.diff-viewer-line-marker {
-  @apply border-r border-zinc-800 px-2 py-1.5 text-center font-mono text-xs text-zinc-500 select-none;
-}
-
-.diff-viewer-line-code {
-  @apply block whitespace-pre px-3 py-1.5 font-mono text-[12px] leading-5 text-zinc-100;
-}
-
-.diff-viewer-line[data-kind='meta'] {
-  @apply bg-zinc-900;
-}
-
-.diff-viewer-line[data-kind='meta'] .diff-viewer-line-code,
-.diff-viewer-line[data-kind='meta'] .diff-viewer-line-marker {
-  @apply text-sky-300;
-}
-
-.diff-viewer-line[data-kind='hunk'] {
-  @apply bg-sky-950/40;
-}
-
-.diff-viewer-line[data-kind='hunk'] .diff-viewer-line-code,
-.diff-viewer-line[data-kind='hunk'] .diff-viewer-line-marker {
-  @apply text-sky-300;
-}
-
-.diff-viewer-line[data-kind='add'] {
-  background: rgba(20, 83, 45, 0.38);
-}
-
-.diff-viewer-line[data-kind='add'] .diff-viewer-line-marker,
-.diff-viewer-line[data-kind='add'] .diff-viewer-line-code {
-  @apply text-emerald-200;
-}
-
-.diff-viewer-line[data-kind='remove'] {
-  background: rgba(127, 29, 29, 0.32);
-}
-
-.diff-viewer-line[data-kind='remove'] .diff-viewer-line-marker,
-.diff-viewer-line[data-kind='remove'] .diff-viewer-line-code {
-  @apply text-rose-200;
-}
-
-.diff-viewer-line[data-kind='context'] {
-  @apply bg-zinc-950;
-}
-
-.diff-viewer-line[data-kind='context'] .diff-viewer-line-code {
-  @apply text-zinc-100;
-}
-
-.diff-viewer-mobile-sheet-backdrop {
-  @apply absolute inset-0 z-20 bg-black/35 flex items-end;
-}
-
-.diff-viewer-mobile-sheet {
-  @apply w-full max-h-[70vh] rounded-t-3xl bg-white shadow-2xl border-t border-zinc-200 flex flex-col overflow-hidden;
-}
-
-.diff-viewer-mobile-sheet-handle {
-  @apply mx-auto mt-3 h-1.5 w-12 rounded-full bg-zinc-300;
-}
-
-.diff-viewer-mobile-sheet-header {
-  @apply flex items-center justify-between gap-3 px-4 pt-3 pb-2 border-b border-zinc-200;
-}
-
-.diff-viewer-mobile-sheet-list {
-  @apply flex min-h-0 flex-col gap-2 overflow-y-auto px-3 py-3;
-}
-
-.diff-viewer-sheet-enter-active,
-.diff-viewer-sheet-leave-active {
-  @apply transition-opacity duration-200;
-}
-
-.diff-viewer-sheet-enter-active .diff-viewer-mobile-sheet,
-.diff-viewer-sheet-leave-active .diff-viewer-mobile-sheet {
-  transition: transform 200ms ease;
-}
-
-.diff-viewer-sheet-enter-from,
-.diff-viewer-sheet-leave-to {
-  @apply opacity-0;
-}
-
-.diff-viewer-sheet-enter-from .diff-viewer-mobile-sheet,
-.diff-viewer-sheet-leave-to .diff-viewer-mobile-sheet {
-  transform: translateY(100%);
-}
-
-@media (max-width: 767px) {
-  .diff-viewer-backdrop {
-    @apply p-0 items-stretch;
-  }
-
-  .diff-viewer-shell {
-    @apply h-[100dvh] w-screen rounded-none border-0 shadow-none;
-  }
-
-  .diff-viewer-main {
-    @apply min-w-0;
-  }
-
-  .diff-viewer-toolbar {
-    @apply sticky top-0 z-10 bg-white px-3 py-3;
-  }
-
-  .diff-viewer-title {
-    @apply text-sm leading-5;
-  }
-
-  .diff-viewer-subtitle {
-    @apply text-xs;
-  }
-
-  .diff-viewer-meta {
-    @apply px-3 py-2;
-  }
-
-  .diff-viewer-language {
-    @apply text-[10px];
-  }
-
-  .diff-viewer-line {
-    grid-template-columns: 2.75rem 2.75rem 1.5rem minmax(0, 1fr);
-  }
-
-  .diff-viewer-line-number {
-    @apply px-1.5 py-1 text-[10px];
-  }
-
-  .diff-viewer-line-marker {
-    @apply px-1 py-1 text-[10px];
-  }
-
-  .diff-viewer-line-code {
-    @apply px-2 py-1 text-[11px] leading-5;
-  }
-}
 </style>

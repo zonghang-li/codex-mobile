@@ -5,7 +5,7 @@ describe('ThreadConversation render-window wiring', () => {
   it('renders every already-loaded message without a client-side history window', async () => {
     const source = await readFile(new URL('./ThreadConversation.vue', import.meta.url), 'utf8')
     expect(source).toContain('const renderableMessages = computed(() => filterRenderableThreadMessages(')
-    expect(source).toContain('const visibleMessages = computed(() => renderableMessages.value)')
+    expect(source).toContain('const visibleMessages = computed(() => renderableMessages.value.filter(shouldRenderVisibleMessage))')
     expect(source).not.toContain('renderableMessages.value.slice(effectiveRenderWindowStart.value)')
     expect(source).not.toContain('props.messages.slice(effectiveRenderWindowStart.value)')
   })

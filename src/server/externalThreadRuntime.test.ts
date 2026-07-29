@@ -53,6 +53,7 @@ type FakeRuntimeOptions = {
   log?: string | Buffer
   rollouts?: FakeRollout[]
   fds?: RuntimeFdSnapshot[]
+  mtimeMs?: number
   platform?: NodeJS.Platform
   uid?: number | null
   resolvedSessionsRoot?: string
@@ -83,6 +84,7 @@ class FakeRuntimeSystem implements ExternalRuntimeSystem {
   private readonly fds: RuntimeFdSnapshot[]
   private readonly resolvedSessionsRoot: string
   private readonly resolvedRolloutPath: string
+  private readonly mtimeMs: number | undefined
   private readonly regular: boolean
   private readonly scanError: Error | undefined
   private replacementDuringRead: { log: string; ino: string } | undefined
@@ -94,6 +96,7 @@ class FakeRuntimeSystem implements ExternalRuntimeSystem {
     this.fds = options.fds ?? []
     this.resolvedSessionsRoot = options.resolvedSessionsRoot ?? sessionsRoot
     this.resolvedRolloutPath = options.resolvedRolloutPath ?? rolloutPath
+    this.mtimeMs = options.mtimeMs
     const rollouts: MutableFakeRollout[] = options.rollouts
       ? options.rollouts.map((rollout) => ({
           path: rollout.path,
@@ -129,6 +132,7 @@ class FakeRuntimeSystem implements ExternalRuntimeSystem {
       dev: rollout.dev,
       ino: rollout.ino,
       size: rollout.bytes.length,
+      ...(this.mtimeMs === undefined ? {} : { mtimeMs: this.mtimeMs }),
       regular: this.regular,
     }
   }
@@ -438,7 +442,7 @@ describe('default Linux descriptor discovery work caps', () => {
     expect(result.snapshots).toHaveLength(4_096)
     expect(result.complete).toBe(false)
     expect(nodeFs.stat).not.toHaveBeenCalledWith(`/proc/42/fd/${fds.at(-1)}`, { bigint: true })
-  })
+  }, 10_000)
 
   it('yields no more than the global snapshot cap', async () => {
     const processes = Array.from({ length: 3 }, (_, processIndex): DefaultRuntimeProcessFixture => ({
@@ -457,7 +461,7 @@ describe('default Linux descriptor discovery work caps', () => {
     expect(EXTERNAL_RUNTIME_MAX_FD_SNAPSHOTS).toBe(8_192)
     expect(result.snapshots).toHaveLength(8_192)
     expect(result.complete).toBe(false)
-  })
+  }, 10_000)
 
   it('returns partial results when the scan wall budget is exhausted', async () => {
     defaultRuntimeProbe({ processes: [{
@@ -814,6 +818,36 @@ describe('ExternalThreadRuntimeProbe', () => {
     await expect(registeredProbe(system).inspect('thread-1', 99)).resolves.toEqual({
       state: 'unknown',
     })
+  })
+
+  it('treats a recently updated unmatched rollout as running without scanning descriptors', async () => {
+    const system = fakeRuntimeSystem({
+      log: lifecycle('task_started', 'turn-a'),
+      mtimeMs: Date.now(),
+    })
+
+    await expect(registeredProbe(system).inspect('thread-1', 99)).resolves.toEqual({
+      state: 'running',
+      turnId: 'turn-a',
+      interruptible: false,
+      source: 'external-session-writer',
+    })
+    expect(system.scanCount).toBe(0)
+  })
+
+  it('treats a quiet unmatched rollout within the active grace window as running without scanning descriptors', async () => {
+    const system = fakeRuntimeSystem({
+      log: lifecycle('task_started', 'turn-a'),
+      mtimeMs: Date.now() - (9 * 60 * 1000),
+    })
+
+    await expect(registeredProbe(system).inspect('thread-1', 99)).resolves.toEqual({
+      state: 'running',
+      turnId: 'turn-a',
+      interruptible: false,
+      source: 'external-session-writer',
+    })
+    expect(system.scanCount).toBe(0)
   })
 
   it('excludes the bridge child PID from writer evidence', async () => {

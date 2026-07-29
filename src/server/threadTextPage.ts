@@ -3,9 +3,15 @@ import { open, type FileHandle } from 'node:fs/promises'
 
 export type ThreadTextPageItem = {
   id: string
-  type: 'agentMessage' | 'reasoning' | 'contextCompaction'
+  type: 'agentMessage' | 'reasoning' | 'contextCompaction' | 'commandExecution' | 'userMessage'
   text?: string
   summary?: string[]
+  content?: Array<{ type: 'input_text'; text: string }>
+  command?: string
+  cwd?: string | null
+  status?: 'inProgress' | 'completed'
+  aggregatedOutput?: string
+  exitCode?: number | null
   sessionOrder: number
 }
 
@@ -25,16 +31,56 @@ type ThreadTextCursor = {
   snapshotEndOffset: number
 }
 
-const DEFAULT_LIMIT = 300
-const MAX_LIMIT = 600
+const DEFAULT_LIMIT = 80
+const MAX_LIMIT = 200
 const READ_CHUNK_BYTES = 64 * 1024
-const TARGET_PAGE_BYTES = 256 * 1024
+const TARGET_PAGE_BYTES = 64 * 1024
 const MAX_PAGE_BYTES = 1024 * 1024
 const MAX_SCAN_BYTES = 2 * 1024 * 1024
 const MAX_SCAN_LINES = 2_000
 const MAX_RELEVANT_LINE_BYTES = 1024 * 1024
 const OVERSIZED_CLASSIFIER_BYTES = 64 * 1024
 const THREAD_TEXT_CURSOR_KEY = randomBytes(32)
+const TITLE_ONLY_REASONING_PREFIXES = [
+  'Adding',
+  'Allowing',
+  'Analyzing',
+  'Assessing',
+  'Asserting',
+  'Checking',
+  'Choosing',
+  'Clarifying',
+  'Confirming',
+  'Defining',
+  'Designing',
+  'Diagnosing',
+  'Evaluating',
+  'Examining',
+  'Identifying',
+  'Implementing',
+  'Inspecting',
+  'Investigating',
+  'Linking',
+  'Locating',
+  'Parsing',
+  'Planning',
+  'Preventing',
+  'Preparing',
+  'Proposing',
+  'Reading',
+  'Refining',
+  'Reviewing',
+  'Testing',
+  'Tracing',
+  'Updating',
+  'Validating',
+  'Verifying',
+  'Weighing',
+] as const
+
+const TITLE_ONLY_REASONING_EXACT_TEXTS = new Set([
+  'Existing tests',
+])
 
 export class ThreadTextPageError extends Error {
   readonly statusCode: 400 | 409 | 413
@@ -61,6 +107,54 @@ function asRecord(value: unknown): Record<string, unknown> | null {
 function normalizeLimit(limit: number | undefined): number {
   if (limit === undefined || !Number.isFinite(limit)) return DEFAULT_LIMIT
   return Math.max(1, Math.min(MAX_LIMIT, Math.floor(limit)))
+}
+
+function readString(value: unknown): string {
+  return typeof value === 'string' ? value.trim() : ''
+}
+
+function normalizePotentialReasoningStatusTitle(text: string): string {
+  return text
+    .replace(/\s+/gu, ' ')
+    .trim()
+    .replace(/^#{1,6}\s+/u, '')
+    .replace(/^\*\*([\s\S]+)\*\*$/u, '$1')
+    .replace(/^__([\s\S]+)__$/u, '$1')
+    .trim()
+}
+
+function isTitleOnlyReasoningStatusText(value: string): boolean {
+  const text = normalizePotentialReasoningStatusTitle(value)
+  if (!text || text.length > 128) return false
+  if (/[\p{Script=Han}]/u.test(text)) return false
+  if (/[。！？.!?:；;，,]/u.test(text)) return false
+  if (TITLE_ONLY_REASONING_EXACT_TEXTS.has(text)) return true
+  if (TITLE_ONLY_REASONING_PREFIXES.some((prefix) => text.startsWith(`${prefix} `))) {
+    return true
+  }
+  if (/^(?:I|I'm|I'll|I’ll|We|The|This|That|It|They|There)\b/u.test(text)) {
+    return false
+  }
+  return /^[A-Z][\p{L}\p{N}_./'()+-]*(?:\s+[\p{L}\p{N}_./'()+-]+){1,14}$/u.test(text)
+    && /\b[\p{L}\p{N}_./'()+-]*ing\b/u.test(text)
+}
+
+function isInjectedUserContextText(value: string): boolean {
+  const text = value.trimStart()
+  return text.startsWith('<environment_context>')
+    || text.startsWith('<recommended_plugins>')
+    || text.startsWith('<permissions instructions>')
+    || text.startsWith('# AGENTS.md instructions')
+}
+
+function readUserMessageContent(payload: Record<string, unknown>): Array<{ type: 'input_text'; text: string }> {
+  return (Array.isArray(payload.content) ? payload.content : [])
+    .map(asRecord)
+    .filter((part): part is Record<string, unknown> =>
+      part?.type === 'input_text' && typeof part.text === 'string',
+    )
+    .map((part) => ({ type: 'input_text' as const, text: part.text as string }))
+    .filter((part) => part.text.trim().length > 0)
 }
 
 function encodeCursor(cursor: ThreadTextCursor): string {
@@ -294,37 +388,68 @@ function oversizedLineIsDefinitelyIrrelevant(prefix: Buffer): boolean {
     if (payloadType !== 'message') return true
     return payloadRole !== undefined && payloadRole !== 'assistant'
   }
-  return payloadType !== 'context_compacted' && payloadType !== 'task_started'
+  return payloadType !== 'task_started'
+    && payloadType !== 'agent_reasoning'
 }
 
 function projectLine(line: Buffer, sessionOrder: number): {
   item: ThreadTextPageItem | null
   taskStartedTurnId: string | null
+  completedCommandCallId: string | null
 } {
   let row: Record<string, unknown> | null
   try {
     row = asRecord(JSON.parse(line.toString('utf8')))
   } catch {
-    return { item: null, taskStartedTurnId: null }
+    return { item: null, taskStartedTurnId: null, completedCommandCallId: null }
   }
   const payload = asRecord(row?.payload)
-  if (!payload) return { item: null, taskStartedTurnId: null }
+  if (!payload) return { item: null, taskStartedTurnId: null, completedCommandCallId: null }
 
   if (row?.type === 'event_msg' && payload.type === 'task_started') {
     return {
       item: null,
       taskStartedTurnId: typeof payload.turn_id === 'string' ? payload.turn_id : '',
+      completedCommandCallId: null,
     }
   }
 
   if (row?.type === 'event_msg' && payload.type === 'context_compacted') {
+    return { item: null, taskStartedTurnId: null, completedCommandCallId: null }
+  }
+
+  if (row?.type === 'event_msg' && payload.type === 'agent_reasoning') {
     return {
-      item: {
-        id: `rollout:contextCompaction:${sessionOrder}`,
-        type: 'contextCompaction',
-        sessionOrder,
-      },
+      item: null,
       taskStartedTurnId: null,
+      completedCommandCallId: null,
+    }
+  }
+
+  if (row?.type === 'response_item' && payload.type === 'function_call_output') {
+    return { item: null, taskStartedTurnId: null, completedCommandCallId: null }
+  }
+
+  if (row?.type === 'response_item' && payload.type === 'function_call' && payload.name === 'exec_command') {
+    return { item: null, taskStartedTurnId: null, completedCommandCallId: null }
+  }
+
+  if (row?.type === 'response_item' && payload.type === 'message' && payload.role === 'user') {
+    const content = readUserMessageContent(payload)
+    const text = content.map((part) => part.text).join('')
+    return {
+      item: content.length > 0 && !isInjectedUserContextText(text)
+        ? {
+            id: typeof payload.id === 'string' && payload.id.length > 0
+              ? payload.id
+              : `rollout:userMessage:${sessionOrder}`,
+            type: 'userMessage',
+            content,
+            sessionOrder,
+          }
+        : null,
+      taskStartedTurnId: null,
+      completedCommandCallId: null,
     }
   }
 
@@ -333,7 +458,7 @@ function projectLine(line: Buffer, sessionOrder: number): {
     || typeof payload.id !== 'string'
     || payload.id.length === 0
   ) {
-    return { item: null, taskStartedTurnId: null }
+    return { item: null, taskStartedTurnId: null, completedCommandCallId: null }
   }
 
   if (payload.type === 'message' && payload.role === 'assistant') {
@@ -353,6 +478,7 @@ function projectLine(line: Buffer, sessionOrder: number): {
         sessionOrder,
       },
       taskStartedTurnId: null,
+      completedCommandCallId: null,
     }
   }
 
@@ -363,18 +489,23 @@ function projectLine(line: Buffer, sessionOrder: number): {
         part?.type === 'summary_text' && typeof part.text === 'string',
       )
       .map((part) => part.text as string)
+      .filter((text) => text.trim().length > 0)
+      .filter((text) => !isTitleOnlyReasoningStatusText(text))
     return {
-      item: {
-        id: payload.id,
-        type: 'reasoning',
-        summary,
-        sessionOrder,
-      },
+      item: summary.length > 0
+        ? {
+            id: payload.id,
+            type: 'reasoning',
+            summary,
+            sessionOrder,
+          }
+        : null,
       taskStartedTurnId: null,
+      completedCommandCallId: null,
     }
   }
 
-  return { item: null, taskStartedTurnId: null }
+  return { item: null, taskStartedTurnId: null, completedCommandCallId: null }
 }
 
 function buildPageResult(input: {
