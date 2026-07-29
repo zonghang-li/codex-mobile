@@ -1195,6 +1195,42 @@ describe('getThreadDetail', () => {
     })
   })
 
+  it('marks a lightweight running live-state projection as partial', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({
+      threadId: 'external-thread',
+      activeTurnId: 'turn-external',
+      conversationState: {
+        turns: [{
+          id: 'turn-external',
+          status: 'inProgress',
+          rawItemCompression: {
+            originalItemCount: 500,
+            retainedItemCount: 0,
+            omittedItemCount: 500,
+          },
+          items: [],
+        }],
+      },
+      isInProgress: true,
+      externalRuntime: {
+        state: 'running',
+        turnId: 'turn-external',
+        interruptible: false,
+        source: 'external-session-writer',
+      },
+      hasMoreOlder: true,
+    }), { status: 200, headers: { 'Content-Type': 'application/json' } })))
+
+    await expect(getExternalThreadLiveSnapshot('external-thread')).resolves.toMatchObject({
+      activeTurnId: 'turn-external',
+      inProgress: true,
+      ownership: 'external',
+      isPartialTurnProjection: true,
+      messages: [],
+      hasMoreOlder: true,
+    })
+  })
+
   it('sends the known live projection key and normalizes not-modified responses', async () => {
     let requestUrl = ''
     vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
@@ -1550,6 +1586,43 @@ describe('thread text page', () => {
       '/codex-api/thread-text-page?threadId=thread+1&turnId=turn%2F1&cursor=opaque%2B%2F%3D+cursor&limit=300',
     )
     expect(requestSignal).toBe(controller.signal)
+  })
+
+  it('forwards active tail delta parameters and normalizes not-modified empty pages', async () => {
+    let requestUrl = ''
+    const controller = new AbortController()
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
+      requestUrl = String(input)
+      return new Response(JSON.stringify({
+        threadId: 'thread 1',
+        turnId: 'turn/1',
+        items: [],
+        nextOlderCursor: null,
+        hasMoreOlder: false,
+        notModified: true,
+        tailSignature: 'tail-1',
+      }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    }))
+
+    await expect(getThreadTextPage(
+      'thread 1',
+      'turn/1',
+      undefined,
+      undefined,
+      controller.signal,
+      { knownTailSignature: 'tail-1', afterSessionOrder: 140 },
+    )).resolves.toMatchObject({
+      threadId: 'thread 1',
+      turnId: 'turn/1',
+      messages: [],
+      nextOlderCursor: null,
+      hasMoreOlder: false,
+      notModified: true,
+      tailSignature: 'tail-1',
+    })
+    expect(requestUrl).toBe(
+      '/codex-api/thread-text-page?threadId=thread+1&turnId=turn%2F1&knownTailSignature=tail-1&afterSessionOrder=140',
+    )
   })
 
   it('normalizes an aborted request through the thread text page API method', async () => {

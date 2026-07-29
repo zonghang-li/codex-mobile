@@ -88,6 +88,7 @@ import {
   mergeHydratedTurnTextIntoTranscript,
   mergeThreadTextPage,
 } from './threadTextHydration'
+import { createMultiWindowThreadSync } from './multiWindowThreadSync'
 
 type ThreadDetailSnapshot = Awaited<ReturnType<typeof getThreadDetail>> & {
   isPartialTurnProjection?: boolean
@@ -96,6 +97,8 @@ type ThreadDetailSnapshot = Awaited<ReturnType<typeof getThreadDetail>> & {
   projectionKey?: string
   notModified?: boolean
 }
+
+type ThreadTextPageSnapshot = Awaited<ReturnType<typeof getThreadTextPage>>
 
 type ThreadDetailRequestLease = {
   epoch: number
@@ -111,6 +114,7 @@ type ActiveTextHydration = {
   consumedCursors: Set<string>
   controller: AbortController | null
   recoverableConflictProjectionKey?: string
+  tailSignature?: string
 }
 
 type OptimisticUserSubmission = {
@@ -1964,6 +1968,8 @@ export function useDesktopState() {
   const delayedTurnSyncTimerByThreadId = new Map<string, number>()
   const activeTextHydrationByThreadId = new Map<string, ActiveTextHydration>()
   const activeTextHydrationGenerationByThreadId = new Map<string, number>()
+  let multiWindowThreadSync = createMultiWindowThreadSync()
+  let multiWindowThreadSyncDisposed = false
   const compressedLiveProjectionBackfillKeyByThreadId = new Map<string, string>()
   const compressedLiveProjectionBackfillTimerByThreadId = new Map<string, number>()
   let loadThreadsPromise: Promise<void> | null = null
@@ -3628,6 +3634,7 @@ export function useDesktopState() {
 
   function onRuntimeVisibilityChange(): void {
     if (typeof document === 'undefined') return
+    multiWindowThreadSync.setVisible(document.visibilityState === 'visible')
     cancelBackgroundRuntimeRequest()
     cancelExternalRuntimePolling()
     if (document.visibilityState !== 'visible') {
@@ -4225,6 +4232,29 @@ export function useDesktopState() {
     removeLiveAgentMessagesPersistedIn(threadId, nextTranscript)
   }
 
+  function newestHydratedSessionOrder(messages: UiMessage[]): number | undefined {
+    const newest = messages.reduce((maximum, message) => {
+      if (typeof message.sessionOrder !== 'number' || !Number.isFinite(message.sessionOrder)) {
+        return maximum
+      }
+      return Math.max(maximum, message.sessionOrder)
+    }, Number.NEGATIVE_INFINITY)
+    return Number.isFinite(newest) ? newest : undefined
+  }
+
+  function activeTextPageRequestKey(
+    cursor: string | undefined,
+    tailOptions: { knownTailSignature?: string; afterSessionOrder?: number } | undefined,
+  ): string {
+    if (cursor) return `cursor:${cursor}`
+    if (!tailOptions?.knownTailSignature) return 'newest:full:limit=default'
+    const afterSessionOrder = typeof tailOptions.afterSessionOrder === 'number'
+      && Number.isFinite(tailOptions.afterSessionOrder)
+      ? Math.max(0, Math.floor(tailOptions.afterSessionOrder))
+      : ''
+    return `newest:tail:${tailOptions.knownTailSignature}:after=${afterSessionOrder}:limit=default`
+  }
+
   async function continueActiveTextHydration(
     threadId: string,
     hydration: ActiveTextHydration,
@@ -4243,16 +4273,46 @@ export function useDesktopState() {
     const controller = new AbortController()
     hydration.controller = controller
     try {
-      const page = await getThreadTextPage(
+      const tailOptions = !cursor && hydration.tailSignature
+        ? {
+            knownTailSignature: hydration.tailSignature,
+            afterSessionOrder: newestHydratedSessionOrder(hydration.messages),
+          }
+        : undefined
+      const loadPage = (): Promise<ThreadTextPageSnapshot> => tailOptions
+        ? getThreadTextPage(
+            threadId,
+            hydration.turnId,
+            cursor,
+            undefined,
+            controller.signal,
+            tailOptions,
+          )
+        : getThreadTextPage(
+            threadId,
+            hydration.turnId,
+            cursor,
+            undefined,
+            controller.signal,
+          )
+      const page = await multiWindowThreadSync.loadActiveTextPage({
         threadId,
-        hydration.turnId,
-        cursor,
-        undefined,
-        controller.signal,
-      )
+        turnId: hydration.turnId,
+        requestKey: activeTextPageRequestKey(cursor, tailOptions),
+        signal: controller.signal,
+        load: loadPage,
+      })
       if (!isActiveTextHydrationCurrent(threadId, hydration, generation)) return
 
       hydration.consumedCursors.add(cursorKey)
+      if (!cursor && page.tailSignature) {
+        hydration.tailSignature = page.tailSignature
+      }
+      if (page.notModified === true) {
+        hydration.nextOlderCursor = page.nextOlderCursor
+        hydration.hasMoreOlder = false
+        return
+      }
       hydration.messages = mergeThreadTextPage(hydration.messages, page.messages)
       hydration.nextOlderCursor = page.nextOlderCursor
       hydration.hasMoreOlder = false
@@ -7137,6 +7197,9 @@ export function useDesktopState() {
       && isLiveProjection
       && !isPartialTurnProjection
       && !liveProjectionAdvancesActiveText
+    const shouldRefreshChangedPartialLiveProjection = liveProjectionKeyChanged
+      && isLiveProjection
+      && isPartialTurnProjection
     const previousMessageIds = new Set(previousPersisted.map((message) => message.id))
     const compressedLiveProjectionHasNewRows = isLiveProjection
       && isPartialTurnProjection
@@ -7165,8 +7228,8 @@ export function useDesktopState() {
       }
       ensureActiveTextHydration(threadId, activeTurnId, {
         refreshExhausted: isLiveProjection,
-        forceRefreshExhausted: shouldRefreshChangedFullLiveProjection,
-        forceRefreshNewest: shouldRefreshChangedFullLiveProjection,
+        forceRefreshExhausted: shouldRefreshChangedFullLiveProjection || shouldRefreshChangedPartialLiveProjection,
+        forceRefreshNewest: shouldRefreshChangedFullLiveProjection || shouldRefreshChangedPartialLiveProjection,
       })
     }
     if (options.markRead) {
@@ -8931,6 +8994,13 @@ export function useDesktopState() {
   function startPolling(): void {
     if (typeof window === 'undefined') return
 
+    if (multiWindowThreadSyncDisposed) {
+      multiWindowThreadSync = createMultiWindowThreadSync()
+      multiWindowThreadSyncDisposed = false
+      if (typeof document !== 'undefined') {
+        multiWindowThreadSync.setVisible(document.visibilityState === 'visible')
+      }
+    }
     externalRuntimePollingEnabled = true
     backgroundRuntimePollingEnabled = true
     if (typeof document !== 'undefined' && !runtimeVisibilityListenerInstalled) {
@@ -9017,6 +9087,8 @@ export function useDesktopState() {
     for (const threadId of activeTextHydrationByThreadId.keys()) {
       cancelActiveTextHydration(threadId)
     }
+    multiWindowThreadSync.dispose()
+    multiWindowThreadSyncDisposed = true
     if (typeof document !== 'undefined' && runtimeVisibilityListenerInstalled) {
       document.removeEventListener('visibilitychange', onRuntimeVisibilityChange)
       runtimeVisibilityListenerInstalled = false

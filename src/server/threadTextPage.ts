@@ -1,4 +1,4 @@
-import { createHmac, randomBytes, timingSafeEqual } from 'node:crypto'
+import { createHash, createHmac, randomBytes, timingSafeEqual } from 'node:crypto'
 import { open, type FileHandle } from 'node:fs/promises'
 
 export type ThreadTextPageItem = {
@@ -21,6 +21,8 @@ export type ThreadTextPageResult = {
   items: ThreadTextPageItem[]
   nextOlderCursor: string | null
   hasMoreOlder: boolean
+  notModified?: boolean
+  tailSignature?: string
 }
 
 type ThreadTextCursor = {
@@ -107,6 +109,11 @@ function asRecord(value: unknown): Record<string, unknown> | null {
 function normalizeLimit(limit: number | undefined): number {
   if (limit === undefined || !Number.isFinite(limit)) return DEFAULT_LIMIT
   return Math.max(1, Math.min(MAX_LIMIT, Math.floor(limit)))
+}
+
+function normalizeAfterSessionOrder(value: number | undefined): number | null {
+  if (value === undefined || !Number.isFinite(value)) return null
+  return Math.max(0, Math.floor(value))
 }
 
 function readString(value: unknown): string {
@@ -515,6 +522,7 @@ function buildPageResult(input: {
   hasMoreOlder: boolean
   beforeOffset: number
   snapshotEndOffset: number
+  tailSignature?: string
 }): ThreadTextPageResult {
   return {
     threadId: input.threadId,
@@ -530,7 +538,25 @@ function buildPageResult(input: {
         })
       : null,
     hasMoreOlder: input.hasMoreOlder,
+    ...(input.tailSignature ? { tailSignature: input.tailSignature } : {}),
   }
+}
+
+function buildTailSignature(input: {
+  threadId: string
+  turnId: string
+  snapshotEndOffset: number
+  mtimeMs: number
+}): string {
+  return createHash('sha256')
+    .update(JSON.stringify({
+      threadId: input.threadId,
+      turnId: input.turnId,
+      snapshotEndOffset: input.snapshotEndOffset,
+      mtimeMs: Math.floor(input.mtimeMs),
+    }))
+    .digest('base64url')
+    .slice(0, 32)
 }
 
 function serializedPageBytes(page: ThreadTextPageResult): number {
@@ -565,6 +591,8 @@ export async function readThreadTextPage(input: {
   turnId: string
   cursor?: string
   limit?: number
+  knownTailSignature?: string
+  afterSessionOrder?: number
 }, options: {
   trustedActiveTurn?: boolean
   trustedSnapshotEndOffset?: number
@@ -588,6 +616,29 @@ export async function readThreadTextPage(input: {
       ?? options.trustedSnapshotEndOffset
       ?? fileStats.size
     const beforeOffset = cursor?.beforeOffset ?? snapshotEndOffset
+    const tailSignature = !cursor
+      ? buildTailSignature({
+          threadId: input.threadId,
+          turnId: input.turnId,
+          snapshotEndOffset,
+          mtimeMs: fileStats.mtimeMs,
+        })
+      : undefined
+    if (
+      !cursor
+      && input.knownTailSignature
+      && input.knownTailSignature === tailSignature
+    ) {
+      return {
+        threadId: input.threadId,
+        turnId: input.turnId,
+        items: [],
+        nextOlderCursor: null,
+        hasMoreOlder: false,
+        notModified: true,
+        tailSignature,
+      }
+    }
 
     if (fileStats.size < snapshotEndOffset) {
       throw new ThreadTextPageError('Rollout snapshot was truncated', 409)
@@ -603,6 +654,7 @@ export async function readThreadTextPage(input: {
     }
 
     const limit = normalizeLimit(input.limit)
+    const afterSessionOrder = cursor ? null : normalizeAfterSessionOrder(input.afterSessionOrder)
     const collected: ThreadTextPageItem[] = []
     let nextBeforeOffset = beforeOffset
     let pageLimitReached = false
@@ -645,6 +697,9 @@ export async function readThreadTextPage(input: {
           break
         }
         continue
+      }
+      if (afterSessionOrder !== null && projected.item.sessionOrder <= afterSessionOrder) {
+        break
       }
       if (pageLimitReached) {
         if (cursorWouldExceedMax) {
@@ -710,14 +765,25 @@ export async function readThreadTextPage(input: {
       }
     }
 
-    const result = buildPageResult({
+    let result = buildPageResult({
       threadId: input.threadId,
       turnId: input.turnId,
       itemsBackwards: collected,
       hasMoreOlder: (foundOlderVisible || scanBudgetReached) && nextBeforeOffset > 0,
       beforeOffset: nextBeforeOffset,
       snapshotEndOffset,
+      tailSignature,
     })
+    if (tailSignature && serializedPageBytes(result) > MAX_PAGE_BYTES) {
+      result = buildPageResult({
+        threadId: input.threadId,
+        turnId: input.turnId,
+        itemsBackwards: collected,
+        hasMoreOlder: (foundOlderVisible || scanBudgetReached) && nextBeforeOffset > 0,
+        beforeOffset: nextBeforeOffset,
+        snapshotEndOffset,
+      })
+    }
     if (serializedPageBytes(result) > MAX_PAGE_BYTES) {
       throw new ThreadTextPageError('Thread text page exceeds the response size limit', 413)
     }
