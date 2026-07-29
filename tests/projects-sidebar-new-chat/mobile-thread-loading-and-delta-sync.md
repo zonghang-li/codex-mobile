@@ -1,13 +1,14 @@
 ### Mobile thread loading and delta sync
 
 #### Feature/Change Name
-Mobile sidebar and conversation loading use metadata-only sidebar pages, active-thread text pagination, small runtime-state probes, and thread-id delta notifications.
+Mobile sidebar and conversation loading use metadata-only sidebar pages, active-thread text pagination, lightweight running live-state, small runtime-state probes, thread-id delta notifications, and same-thread multi-window request sharing.
 
 #### Prerequisites/Setup
 1. Dev server or installed safe service running with browser devtools Network panel open.
 2. A workspace with more than 20 threads, including at least one running or recently completed thread.
 3. One selected thread with enough assistant output and reasoning text to require active-turn text pagination.
-4. Light theme and dark theme both available from the appearance switcher.
+4. Two mobile browser windows or tabs can be opened on the same origin.
+5. Light theme and dark theme both available from the appearance switcher.
 
 #### Steps
 1. Open the mobile UI on a cold load and inspect the first sidebar requests.
@@ -24,11 +25,14 @@ Mobile sidebar and conversation loading use metadata-only sidebar pages, active-
 12. Confirm historical turns show assistant/user body summaries but do not expose reasoning text; only the last running turn can show reasoning body text.
 13. Confirm title-only reasoning statuses such as `Planning ...`, `Updating ...`, `Inspecting ...`, and `Reviewing ...` do not appear as reasoning transcript text.
 14. Leave a long selected thread open while another Codex client writes new output; confirm the selected external live projection checks for changes at the fast selected interval, about 150 ms while the tab is visible, and appends each new paragraph-sized tail instead of batching several updates together.
-15. With server logs open, confirm the selected `/codex-api/thread-live-state` request reuses a recent `/codex-api/thread-runtime-states` running observation when available, can use a fresh running desktop-writer snapshot for the first projection, and treats a recently updated unmatched rollout as running even when the writer does not hold an open fd.
-16. Restart the safe service while another Codex client owns the selected running thread, then leave that client quiet for several minutes without a terminal lifecycle record; confirm `/codex-api/thread-text-page` keeps returning the active page from the local rollout path instead of falling back to slow `thread/read` or `409`.
-17. Confirm intermediate assistant progress/commentary rows may render as transcript body, but `Copy` and `Fork` controls appear only on a completed final assistant response; copying that response excludes prior commentary/progress text.
-18. Let the selected running turn complete from another Codex client and confirm the final detail refresh happens immediately rather than waiting for the generic event-sync debounce or an external runtime poll.
-19. Repeat the visible checks in dark theme.
+15. Inspect a running `/codex-api/thread-live-state` response and confirm it contains only lightweight projection metadata plus an empty or compressed conversation shell, not the active turn's large `items` payload; the browser should then fetch `/codex-api/thread-text-page` for the active text delta.
+16. Open two visible mobile windows on the same selected running thread and watch server/network logs while new assistant text arrives; confirm only one window performs each identical selected active-text page request and the other window receives the same delta through the cross-window sync path.
+17. Hide or close the window that was issuing selected active-text requests, then let another assistant paragraph arrive; confirm a remaining visible window takes over promptly without waiting for a long timeout or replaying the whole active turn.
+18. With server logs open, confirm the selected `/codex-api/thread-live-state` request reuses a recent `/codex-api/thread-runtime-states` running observation when available, can use a fresh running desktop-writer snapshot for the first projection, and treats a recently updated unmatched rollout as running even when the writer does not hold an open fd.
+19. Restart the safe service while another Codex client owns the selected running thread, then leave that client quiet for several minutes without a terminal lifecycle record; confirm `/codex-api/thread-text-page` keeps returning the active page from the local rollout path instead of falling back to slow `thread/read` or `409`.
+20. Confirm intermediate assistant progress/commentary rows may render as transcript body, but `Copy` and `Fork` controls appear only on a completed final assistant response; copying that response excludes prior commentary/progress text.
+21. Let the selected running turn complete from another Codex client and confirm the final detail refresh happens immediately rather than waiting for the generic event-sync debounce or an external runtime poll.
+22. Repeat the visible checks in dark theme.
 
 #### Expected Results
 - Cold sidebar load and background sidebar pagination remain metadata-only.
@@ -38,6 +42,9 @@ Mobile sidebar and conversation loading use metadata-only sidebar pages, active-
 - Active-thread output appends incrementally without clearing already displayed hydrated reasoning or assistant text.
 - Selected active-thread text deltas trigger a dedicated newest-text refresh immediately; generic notification debounce remains reserved for list/runtime/background reconciliation.
 - Selected external running threads use a fast lightweight live-projection check of about 150 ms while visible; the heavier active-turn text page is fetched only when the projection key changes.
+- Running live-state payloads do not include the active turn's full item history; the selected text page endpoint supplies only the missing newest tail.
+- Multiple visible windows on the same origin and selected thread share identical active-text page requests through `BroadcastChannel('codex-mobile-thread-sync')`; same-thread backend read cost is close to one visible window, while different selected running threads still poll independently.
+- A hidden, closed, or stale leader window does not block a visible follower from taking over selected active-text sync.
 - Selected external live projection is not serialized behind a sidebar runtime batch: the selected thread gets an isolated first runtime probe, and live-state can reuse a short-lived running runtime observation or a fresh writer snapshot instead of starting another slow inspect.
 - Running detection does not depend solely on a long-lived writable fd; an active rollout with an unmatched `task_started` and a file update within the quiet grace window is enough to keep the selected task in the realtime path.
 - Active-turn text paging reuses the cached session path from the selected thread snapshot, so paragraph-sized deltas are not serialized behind repeated `thread/read` calls.
@@ -53,5 +60,6 @@ Mobile sidebar and conversation loading use metadata-only sidebar pages, active-
 
 #### Rollback/Cleanup
 - Stop any manually started dev server or safe service if it is not normally running.
+- Close any extra mobile test windows or tabs opened for the multi-window sync check.
 
 ---

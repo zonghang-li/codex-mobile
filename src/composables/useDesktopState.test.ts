@@ -187,6 +187,42 @@ function deferred<T>() {
   return { promise, resolve, reject }
 }
 
+type BroadcastListener = (event: { data: unknown }) => void
+
+class FakeBroadcastChannel {
+  static channels = new Map<string, Set<FakeBroadcastChannel>>()
+
+  readonly listeners = new Set<BroadcastListener>()
+  closed = false
+
+  constructor(readonly name: string) {
+    const peers = FakeBroadcastChannel.channels.get(name) ?? new Set<FakeBroadcastChannel>()
+    peers.add(this)
+    FakeBroadcastChannel.channels.set(name, peers)
+  }
+
+  postMessage(message: unknown): void {
+    const peers = FakeBroadcastChannel.channels.get(this.name) ?? new Set<FakeBroadcastChannel>()
+    for (const peer of peers) {
+      if (peer === this || peer.closed) continue
+      for (const listener of peer.listeners) listener({ data: message })
+    }
+  }
+
+  addEventListener(eventName: 'message', listener: BroadcastListener): void {
+    if (eventName === 'message') this.listeners.add(listener)
+  }
+
+  removeEventListener(eventName: 'message', listener: BroadcastListener): void {
+    if (eventName === 'message') this.listeners.delete(listener)
+  }
+
+  close(): void {
+    this.closed = true
+    FakeBroadcastChannel.channels.get(this.name)?.delete(this)
+  }
+}
+
 async function setupExternalRuntimeState() {
   vi.useFakeTimers()
   installFakeTimerWindow()
@@ -6674,6 +6710,287 @@ describe('active turn text hydration', () => {
       .filter((message) => message.turnId === 'turn-external')
       .map((message) => message.id))
       .toEqual(['reason-2', 'agent-2', 'agent-live'])
+  })
+
+  it('requests active text tail deltas without clearing hydrated history', async () => {
+    installTestWindow()
+    vi.stubGlobal('document', {
+      visibilityState: 'visible',
+      addEventListener: vi.fn(),
+      removeEventListener: vi.fn(),
+    })
+    gatewayMocks.getThreadDetail
+      .mockResolvedValueOnce({
+        ...partialExternalDetail([]),
+        projectionKey: 'projection-1',
+      })
+      .mockResolvedValueOnce({
+        ...partialExternalDetail([]),
+        projectionKey: 'projection-2',
+      })
+    gatewayMocks.getThreadTextPage
+      .mockResolvedValueOnce({
+        threadId: 'thread-external',
+        turnId: 'turn-external',
+        messages: [
+          activeText('agent-1', 'agentMessage', 100),
+          activeText('agent-2', 'agentMessage', 200),
+        ],
+        nextOlderCursor: null,
+        hasMoreOlder: false,
+        tailSignature: 'tail-1',
+      })
+      .mockResolvedValueOnce({
+        threadId: 'thread-external',
+        turnId: 'turn-external',
+        messages: [
+          activeText('agent-3', 'agentMessage', 300),
+        ],
+        nextOlderCursor: null,
+        hasMoreOlder: false,
+        tailSignature: 'tail-2',
+      })
+
+    const state = useDesktopState()
+    state.primeSelectedThread('thread-external')
+    await state.loadMessages('thread-external')
+    await flushMicrotasks()
+
+    await state.loadMessages('thread-external', { silent: true, force: true })
+    await flushMicrotasks()
+
+    expect(gatewayMocks.getThreadTextPage).toHaveBeenCalledTimes(2)
+    expect(gatewayMocks.getThreadTextPage).toHaveBeenNthCalledWith(
+      2,
+      'thread-external',
+      'turn-external',
+      undefined,
+      undefined,
+      expect.any(AbortSignal),
+      {
+        knownTailSignature: 'tail-1',
+        afterSessionOrder: 200,
+      },
+    )
+    expect(state.messages.value.map((message) => message.id)).toEqual([
+      'agent-1',
+      'agent-2',
+      'agent-3',
+    ])
+  })
+
+  it('shares selected active text hydration across visible windows for the same thread', async () => {
+    vi.useFakeTimers()
+    installFakeTimerWindow()
+    FakeBroadcastChannel.channels.clear()
+    vi.stubGlobal('BroadcastChannel', FakeBroadcastChannel)
+    Object.assign(window, { BroadcastChannel: FakeBroadcastChannel })
+    vi.stubGlobal('document', {
+      visibilityState: 'visible',
+      addEventListener: vi.fn(),
+      removeEventListener: vi.fn(),
+    })
+    gatewayMocks.getThreadDetail.mockResolvedValue(partialExternalDetail([]))
+    gatewayMocks.getThreadTextPage.mockResolvedValue({
+      threadId: 'thread-external',
+      turnId: 'turn-external',
+      messages: [activeText('agent-shared', 'agentMessage', 100)],
+      nextOlderCursor: null,
+      hasMoreOlder: false,
+      tailSignature: 'tail-shared',
+    })
+
+    const firstWindow = useDesktopState()
+    const secondWindow = useDesktopState()
+    firstWindow.primeSelectedThread('thread-external')
+    secondWindow.primeSelectedThread('thread-external')
+
+    await Promise.all([
+      firstWindow.loadMessages('thread-external'),
+      secondWindow.loadMessages('thread-external'),
+    ])
+    await vi.advanceTimersByTimeAsync(40)
+    await flushMicrotasks()
+
+    expect(gatewayMocks.getThreadTextPage).toHaveBeenCalledTimes(1)
+    expect(firstWindow.messages.value.map((message) => message.id)).toEqual(['agent-shared'])
+    expect(secondWindow.messages.value.map((message) => message.id)).toEqual(['agent-shared'])
+
+    firstWindow.stopPolling()
+    secondWindow.stopPolling()
+  })
+
+  it('keeps sharing selected active text hydration after polling restarts', async () => {
+    vi.useFakeTimers()
+    installFakeTimerWindow()
+    FakeBroadcastChannel.channels.clear()
+    vi.stubGlobal('BroadcastChannel', FakeBroadcastChannel)
+    Object.assign(window, { BroadcastChannel: FakeBroadcastChannel })
+    vi.stubGlobal('document', {
+      visibilityState: 'visible',
+      addEventListener: vi.fn(),
+      removeEventListener: vi.fn(),
+    })
+    gatewayMocks.subscribeCodexNotifications.mockReturnValue(vi.fn())
+    gatewayMocks.getPendingServerRequests.mockResolvedValue([])
+    gatewayMocks.getThreadRuntimeStates.mockResolvedValue([])
+    gatewayMocks.getThreadDetail.mockResolvedValue(partialExternalDetail([]))
+    gatewayMocks.getThreadTextPage.mockResolvedValue({
+      threadId: 'thread-external',
+      turnId: 'turn-external',
+      messages: [activeText('agent-shared-after-restart', 'agentMessage', 100)],
+      nextOlderCursor: null,
+      hasMoreOlder: false,
+      tailSignature: 'tail-shared-after-restart',
+    })
+
+    const firstWindow = useDesktopState()
+    const secondWindow = useDesktopState()
+    firstWindow.stopPolling()
+    secondWindow.stopPolling()
+    firstWindow.startPolling()
+    secondWindow.startPolling()
+    firstWindow.primeSelectedThread('thread-external')
+    secondWindow.primeSelectedThread('thread-external')
+
+    await Promise.all([
+      firstWindow.loadMessages('thread-external'),
+      secondWindow.loadMessages('thread-external'),
+    ])
+    await vi.advanceTimersByTimeAsync(40)
+    await flushMicrotasks()
+
+    expect(gatewayMocks.getThreadTextPage).toHaveBeenCalledTimes(1)
+    expect(firstWindow.messages.value.map((message) => message.id)).toEqual(['agent-shared-after-restart'])
+    expect(secondWindow.messages.value.map((message) => message.id)).toEqual(['agent-shared-after-restart'])
+
+    firstWindow.stopPolling()
+    secondWindow.stopPolling()
+  })
+
+  it('does not share a tail-delta active text request with a full newest request', async () => {
+    vi.useFakeTimers()
+    installFakeTimerWindow()
+    FakeBroadcastChannel.channels.clear()
+    vi.stubGlobal('crypto', {
+      randomUUID: vi.fn()
+        .mockReturnValueOnce('a-delta-window')
+        .mockReturnValueOnce('b-full-window'),
+    })
+    vi.stubGlobal('BroadcastChannel', FakeBroadcastChannel)
+    Object.assign(window, { BroadcastChannel: FakeBroadcastChannel })
+    vi.stubGlobal('document', {
+      visibilityState: 'visible',
+      addEventListener: vi.fn(),
+      removeEventListener: vi.fn(),
+    })
+    gatewayMocks.getThreadDetail
+      .mockResolvedValueOnce({
+        ...partialExternalDetail([]),
+        projectionKey: 'projection-1',
+      })
+      .mockResolvedValueOnce({
+        ...partialExternalDetail([]),
+        projectionKey: 'projection-2',
+      })
+      .mockResolvedValueOnce({
+        ...partialExternalDetail([]),
+        projectionKey: 'projection-3',
+      })
+    let fullRequestCount = 0
+    gatewayMocks.getThreadTextPage.mockImplementation(async (
+      _threadId: string,
+      _turnId: string,
+      _cursor?: string,
+      _limit?: number,
+      _signal?: AbortSignal,
+      options?: { knownTailSignature?: string; afterSessionOrder?: number },
+    ) => {
+      if (options?.knownTailSignature) {
+        return {
+          threadId: 'thread-external',
+          turnId: 'turn-external',
+          messages: [activeText('agent-4', 'agentMessage', 400)],
+          nextOlderCursor: null,
+          hasMoreOlder: false,
+          tailSignature: 'tail-2',
+        }
+      }
+      fullRequestCount += 1
+      return {
+        threadId: 'thread-external',
+        turnId: 'turn-external',
+        messages: (fullRequestCount === 1
+          ? [
+              activeText('agent-1', 'agentMessage', 100),
+              activeText('agent-2', 'agentMessage', 200),
+              activeText('agent-3', 'agentMessage', 300),
+            ]
+          : [
+          activeText('agent-1', 'agentMessage', 100),
+          activeText('agent-2', 'agentMessage', 200),
+          activeText('agent-3', 'agentMessage', 300),
+              activeText('agent-4', 'agentMessage', 400),
+            ]),
+        nextOlderCursor: null,
+        hasMoreOlder: false,
+        tailSignature: fullRequestCount === 1 ? 'tail-1' : 'tail-2',
+      }
+    })
+
+    const deltaWindow = useDesktopState()
+    deltaWindow.primeSelectedThread('thread-external')
+    await deltaWindow.loadMessages('thread-external')
+    await vi.advanceTimersByTimeAsync(40)
+    await flushMicrotasks()
+    expect(deltaWindow.messages.value.map((message) => message.id)).toEqual([
+      'agent-1',
+      'agent-2',
+      'agent-3',
+    ])
+    vi.setSystemTime(Date.now() + 600)
+
+    const fullWindow = useDesktopState()
+    deltaWindow.primeSelectedThread('thread-external')
+    fullWindow.primeSelectedThread('thread-external')
+    await Promise.all([
+      deltaWindow.loadMessages('thread-external', { silent: true, force: true }),
+      fullWindow.loadMessages('thread-external'),
+    ])
+    await flushMicrotasks()
+    await vi.advanceTimersByTimeAsync(40)
+    await flushMicrotasks()
+
+    expect(gatewayMocks.getThreadTextPage).toHaveBeenCalledTimes(3)
+    expect(gatewayMocks.getThreadTextPage).toHaveBeenNthCalledWith(
+      2,
+      'thread-external',
+      'turn-external',
+      undefined,
+      undefined,
+      expect.any(AbortSignal),
+      {
+        knownTailSignature: 'tail-1',
+        afterSessionOrder: 300,
+      },
+    )
+    expect(gatewayMocks.getThreadTextPage).toHaveBeenNthCalledWith(
+      3,
+      'thread-external',
+      'turn-external',
+      undefined,
+      undefined,
+      expect.any(AbortSignal),
+    )
+    expect(fullWindow.messages.value.map((message) => message.id)).toEqual([
+      'agent-1',
+      'agent-2',
+      'agent-3',
+      'agent-4',
+    ])
+
+    deltaWindow.stopPolling()
+    fullWindow.stopPolling()
   })
 
   it('hydrates every text item from a compressed locally running turn', async () => {

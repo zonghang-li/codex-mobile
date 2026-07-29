@@ -8,6 +8,8 @@ import type { ExternalThreadRuntime } from '../types/threadRuntime'
 import {
   augmentThreadResultWithExternalRuntime,
   createCodexBridgeMiddleware,
+  pruneExpiredCachedHttpResponses,
+  trimCachedHttpResponses,
 } from './codexAppServerBridge'
 import { PERMISSIVE_SECURITY_POLICY } from './securityPolicy'
 
@@ -26,6 +28,22 @@ function fakeProbe(runtime: ExternalThreadRuntime) {
     )),
   }
 }
+
+describe('HTTP response cache bounds', () => {
+  it('prunes expired entries and trims the oldest cached responses', () => {
+    const cache = new Map([
+      ['expired', { response: { status: 200, payload: { value: 'expired' } }, expiresAt: 999 }],
+      ['oldest', { response: { status: 200, payload: { value: 'oldest' } }, expiresAt: 2_000 }],
+      ['newest', { response: { status: 200, payload: { value: 'newest' } }, expiresAt: 2_000 }],
+    ])
+
+    pruneExpiredCachedHttpResponses(cache, 1_000)
+    expect([...cache.keys()]).toEqual(['oldest', 'newest'])
+
+    trimCachedHttpResponses(cache, 1)
+    expect([...cache.keys()]).toEqual(['newest'])
+  })
+})
 
 describe('external thread runtime bridge augmentation', () => {
   it('attaches external runtime to an idle thread without mutating the sanitized response', async () => {
@@ -458,6 +476,38 @@ describe('GET /codex-api/thread-text-page', () => {
     const serialized = JSON.stringify([firstBody, secondBody])
     expect(serialized).not.toContain('raw function arguments')
     expect(serialized).not.toContain('raw function output')
+  })
+
+  it('deduplicates concurrent active text-page requests for the same tail signature', async () => {
+    const fixture = await createRolloutFixture()
+    disposers.push(fixture.cleanup)
+    const middleware = createCodexBridgeMiddleware()
+    const rpc = stubThreadRead(fixture.sessionPath)
+    const shared = sharedBridgeForTest()
+    const inspect = vi.spyOn(shared.runtimeProbe, 'inspect').mockImplementation(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 20))
+      return {
+        state: 'running',
+        turnId: 'turn-active',
+        interruptible: false,
+        source: 'external-session-writer',
+      }
+    })
+    const port = await listenWithMiddleware(middleware)
+    const url = `http://127.0.0.1:${port}/codex-api/thread-text-page?threadId=thread-1&turnId=turn-active&limit=2&knownTailSignature=stale&afterSessionOrder=0`
+
+    const [first, second] = await Promise.all([
+      fetch(url),
+      fetch(url),
+    ])
+    const firstBody = await first.json()
+    const secondBody = await second.json()
+
+    expect(first.status).toBe(200)
+    expect(second.status).toBe(200)
+    expect(firstBody).toEqual(secondBody)
+    expect(rpc).toHaveBeenCalledTimes(1)
+    expect(inspect).toHaveBeenCalledTimes(1)
   })
 
   it('uses a cached thread snapshot path without retrying thread/read', async () => {
@@ -897,6 +947,17 @@ describe('POST /codex-api/rpc guarded resume', () => {
           id: 'thread-cached',
           path: join(codexHome, 'sessions', 'thread-cached.jsonl'),
           status: { type: 'idle' },
+          externalRuntime: {
+            state: 'running',
+            turnId: 'turn-stale-runtime',
+            interruptible: false,
+            source: 'external-session-writer',
+          },
+          turns: [{ id: 'turn-heavy', items: [{ id: 'item-heavy' }] }],
+          items: [{ id: 'top-item-heavy' }],
+          messages: [{ id: 'message-heavy' }],
+          conversation: { turns: [] },
+          transcript: [{ id: 'transcript-heavy' }],
         },
       ],
       nextCursor: null,
@@ -937,6 +998,20 @@ describe('POST /codex-api/rpc guarded resume', () => {
     }
 
     expect(first.status).toBe(200)
+    const firstPayload = await first.json() as {
+      result?: { data?: Array<Record<string, unknown>> }
+    }
+    expect(firstPayload.result?.data?.[0]).toMatchObject({
+      id: 'thread-cached',
+      path: join(codexHome, 'sessions', 'thread-cached.jsonl'),
+      status: { type: 'idle' },
+    })
+    expect(firstPayload.result?.data?.[0]).not.toHaveProperty('turns')
+    expect(firstPayload.result?.data?.[0]).not.toHaveProperty('items')
+    expect(firstPayload.result?.data?.[0]).not.toHaveProperty('messages')
+    expect(firstPayload.result?.data?.[0]).not.toHaveProperty('conversation')
+    expect(firstPayload.result?.data?.[0]).not.toHaveProperty('transcript')
+    expect(firstPayload.result?.data?.[0]).not.toHaveProperty('externalRuntime')
     expect(second).not.toBe('timeout')
     expect(second).toHaveProperty('status', 200)
     expect(rpc).toHaveBeenCalledTimes(1)
@@ -2636,6 +2711,7 @@ describe('GET /codex-api/thread-live-state external runtime parity', () => {
       `http://127.0.0.1:${port}/codex-api/thread-live-state?threadId=thread-active-text-compressed`,
     )
     const payload = await response.json() as {
+      activeTurnId?: string
       conversationState?: {
         turns?: Array<{
           id?: string
@@ -2651,14 +2727,78 @@ describe('GET /codex-api/thread-live-state external runtime parity', () => {
     const activeTurn = payload.conversationState?.turns?.find((turn) => turn.id === 'turn-external')
 
     expect(response.status).toBe(200)
-    expect(activeTurn?.items?.map((item) => item.id)).toEqual(['user-active'])
+    expect(payload.activeTurnId).toBe('turn-external')
+    expect(activeTurn?.items).toEqual([])
     expect(activeTurn?.rawItemCompression).toEqual({
       originalItemCount: 51,
-      retainedItemCount: 1,
-      omittedItemCount: 50,
+      retainedItemCount: 0,
+      omittedItemCount: 51,
     })
+    expect(JSON.stringify(payload)).not.toContain('user-active')
     expect(JSON.stringify(payload)).not.toContain('active output')
-    expect(JSON.stringify(payload).length).toBeLessThan(4096)
+    expect(JSON.stringify(payload).length).toBeLessThan(3072)
+  })
+
+  it('deduplicates concurrent running live-state projections for the same known key', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'codex-mobile-live-state-concurrent-'))
+    disposers.push(() => {
+      void rm(dir, { recursive: true, force: true })
+    })
+    const rolloutPath = join(dir, 'thread-concurrent.jsonl')
+    await writeFile(rolloutPath, '{"type":"session_meta"}\n')
+
+    const middleware = createCodexBridgeMiddleware()
+    const shared = sharedBridgeForTest() as ReturnType<typeof sharedBridgeForTest> & {
+      appServer: ReturnType<typeof sharedBridgeForTest>['appServer'] & {
+        rpc: (method: string, params: unknown) => Promise<unknown>
+      }
+    }
+    vi.spyOn(shared.appServer, 'getPid').mockReturnValue(4242)
+    const rpc = vi.spyOn(shared.appServer, 'rpc').mockImplementation(async (method) => {
+      if (method === 'thread/turns/list') {
+        await new Promise((resolve) => setTimeout(resolve, 20))
+        return {
+          data: [{
+            id: 'turn-external',
+            status: 'inProgress',
+            items: [{
+              id: 'agent-heavy',
+              type: 'agentMessage',
+              text: 'x'.repeat(128_000),
+            }],
+          }],
+          nextCursor: null,
+          backwardsCursor: null,
+        }
+      }
+      return {
+        thread: {
+          id: 'thread-concurrent',
+          path: rolloutPath,
+          turns: [],
+        },
+      }
+    })
+    vi.spyOn(shared.runtimeProbe, 'inspect').mockResolvedValue({
+      state: 'running',
+      turnId: 'turn-external',
+      interruptible: false,
+      source: 'external-session-writer',
+    })
+    const port = await listenWithMiddleware(middleware)
+
+    const [first, second] = await Promise.all([
+      fetch(`http://127.0.0.1:${port}/codex-api/thread-live-state?threadId=thread-concurrent&knownProjectionKey=stale`),
+      fetch(`http://127.0.0.1:${port}/codex-api/thread-live-state?threadId=thread-concurrent&knownProjectionKey=stale`),
+    ])
+    const firstPayload = await first.json() as { projectionKey?: string; isInProgress?: boolean }
+    const secondPayload = await second.json() as { projectionKey?: string; isInProgress?: boolean }
+
+    expect(first.status).toBe(200)
+    expect(second.status).toBe(200)
+    expect(firstPayload).toMatchObject({ isInProgress: true })
+    expect(secondPayload).toMatchObject({ isInProgress: true, projectionKey: firstPayload.projectionKey })
+    expect(rpc).toHaveBeenCalledTimes(2)
   })
 
   it('returns a lightweight not-modified cached idle live-state when the projection key matches', async () => {

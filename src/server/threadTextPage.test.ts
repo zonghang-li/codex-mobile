@@ -1,4 +1,4 @@
-import { mkdtemp, rm, truncate, writeFile } from 'node:fs/promises'
+import { appendFile, mkdtemp, rm, truncate, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
@@ -197,6 +197,72 @@ describe('readThreadTextPage', () => {
     expect(second.items.map((item) => item.id)).toEqual(['reason-1', 'agent-1'])
     expect(second.hasMoreOlder).toBe(false)
     expect(second.nextOlderCursor).toBeNull()
+  })
+
+  it('returns a not-modified active tail when the rollout tail signature is unchanged', async () => {
+    const sessionPath = await writeRollout([
+      event('task_started', { turn_id: 'turn-active' }),
+      assistant('First update', 'agent-1'),
+    ])
+
+    const first = await readThreadTextPage({
+      sessionPath,
+      threadId: 'thread-1',
+      turnId: 'turn-active',
+      limit: 20,
+    })
+
+    expect(first.tailSignature).toEqual(expect.any(String))
+
+    const second = await readThreadTextPage({
+      sessionPath,
+      threadId: 'thread-1',
+      turnId: 'turn-active',
+      limit: 20,
+      knownTailSignature: first.tailSignature,
+    })
+
+    expect(second).toMatchObject({
+      threadId: 'thread-1',
+      turnId: 'turn-active',
+      items: [],
+      nextOlderCursor: null,
+      hasMoreOlder: false,
+      notModified: true,
+      tailSignature: first.tailSignature,
+    })
+  })
+
+  it('returns only assistant text appended after the last hydrated session order', async () => {
+    const sessionPath = await writeRollout([
+      event('task_started', { turn_id: 'turn-active' }),
+      assistant('First update', 'agent-1'),
+    ])
+    const first = await readThreadTextPage({
+      sessionPath,
+      threadId: 'thread-1',
+      turnId: 'turn-active',
+      limit: 20,
+    })
+    const newestSessionOrder = Math.max(...first.items.map((item) => item.sessionOrder))
+
+    await appendFile(sessionPath, `${JSON.stringify(assistant('Second update', 'agent-2'))}\n`, 'utf8')
+
+    const second = await readThreadTextPage({
+      sessionPath,
+      threadId: 'thread-1',
+      turnId: 'turn-active',
+      limit: 20,
+      afterSessionOrder: newestSessionOrder,
+      knownTailSignature: first.tailSignature,
+    })
+
+    expect(second.notModified).toBeUndefined()
+    expect(second.items.map((item) => ({ id: item.id, text: item.text }))).toEqual([
+      { id: 'agent-2', text: 'Second update' },
+    ])
+    expect(second.hasMoreOlder).toBe(false)
+    expect(second.tailSignature).not.toBe(first.tailSignature)
   })
 
   it('projects assistant commentary phase messages as visible active-turn text', async () => {

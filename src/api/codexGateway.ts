@@ -865,6 +865,8 @@ export type ThreadTextPage = {
   messages: UiMessage[]
   nextOlderCursor: string | null
   hasMoreOlder: boolean
+  notModified?: boolean
+  tailSignature?: string
 }
 
 class ThreadTurnPaginationUnsupportedError extends Error {
@@ -1291,10 +1293,25 @@ export async function getThreadTextPage(
   cursor?: string,
   limit?: number,
   signal?: AbortSignal,
+  options: {
+    knownTailSignature?: string
+    afterSessionOrder?: number
+  } = {},
 ): Promise<ThreadTextPage> {
   const params = new URLSearchParams({ threadId, turnId })
   if (cursor) params.set('cursor', cursor)
   if (limit !== undefined) params.set('limit', String(limit))
+  const knownTailSignature = options.knownTailSignature?.trim() ?? ''
+  if (!cursor && knownTailSignature.length > 0) {
+    params.set('knownTailSignature', knownTailSignature)
+  }
+  if (
+    !cursor
+    && typeof options.afterSessionOrder === 'number'
+    && Number.isFinite(options.afterSessionOrder)
+  ) {
+    params.set('afterSessionOrder', String(Math.max(0, Math.floor(options.afterSessionOrder))))
+  }
 
   let response: Response
   try {
@@ -1352,6 +1369,8 @@ export async function getThreadTextPage(
     messages: normalized.filter((message) => message.turnId === turnId),
     nextOlderCursor: readString(payload?.nextOlderCursor),
     hasMoreOlder: payload?.hasMoreOlder === true,
+    notModified: payload?.notModified === true ? true : undefined,
+    tailSignature: readString(payload?.tailSignature) ?? undefined,
   }
 }
 
