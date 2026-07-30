@@ -14,7 +14,7 @@
 2. On mobile, open a different thread, expand the sidebar, and leave the desktop-running thread unselected.
 3. While the different thread remains selected, wait for one background poll and inspect `POST /codex-api/thread-runtime-states`; confirm its request body includes `<desktop-thread-id>` and its successful response has `states["<desktop-thread-id>"].state: "running"`. Temporarily select the desktop thread, wait for its selected-thread poll, and inspect `GET /codex-api/thread-runtime-state?threadId=<desktop-thread-id>`; confirm its successful response has `state: "running"`. Return to the different thread and wait for the next background poll before continuing. These same-origin requests use the mobile app's existing authenticated session; do not copy or record cookies, passwords, or authorization values.
 4. In the mobile DevTools Elements panel, inspect the desktop thread's sidebar row. Confirm it contains `.thread-status-indicator[data-state="working"]` and does not contain `.thread-status-indicator[data-state="unread"]` within one poll cycle after returning to the different thread.
-5. Select the externally owned desktop thread on mobile. Confirm the composer remains non-interruptible: it cannot submit, edit, attach, change turn settings, or send an interrupt, and the disabled running control identifies the task as running in another client. Return to the different thread before the desktop task completes; this records the latest mobile last-read state before the completion update.
+5. Select the externally owned desktop thread on mobile. Confirm the composer does not start an unguarded competing turn: Queue mode stores a follow-up, plain-text Steer uses the explicit external steer path, Stop targets the external active turn id, and edit, attach, turn-setting, queued-row edit/delete/reorder controls remain blocked. Return to the different thread before the desktop task completes; this records the latest mobile last-read state before the completion update.
 6. Complete the task from the desktop client while the different thread remains selected on mobile. Wait for the next background-runtime poll and its forced summary refresh. On the same desktop-thread row, confirm `.thread-status-indicator[data-state="working"]` disappears and is replaced by `.thread-status-indicator[data-state="unread"]`; this proves that row transitioned from working to unread after completion rather than relying on a different conversation that was already unread.
 7. In the mobile DevTools Network panel, inspect the batch polling requests. Confirm no more than one `POST /codex-api/thread-runtime-states` request is in flight at a time and every request body contains at most 50 `threadIds`. Hide the page or switch the browser tab to the background for longer than one poll interval and confirm that no batch requests are issued while `document.hidden` is true; make the page visible again and confirm polling resumes.
 8. With at least 51 thread rows loaded, record two or more consecutive batch request bodies. Confirm the selected non-external thread is included in every batch, each body has at most 50 IDs, and the union of consecutive batches eventually contains every loaded row instead of repeating only the first 50.
@@ -30,7 +30,7 @@
 
 #### Expected Results
 - The batch endpoint reports `running` for the desktop-owned task while another thread is selected; after temporarily selecting the desktop thread, its single endpoint also reports `running`.
-- Within one poll cycle, the unselected desktop thread is marked `working`, never `unread`, and selecting it keeps the mobile composer non-interruptible.
+- Within one poll cycle, the unselected desktop thread is marked `working`, never `unread`, and selecting it keeps mobile controls in external ownership mode: Stop and busy Queue/Steer are available, while edit/configuration mutations remain blocked.
 - After desktop completion, the same desktop-thread row transitions from `working` to `unread` after the forced summary refresh.
 - Background polling has one batch request in flight at a time, sends no more than 50 thread IDs per request, and sends no requests while the page is hidden.
 - Consecutive limited batches rotate across all loaded rows, while the selected non-external row remains prioritized.
@@ -51,7 +51,7 @@ viewports/appearances: 390x844 Light; 390x844 Dark; 768x1024 Light; 768x1024 Dar
 single runtime state:
 batch runtime state:
 desktop row state while running:
-composer non-interruptible:
+composer external-control state:
 desktop row state after completion while unread:
 maximum batch threadIds:
 maximum concurrent batch requests:

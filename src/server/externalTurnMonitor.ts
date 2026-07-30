@@ -12,7 +12,7 @@ import { parseRolloutRecord, type ParsedRolloutRecord } from './rolloutLifecycle
 export const EXTERNAL_TURN_SCAN_INTERVAL_MS = 15_000
 export const EXTERNAL_TURN_INACTIVE_EXPIRY_MS = 24 * 60 * 60 * 1_000
 const READ_CHUNK_BYTES = 64 * 1024
-const MAX_TRAILING_BYTES = 256 * 1024
+const MAX_TRAILING_BYTES = 4 * 1024 * 1024
 const DEFAULT_CURSOR_LIMIT = 256
 const CHECKPOINT_BYTES = 256
 const RECENT_TURN_LIMIT = 256
@@ -59,6 +59,7 @@ type RolloutCursor = {
   notificationScope: NtfyThreadScope
   activeTurn: { turnId: string; startedAt: number } | null
   pendingInitialLifecycle: Exclude<ParsedRolloutRecord, { kind: 'session' }> | null
+  skippingOversizedLine: boolean
   lastObservedAt: number
   lastFileActivityAt: number
   lastWriterSeenAt: number
@@ -69,9 +70,8 @@ type RolloutSession = { threadId: string; notificationScope: NtfyThreadScope }
 type InitialTail = {
   latestLifecycle: Exclude<ParsedRolloutRecord, { kind: 'session' }> | null
   trailing: Buffer
+  skippingOversizedLine: boolean
 }
-
-class OversizedTrailingLineError extends Error {}
 
 function identityFor(cursor: RolloutCursor, size: number): RuntimeFileIdentity {
   return { path: cursor.path, dev: cursor.dev, ino: cursor.ino, size }
@@ -238,16 +238,29 @@ export function createExternalTurnMonitor(
       ? Buffer.concat([cursor.trailing, chunk])
       : chunk
     let lineStart = 0
+    if (cursor.skippingOversizedLine) {
+      const newline = bytes.indexOf(0x0a)
+      if (newline === -1) return true
+      cursor.skippingOversizedLine = false
+      lineStart = newline + 1
+    }
     let newline = bytes.indexOf(0x0a)
+    if (newline !== -1 && newline < lineStart) {
+      newline = bytes.indexOf(0x0a, lineStart)
+    }
     while (newline !== -1) {
       await applyCompleteLine(cursor, bytes.subarray(lineStart, newline))
       lineStart = newline + 1
       newline = bytes.indexOf(0x0a, lineStart)
     }
-    cursor.trailing = Buffer.from(bytes.subarray(lineStart))
-    if (cursor.trailing.length <= MAX_TRAILING_BYTES) return true
-    warnOnce('Unable to parse external turn lifecycle')
-    return false
+    const trailing = bytes.subarray(lineStart)
+    if (trailing.length <= MAX_TRAILING_BYTES) {
+      cursor.trailing = Buffer.from(trailing)
+      return true
+    }
+    cursor.trailing = Buffer.alloc(0)
+    cursor.skippingOversizedLine = true
+    return true
   }
 
   async function readSessionMetadata(identity: RuntimeFileIdentity): Promise<RolloutSession | null> {
@@ -290,57 +303,101 @@ export function createExternalTurnMonitor(
 
   async function readInitialTail(identity: RuntimeFileIdentity): Promise<InitialTail> {
     let end = identity.size
-    let crossing: Buffer<ArrayBufferLike> = Buffer.alloc(0)
-    let trailing: Buffer<ArrayBufferLike> | null = null
+    let suffix: Buffer = Buffer.alloc(0)
+    let trailing: Buffer | null = null
+    let skippingOversizedLine = false
+    let skippingInitialTrailingLine = false
 
     while (end > 0) {
       const start = Math.max(0, end - READ_CHUNK_BYTES)
       const chunk = await system.readRange(identity.path, start, end - start, identity)
       if (chunk.length !== end - start) throw new Error('Unable to read external rollout')
-      let bytes: Buffer
 
-      if (trailing === null) {
-        const lastNewline = chunk.lastIndexOf(0x0a)
-        if (lastNewline === -1) {
-          crossing = crossing.length > 0 ? Buffer.concat([chunk, crossing]) : Buffer.from(chunk)
-          if (crossing.length > MAX_TRAILING_BYTES) throw new OversizedTrailingLineError()
-          end = start
+      let scanEnd = chunk.length
+      while (scanEnd > 0) {
+        if (skippingOversizedLine) {
+          const boundary = chunk.lastIndexOf(0x0a, scanEnd - 1)
+          if (boundary === -1) {
+            scanEnd = 0
+            break
+          }
+          skippingOversizedLine = false
+          suffix = Buffer.alloc(0)
+          scanEnd = boundary
           continue
         }
-        trailing = Buffer.concat([chunk.subarray(lastNewline + 1), crossing])
-        if (trailing.length > MAX_TRAILING_BYTES) throw new OversizedTrailingLineError()
-        bytes = chunk.subarray(0, lastNewline + 1)
-      } else {
-        bytes = crossing.length > 0 ? Buffer.concat([chunk, crossing]) : chunk
-      }
 
-      const firstNewline = bytes.indexOf(0x0a)
-      if (firstNewline === -1) {
-        crossing = bytes
-        if (crossing.length > MAX_TRAILING_BYTES) throw new OversizedTrailingLineError()
-        end = start
-        continue
-      }
+        const boundary = chunk.lastIndexOf(0x0a, scanEnd - 1)
+        const segmentStart = boundary + 1
+        const segment = chunk.subarray(segmentStart, scanEnd)
+        const line = suffix.length > 0 ? Buffer.concat([segment, suffix]) : Buffer.from(segment)
 
-      const firstCompleteOffset = start === 0 ? 0 : firstNewline + 1
-      let lineEnd = bytes.length - 1
-      while (lineEnd >= firstCompleteOffset) {
-        const previousNewline = bytes.lastIndexOf(0x0a, lineEnd - 1)
-        const lineStart = Math.max(firstCompleteOffset, previousNewline + 1)
-        const record = parseRolloutRecord(bytes.subarray(lineStart, lineEnd).toString('utf8'))
-        if (record?.kind === 'started' || record?.kind === 'terminal') {
-          return { latestLifecycle: record, trailing }
+        if (line.length > MAX_TRAILING_BYTES) {
+          if (trailing === null) {
+            trailing = Buffer.alloc(0)
+            skippingInitialTrailingLine = true
+          }
+          suffix = Buffer.alloc(0)
+          if (boundary === -1) {
+            skippingOversizedLine = true
+            scanEnd = 0
+            break
+          }
+          scanEnd = boundary
+          continue
         }
-        if (previousNewline < firstCompleteOffset) break
-        lineEnd = previousNewline
+
+        if (boundary === -1) {
+          suffix = line
+          scanEnd = 0
+          break
+        }
+
+        if (trailing === null) {
+          trailing = Buffer.from(line)
+          suffix = Buffer.alloc(0)
+          scanEnd = boundary
+          continue
+        }
+
+        const record = parseRolloutRecord(line.toString('utf8'))
+        if (record?.kind === 'started' || record?.kind === 'terminal') {
+          return {
+            latestLifecycle: record,
+            trailing,
+            skippingOversizedLine: skippingInitialTrailingLine,
+          }
+        }
+        suffix = Buffer.alloc(0)
+        scanEnd = boundary
       }
 
-      crossing = Buffer.from(bytes.subarray(0, firstNewline + 1))
-      if (crossing.length > MAX_TRAILING_BYTES) throw new OversizedTrailingLineError()
       end = start
     }
 
-    return { latestLifecycle: null, trailing: trailing ?? crossing }
+    if (suffix.length > 0 && suffix.length <= MAX_TRAILING_BYTES) {
+      if (trailing === null) {
+        trailing = Buffer.from(suffix)
+      } else {
+        const record = parseRolloutRecord(suffix.toString('utf8'))
+        if (record?.kind === 'started' || record?.kind === 'terminal') {
+          return {
+            latestLifecycle: record,
+            trailing,
+            skippingOversizedLine: skippingInitialTrailingLine,
+          }
+        }
+      }
+    } else if (suffix.length > MAX_TRAILING_BYTES && trailing === null) {
+      trailing = Buffer.alloc(0)
+      skippingInitialTrailingLine = true
+    }
+
+    return {
+      latestLifecycle: null,
+      trailing: trailing ?? Buffer.alloc(0),
+      skippingOversizedLine: skippingInitialTrailingLine,
+    }
   }
 
   async function register(writer: ExternalRolloutWriter): Promise<void> {
@@ -355,16 +412,7 @@ export function createExternalTurnMonitor(
     const session = await readSessionMetadata(stableIdentity)
     if (!session) return
 
-    let tail: InitialTail
-    try {
-      tail = await readInitialTail(stableIdentity)
-    } catch (error) {
-      if (error instanceof OversizedTrailingLineError) {
-        warnOnce('Unable to parse external turn lifecycle')
-        return
-      }
-      throw error
-    }
+    const tail = await readInitialTail(stableIdentity)
     const revalidated = await system.statFile(writer.path)
     if (!hasStableIdentity(revalidated, stableIdentity) || revalidated.size < stableIdentity.size) return
     const checkpoint = await readCheckpoint(stableIdentity, stableIdentity.size)
@@ -382,6 +430,7 @@ export function createExternalTurnMonitor(
       notificationScope: session.notificationScope,
       activeTurn: null,
       pendingInitialLifecycle: tail.latestLifecycle,
+      skippingOversizedLine: tail.skippingOversizedLine,
       lastObservedAt: registeredAt,
       lastFileActivityAt: registeredAt,
       lastWriterSeenAt: registeredAt,

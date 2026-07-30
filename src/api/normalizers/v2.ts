@@ -267,31 +267,54 @@ function parseUserMessageContent(
   const rawBlocks: UiMessage[] = []
 
   for (const [index, block] of content.entries()) {
-    if (block.type === 'text' && typeof block.text === 'string' && block.text.length > 0) {
-      textChunks.push(block.text)
+    const blockType = typeof (block as { type?: unknown }).type === 'string'
+      ? (block as { type: string }).type
+      : ''
+    const blockText = typeof (block as { text?: unknown }).text === 'string'
+      ? (block as { text: string }).text
+      : ''
+    const blockUrl = typeof (block as { url?: unknown }).url === 'string'
+      ? (block as { url: string }).url
+      : ''
+    const blockPath = typeof (block as { path?: unknown }).path === 'string'
+      ? (block as { path: string }).path
+      : ''
+    if (
+      (blockType === 'text' || blockType === 'input_text')
+      && blockText.length > 0
+    ) {
+      textChunks.push(blockText)
     }
-    if (block.type === 'image' && typeof block.url === 'string' && block.url.trim().length > 0) {
-      const label = imageAttachmentLabel(block.url)
+    if (blockType === 'image' && blockUrl.trim().length > 0) {
+      const label = imageAttachmentLabel(blockUrl)
       if (!imageLabels.includes(label)) imageLabels.push(label)
     }
-    if (block.type === 'localImage' && typeof block.path === 'string' && block.path.trim().length > 0) {
-      const label = imageAttachmentLabel(block.path)
+    if (blockType === 'localImage' && blockPath.trim().length > 0) {
+      const label = imageAttachmentLabel(blockPath)
       if (!imageLabels.includes(label)) imageLabels.push(label)
     }
-    if (block.type === 'skill') {
-      const name = typeof block.name === 'string' ? block.name.trim() : ''
-      const path = typeof block.path === 'string' ? block.path.trim() : ''
+    if (blockType === 'skill') {
+      const name = typeof (block as { name?: unknown }).name === 'string'
+        ? (block as { name: string }).name.trim()
+        : ''
+      const path = blockPath.trim()
       if (name && path) {
         skills.push({ name, path })
       }
     }
 
-    if (block.type !== 'text' && block.type !== 'image' && block.type !== 'localImage' && block.type !== 'skill') {
+    if (
+      blockType !== 'text'
+      && blockType !== 'input_text'
+      && blockType !== 'image'
+      && blockType !== 'localImage'
+      && blockType !== 'skill'
+    ) {
       rawBlocks.push({
         id: `${itemId}:user-content:${index}`,
         role: 'user',
         text: '',
-        messageType: `userContent.${block.type}`,
+        messageType: `userContent.${blockType || 'unknown'}`,
         rawPayload: toRawPayload(block),
         isUnhandled: true,
       })
@@ -738,14 +761,16 @@ function toUiMessages(item: ThreadItem): UiMessage[] {
   }
 
   if (item.type === 'contextCompaction') {
+    const raw = item as unknown as Record<string, unknown>
+    const text = readString(raw.text) || 'Context automatically compacting'
     return [{
       id: item.id,
       role: 'system',
-      text: 'Context automatically compacting',
+      text,
       messageType: 'contextCompaction',
       activity: {
         kind: 'status',
-        label: 'Context automatically compacting',
+        label: text,
       },
     }]
   }

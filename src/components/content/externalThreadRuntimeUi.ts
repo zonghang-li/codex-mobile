@@ -7,8 +7,9 @@ export type ExternalRuntimeTakeoverEffects = {
   invalidateAttachments: () => void
 }
 
-export function canApplyThreadUiMutation(ownership: RuntimeOwnership): boolean {
-  return ownership !== 'external'
+export function canApplyThreadUiMutation(_ownership: RuntimeOwnership): boolean {
+  // Text draft changes are browser-local; external ownership only blocks writer-affecting work.
+  return true
 }
 
 export function canApplyAttachmentMutation(
@@ -16,7 +17,7 @@ export function canApplyAttachmentMutation(
   expectedSessionToken: number,
   currentSessionToken: number,
 ): boolean {
-  return canApplyThreadUiMutation(ownership) && expectedSessionToken === currentSessionToken
+  return ownership !== 'external' && expectedSessionToken === currentSessionToken
 }
 
 export function applyExternalRuntimeTakeover(

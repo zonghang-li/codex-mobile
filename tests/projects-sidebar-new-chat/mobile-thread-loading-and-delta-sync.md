@@ -8,7 +8,8 @@ Mobile sidebar and conversation loading use metadata-only sidebar pages, active-
 2. A workspace with more than 20 threads, including at least one running or recently completed thread.
 3. One selected thread with enough assistant output and reasoning text to require active-turn text pagination.
 4. Two mobile browser windows or tabs can be opened on the same origin.
-5. Light theme and dark theme both available from the appearance switcher.
+5. A running thread owned by another Codex client is available for mobile takeover checks.
+6. Light theme and dark theme both available from the appearance switcher.
 
 #### Steps
 1. Open the mobile UI on a cold load and inspect the first sidebar requests.
@@ -17,32 +18,40 @@ Mobile sidebar and conversation loading use metadata-only sidebar pages, active-
 4. Restart the safe service with no warm in-memory thread-list cache and confirm the first `thread/list` response can come from `session_index.jsonl` metadata while the real app-server list refreshes in the background.
 5. Select a thread with long output and confirm the conversation body loads through paged current-thread text/detail requests rather than a full sidebar detail scan.
 6. Confirm the initial selected-thread transcript displays only the newest 3 turns by default; older turns load only through explicit older-page pagination and this display window does not alter Codex reasoning context.
-7. While the selected thread is running, let new assistant text arrive and confirm previously loaded reasoning/output remains visible while the new tail appends promptly without waiting for the generic notification debounce.
+7. While the selected thread is running, let another Codex client submit a new user message and produce assistant text; confirm the mobile transcript first shows that user message bubble and then appends the new assistant tail promptly without waiting for the generic notification debounce.
 8. Inspect `/codex-api/thread-text-page` calls after the selected thread has a cached detail/live snapshot, or after a service restart where only the local rollout file is available, and confirm they use the resolved rollout path instead of issuing `thread/read` before every page.
 9. Trigger or observe a notification for a different loaded thread and confirm the UI refreshes only that changed thread's visible status/metadata instead of issuing a full thread-list refresh.
 10. Inspect `/codex-api/thread-runtime-states` calls and confirm each batch stays small, probes a loaded selected thread before the sidebar/background batch, includes recently running/actionable visible rows, and does not rotate through all historical loaded threads.
-11. Open a blue-dot thread, return to another thread, then let sidebar metadata refresh; confirm the read row does not regain a blue dot just because its metadata timestamp changed.
-12. Confirm historical turns show assistant/user body summaries but do not expose reasoning text; only the last running turn can show reasoning body text.
-13. Confirm title-only reasoning statuses such as `Planning ...`, `Updating ...`, `Inspecting ...`, and `Reviewing ...` do not appear as reasoning transcript text.
-14. Leave a long selected thread open while another Codex client writes new output; confirm the selected external live projection checks for changes at the fast selected interval, about 150 ms while the tab is visible, and appends each new paragraph-sized tail instead of batching several updates together.
-15. Inspect a running `/codex-api/thread-live-state` response and confirm it contains only lightweight projection metadata plus an empty or compressed conversation shell, not the active turn's large `items` payload; the browser should then fetch `/codex-api/thread-text-page` for the active text delta.
-16. Open two visible mobile windows on the same selected running thread and watch server/network logs while new assistant text arrives; confirm only one window performs each identical selected active-text page request and the other window receives the same delta through the cross-window sync path.
-17. Hide or close the window that was issuing selected active-text requests, then let another assistant paragraph arrive; confirm a remaining visible window takes over promptly without waiting for a long timeout or replaying the whole active turn.
-18. With server logs open, confirm the selected `/codex-api/thread-live-state` request reuses a recent `/codex-api/thread-runtime-states` running observation when available, can use a fresh running desktop-writer snapshot for the first projection, and treats a recently updated unmatched rollout as running even when the writer does not hold an open fd.
-19. Restart the safe service while another Codex client owns the selected running thread, then leave that client quiet for several minutes without a terminal lifecycle record; confirm `/codex-api/thread-text-page` keeps returning the active page from the local rollout path instead of falling back to slow `thread/read` or `409`.
-20. Confirm intermediate assistant progress/commentary rows may render as transcript body, but `Copy` and `Fork` controls appear only on a completed final assistant response; copying that response excludes prior commentary/progress text.
-21. Let the selected running turn complete from another Codex client and confirm the final detail refresh happens immediately rather than waiting for the generic event-sync debounce or an external runtime poll.
-22. Repeat the visible checks in dark theme.
+11. Manually refresh a selected running thread whose `thread/read` metadata reports an external active turn but whose newest `/codex-api/thread-turn-page` response contains only historical turns; confirm the browser immediately follows with `/codex-api/thread-text-page` for the active turn and shows the latest active tail.
+12. Manually refresh a selected running thread whose newest `/codex-api/thread-turn-page` response includes the external active turn; confirm that active turn is returned as an `inProgress` partial shell with empty `items`, not a large stale item window, and the browser uses `/codex-api/thread-text-page` for the visible active text.
+13. Open a blue-dot thread, return to another thread, then let sidebar metadata refresh; confirm the read row does not regain a blue dot just because its metadata timestamp changed.
+14. Confirm historical turns show assistant/user body summaries but do not expose reasoning text; only the last running turn can show reasoning body text.
+15. Confirm title-only reasoning statuses such as `Planning ...`, `Updating ...`, `Inspecting ...`, and `Reviewing ...` do not appear as reasoning transcript text.
+16. Leave a long selected thread open while another Codex client writes new output; confirm the selected external live projection checks for changes at the fast selected interval, about 150 ms while the tab is visible, and appends each new paragraph-sized tail instead of batching several updates together.
+17. Inspect a running `/codex-api/thread-live-state` response and confirm it contains only lightweight projection metadata plus an empty or compressed conversation shell, not the active turn's large `items` payload; the browser should then fetch `/codex-api/thread-text-page` for the active text delta.
+18. Open two visible mobile windows on the same selected running thread and watch server/network logs while new assistant text arrives; confirm only one window performs each identical selected active-text page request and the other window receives the same delta through the cross-window sync path.
+19. Hide or close the window that was issuing selected active-text requests, then let another assistant paragraph arrive; confirm a remaining visible window takes over promptly without waiting for a long timeout or replaying the whole active turn.
+20. With server logs open, confirm the selected `/codex-api/thread-live-state` request reuses a recent `/codex-api/thread-runtime-states` running observation when available, can use a fresh running desktop-writer snapshot for the first projection, and treats a recently updated unmatched rollout as running even when the writer does not hold an open fd.
+21. Restart the safe service while another Codex client owns the selected running thread, then leave that client quiet for several minutes without a terminal lifecycle record; confirm `/codex-api/thread-text-page` keeps returning the active page from the local rollout path instead of falling back to slow `thread/read` or `409`.
+22. Confirm intermediate assistant progress/commentary rows may render as transcript body, but `Copy` and `Fork` controls plus the completion time appear only on a completed final assistant response, including responses whose persisted phase is `final_answer`; copying that response excludes prior commentary/progress text.
+23. Let the selected running turn complete from another Codex client and confirm the final detail refresh happens immediately rather than waiting for the generic event-sync debounce or an external runtime poll.
+24. Open a running thread owned by another Codex client, refresh the mobile page, and confirm the composer textarea, send button with a non-empty draft, and stop button with an empty draft remain usable.
+25. Refresh a selected thread whose initial detail briefly reports local running while another Codex client is the real writer; confirm the next runtime probe hands the thread to the external realtime path and immediately appends the selected active text tail.
+26. With "When busy, send as" set to Queue, submit a mobile prompt while the external turn is still running and confirm it appears in the queue without starting a competing turn.
+27. With "When busy, send as" set to Steer, submit a plain-text mobile prompt during an externally owned running turn and confirm the request uses the explicit external steer path and immediately renders an optimistic user bubble. Repeat with an attachment or skill selected and confirm that unsupported external steer payload is sanitized into a text-only queued message instead of racing the writer.
+28. Tap Stop on an externally owned running thread and confirm the request uses the current active turn id, then refreshes the selected thread state without clearing visible output.
+29. Confirm existing queued-message edit, delete, and reorder controls remain disabled while an external writer owns the thread; explicit queued-row "Steer" remains available only for text-only queued messages and is disabled for queued messages that still contain images, skills, or file attachments.
+30. Repeat the visible checks in dark theme.
 
 #### Expected Results
 - Cold sidebar load and background sidebar pagination remain metadata-only.
 - Cold sidebar load shows the newest 5 known threads first, can use a lightweight `session_index.jsonl` fallback on service restart, and loads the rest asynchronously.
 - Switching threads does not fetch every loaded thread's turn content.
 - Initial selected-thread detail displays the newest 3 turns only; older turns remain available through pagination and this display limit does not affect model context.
-- Active-thread output appends incrementally without clearing already displayed hydrated reasoning or assistant text.
+- Active-thread output appends incrementally without clearing already displayed hydrated reasoning or assistant text, and a new external active turn keeps its user message bubble visible even when live-state omitted the active turn items and the latest text page is a small tail page.
 - Selected active-thread text deltas trigger a dedicated newest-text refresh immediately; generic notification debounce remains reserved for list/runtime/background reconciliation.
 - Selected external running threads use a fast lightweight live-projection check of about 150 ms while visible; the heavier active-turn text page is fetched only when the projection key changes.
-- Running live-state payloads do not include the active turn's full item history; the selected text page endpoint supplies only the missing newest tail.
+- Running live-state payloads do not include the active turn's full item history; the selected text page endpoint supplies the turn-start user anchor plus only the missing newest tail.
 - Multiple visible windows on the same origin and selected thread share identical active-text page requests through `BroadcastChannel('codex-mobile-thread-sync')`; same-thread backend read cost is close to one visible window, while different selected running threads still poll independently.
 - A hidden, closed, or stale leader window does not block a visible follower from taking over selected active-text sync.
 - Selected external live projection is not serialized behind a sidebar runtime batch: the selected thread gets an isolated first runtime probe, and live-state can reuse a short-lived running runtime observation or a fresh writer snapshot instead of starting another slow inspect.
@@ -51,11 +60,19 @@ Mobile sidebar and conversation loading use metadata-only sidebar pages, active-
 - After a service restart, known-key live-state and active-turn text paging can rediscover the local rollout path from `CODEX_HOME/sessions` by thread id, avoiding a cold `thread/read` before realtime resumes.
 - Selected current-turn completion notifications cancel pending external projection polls and refresh the final detail immediately.
 - Known-thread notifications drive targeted message/runtime refreshes; full thread-list refresh happens only for unknown or structural list changes.
+- Selected direct-route or older-page threads are not dependent on the loaded sidebar page for live sync: runtime polling and runtime notifications still promote them to external ownership and active text-page hydration still appends new output.
+- Manual refresh does not depend on the active turn being present in the newest history page: external runtime metadata marks the omitted active turn as partial, causing immediate active text-page hydration.
+- If the active turn is present in the newest history page, that turn is still returned as an empty partial shell instead of a stale bulk item window, so visible active text always comes from the newest text-page tail.
 - Runtime-state polling stays bounded to the selected, visible/actionable, and recently running set.
 - Read sidebar rows do not regain blue unread dots from metadata-only timestamp refreshes.
 - A selected long thread that was previously showing a truncated terminal/live window repairs itself after the compressed projection changes; existing output stays visible and the newest tail appears.
 - Historical reasoning remains hidden, running-last-turn reasoning body remains visible, and title-only reasoning statuses are filtered.
-- Response actions are anchored to final assistant body text only; retained commentary/progress rows do not expose `Copy` or `Fork`.
+- Response actions and completion time are anchored to final assistant body text only, including `final_answer` phase payloads; retained commentary/progress rows do not expose `Copy` or `Fork`.
+- Refreshing an externally owned running thread does not leave the mobile composer read-only: text input, new-message submit, and Stop stay available.
+- If a refreshed selected thread inherits a stale local-running lease, runtime discovery promotes it to external ownership unless a real local mobile submission is still pending, and the active text tail resumes without a page-wide reload.
+- Mobile submissions during external ownership honor the selected Queue/Steer mode for plain text: Queue stays append-only queued, Steer sends through the explicit external steer path, and unsupported attachment/skill steers are sanitized into text-only queued messages.
+- Mobile Stop can target the external active turn id, and the follow-up refresh does not clear or overwrite visible transcript history.
+- Existing queued-message mutation controls stay disabled while an external writer owns the thread.
 - The behavior is readable and stable in light and dark themes.
 
 #### Rollback/Cleanup

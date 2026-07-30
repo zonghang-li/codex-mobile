@@ -977,9 +977,9 @@
           <template v-else>
             <div class="content-grid">
               <ReviewPane
-                v-if="isReviewPaneOpen && selectedThreadId && composerCwd"
+                v-if="isReviewPaneOpen && selectedThreadId && threadGitCwd"
                 :thread-id="selectedThreadId"
-                :cwd="composerCwd"
+                :cwd="threadGitCwd"
                 :is-thread-in-progress="isSelectedThreadInProgress"
                 :initial-file-path="reviewInitialFilePath"
                 :commit-sha="reviewInitialCommitSha"
@@ -1011,6 +1011,7 @@
                   <QueuedMessages
                     :messages="selectedThreadQueuedMessages"
                     :disabled="selectedThreadRuntimeOwnership === 'external'"
+                    :steer-disabled-message-ids="selectedThreadQueuedSteerDisabledMessageIds"
                     @edit="onEditQueuedMessage"
                     @steer="steerQueuedMessage"
                     @delete="removeQueuedMessage"
@@ -1020,6 +1021,7 @@
                     :thread-id="selectedThreadId"
                     :goal="selectedThreadGoal"
                     :goal-supported="selectedThreadGoalSupported"
+                    :read-only="selectedThreadRuntimeOwnership === 'external'"
                     :is-updating-goal="isUpdatingThreadGoal"
                     @set-goal="updateSelectedThreadGoal"
                     @clear-goal="clearSelectedThreadGoal"
@@ -1051,6 +1053,7 @@
                     :thread-token-usage="selectedThreadTokenUsage"
                     :codex-quota="codexQuota"
                     :is-turn-in-progress="isSelectedThreadInProgress"
+                    :can-interrupt-turn="selectedThreadCanInterrupt"
                     :is-stop-pending="isSelectedThreadInterruptPending"
                     :is-interrupting-turn="isInterruptingTurn"
                     :runtime-ownership="selectedThreadRuntimeOwnership"
@@ -1447,6 +1450,8 @@ const {
   isPendingNewThreadStop,
   isSelectedThreadInterruptPending,
   selectedThreadRuntimeOwnership,
+  selectedThreadCanInterrupt,
+  selectedThreadRuntimeCwd,
   isUpdatingSpeedMode,
   isUpdatingThreadGoal,
   error: desktopError,
@@ -1592,6 +1597,7 @@ const threadCommitFilesLoadingFor = ref('')
 const threadCommitFilesError = ref('')
 const isLoadingThreadBranches = ref(false)
 const isSwitchingThreadBranch = ref(false)
+const failedRuntimeGitCwd = ref('')
 
 function toThreadBranchCommitsKey(branch: string, includeResetHistory: boolean): string {
   return `${branch}\u0000${includeResetHistory ? 'with-reset-history' : 'without-reset-history'}`
@@ -1772,6 +1778,15 @@ const composerCwd = computed(() => {
   if (isHomeRoute.value) return newThreadCwd.value.trim()
   return selectedThread.value?.cwd?.trim() ?? ''
 })
+const threadGitCwd = computed(() => {
+  if (!isHomeRoute.value) {
+    const runtimeCwd = selectedThreadRuntimeCwd.value.trim()
+    return runtimeCwd && runtimeCwd !== failedRuntimeGitCwd.value
+      ? runtimeCwd
+      : composerCwd.value.trim()
+  }
+  return composerCwd.value.trim()
+})
 const canShowContentHeaderBranchDropdown = computed(() => (
   (route.name === 'thread' && selectedThreadId.value.length > 0) ||
   (isHomeRoute.value && isNewThreadCwdGitRepo.value)
@@ -1784,6 +1799,12 @@ const isVirtualKeyboardOpen = computed(() => {
 const directoryCwd = computed(() => selectedThread.value?.cwd?.trim() ?? newThreadCwd.value.trim())
 const isSelectedThreadInProgress = computed(() => !isHomeRoute.value && selectedThread.value?.inProgress === true)
 const hasSidebarAttentionIndicator = computed(() => hasSidebarAttention(projectGroups.value))
+const selectedThreadQueuedSteerDisabledMessageIds = computed(() => {
+  if (selectedThreadRuntimeOwnership.value !== 'external') return []
+  return selectedThreadQueuedMessages.value
+    .filter((message) => message.imageUrls.length > 0 || message.skills.length > 0 || message.fileAttachments.length > 0)
+    .map((message) => message.id)
+})
 const showThreadContextBadge = computed(() => !isHomeRoute.value && !isSkillsRoute.value && !isAutomationsRoute.value && selectedThreadId.value.trim().length > 0)
 const isAccountSwitchBlocked = computed(() =>
   isSendingMessage.value ||
@@ -3209,7 +3230,7 @@ function onSelectNewWorktreeBranch(branch: string): void {
 }
 
 function canLoadBranchStateForCwd(cwd: string): boolean {
-  const currentCwd = composerCwd.value.trim()
+  const currentCwd = threadGitCwd.value.trim()
   if (!cwd || currentCwd !== cwd) return false
   return route.name === 'thread' || (route.name === 'home' && isNewThreadCwdGitRepo.value)
 }
@@ -3258,7 +3279,7 @@ function loadThreadWorktreeChangeSummary(cwd: string): void {
     })
 }
 
-async function loadThreadBranches(cwd: string): Promise<void> {
+async function loadThreadBranches(cwd: string, options: { fallbackCwd?: string } = {}): Promise<void> {
   const targetCwd = cwd.trim()
   if (!targetCwd) {
     resetThreadBranchState()
@@ -3277,11 +3298,18 @@ async function loadThreadBranches(cwd: string): Promise<void> {
     currentThreadHeadDate.value = state.headDate
     isThreadDetachedHead.value = state.detached
     isThreadWorktreeDirty.value = state.dirty
+    if (failedRuntimeGitCwd.value === targetCwd) failedRuntimeGitCwd.value = ''
     loadThreadWorktreeChangeSummary(targetCwd)
     const defaultBranchForCommits = state.currentBranch?.trim() || state.options[0]?.value?.trim() || ''
     if (defaultBranchForCommits) loadThreadBranchCommits({ branch: defaultBranchForCommits, includeResetHistory: true })
   } catch {
     if (requestId !== threadBranchesRequestId || !canLoadBranchStateForCwd(targetCwd)) return
+    const fallbackCwd = options.fallbackCwd?.trim() ?? ''
+    if (fallbackCwd && fallbackCwd !== targetCwd) {
+      failedRuntimeGitCwd.value = targetCwd
+      void loadThreadBranches(fallbackCwd)
+      return
+    }
     threadBranchOptions.value = []
     currentThreadBranch.value = null
     currentThreadHeadSha.value = null
@@ -3304,14 +3332,14 @@ function applyThreadGitState(state: { currentBranch: string | null; headSha: str
   currentThreadHeadDate.value = state.headDate
   isThreadDetachedHead.value = state.detached
   isThreadWorktreeDirty.value = state.dirty
-  loadThreadWorktreeChangeSummary(composerCwd.value)
+  loadThreadWorktreeChangeSummary(threadGitCwd.value)
 }
 
 function onCheckoutContentHeaderBranch(value: string): void {
   if (isSwitchingThreadBranch.value) return
   const targetBranch = value.trim()
   if (!targetBranch || targetBranch === (currentThreadBranch.value ?? '')) return
-  const cwd = composerCwd.value.trim()
+  const cwd = threadGitCwd.value.trim()
   if (!cwd) return
 
   isSwitchingThreadBranch.value = true
@@ -3341,7 +3369,7 @@ function onResetContentHeaderBranchToCommit(payload: { branch: string; sha: stri
   if (isSwitchingThreadBranch.value) return
   const targetBranch = payload.branch.trim()
   const targetSha = payload.sha.trim()
-  const cwd = composerCwd.value.trim()
+  const cwd = threadGitCwd.value.trim()
   if (!targetBranch || !targetSha || !cwd) return
   isSwitchingThreadBranch.value = true
   threadBranchError.value = ''
@@ -3365,7 +3393,7 @@ function onResetContentHeaderBranchToCommit(payload: { branch: string; sha: stri
 function loadThreadBranchCommits(payload: string | { branch: string; includeResetHistory?: boolean }): void {
   const targetBranch = (typeof payload === 'string' ? payload : payload.branch).trim()
   const includeResetHistory = typeof payload === 'string' ? true : payload.includeResetHistory !== false
-  const cwd = composerCwd.value.trim()
+  const cwd = threadGitCwd.value.trim()
   const cacheKey = toThreadBranchCommitsKey(targetBranch, includeResetHistory)
   if (!targetBranch || !cwd || threadBranchCommitsLoadingFor.value === cacheKey) return
   threadBranchCommitsError.value = ''
@@ -3393,7 +3421,7 @@ function loadThreadBranchCommits(payload: string | { branch: string; includeRese
 
 function loadThreadCommitFiles(sha: string): void {
   const targetSha = sha.trim()
-  const cwd = composerCwd.value.trim()
+  const cwd = threadGitCwd.value.trim()
   if (!targetSha || !cwd || threadCommitFilesLoadingFor.value === targetSha) return
   threadCommitFilesError.value = ''
   if (threadCommitFilesBySha.value[targetSha]) return
@@ -4548,11 +4576,12 @@ watch(
   () => selectedThreadId.value,
   () => {
     worktreeInitStatus.value = { phase: 'idle', title: '', message: '' }
+    failedRuntimeGitCwd.value = ''
   },
 )
 
 watch(
-  () => [route.name, composerCwd.value, isNewThreadCwdGitRepo.value] as const,
+  () => [route.name, threadGitCwd.value, isNewThreadCwdGitRepo.value] as const,
   ([routeName, cwd, isNewThreadGitRepo]) => {
     const shouldLoadBranches = routeName === 'thread' || (routeName === 'home' && isNewThreadGitRepo)
     if (!shouldLoadBranches) {
@@ -4563,7 +4592,7 @@ watch(
     threadBranchCommitsByBranch.value = {}
     threadBranchCommitsLoadingFor.value = ''
     threadBranchCommitsError.value = ''
-    void loadThreadBranches(cwd)
+    void loadThreadBranches(cwd, { fallbackCwd: composerCwd.value })
   },
   { immediate: true },
 )

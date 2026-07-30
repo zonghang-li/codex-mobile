@@ -22,12 +22,18 @@ describe('mobile conversation message actions', () => {
     expect(appSource).not.toContain('function onRollback(')
   })
 
-  it('always submits new running-turn input to the queue', () => {
+  it('submits running-turn input with the configured queue or steer mode', () => {
     expect(composerSource).toContain(
-      "props.isTurnInProgress ? 'queue' : 'steer'",
+      "props.isTurnInProgress ? props.inProgressSubmitMode ?? 'queue' : 'steer'",
     )
     expect(composerSource).not.toContain(
       "onSubmit(isTurnInProgress ? activeInProgressMode : 'steer')",
     )
+  })
+
+  it('shows turn errors without a feedback action in the conversation stream', () => {
+    expect(conversationSource).not.toContain('turn-error-feedback')
+    expect(conversationSource).not.toContain('prepareTurnErrorFeedback')
+    expect(conversationSource).not.toContain('Send feedback')
   })
 })

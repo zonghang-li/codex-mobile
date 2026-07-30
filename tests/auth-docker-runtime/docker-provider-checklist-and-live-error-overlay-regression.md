@@ -15,9 +15,9 @@ Docker provider/auth checklist execution and live error overlay de-duplication.
 #### Steps
 1. In light theme, open the no-auth container, confirm the composer starts on `big-pickle`, send `hi`, and wait for an assistant reply.
 2. Switch the Settings provider selector to OpenRouter, send `hi` again, and wait for a reply or provider-scoped response.
-3. Open the invalid-auth container, send `hi`, wait for the final 401/auth error, and confirm `Send feedback` is visible.
+3. Open the invalid-auth container, send `hi`, wait for the final 401/auth error, and confirm the persisted chat error has no inline `Send feedback` action.
 4. Reload the invalid-auth thread and confirm the persisted error remains without a duplicate live `Thinking` error overlay.
-5. Switch the invalid-auth thread to dark theme and confirm the persisted error and feedback button remain readable.
+5. Switch the invalid-auth thread to dark theme and confirm the persisted error remains readable without an inline feedback button.
 6. Open the malformed-auth container, confirm it falls back to `big-pickle`, send `hi`, and wait for an assistant reply.
 
 #### Expected Results
@@ -26,7 +26,7 @@ Docker provider/auth checklist execution and live error overlay de-duplication.
 - Provider switching is scoped to the selected provider and does not require changing the model dropdown directly.
 - Invalid/expired auth stays on the Codex provider path and renders the final auth failure as a persisted chat error.
 - A new live error is still visible when an older persisted turn error exists, but the same live error is suppressed after that exact error has persisted.
-- Feedback mailto diagnostics include recent diagnostics, visible page text, and the visible auth error.
+- Persisted chat errors stay text-only; feedback mailto diagnostics remain available from supported non-conversation error surfaces.
 - Malformed auth is treated as unusable auth and falls back to Zen.
 
 #### Rollback/Cleanup

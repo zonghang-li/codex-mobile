@@ -2,10 +2,11 @@ export type ExternalThreadRuntime =
   | {
       state: 'running'
       turnId: string
-      interruptible: false
+      interruptible: boolean
       source: 'external-session-writer'
+      cwd?: string
     }
-  | { state: 'idle' }
+  | { state: 'idle'; cwd?: string }
   | { state: 'unknown' }
 
 export type LocalAppServerRunningRuntime = {
@@ -27,4 +28,5 @@ export type ThreadDetailRuntime = {
   ownership: ThreadRuntimeOwnership
   canInterrupt: boolean
   externalRuntimeState: ExternalThreadRuntime['state']
+  runtimeCwd?: string
 }

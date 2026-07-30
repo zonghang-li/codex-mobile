@@ -75,6 +75,17 @@ function userMessageWithoutId(text: string): Record<string, unknown> {
   }
 }
 
+function userMessageEvent(text: string, clientId: string): Record<string, unknown> {
+  return {
+    type: 'event_msg',
+    payload: {
+      type: 'user_message',
+      client_id: clientId,
+      message: text,
+    },
+  }
+}
+
 function functionCall(
   name: string,
   argumentsJson: string,
@@ -125,6 +136,94 @@ describe('readThreadTextPage', () => {
     ])
   })
 
+  it('does not project internal subagent notifications as user messages', async () => {
+    const sessionPath = await writeRollout([
+      event('task_started', { turn_id: 'turn-active' }),
+      userMessage('<subagent_notification>\n{"status":{"completed":"hidden internal result"}}', 'subagent-note'),
+      assistant('Visible update after subagent result', 'agent-1'),
+    ])
+
+    const result = await readThreadTextPage({
+      sessionPath,
+      threadId: 'thread-1',
+      turnId: 'turn-active',
+    })
+
+    expect(result.items.map((item) => ({ id: item.id, type: item.type, text: item.text }))).toEqual([
+      { id: 'agent-1', type: 'agentMessage', text: 'Visible update after subagent result' },
+    ])
+  })
+
+  it('projects delegated handoff envelopes as collapsed-capable active-turn user messages', async () => {
+    const sessionPath = await writeRollout([
+      event('task_started', { turn_id: 'turn-active' }),
+      userMessage('<codex_delegation>\n<input>visible handoff</input>\n</codex_delegation>', 'handoff-note'),
+      assistant('Visible update after handoff', 'agent-1'),
+    ])
+
+    const result = await readThreadTextPage({
+      sessionPath,
+      threadId: 'thread-1',
+      turnId: 'turn-active',
+    })
+
+    expect(result.items.map((item) => ({ id: item.id, type: item.type, text: item.text }))).toEqual([
+      {
+        id: 'handoff-note',
+        type: 'userMessage',
+        text: '<codex_delegation>\n<input>visible handoff</input>\n</codex_delegation>',
+      },
+      { id: 'agent-1', type: 'agentMessage', text: 'Visible update after handoff' },
+    ])
+    expect(JSON.stringify(result)).toContain('codex_delegation')
+    expect(JSON.stringify(result)).toContain('visible handoff')
+  })
+
+  it('decodes escaped delegated handoff envelopes before returning user message text', async () => {
+    const escaped = [
+      '&lt;codex_delegation&gt;',
+      '&lt;source_thread_id&gt;old-thread&lt;/source_thread_id&gt;',
+      '&lt;input&gt;PLAN02A_RESUME',
+      'Task2 is superseded where it conflicts...&lt;/input&gt;',
+      '&lt;/codex_delegation&gt;',
+    ].join('\n')
+
+    const sessionPath = await writeRollout([
+      event('task_started', { turn_id: 'turn-active' }),
+      userMessage(escaped, 'handoff-note'),
+      assistant('Visible update after handoff', 'agent-1'),
+    ])
+
+    const result = await readThreadTextPage({
+      sessionPath,
+      threadId: 'thread-1',
+      turnId: 'turn-active',
+    })
+
+    expect(result.items[0]).toMatchObject({
+      id: 'handoff-note',
+      type: 'userMessage',
+      text: [
+        '<codex_delegation>',
+        '<source_thread_id>old-thread</source_thread_id>',
+        '<input>PLAN02A_RESUME',
+        'Task2 is superseded where it conflicts...</input>',
+        '</codex_delegation>',
+      ].join('\n'),
+      content: [{
+        type: 'input_text',
+        text: [
+          '<codex_delegation>',
+          '<source_thread_id>old-thread</source_thread_id>',
+          '<input>PLAN02A_RESUME',
+          'Task2 is superseded where it conflicts...</input>',
+          '</codex_delegation>',
+        ].join('\n'),
+      }],
+    })
+    expect(JSON.stringify(result)).not.toContain('&lt;codex_delegation')
+  })
+
   it('drops empty and title-only response reasoning records from active-turn text pages', async () => {
     const sessionPath = await writeRollout([
       event('task_started', { turn_id: 'turn-active' }),
@@ -143,6 +242,13 @@ describe('readThreadTextPage', () => {
       reasoning('Defining serialization fields for layer counts', 'reason-title-3'),
       reasoning('Comparing current and expected transaction shape', 'reason-title-4'),
       reasoning('Existing tests', 'reason-title-5'),
+      reasoning('**Planning topology.cpp synchronization and testing**', 'reason-title-6'),
+      reasoning('**Planning**', 'reason-title-7'),
+      reasoning('Verifying std::array initialization and constexpr usage', 'reason-title-8'),
+      reasoning('Planning ...', 'reason-title-ellipsis-1'),
+      reasoning('Updating ...', 'reason-title-ellipsis-2'),
+      reasoning('Inspecting ...', 'reason-title-ellipsis-3'),
+      reasoning('Reviewing ...', 'reason-title-ellipsis-4'),
       reasoning('Visible summary', 'reason-visible'),
     ])
 
@@ -194,9 +300,47 @@ describe('readThreadTextPage', () => {
       limit: 2,
     })
 
-    expect(second.items.map((item) => item.id)).toEqual(['reason-1', 'agent-1'])
-    expect(second.hasMoreOlder).toBe(false)
-    expect(second.nextOlderCursor).toBeNull()
+    expect(second.items.map((item) => item.type)).toEqual(['agentMessage', 'contextCompaction'])
+    expect(second.items.map((item) => item.id)).toEqual([
+      'agent-1',
+      expect.stringMatching(/^rollout:contextCompaction:\d+$/u),
+    ])
+    expect(second.items[1]?.text).toBe('Context automatically compacted')
+    expect(second.hasMoreOlder).toBe(true)
+    expect(second.nextOlderCursor).toEqual(expect.any(String))
+
+    const third = await readThreadTextPage({
+      sessionPath,
+      threadId: 'thread-1',
+      turnId: 'turn-active',
+      cursor: second.nextOlderCursor!,
+      limit: 2,
+    })
+
+    expect(third.items.map((item) => item.id)).toEqual(['reason-1'])
+    expect(third.hasMoreOlder).toBe(false)
+    expect(third.nextOlderCursor).toBeNull()
+  })
+
+  it('projects completed context compaction events as visible status rows', async () => {
+    const sessionPath = await writeRollout([
+      event('task_started', { turn_id: 'turn-active' }),
+      event('context_compacted', {}),
+    ])
+
+    const result = await readThreadTextPage({
+      sessionPath,
+      threadId: 'thread-1',
+      turnId: 'turn-active',
+      limit: 5,
+    })
+
+    expect(result.items).toMatchObject([{
+      id: expect.stringMatching(/^rollout:contextCompaction:\d+$/u),
+      type: 'contextCompaction',
+      text: 'Context automatically compacted',
+      sessionOrder: expect.any(Number),
+    }])
   })
 
   it('returns a not-modified active tail when the rollout tail signature is unchanged', async () => {
@@ -233,6 +377,22 @@ describe('readThreadTextPage', () => {
     })
   })
 
+  it('rejects an untrusted newest page after the requested turn is terminal', async () => {
+    const sessionPath = await writeRollout([
+      event('task_started', { turn_id: 'turn-active' }),
+      assistant('Final update', 'agent-final'),
+      event('task_complete', { turn_id: 'turn-active' }),
+    ])
+
+    await expect(readThreadTextPage({
+      sessionPath,
+      threadId: 'thread-1',
+      turnId: 'turn-active',
+    })).rejects.toMatchObject({
+      statusCode: 409,
+    })
+  })
+
   it('returns only assistant text appended after the last hydrated session order', async () => {
     const sessionPath = await writeRollout([
       event('task_started', { turn_id: 'turn-active' }),
@@ -262,6 +422,247 @@ describe('readThreadTextPage', () => {
       { id: 'agent-2', text: 'Second update' },
     ])
     expect(second.hasMoreOlder).toBe(false)
+    expect(second.tailSignature).not.toBe(first.tailSignature)
+  })
+
+  it('projects user message events before assistant deltas so mobile can show the input immediately', async () => {
+    const sessionPath = await writeRollout([
+      event('task_started', { turn_id: 'turn-active' }),
+      assistant('First update', 'agent-1'),
+    ])
+    const first = await readThreadTextPage({
+      sessionPath,
+      threadId: 'thread-1',
+      turnId: 'turn-active',
+      limit: 20,
+    })
+    const newestSessionOrder = Math.max(...first.items.map((item) => item.sessionOrder))
+
+    await appendFile(
+      sessionPath,
+      [
+        JSON.stringify(userMessageEvent('继续 Task2', 'client-steer-1')),
+        JSON.stringify(assistant('收到，继续 Task2', 'agent-2')),
+        '',
+      ].join('\n'),
+      'utf8',
+    )
+
+    const second = await readThreadTextPage({
+      sessionPath,
+      threadId: 'thread-1',
+      turnId: 'turn-active',
+      limit: 20,
+      afterSessionOrder: newestSessionOrder,
+      knownTailSignature: first.tailSignature,
+    })
+
+    expect(second.items.map((item) => ({ id: item.id, type: item.type, text: item.text }))).toEqual([
+      { id: 'rollout:userMessage:event:client-steer-1', type: 'userMessage', text: '继续 Task2' },
+      { id: 'agent-2', type: 'agentMessage', text: '收到，继续 Task2' },
+    ])
+  })
+
+  it('keeps recent user anchors in delta pages when the client already advanced past them', async () => {
+    const sessionPath = await writeRollout([
+      event('task_started', { turn_id: 'turn-active' }),
+      assistant('First update', 'agent-1'),
+      userMessageEvent('补充约束', 'client-steer-2'),
+      assistant('Response after steer', 'agent-2'),
+    ])
+    const all = await readThreadTextPage({
+      sessionPath,
+      threadId: 'thread-1',
+      turnId: 'turn-active',
+      limit: 20,
+    })
+    const newestSessionOrder = Math.max(...all.items.map((item) => item.sessionOrder))
+
+    const second = await readThreadTextPage({
+      sessionPath,
+      threadId: 'thread-1',
+      turnId: 'turn-active',
+      limit: 20,
+      afterSessionOrder: newestSessionOrder,
+      knownTailSignature: 'stale-tail-signature',
+    })
+
+    expect(second.notModified).toBeUndefined()
+    expect(second.items.map((item) => ({ id: item.id, type: item.type, text: item.text }))).toEqual([
+      { id: 'rollout:userMessage:event:client-steer-2', type: 'userMessage', text: '补充约束' },
+    ])
+  })
+
+  it('does not collapse repeated user inputs with the same text across assistant output', async () => {
+    const sessionPath = await writeRollout([
+      event('task_started', { turn_id: 'turn-active' }),
+      userMessageEvent('继续', 'client-steer-1'),
+      assistant('First response', 'agent-1'),
+      userMessage('继续', 'msg-steer-2'),
+      userMessageEvent('继续', 'client-steer-2'),
+      assistant('Second response', 'agent-2'),
+    ])
+
+    const result = await readThreadTextPage({
+      sessionPath,
+      threadId: 'thread-1',
+      turnId: 'turn-active',
+      limit: 20,
+    })
+
+    expect(result.items.map((item) => ({ id: item.id, type: item.type, text: item.text }))).toEqual([
+      { id: 'rollout:userMessage:event:client-steer-1', type: 'userMessage', text: '继续' },
+      { id: 'agent-1', type: 'agentMessage', text: 'First response' },
+      { id: 'msg-steer-2', type: 'userMessage', text: '继续' },
+      { id: 'agent-2', type: 'agentMessage', text: 'Second response' },
+    ])
+  })
+
+  it('reorders late delegated user events before the assistant response they trigger', async () => {
+    const sessionPath = await writeRollout([
+      event('task_started', { turn_id: 'turn-active' }),
+      assistant('收到。继续 Task2。', 'agent-after-steer'),
+      userMessageEvent(
+        '<codex_delegation>\n<input>TASK2_PLANNER_FINDING_2</input>\n</codex_delegation>',
+        'client-late-delegation',
+      ),
+    ])
+
+    const result = await readThreadTextPage({
+      sessionPath,
+      threadId: 'thread-1',
+      turnId: 'turn-active',
+      limit: 20,
+    })
+
+    expect(result.items.map((item) => ({ id: item.id, type: item.type, text: item.text }))).toEqual([
+      {
+        id: 'rollout:userMessage:event:client-late-delegation',
+        type: 'userMessage',
+        text: '<codex_delegation>\n<input>TASK2_PLANNER_FINDING_2</input>\n</codex_delegation>',
+      },
+      { id: 'agent-after-steer', type: 'agentMessage', text: '收到。继续 Task2。' },
+    ])
+  })
+
+  it('reorders wrapped late delegated user events before the assistant response they trigger', async () => {
+    const wrappedDelegation = [
+      'TASK2_PLANNER_FINDING_2 (apply before Task2 final stop; no history rewrite):',
+      '<codex_delegation>',
+      '<input>收到。继续 Task2。</input>',
+      '</codex_delegation>',
+    ].join('\n')
+    const sessionPath = await writeRollout([
+      event('task_started', { turn_id: 'turn-active' }),
+      assistant('收到。继续 Task2。', 'agent-after-steer'),
+      userMessageEvent(wrappedDelegation, 'client-late-wrapped-delegation'),
+    ])
+
+    const result = await readThreadTextPage({
+      sessionPath,
+      threadId: 'thread-1',
+      turnId: 'turn-active',
+      limit: 20,
+    })
+
+    expect(result.items.map((item) => ({ id: item.id, type: item.type, text: item.text }))).toEqual([
+      {
+        id: 'rollout:userMessage:event:client-late-wrapped-delegation',
+        type: 'userMessage',
+        text: wrappedDelegation,
+      },
+      { id: 'agent-after-steer', type: 'agentMessage', text: '收到。继续 Task2。' },
+    ])
+  })
+
+  it('does not reorder ordinary late event-sourced user messages ahead of existing output', async () => {
+    const lateUserInput = 'TASK2_PLANNER_FINDING_2 (apply before Task2 final stop; no history rewrite)'
+    const sessionPath = await writeRollout([
+      event('task_started', { turn_id: 'turn-active' }),
+      assistant('收到。继续 Task2。', 'agent-after-steer'),
+      userMessageEvent(lateUserInput, 'client-late-user-input'),
+    ])
+
+    const result = await readThreadTextPage({
+      sessionPath,
+      threadId: 'thread-1',
+      turnId: 'turn-active',
+      limit: 20,
+    })
+
+    expect(result.items.map((item) => ({ id: item.id, type: item.type, text: item.text }))).toEqual([
+      { id: 'agent-after-steer', type: 'agentMessage', text: '收到。继续 Task2。' },
+      {
+        id: 'rollout:userMessage:event:client-late-user-input',
+        type: 'userMessage',
+        text: lateUserInput,
+      },
+    ])
+  })
+
+  it('keeps multiple late delegated user events paired with their own response segment', async () => {
+    const firstDelegation = '<codex_delegation>\n<input>FIRST_STEER</input>\n</codex_delegation>'
+    const secondDelegation = '<codex_delegation>\n<input>SECOND_STEER</input>\n</codex_delegation>'
+    const sessionPath = await writeRollout([
+      event('task_started', { turn_id: 'turn-active' }),
+      assistant('First response', 'agent-first'),
+      userMessageEvent(firstDelegation, 'client-late-first'),
+      assistant('Second response', 'agent-second'),
+      userMessageEvent(secondDelegation, 'client-late-second'),
+    ])
+
+    const result = await readThreadTextPage({
+      sessionPath,
+      threadId: 'thread-1',
+      turnId: 'turn-active',
+      limit: 20,
+    })
+
+    expect(result.items.map((item) => ({ id: item.id, type: item.type, text: item.text }))).toEqual([
+      { id: 'rollout:userMessage:event:client-late-first', type: 'userMessage', text: firstDelegation },
+      { id: 'agent-first', type: 'agentMessage', text: 'First response' },
+      { id: 'rollout:userMessage:event:client-late-second', type: 'userMessage', text: secondDelegation },
+      { id: 'agent-second', type: 'agentMessage', text: 'Second response' },
+    ])
+  })
+
+  it('returns not-modified with a fresh tail signature when only filtered reasoning is appended', async () => {
+    const sessionPath = await writeRollout([
+      event('task_started', { turn_id: 'turn-active' }),
+      assistant('First update', 'agent-1'),
+    ])
+    const first = await readThreadTextPage({
+      sessionPath,
+      threadId: 'thread-1',
+      turnId: 'turn-active',
+      limit: 20,
+    })
+    const newestSessionOrder = Math.max(...first.items.map((item) => item.sessionOrder))
+
+    await appendFile(
+      sessionPath,
+      `${JSON.stringify(reasoning('Planning topology synchronization', 'reason-title'))}\n`,
+      'utf8',
+    )
+
+    const second = await readThreadTextPage({
+      sessionPath,
+      threadId: 'thread-1',
+      turnId: 'turn-active',
+      limit: 20,
+      afterSessionOrder: newestSessionOrder,
+      knownTailSignature: first.tailSignature,
+    })
+
+    expect(second).toMatchObject({
+      threadId: 'thread-1',
+      turnId: 'turn-active',
+      items: [],
+      nextOlderCursor: null,
+      hasMoreOlder: false,
+      notModified: true,
+    })
+    expect(second.tailSignature).toEqual(expect.any(String))
     expect(second.tailSignature).not.toBe(first.tailSignature)
   })
 
@@ -341,8 +742,92 @@ describe('readThreadTextPage', () => {
       { id: 'agent-after', type: 'agentMessage' },
     ])
     expect(result.items[1]).toMatchObject({
+      text: '继续',
       content: [{ type: 'input_text', text: '继续' }],
     })
+  })
+
+  it('includes the turn-start user message on a small active tail page', async () => {
+    const sessionPath = await writeRollout([
+      event('task_started', { turn_id: 'turn-active' }),
+      userMessage('设置 goal: 需要最终审核 0/0/0 通过', 'user-active'),
+      assistant('Older update', 'agent-older'),
+      assistant('Recent update', 'agent-recent'),
+      assistant('Latest update', 'agent-latest'),
+    ])
+
+    const result = await readThreadTextPage({
+      sessionPath,
+      threadId: 'thread-1',
+      turnId: 'turn-active',
+      limit: 2,
+    })
+
+    expect(result.items.map((item) => item.id)).toEqual([
+      'user-active',
+      'agent-recent',
+      'agent-latest',
+    ])
+    expect(result.items[0]).toMatchObject({
+      type: 'userMessage',
+      text: '设置 goal: 需要最终审核 0/0/0 通过',
+      content: [{ type: 'input_text', text: '设置 goal: 需要最终审核 0/0/0 通过' }],
+    })
+    expect(result.hasMoreOlder).toBe(true)
+  })
+
+  it('keeps the turn-start user anchor when the active tail contains a later steer user message', async () => {
+    const sessionPath = await writeRollout([
+      event('task_started', { turn_id: 'turn-active' }),
+      userMessage('start prompt', 'user-active'),
+      assistant('Older update', 'agent-older'),
+      userMessage('later steer', 'user-steer'),
+      assistant('Latest update', 'agent-latest'),
+    ])
+
+    const result = await readThreadTextPage({
+      sessionPath,
+      threadId: 'thread-1',
+      turnId: 'turn-active',
+      limit: 2,
+    })
+
+    expect(result.items.map((item) => item.id)).toEqual([
+      'user-active',
+      'user-steer',
+      'agent-latest',
+    ])
+    expect(result.items[0]).toMatchObject({
+      type: 'userMessage',
+      text: 'start prompt',
+      content: [{ type: 'input_text', text: 'start prompt' }],
+    })
+    expect(result.hasMoreOlder).toBe(true)
+  })
+
+  it('can skip the turn-start user anchor for internal active tail probes', async () => {
+    const sessionPath = await writeRollout([
+      event('task_started', { turn_id: 'turn-active' }),
+      userMessage('设置 goal: 需要最终审核 0/0/0 通过', 'user-active'),
+      assistant('Older update', 'agent-older'),
+      assistant('Recent update', 'agent-recent'),
+      assistant('Latest update', 'agent-latest'),
+    ])
+
+    const result = await readThreadTextPage({
+      sessionPath,
+      threadId: 'thread-1',
+      turnId: 'turn-active',
+      limit: 2,
+    }, {
+      includeTurnStartUserAnchor: false,
+    })
+
+    expect(result.items.map((item) => item.id)).toEqual([
+      'agent-recent',
+      'agent-latest',
+    ])
+    expect(result.hasMoreOlder).toBe(true)
   })
 
   it('projects visible user messages without ids while dropping injected user context', async () => {

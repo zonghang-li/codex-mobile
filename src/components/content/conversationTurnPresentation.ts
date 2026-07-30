@@ -93,7 +93,7 @@ function explicitTurnKey(message: UiMessage): string {
 
 function isFinalPhaseMessage(message: UiMessage): boolean {
   const phase = message.phase?.trim().toLowerCase() ?? ''
-  return !phase || phase === 'final'
+  return !phase || phase === 'final' || phase === 'final_answer'
 }
 
 function isFinalAssistantResponse(message: UiMessage): boolean {
@@ -201,15 +201,24 @@ function normalizePotentialReasoningStatusTitle(text: string): string {
     .trim()
 }
 
+function hasReasoningSentencePunctuation(text: string): boolean {
+  const withoutScopeSeparators = text.replace(/::/gu, '')
+  const withoutTerminalEllipsis = withoutScopeSeparators.replace(/\s*(?:\.{3,}|…)\s*$/u, '')
+  return /[。！？!?:；;，,]/u.test(withoutTerminalEllipsis) || /\.$/u.test(withoutTerminalEllipsis)
+}
+
 function isTitleOnlyReasoningStatusText(value: string): boolean {
   const text = normalizePotentialReasoningStatusTitle(value)
   if (!text || text.length > 128) return false
   if (/[\p{Script=Han}]/u.test(text)) return false
   if (TITLE_ONLY_REASONING_EXACT_TEXTS.has(text)) return true
-  if (TITLE_ONLY_REASONING_PREFIXES.some((prefix) => text.startsWith(`${prefix} `))) {
+  if (
+    !hasReasoningSentencePunctuation(text)
+    && TITLE_ONLY_REASONING_PREFIXES.some((prefix) => text === prefix || text.startsWith(`${prefix} `))
+  ) {
     return true
   }
-  if (/[。！？.!?:；;，,]/u.test(text)) return false
+  if (hasReasoningSentencePunctuation(text)) return false
   if (/^(?:I|I'm|I'll|I’ll|We|The|This|That|It|They|There)\b/u.test(text)) {
     return false
   }

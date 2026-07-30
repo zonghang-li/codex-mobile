@@ -65,6 +65,7 @@ import type {
   ExternalThreadRuntime,
   ThreadDetailRuntime,
   ThreadRuntimeObservation,
+  ThreadRuntimeOwnership,
 } from '../types/threadRuntime'
 
 type CurrentModelConfig = {
@@ -559,24 +560,37 @@ function hasOnlyKeys(record: Record<string, unknown>, keys: string[]): boolean {
   return recordKeys.length === keys.length && keys.every((key) => recordKeys.includes(key))
 }
 
+function hasNoKeysOutside(record: Record<string, unknown>, keys: string[]): boolean {
+  const allowed = new Set(keys)
+  return Object.keys(record).every((key) => allowed.has(key))
+}
+
 function parseExternalThreadRuntime(value: unknown): ExternalThreadRuntime {
   const runtime = asRecord(value)
   if (!runtime || typeof runtime.state !== 'string') return { state: 'unknown' }
-  if (runtime.state === 'idle' && hasOnlyKeys(runtime, ['state'])) return { state: 'idle' }
+  if (runtime.state === 'idle' && hasNoKeysOutside(runtime, ['state', 'cwd'])) {
+    const cwd = readString(runtime.cwd)?.trim() ?? ''
+    return {
+      state: 'idle',
+      ...(cwd ? { cwd: normalizePathForUi(cwd) } : {}),
+    }
+  }
   if (runtime.state === 'unknown' && hasOnlyKeys(runtime, ['state'])) return { state: 'unknown' }
   if (
     runtime.state === 'running'
-    && hasOnlyKeys(runtime, ['state', 'turnId', 'interruptible', 'source'])
+    && hasNoKeysOutside(runtime, ['state', 'turnId', 'interruptible', 'source', 'cwd'])
     && typeof runtime.turnId === 'string'
     && runtime.turnId.trim().length > 0
-    && runtime.interruptible === false
+    && typeof runtime.interruptible === 'boolean'
     && runtime.source === 'external-session-writer'
   ) {
+    const cwd = readString(runtime.cwd)?.trim() ?? ''
     return {
       state: 'running',
       turnId: runtime.turnId.trim(),
-      interruptible: false,
+      interruptible: runtime.interruptible,
       source: 'external-session-writer',
+      ...(cwd ? { cwd: normalizePathForUi(cwd) } : {}),
     }
   }
   return { state: 'unknown' }
@@ -610,28 +624,35 @@ function unknownRuntimeMap(threadIds: readonly string[]): Record<string, ThreadR
   return Object.fromEntries(threadIds.map((threadId) => [threadId, { state: 'unknown' }]))
 }
 
-function readExternalRuntime(payload: ThreadReadResponse): ExternalThreadRuntime {
-  return parseExternalThreadRuntime(asRecord(payload.thread)?.externalRuntime)
+function readThreadRuntimeObservation(payload: ThreadReadResponse): ThreadRuntimeObservation {
+  return parseThreadRuntimeObservation(asRecord(payload.thread)?.externalRuntime)
 }
 
 export function readThreadDetailRuntime(payload: ThreadReadResponse): ThreadDetailRuntime {
-  const external = readExternalRuntime(payload)
-  if (external.state === 'running') {
+  const runtime = readThreadRuntimeObservation(payload)
+  if (runtime.state === 'running') {
+    const isLocal = runtime.source === 'local-app-server'
     return {
       inProgress: true,
-      activeTurnId: external.turnId,
-      ownership: 'external',
-      canInterrupt: false,
-      externalRuntimeState: external.state,
+      activeTurnId: runtime.turnId,
+      ownership: isLocal ? 'local' : 'external',
+      canInterrupt: runtime.interruptible === true,
+      externalRuntimeState: runtime.state,
+      ...(runtime.source === 'external-session-writer' && runtime.cwd ? { runtimeCwd: runtime.cwd } : {}),
     }
   }
   if (readThreadInProgressFromResponse(payload)) {
+    const activeTurnId = readActiveTurnIdFromResponse(payload)
+    const idleProbeHasOnlyRecoveredActiveShell =
+      runtime.state === 'idle' &&
+      isRecoveredActiveTurn(Array.isArray(payload.thread.turns) ? payload.thread.turns : [], activeTurnId)
+    const shouldTreatAsLocal = runtime.state === 'idle' && !idleProbeHasOnlyRecoveredActiveShell
     return {
       inProgress: true,
-      activeTurnId: readActiveTurnIdFromResponse(payload),
-      ownership: external.state === 'idle' ? 'local' : 'external',
-      canInterrupt: external.state === 'idle',
-      externalRuntimeState: external.state,
+      activeTurnId,
+      ownership: shouldTreatAsLocal ? 'local' : 'external',
+      canInterrupt: shouldTreatAsLocal,
+      externalRuntimeState: runtime.state,
     }
   }
   return {
@@ -639,19 +660,20 @@ export function readThreadDetailRuntime(payload: ThreadReadResponse): ThreadDeta
     activeTurnId: '',
     ownership: 'idle',
     canInterrupt: false,
-    externalRuntimeState: external.state,
+    externalRuntimeState: runtime.state,
+    ...(runtime.state === 'idle' && runtime.cwd ? { runtimeCwd: runtime.cwd } : {}),
   }
 }
 
 export async function getThreadRuntimeState(
   threadId: string,
   signal?: AbortSignal,
-): Promise<ExternalThreadRuntime> {
+): Promise<ThreadRuntimeObservation> {
   const params = new URLSearchParams({ threadId })
   try {
     const response = await fetch(`/codex-api/thread-runtime-state?${params.toString()}`, { signal })
     if (!response.ok) return { state: 'unknown' }
-    return parseExternalThreadRuntime(await response.json())
+    return parseThreadRuntimeObservation(await response.json())
   } catch {
     return { state: 'unknown' }
   }
@@ -952,12 +974,38 @@ function hasRawItemCompression(rawTurn: unknown): boolean {
     && compression.omittedItemCount > 0
 }
 
+function isLocalRolloutRecoveredTurn(rawTurn: unknown): boolean {
+  return asRecord(rawTurn)?.codexMobileRecoveredTurn === true
+}
+
 function isCompressedActiveTurn(rawTurns: readonly unknown[], activeTurnId: string): boolean {
   if (activeTurnId) {
     const activeTurn = rawTurns.find((turn) => readString(asRecord(turn)?.id) === activeTurnId)
     return hasRawItemCompression(activeTurn)
   }
   return rawTurns.some((turn) => hasRawItemCompression(turn))
+}
+
+function isRecoveredActiveTurn(rawTurns: readonly unknown[], activeTurnId: string): boolean {
+  if (activeTurnId) {
+    const activeTurn = rawTurns.find((turn) => readString(asRecord(turn)?.id) === activeTurnId)
+    return isLocalRolloutRecoveredTurn(activeTurn)
+  }
+  return rawTurns.some((turn) => isLocalRolloutRecoveredTurn(turn))
+}
+
+function hasTurn(rawTurns: readonly unknown[], turnId: string): boolean {
+  return rawTurns.some((turn) => readString(asRecord(turn)?.id) === turnId)
+}
+
+function isPartialActiveTurnProjection(
+  rawTurns: readonly unknown[],
+  runtime: ThreadDetailRuntime,
+): boolean {
+  if (isCompressedActiveTurn(rawTurns, runtime.activeTurnId)) return true
+  return runtime.inProgress === true &&
+    runtime.activeTurnId.length > 0 &&
+    !hasTurn(rawTurns, runtime.activeTurnId)
 }
 
 async function getThreadDetailV2(
@@ -980,16 +1028,21 @@ async function getThreadDetailV2(
   ownership: ThreadDetailRuntime['ownership']
   canInterrupt: boolean
   externalRuntimeState: ThreadDetailRuntime['externalRuntimeState']
+  runtimeCwd?: string
 }> {
-  const metadataPromise = callRpc<ThreadReadResponse>('thread/read', {
+  const metadata = await callRpc<ThreadReadResponse>('thread/read', {
     threadId,
     includeTurns: false,
   }, signal)
   try {
-    const [metadata, page] = await Promise.all([
-      metadataPromise,
-      getThreadTurnPageV2(threadId, null, 3, signal),
-    ])
+    const metadataRuntime = readThreadDetailRuntime(metadata)
+    const page = await getThreadTurnPageV2(
+      threadId,
+      null,
+      3,
+      signal,
+      metadataRuntime.inProgress ? metadataRuntime.activeTurnId : '',
+    )
     if (
       page.rawTurns.length === 0
       && page.messages.length === 0
@@ -1019,7 +1072,7 @@ async function getThreadDetailV2(
     const runtime = readThreadDetailRuntime(payload)
     return {
       isPagedProjection: true,
-      isPartialTurnProjection: isCompressedActiveTurn(page.rawTurns, runtime.activeTurnId),
+      isPartialTurnProjection: isPartialActiveTurnProjection(page.rawTurns, runtime),
       model: normalizeThreadModelFromPayload(metadata),
       modelProvider: normalizeThreadModelProviderFromPayload(metadata),
       reasoningEffort: normalizeThreadReasoningEffortFromPayload(metadata),
@@ -1073,6 +1126,7 @@ async function getExternalThreadLiveStateSnapshotV2(
   ownership: ThreadDetailRuntime['ownership']
   canInterrupt: boolean
   externalRuntimeState: ThreadDetailRuntime['externalRuntimeState']
+  runtimeCwd?: string
   liveAuthority: UiThreadLiveAuthority
   liveSnapshot: UiThreadLiveSnapshot | null
 }> {
@@ -1101,7 +1155,7 @@ async function getExternalThreadLiveStateSnapshotV2(
   } as unknown as ThreadReadResponse
   const normalized = normalizeThreadMessagesV2(result, threadTurnStartIndex)
   const runtime = readThreadDetailRuntime(result)
-  const isPartialTurnProjection = isCompressedActiveTurn(turns, runtime.activeTurnId)
+  const isPartialTurnProjection = isPartialActiveTurnProjection(turns, runtime)
   const rawAuthority = readLiveAuthority(payload?.liveAuthority)
   const rawSnapshot = readLiveSnapshot(payload?.liveSnapshot)
   const liveAuthority = rawAuthority === 'writer-snapshot' && rawSnapshot
@@ -1137,9 +1191,11 @@ async function getThreadTurnPageV2(
   cursor: string | null,
   limit: number,
   signal?: AbortSignal,
+  activeTurnId = '',
 ): Promise<InternalThreadTurnPage> {
   const params = new URLSearchParams({ threadId })
   if (cursor) params.set('cursor', cursor)
+  if (activeTurnId.trim().length > 0) params.set('activeTurnId', activeTurnId.trim())
   params.set('limit', String(limit))
   let response: Response
   try {
@@ -1251,6 +1307,7 @@ export async function getThreadDetail(threadId: string, signal?: AbortSignal): P
   ownership: ThreadDetailRuntime['ownership']
   canInterrupt: boolean
   externalRuntimeState: ThreadDetailRuntime['externalRuntimeState']
+  runtimeCwd?: string
 }> {
   try {
     return await getThreadDetailV2(threadId, signal)
@@ -1277,6 +1334,7 @@ export async function getExternalThreadLiveSnapshot(threadId: string, signal?: A
   ownership: ThreadDetailRuntime['ownership']
   canInterrupt: boolean
   externalRuntimeState: ThreadDetailRuntime['externalRuntimeState']
+  runtimeCwd?: string
   liveAuthority: UiThreadLiveAuthority
   liveSnapshot: UiThreadLiveSnapshot | null
 }> {
@@ -2305,6 +2363,7 @@ export async function forkThread(
 }
 
 export type FileAttachmentParam = { label: string; path: string; fsPath: string; uploadHandle?: string }
+export type StartThreadTurnOptions = { externalSteer?: boolean }
 
 type ManagedLocalImage = { path: string; uploadHandle: string; label: string }
 
@@ -2424,6 +2483,7 @@ export async function startThreadTurn(
   skills?: Array<{ name: string; path: string }>,
   fileAttachments: FileAttachmentParam[] = [],
   collaborationMode?: CollaborationModeKind,
+  options: StartThreadTurnOptions = {},
 ): Promise<string> {
   const managedImages = imageUrls.flatMap((imageUrl) => {
     const image = extractManagedLocalImageFromUrl(imageUrl.trim())
@@ -2485,6 +2545,9 @@ export async function startThreadTurn(
         },
       }
     }
+    if (options.externalSteer === true) {
+      params.__codexMobileExternalSteer = true
+    }
     const payload = await callRpc<{ turn?: Turn }>('turn/start', params)
     return typeof payload?.turn?.id === 'string' ? payload.turn.id.trim() : ''
   } catch (error) {
@@ -2492,7 +2555,11 @@ export async function startThreadTurn(
   }
 }
 
-export async function interruptThreadTurn(threadId: string, turnId?: string): Promise<void> {
+export async function interruptThreadTurn(
+  threadId: string,
+  turnId?: string,
+  ownership?: ThreadRuntimeOwnership,
+): Promise<void> {
   const normalizedThreadId = threadId.trim()
   const normalizedTurnId = turnId?.trim() || ''
   if (!normalizedThreadId) return
@@ -2501,9 +2568,25 @@ export async function interruptThreadTurn(threadId: string, turnId?: string): Pr
     if (!normalizedTurnId) {
       throw new Error('turn/interrupt requires turnId')
     }
+    if (ownership === 'external') {
+      const response = await fetch('/codex-api/thread-runtime-interrupt', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ threadId: normalizedThreadId, turnId: normalizedTurnId }),
+      })
+      if (!response.ok) {
+        const payload = asRecord(await response.json().catch(() => null))
+        throw new Error(extractErrorMessage(payload, `External runtime interrupt failed with ${response.status}`))
+      }
+      return
+    }
     await callRpc('turn/interrupt', { threadId: normalizedThreadId, turnId: normalizedTurnId })
   } catch (error) {
-    throw normalizeCodexApiError(error, `Failed to interrupt turn for thread ${normalizedThreadId}`, 'turn/interrupt')
+    throw normalizeCodexApiError(
+      error,
+      `Failed to interrupt turn for thread ${normalizedThreadId}`,
+      ownership === 'external' ? 'thread-runtime-interrupt' : 'turn/interrupt',
+    )
   }
 }
 

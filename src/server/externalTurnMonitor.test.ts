@@ -47,6 +47,7 @@ class FakeMonitorSystem implements ExternalRuntimeSystem {
     return {
       path: file.path,
       pid: 42,
+      startTime: '42000',
       ancestorPids: [],
       uid: 1000,
       cmdline: '/usr/local/bin/codex\0app-server\0',
@@ -56,6 +57,8 @@ class FakeMonitorSystem implements ExternalRuntimeSystem {
       flags: 0o100001,
     }
   }
+
+  async signalProcess(): Promise<void> {}
 
   async realpath(path: string): Promise<string> {
     const failures = this.realpathFailures.get(path) ?? 0
@@ -158,6 +161,17 @@ function completed(turnId: string, occurredAt: number, durationMs?: number): str
       turn_id: turnId,
       completed_at: new Date(occurredAt).toISOString(),
       ...(durationMs === undefined ? {} : { duration_ms: durationMs }),
+    },
+  })}\n`
+}
+
+function longResponseLine(size: number): string {
+  return `${JSON.stringify({
+    type: 'response_item',
+    payload: {
+      type: 'message',
+      role: 'assistant',
+      content: [{ type: 'output_text', text: 'x'.repeat(size) }],
     },
   })}\n`
 }
@@ -899,17 +913,67 @@ describe('ExternalTurnMonitor', () => {
     expect(fixture.scheduled).toHaveLength(1)
   })
 
-  it('warns with a redacted message and drops an oversized trailing line', async () => {
+  it('keeps lifecycle state when an oversized ordinary trailing line is still being written', async () => {
     const fixture = monitorFixture()
     fixture.system.add(
       '/sessions/rollout-1.jsonl',
-      sessionMeta('thread-1') + 'x'.repeat(256 * 1024 + 1),
+      sessionMeta('thread-1') + started('turn-1', 1_000) + 'x'.repeat(5 * 1024 * 1024),
       '1',
     )
 
     await fixture.monitor.start()
 
-    expect(fixture.warnings).toEqual(['Unable to parse external turn lifecycle'])
-    expect(fixture.warnings.join(' ')).not.toContain('/sessions/')
+    expect(fixture.events).toEqual([observedStarted('thread-1', 'turn-1', 1_000)])
+    expect(fixture.warnings).toEqual([])
+  })
+
+  it('keeps lifecycle state when a large ordinary trailing line is still being written', async () => {
+    const fixture = monitorFixture()
+    fixture.system.add(
+      '/sessions/rollout-1.jsonl',
+      sessionMeta('thread-1') + started('turn-1', 1_000) + 'x'.repeat(1024 * 1024),
+      '1',
+    )
+
+    await fixture.monitor.start()
+
+    expect(fixture.events).toEqual([observedStarted('thread-1', 'turn-1', 1_000)])
+    expect(fixture.warnings).toEqual([])
+  })
+
+  it('registers lifecycle state behind a long complete response line', async () => {
+    const fixture = monitorFixture()
+    fixture.system.add(
+      '/sessions/rollout-1.jsonl',
+      sessionMeta('thread-1') + started('turn-1', 1_000) + longResponseLine(300 * 1024),
+      '1',
+    )
+
+    await fixture.monitor.start()
+
+    expect(fixture.events).toEqual([observedStarted('thread-1', 'turn-1', 1_000)])
+    expect(fixture.warnings).toEqual([])
+  })
+
+  it('continues monitoring after a long complete response line append', async () => {
+    const fixture = monitorFixture()
+    const rollout = fixture.system.add(
+      '/sessions/rollout-1.jsonl',
+      sessionMeta('thread-1') + started('turn-1', 1_000),
+      '1',
+    )
+    await fixture.monitor.start()
+    fixture.system.append(
+      rollout,
+      longResponseLine(300 * 1024) + completed('turn-1', 2_000, 1_000),
+    )
+
+    await fixture.runScheduledScan()
+
+    expect(fixture.events).toEqual([
+      observedStarted('thread-1', 'turn-1', 1_000),
+      observedCompleted('thread-1', 'turn-1', 2_000, 1_000),
+    ])
+    expect(fixture.warnings).toEqual([])
   })
 })

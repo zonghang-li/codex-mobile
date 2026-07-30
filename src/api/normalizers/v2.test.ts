@@ -813,6 +813,26 @@ Reply with &lt;/instructions&gt; and A &amp; B
       activity: messages[4]?.activity,
     })).not.toContain('private child result')
   })
+
+  it('preserves explicit context compaction status text from text page rows', () => {
+    const messages = normalizeThreadMessagesV2(threadReadResponseWithContent([
+      {
+        type: 'contextCompaction',
+        id: 'compact-done',
+        text: 'Context automatically compacted',
+      },
+    ]))
+
+    expect(messages).toMatchObject([{
+      id: 'compact-done',
+      messageType: 'contextCompaction',
+      text: 'Context automatically compacted',
+      activity: {
+        kind: 'status',
+        label: 'Context automatically compacted',
+      },
+    }])
+  })
 })
 
 describe('readThreadInProgressFromResponse', () => {

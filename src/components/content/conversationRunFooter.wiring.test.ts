@@ -66,19 +66,20 @@ describe('ConversationRunFooter desktop parity wiring', () => {
     expect(footerSource).toContain('goal-resume-button')
     expect(footerSource).toContain('goal-edit-button')
     expect(footerSource).toContain('goal-complete-button')
-    expect(footerSource).toContain("emit('set-goal', { status: 'complete' })")
+    expect(footerSource).toContain("emitGoalUpdate({ status: 'complete' })")
     expect(footerSource).toContain('goal-blocked-button')
-    expect(footerSource).toContain("emit('set-goal', { status: 'blocked' })")
+    expect(footerSource).toContain("emitGoalUpdate({ status: 'blocked' })")
     expect(footerSource).toContain('goal-clear-button')
     expect(footerSource).toContain('goal-expand-button')
     expect(globalStyleSource).toContain(':root.dark .conversation-goal-strip')
   })
 
-  it('does not make Goal controls read-only for an external turn owner', () => {
-    expect(appSource).not.toContain(
-      '<ConversationRunFooter\n                    :footer-state="selectedConversationFooterState"\n                    :goal="selectedThreadGoal"\n                    :goal-supported="selectedThreadGoalSupported"\n                    :read-only="selectedThreadRuntimeOwnership === \'external\'"',
-    )
-    expect(footerSource).not.toContain('v-if="!readOnly"')
+  it('makes Goal controls read-only for an external turn owner', () => {
+    expect(appSource).toContain(':read-only="selectedThreadRuntimeOwnership === \'external\'"')
+    expect(footerSource).toContain('readOnly: boolean')
+    expect(footerSource).toContain('isGoalMutationDisabled')
+    expect(footerSource).toContain(':disabled="isGoalMutationDisabled"')
+    expect(footerSource).toContain('if (isGoalMutationDisabled.value) return')
   })
 
   it('requires an accessible inline second click before clearing a goal', () => {
@@ -175,6 +176,7 @@ describe('ConversationRunFooter desktop parity wiring', () => {
     expect(conversationSource).toContain('dismissLiveErrorNotification')
     expect(conversationSource).toContain('class="conversation-notification conversation-notification-error"')
     expect(conversationSource).toContain('aria-label="Dismiss error notification"')
+    expect(conversationSource).not.toContain('conversation-notification-feedback')
     expect(conversationSource).not.toContain('class="live-overlay-error"')
   })
 

@@ -21,7 +21,7 @@
 
 - The idle-to-running transition and messages appear without reload.
 - Runtime and detail requests never overlap within their respective pollers.
-- Local turns remain interruptible; desktop-owned turns remain non-interruptible.
+- Local turns remain interruptible; desktop-owned turns expose mobile Stop by active turn id while ordinary sends use the busy Queue/Steer path.
 - No authentication, Tailnet exposure, or completion-notification behavior changes.
 
 #### Rollback/Cleanup

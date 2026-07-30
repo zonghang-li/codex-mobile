@@ -19,7 +19,7 @@
           <button
             class="conversation-goal-action goal-edit-button"
             type="button"
-            :disabled="isUpdatingGoal"
+            :disabled="isGoalMutationDisabled"
             :aria-label="t('Edit goal')"
             :title="t('Edit goal')"
             @click="beginGoalEdit"
@@ -30,10 +30,10 @@
             v-if="goalPresentation.canPause"
             class="conversation-goal-action goal-pause-button"
             type="button"
-            :disabled="isUpdatingGoal"
+            :disabled="isGoalMutationDisabled"
             :aria-label="t('Pause goal')"
             :title="t('Pause goal')"
-            @click="emit('set-goal', { status: 'paused' })"
+            @click="emitGoalUpdate({ status: 'paused' })"
           >
             <IconTablerPlayerPause />
           </button>
@@ -41,10 +41,10 @@
             v-if="goalPresentation.canResume"
             class="conversation-goal-action goal-resume-button"
             type="button"
-            :disabled="isUpdatingGoal"
+            :disabled="isGoalMutationDisabled"
             :aria-label="t('Resume goal')"
             :title="t('Resume goal')"
-            @click="emit('set-goal', { status: 'active' })"
+            @click="emitGoalUpdate({ status: 'active' })"
           >
             <IconTablerPlayerPlay />
           </button>
@@ -52,10 +52,10 @@
             v-if="goal.status !== 'complete'"
             class="conversation-goal-action goal-complete-button"
             type="button"
-            :disabled="isUpdatingGoal"
+            :disabled="isGoalMutationDisabled"
             :aria-label="t('Complete goal')"
             :title="t('Complete goal')"
-            @click="emit('set-goal', { status: 'complete' })"
+            @click="emitGoalUpdate({ status: 'complete' })"
           >
             <IconTablerTargetArrow />
           </button>
@@ -63,10 +63,10 @@
             v-if="goal.status === 'active' || goal.status === 'paused'"
             class="conversation-goal-action goal-blocked-button"
             type="button"
-            :disabled="isUpdatingGoal"
+            :disabled="isGoalMutationDisabled"
             :aria-label="t('Mark goal blocked')"
             :title="t('Mark goal blocked')"
-            @click="emit('set-goal', { status: 'blocked' })"
+            @click="emitGoalUpdate({ status: 'blocked' })"
           >
             <IconTablerX />
           </button>
@@ -89,7 +89,7 @@
               ref="confirmGoalClearButtonRef"
               class="is-destructive"
               type="button"
-              :disabled="isUpdatingGoal"
+              :disabled="isGoalMutationDisabled"
               @click="requestGoalClear"
             >
               {{ t('Clear goal') }}
@@ -100,7 +100,7 @@
             ref="clearGoalButtonRef"
             class="conversation-goal-action goal-clear-button"
             type="button"
-            :disabled="isUpdatingGoal"
+            :disabled="isGoalMutationDisabled"
             :aria-label="t('Clear goal')"
             :title="t('Clear goal')"
             @click="requestGoalClear"
@@ -125,7 +125,7 @@
             v-model="editingObjective"
             class="conversation-goal-editor"
             rows="2"
-            :disabled="isUpdatingGoal"
+            :disabled="isGoalMutationDisabled"
             :aria-label="t('Goal objective')"
           />
           <div class="conversation-goal-editor-actions">
@@ -134,7 +134,7 @@
             </button>
             <button
               type="button"
-              :disabled="isUpdatingGoal || !editingObjective.trim()"
+              :disabled="isGoalMutationDisabled || !editingObjective.trim()"
               @click="saveGoalEdit"
             >
               {{ t('Save') }}
@@ -173,6 +173,7 @@ const props = defineProps<{
   threadId: string
   goal: UiThreadGoal | null
   goalSupported: boolean
+  readOnly: boolean
   isUpdatingGoal: boolean
 }>()
 
@@ -194,6 +195,7 @@ let clearGoalConfirmationTimer: ReturnType<typeof setTimeout> | null = null
 const goalPresentation = computed(() => (
   props.goal ? deriveThreadGoalPresentation(props.goal, nowMs.value) : null
 ))
+const isGoalMutationDisabled = computed(() => props.readOnly || props.isUpdatingGoal)
 const {
   isEditingGoal,
   editingObjective,
@@ -221,6 +223,7 @@ onUnmounted(() => {
 })
 
 function beginGoalEdit(): void {
+  if (isGoalMutationDisabled.value) return
   cancelGoalClear(false)
   beginEditingGoal(props.goal?.objective ?? '')
   isGoalExpanded.value = true
@@ -231,9 +234,10 @@ function cancelGoalEdit(): void {
 }
 
 function saveGoalEdit(): void {
+  if (isGoalMutationDisabled.value) return
   const objective = editingObjective.value.trim()
   if (!objective || !props.goal) return
-  emit('set-goal', {
+  emitGoalUpdate({
     objective,
     status: props.goal.status,
   })
@@ -266,13 +270,18 @@ function cancelGoalClear(restoreFocus = true): void {
 }
 
 function requestGoalClear(): void {
-  if (props.isUpdatingGoal) return
+  if (isGoalMutationDisabled.value) return
   if (isClearGoalConfirming.value) {
     cancelGoalClear(false)
     emit('clear-goal')
     return
   }
   armGoalClearConfirmation()
+}
+
+function emitGoalUpdate(input: { objective?: string; status: UiThreadGoalStatus }): void {
+  if (isGoalMutationDisabled.value) return
+  emit('set-goal', input)
 }
 </script>
 

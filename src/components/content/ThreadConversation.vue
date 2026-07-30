@@ -740,14 +740,6 @@
                   v-if="message.directives && message.directives.length > 0"
                   :directives="message.directives"
                 />
-                <a
-                  v-if="isTurnErrorMessage(message)"
-                  class="turn-error-feedback"
-                  :href="feedbackMailto"
-                  @click="prepareTurnErrorFeedback($event, message.text)"
-                >
-                  Send feedback
-                </a>
               </article>
 
               <div
@@ -818,7 +810,6 @@
       aria-live="assertive"
     >
       <span class="conversation-notification-text">{{ visibleLiveErrorText }}</span>
-      <a class="conversation-notification-feedback" :href="feedbackMailto" @click="prepareLiveErrorFeedback($event, visibleLiveErrorText)">Send feedback</a>
       <button
         type="button"
         class="conversation-notification-dismiss"
@@ -867,7 +858,6 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import type { UiLiveOverlay, UiMessage, UiPlanStep, UiServerRequest } from '../../types/codex'
-import { useFeedbackDiagnostics } from '../../composables/useFeedbackDiagnostics'
 import { useMobile } from '../../composables/useMobile'
 import { copyTextToClipboard, copyTextWithSelectionFallback } from '../../utils/clipboard'
 import {
@@ -931,24 +921,6 @@ const fileLinkContextMenuY = ref(0)
 const fileLinkContextBrowseUrl = ref('')
 const fileLinkContextEditUrl = ref('')
 const { isMobile } = useMobile()
-const { buildFeedbackMailto, feedbackMailtoBase, recordVisibleFailure } = useFeedbackDiagnostics()
-const feedbackMailto = feedbackMailtoBase()
-
-function prepareLiveErrorFeedback(event: MouseEvent, message: string): void {
-  recordVisibleFailure(message)
-  const target = event.currentTarget
-  if (target instanceof HTMLAnchorElement) {
-    target.href = buildFeedbackMailto()
-  }
-}
-
-function prepareTurnErrorFeedback(event: MouseEvent, message: string): void {
-  recordVisibleFailure(message)
-  const target = event.currentTarget
-  if (target instanceof HTMLAnchorElement) {
-    target.href = buildFeedbackMailto()
-  }
-}
 
 const liveErrorNotificationText = computed(() => props.liveOverlay?.errorText?.trim() ?? '')
 const liveErrorNotificationKey = computed(() => {
@@ -4591,10 +4563,6 @@ onBeforeUnmount(() => {
   display: none;
 }
 
-.turn-error-feedback {
-  @apply mt-3 inline-flex w-fit rounded-full border border-rose-200 bg-white px-2.5 py-1 text-xs font-semibold leading-none text-rose-700 transition hover:bg-rose-100 focus:outline-none focus:ring-2 focus:ring-rose-300;
-}
-
 .conversation-notification {
   @apply fixed left-1/2 z-40 flex w-[min(42rem,calc(100vw-2rem))] -translate-x-1/2 items-start gap-3 rounded-2xl border bg-white px-4 py-3 text-sm leading-5 shadow-xl;
   bottom: calc(env(safe-area-inset-bottom, 0px) + 9rem);
@@ -4606,10 +4574,6 @@ onBeforeUnmount(() => {
 
 .conversation-notification-text {
   @apply min-w-0 flex-1 whitespace-pre-wrap break-words;
-}
-
-.conversation-notification-feedback {
-  @apply shrink-0 rounded-full border border-rose-200 bg-white px-2.5 py-1 text-xs font-semibold leading-none text-rose-700 transition hover:bg-rose-100 focus:outline-none focus:ring-2 focus:ring-rose-300;
 }
 
 .conversation-notification-dismiss {
@@ -5408,10 +5372,6 @@ onBeforeUnmount(() => {
 
 :global(.dark) .conversation-notification {
   @apply border-rose-500/30 bg-zinc-900 text-rose-200 shadow-black/40;
-}
-
-:global(.dark) .conversation-notification-feedback {
-  @apply border-rose-500/30 bg-zinc-900 text-rose-200 hover:bg-rose-950/40;
 }
 
 :global(.dark) .conversation-notification-dismiss {
