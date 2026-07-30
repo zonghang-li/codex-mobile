@@ -258,7 +258,8 @@ function prepareHeaderFeedback(event: MouseEvent, message: string): void {
 
 const displayLabel = computed(() => {
   if (props.currentBranch) return props.currentBranch
-  if (props.headSubject) return props.headSubject
+  if (props.detached && props.headSha) return `Detached ${props.headSha}`
+  if (!props.detached && props.headSubject) return props.headSubject
   if (props.headSha) return `Detached ${props.headSha}`
   return props.loading ? 'Loading branch...' : 'Detached HEAD'
 })

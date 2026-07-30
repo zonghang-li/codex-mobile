@@ -4,12 +4,17 @@ import router from './router'
 import './style.css'
 import { t } from './composables/useUiLanguage'
 import { installFeedbackDiagnostics } from './composables/useFeedbackDiagnostics'
+import { installAppBuildSync } from './composables/appBuildSync'
 
 console.log('Welcome to codexui. github: https://github.com/friuns2/codexUI')
 
 installFeedbackDiagnostics()
 
 createApp(App).use(router).mount('#app')
+
+if (import.meta.env.PROD) {
+  installAppBuildSync()
+}
 
 if ('serviceWorker' in navigator && import.meta.env.PROD) {
   window.addEventListener('load', () => {

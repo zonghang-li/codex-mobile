@@ -22,6 +22,22 @@ function textMessage(
   }
 }
 
+function userMessage(
+  id: string,
+  text: string,
+  turnId = 'turn-active',
+  sessionOrder?: number,
+): UiMessage {
+  return {
+    id,
+    role: 'user',
+    text,
+    messageType: 'userMessage',
+    turnId,
+    sessionOrder,
+  }
+}
+
 describe('thread text hydration', () => {
   it('prepends older pages into deterministic session order', () => {
     const newest = [
@@ -62,6 +78,174 @@ describe('thread text hydration', () => {
       'reason-3',
     ])
     expect(merged[1]).toBe(ordered)
+  })
+
+  it('upgrades an in-progress context compaction row when the completed event arrives', () => {
+    const compacting = {
+      ...textMessage('compact-start', 'contextCompaction', 'turn-active', 100),
+      text: 'Context automatically compacting',
+    }
+    const compacted = {
+      ...textMessage('rollout:contextCompaction:200', 'contextCompaction', 'turn-active', 200),
+      text: 'Context automatically compacted',
+    }
+
+    const merged = mergeThreadTextPage([compacting], [compacted])
+
+    expect(merged).toHaveLength(1)
+    expect(merged[0]).toMatchObject({
+      id: 'rollout:contextCompaction:200',
+      text: 'Context automatically compacted',
+      messageType: 'contextCompaction',
+      sessionOrder: 200,
+    })
+  })
+
+  it('deduplicates event-sourced and response-sourced copies of the same user input', () => {
+    const eventCopy = userMessage(
+      'rollout:userMessage:event:client-steer-1',
+      '继续 Task2',
+      'turn-active',
+      200,
+    )
+    const responseCopy = userMessage(
+      'msg-steer-1',
+      '继续 Task2',
+      'turn-active',
+      208,
+    )
+
+    const merged = mergeThreadTextPage([
+      eventCopy,
+      textMessage('agent-after', 'agentMessage', 'turn-active', 300),
+    ], [
+      responseCopy,
+    ])
+
+    expect(merged.map((message) => message.id)).toEqual([
+      'msg-steer-1',
+      'agent-after',
+    ])
+  })
+
+  it('does not deduplicate repeated identical user inputs separated by assistant output', () => {
+    const merged = mergeThreadTextPage([
+      userMessage('rollout:userMessage:event:client-steer-1', '继续', 'turn-active', 100),
+      textMessage('agent-1', 'agentMessage', 'turn-active', 200),
+    ], [
+      userMessage('msg-steer-2', '继续', 'turn-active', 300),
+      userMessage('rollout:userMessage:event:client-steer-2', '继续', 'turn-active', 308),
+      textMessage('agent-2', 'agentMessage', 'turn-active', 400),
+    ])
+
+    expect(merged.map((message) => message.id)).toEqual([
+      'rollout:userMessage:event:client-steer-1',
+      'agent-1',
+      'msg-steer-2',
+      'agent-2',
+    ])
+  })
+
+  it('places late delegated user input before the assistant response it triggered', () => {
+    const merged = mergeThreadTextPage([
+      textMessage('agent-after-steer', 'agentMessage', 'turn-active', 100),
+    ], [
+      userMessage(
+        'rollout:userMessage:event:client-late-delegation',
+        '<codex_delegation>\n<input>TASK2_PLANNER_FINDING_2</input>\n</codex_delegation>',
+        'turn-active',
+        200,
+      ),
+    ])
+
+    expect(merged.map((message) => message.id)).toEqual([
+      'rollout:userMessage:event:client-late-delegation',
+      'agent-after-steer',
+    ])
+  })
+
+  it('places wrapped late delegated user input before the assistant response it triggered', () => {
+    const wrappedDelegation = [
+      'TASK2_PLANNER_FINDING_2 (apply before Task2 final stop; no history rewrite):',
+      '<codex_delegation>',
+      '<input>收到。继续 Task2。</input>',
+      '</codex_delegation>',
+    ].join('\n')
+    const merged = mergeThreadTextPage([
+      textMessage('agent-after-steer', 'agentMessage', 'turn-active', 100),
+    ], [
+      userMessage(
+        'rollout:userMessage:event:client-late-wrapped-delegation',
+        wrappedDelegation,
+        'turn-active',
+        200,
+      ),
+    ])
+
+    expect(merged.map((message) => message.id)).toEqual([
+      'rollout:userMessage:event:client-late-wrapped-delegation',
+      'agent-after-steer',
+    ])
+  })
+
+  it('places escaped late delegated user input before the assistant response it triggered', () => {
+    const escapedDelegation = [
+      '&lt;codex_delegation&gt;',
+      '&lt;input&gt;TASK2_PLANNER_FINDING_2&lt;/input&gt;',
+      '&lt;/codex_delegation&gt;',
+    ].join('\n')
+    const merged = mergeThreadTextPage([
+      textMessage('agent-after-steer', 'agentMessage', 'turn-active', 100),
+    ], [
+      userMessage(
+        'rollout:userMessage:event:client-late-escaped-delegation',
+        escapedDelegation,
+        'turn-active',
+        200,
+      ),
+    ])
+
+    expect(merged.map((message) => message.id)).toEqual([
+      'rollout:userMessage:event:client-late-escaped-delegation',
+      'agent-after-steer',
+    ])
+  })
+
+  it('does not place ordinary late event-sourced user input before existing output', () => {
+    const lateUserInput = 'TASK2_PLANNER_FINDING_2 (apply before Task2 final stop; no history rewrite)'
+    const merged = mergeThreadTextPage([
+      textMessage('agent-after-steer', 'agentMessage', 'turn-active', 100),
+    ], [
+      userMessage(
+        'rollout:userMessage:event:client-late-user-input',
+        lateUserInput,
+        'turn-active',
+        200,
+      ),
+    ])
+
+    expect(merged.map((message) => message.id)).toEqual([
+      'agent-after-steer',
+      'rollout:userMessage:event:client-late-user-input',
+    ])
+  })
+
+  it('keeps multiple late delegated user inputs paired with their own response segment', () => {
+    const firstDelegation = '<codex_delegation>\n<input>FIRST_STEER</input>\n</codex_delegation>'
+    const secondDelegation = '<codex_delegation>\n<input>SECOND_STEER</input>\n</codex_delegation>'
+    const merged = mergeThreadTextPage([
+      textMessage('agent-first', 'agentMessage', 'turn-active', 100),
+      userMessage('rollout:userMessage:event:client-late-first', firstDelegation, 'turn-active', 200),
+      textMessage('agent-second', 'agentMessage', 'turn-active', 300),
+      userMessage('rollout:userMessage:event:client-late-second', secondDelegation, 'turn-active', 400),
+    ], [])
+
+    expect(merged.map((message) => message.id)).toEqual([
+      'rollout:userMessage:event:client-late-first',
+      'agent-first',
+      'rollout:userMessage:event:client-late-second',
+      'agent-second',
+    ])
   })
 
   it('appends a bounded live-only row without deleting hydrated text', () => {
@@ -241,6 +425,34 @@ describe('thread text hydration', () => {
         text: '**Planning mobile synchronization**',
       },
       {
+        ...textMessage('reason-title-dotted', 'reasoning', 'turn-active', 150),
+        text: '**Planning topology.cpp synchronization and testing**',
+      },
+      {
+        ...textMessage('reason-title-exact', 'reasoning', 'turn-active', 175),
+        text: 'Planning',
+      },
+      {
+        ...textMessage('reason-title-ellipsis-planning', 'reasoning', 'turn-active', 180),
+        text: 'Planning ...',
+      },
+      {
+        ...textMessage('reason-title-ellipsis-updating', 'reasoning', 'turn-active', 181),
+        text: 'Updating ...',
+      },
+      {
+        ...textMessage('reason-title-ellipsis-inspecting', 'reasoning', 'turn-active', 182),
+        text: 'Inspecting ...',
+      },
+      {
+        ...textMessage('reason-title-ellipsis-reviewing', 'reasoning', 'turn-active', 183),
+        text: 'Reviewing ...',
+      },
+      {
+        ...textMessage('reason-title-scope', 'reasoning', 'turn-active', 190),
+        text: 'Verifying std::array initialization and constexpr usage',
+      },
+      {
         ...textMessage('reason-body', 'reasoning', 'turn-active', 200),
         text: 'The runtime refresh now only needs the changed thread id.',
       },
@@ -281,6 +493,46 @@ describe('thread text hydration', () => {
       'user-active',
       'reason-1',
       'agent-1',
+      'tool-active',
+    ])
+  })
+
+  it('keeps a hydrated active turn user message when live-state omitted active items', () => {
+    const hydrated = [
+      userMessage('user-active', '设置 goal: 需要最终审核 0/0/0 通过', 'turn-active', 100),
+      textMessage('agent-1', 'agentMessage', 'turn-active', 200),
+    ]
+
+    const merged = mergeHydratedTurnTextIntoTranscript([], hydrated, 'turn-active')
+
+    expect(merged.map((message) => message.id)).toEqual([
+      'user-active',
+      'agent-1',
+    ])
+    expect(merged[0]?.role).toBe('user')
+    expect(merged[0]?.text).toBe('设置 goal: 需要最终审核 0/0/0 通过')
+  })
+
+  it('keeps ordered mid-turn user messages in session order', () => {
+    const transcript = [{
+      id: 'tool-active',
+      role: 'system',
+      text: 'Ran a command',
+      messageType: 'mcpToolCall',
+      turnId: 'turn-active',
+    } satisfies UiMessage]
+    const hydrated = [
+      textMessage('agent-before', 'agentMessage', 'turn-active', 100),
+      userMessage('user-steer', '补充约束', 'turn-active', 200),
+      textMessage('agent-after', 'agentMessage', 'turn-active', 300),
+    ]
+
+    const merged = mergeHydratedTurnTextIntoTranscript(transcript, hydrated, 'turn-active')
+
+    expect(merged.map((message) => message.id)).toEqual([
+      'agent-before',
+      'user-steer',
+      'agent-after',
       'tool-active',
     ])
   })

@@ -6,11 +6,12 @@ import {
   getSupportedReasoningEfforts,
 } from '../../utils/modelReasoningEfforts'
 
-export type ComposerPrimaryAction = 'send' | 'stop' | 'externalRunning' | 'hidden'
+export type ComposerPrimaryAction = 'send' | 'stop' | 'hidden'
 
 export type ComposerControlStateInput = {
   runtimeOwnership: ThreadRuntimeOwnership
   isTurnInProgress: boolean
+  canInterruptTurn: boolean
   hasSubmitContent: boolean
   disabled: boolean
   hasPendingRequest: boolean
@@ -117,19 +118,16 @@ export function deriveComposerControlState(
   const composerVisible = !input.hasPendingRequest
   const primaryAction: ComposerPrimaryAction = !composerVisible
     ? 'hidden'
-    : isExternal && input.isTurnInProgress
-      ? 'externalRunning'
-      : input.isTurnInProgress && !input.hasSubmitContent
-        ? 'stop'
-        : 'send'
+    : input.isTurnInProgress && input.canInterruptTurn && !input.hasSubmitContent
+      ? 'stop'
+      : 'send'
   const canSubmit = composerVisible
     && !input.disabled
-    && !isExternal
     && input.hasSubmitContent
   const canStop = composerVisible
     && !input.disabled
-    && !isExternal
     && input.isTurnInProgress
+    && input.canInterruptTurn
   const canEditConfiguration = composerVisible
     && !input.disabled
     && !isExternal
@@ -141,7 +139,7 @@ export function deriveComposerControlState(
     canSubmit,
     canStop,
     canEditConfiguration,
-    canToggleGoal: composerVisible && !input.disabled && input.goalSupported,
+    canToggleGoal: composerVisible && !input.disabled && !isExternal && input.goalSupported,
     modelEffortLabel,
     showFastIcon: input.selectedSpeedMode === 'fast'
       && /^gpt-5\.(?:4|5|6)(?:$|-)/iu.test(input.selectedModel.trim()),

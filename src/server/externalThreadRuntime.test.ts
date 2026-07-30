@@ -34,10 +34,64 @@ function lifecycle(type: 'task_started' | 'task_complete' | 'turn_aborted', turn
   })}\n`
 }
 
-function writerFd(overrides: Partial<RuntimeFdSnapshot> = {}): RuntimeFdSnapshot {
+function execCommandCall(turnId: string, workdir: string): string {
+  return `${JSON.stringify({
+    type: 'response_item',
+    payload: {
+      type: 'function_call',
+      name: 'exec_command',
+      arguments: JSON.stringify({ cmd: 'git status --short', workdir }),
+      internal_chat_message_metadata_passthrough: { turn_id: turnId },
+    },
+  })}\n`
+}
+
+function execCommandCallWithoutTurn(workdir: string): string {
+  return `${JSON.stringify({
+    type: 'response_item',
+    payload: {
+      type: 'function_call',
+      name: 'exec_command',
+      arguments: JSON.stringify({ cmd: 'git status --short', workdir }),
+    },
+  })}\n`
+}
+
+function turnContext(turnId: string, cwd: string): string {
+  return `${JSON.stringify({
+    type: 'turn_context',
+    payload: { turn_id: turnId, cwd },
+  })}\n`
+}
+
+function applyPatchCall(turnId: string, input: string): string {
+  return `${JSON.stringify({
+    type: 'response_item',
+    payload: {
+      type: 'custom_tool_call',
+      name: 'apply_patch',
+      input,
+      internal_chat_message_metadata_passthrough: { turn_id: turnId },
+    },
+  })}\n`
+}
+
+function applyPatchCallWithoutTurn(input: string): string {
+  return `${JSON.stringify({
+    type: 'response_item',
+    payload: {
+      type: 'custom_tool_call',
+      name: 'apply_patch',
+      input,
+    },
+  })}\n`
+}
+
+function writerFd(overrides: Partial<RuntimeFdSnapshot & { startTime?: string }> = {}): RuntimeFdSnapshot {
   return {
     path: rolloutPath,
     pid: 42,
+    startTime: '42000',
     ancestorPids: [],
     uid: 1000,
     cmdline: '/usr/local/bin/codex\0app-server\0',
@@ -77,6 +131,11 @@ class FakeRuntimeSystem implements ExternalRuntimeSystem {
   readonly platform: NodeJS.Platform
   readonly uid: number | null
   readonly readCalls: Array<{ path: string; offset: number; length: number }> = []
+  readonly signalCalls: Array<{
+    pid: number
+    signal: NodeJS.Signals
+    expectedStartTime?: string
+  }> = []
   scanCount = 0
   snapshotYieldCount = 0
 
@@ -166,13 +225,17 @@ class FakeRuntimeSystem implements ExternalRuntimeSystem {
     return rollout.bytes.subarray(offset, Math.min(offset + length, rollout.bytes.length))
   }
 
-  async *listFdSnapshots(): AsyncGenerator<RuntimeFdSnapshot, void, void> {
+  async *listFdSnapshots(): AsyncGenerator<RuntimeFdSnapshot, boolean | void, void> {
     this.scanCount += 1
     if (this.scanError) throw this.scanError
     for (const fd of this.fds) {
       this.snapshotYieldCount += 1
       yield fd
     }
+  }
+
+  async signalProcess(pid: number, signal: NodeJS.Signals, expectedStartTime?: string): Promise<void> {
+    this.signalCalls.push({ pid, signal, expectedStartTime })
   }
 
   append(value: string | Buffer): void {
@@ -693,7 +756,7 @@ describe('ExternalThreadRuntimeProbe', () => {
       'thread-a': {
         state: 'running',
         turnId: 'turn-a',
-        interruptible: false,
+        interruptible: true,
         source: 'external-session-writer',
       },
       'thread-b': { state: 'unknown' },
@@ -719,11 +782,26 @@ describe('ExternalThreadRuntimeProbe', () => {
       running: {
         state: 'running',
         turnId: 'turn-running',
-        interruptible: false,
+        interruptible: true,
         source: 'external-session-writer',
       },
       missing: { state: 'unknown' },
       terminal: { state: 'idle' },
+    })
+  })
+
+  it('does not mark batch runtime interruptible when writer scan is incomplete after a candidate', async () => {
+    const { probe } = batchProbe([
+      { path: '/sessions/thread-a', log: lifecycle('task_started', 'turn-a'), dev: '8', ino: '21' },
+    ], [])
+    const snapshots = vi.spyOn(probe['system'], 'listFdSnapshots')
+    snapshots.mockImplementation(async function* (): AsyncGenerator<RuntimeFdSnapshot, boolean, void> {
+      yield writerFd({ dev: '8', ino: '21' })
+      return false
+    })
+
+    await expect(probe.inspectMany(['thread-a'], 99)).resolves.toEqual({
+      'thread-a': { state: 'unknown' },
     })
   })
 
@@ -739,7 +817,7 @@ describe('ExternalThreadRuntimeProbe', () => {
       'thread-a': {
         state: 'running',
         turnId: 'turn-a',
-        interruptible: false,
+        interruptible: true,
         source: 'external-session-writer',
       },
       'thread-b': { state: 'unknown' },
@@ -768,8 +846,213 @@ describe('ExternalThreadRuntimeProbe', () => {
     await expect(probe.inspect('thread-1', 99)).resolves.toEqual({
       state: 'running',
       turnId: 'turn-a',
-      interruptible: false,
+      interruptible: true,
       source: 'external-session-writer',
+    })
+  })
+
+  it('reports the latest active exec_command workdir as runtime cwd', async () => {
+    const system = fakeRuntimeSystem({
+      log:
+        lifecycle('task_started', 'turn-a') +
+        execCommandCall('turn-a', '/repo/root') +
+        execCommandCall('turn-a', '/tmp/plan00-llama-rebase.WtxjOA/llama.cpp'),
+      fds: [writerFd()],
+    })
+
+    await expect(registeredProbe(system).inspect('thread-1', 99)).resolves.toEqual({
+      state: 'running',
+      turnId: 'turn-a',
+      interruptible: true,
+      source: 'external-session-writer',
+      cwd: '/tmp/plan00-llama-rebase.WtxjOA/llama.cpp',
+    })
+  })
+
+  it('uses exec_command workdir from active rows without passthrough turn metadata', async () => {
+    const system = fakeRuntimeSystem({
+      log:
+        lifecycle('task_started', 'turn-a') +
+        execCommandCallWithoutTurn('/tmp/plan00-llama-rebase.WtxjOA/llama.cpp'),
+      fds: [writerFd()],
+    })
+
+    await expect(registeredProbe(system).inspect('thread-1', 99)).resolves.toMatchObject({
+      state: 'running',
+      turnId: 'turn-a',
+      interruptible: true,
+      source: 'external-session-writer',
+      cwd: '/tmp/plan00-llama-rebase.WtxjOA/llama.cpp',
+    })
+  })
+
+  it('keeps an active apply_patch worktree target as runtime cwd across later root turn context', async () => {
+    const system = fakeRuntimeSystem({
+      log:
+        lifecycle('task_started', 'turn-a') +
+        turnContext('turn-a', '/home/zonghangli/Desktop/prima.cpp') +
+        applyPatchCall('turn-a', [
+          '*** Begin Patch',
+          '*** Update File: /home/zonghangli/Desktop/prima.cpp/.worktrees/kimi-family-k27-k3/docs/plan.md',
+          '@@',
+          '-old',
+          '+new',
+          '*** End Patch',
+          '',
+        ].join('\n')) +
+        turnContext('turn-a', '/home/zonghangli/Desktop/prima.cpp'),
+      fds: [writerFd()],
+    })
+
+    await expect(registeredProbe(system).inspect('thread-1', 99)).resolves.toMatchObject({
+      state: 'running',
+      turnId: 'turn-a',
+      interruptible: true,
+      source: 'external-session-writer',
+      cwd: '/home/zonghangli/Desktop/prima.cpp/.worktrees/kimi-family-k27-k3/docs',
+    })
+  })
+
+  it('uses apply_patch target cwd from active rows without passthrough turn metadata', async () => {
+    const system = fakeRuntimeSystem({
+      log:
+        lifecycle('task_started', 'turn-a') +
+        turnContext('turn-a', '/home/zonghangli/Desktop/prima.cpp') +
+        applyPatchCallWithoutTurn([
+          '*** Begin Patch',
+          '*** Update File: /home/zonghangli/Desktop/prima.cpp/.worktrees/kimi-family-k27-k3/src/main.cpp',
+          '@@',
+          '-old',
+          '+new',
+          '*** End Patch',
+          '',
+        ].join('\n')),
+      fds: [writerFd()],
+    })
+
+    await expect(registeredProbe(system).inspect('thread-1', 99)).resolves.toMatchObject({
+      state: 'running',
+      turnId: 'turn-a',
+      interruptible: true,
+      source: 'external-session-writer',
+      cwd: '/home/zonghangli/Desktop/prima.cpp/.worktrees/kimi-family-k27-k3/src',
+    })
+  })
+
+  it('keeps the last source worktree as runtime cwd across a later root monitoring turn', async () => {
+    const system = fakeRuntimeSystem({
+      log:
+        lifecycle('task_started', 'turn-source') +
+        turnContext('turn-source', '/home/zonghangli/Desktop/prima.cpp') +
+        applyPatchCall('turn-source', [
+          '*** Begin Patch',
+          '*** Update File: /home/zonghangli/Desktop/prima.cpp/.worktrees/kimi-family-k27-k3/src/main.cpp',
+          '@@',
+          '-old',
+          '+new',
+          '*** End Patch',
+          '',
+        ].join('\n')) +
+        lifecycle('task_complete', 'turn-source') +
+        lifecycle('task_started', 'turn-monitor') +
+        turnContext('turn-monitor', '/home/zonghangli/Desktop/prima.cpp') +
+        execCommandCall('turn-monitor', '/home/zonghangli/Desktop/prima.cpp'),
+      fds: [writerFd()],
+    })
+
+    await expect(registeredProbe(system).inspect('thread-1', 99)).resolves.toMatchObject({
+      state: 'running',
+      turnId: 'turn-monitor',
+      interruptible: true,
+      source: 'external-session-writer',
+      cwd: '/home/zonghangli/Desktop/prima.cpp/.worktrees/kimi-family-k27-k3/src',
+    })
+  })
+
+  it('reports the last source worktree cwd after the external turn completes', async () => {
+    const system = fakeRuntimeSystem({
+      log:
+        lifecycle('task_started', 'turn-source') +
+        turnContext('turn-source', '/home/zonghangli/Desktop/prima.cpp') +
+        applyPatchCall('turn-source', [
+          '*** Begin Patch',
+          '*** Update File: /home/zonghangli/Desktop/prima.cpp/.worktrees/kimi-family-k27-k3/src/main.cpp',
+          '@@',
+          '-old',
+          '+new',
+          '*** End Patch',
+          '',
+        ].join('\n')) +
+        lifecycle('task_complete', 'turn-source'),
+      fds: [writerFd()],
+    })
+
+    await expect(registeredProbe(system).inspect('thread-1', 99)).resolves.toEqual({
+      state: 'idle',
+      cwd: '/home/zonghangli/Desktop/prima.cpp/.worktrees/kimi-family-k27-k3/src',
+    })
+  })
+
+  it('prefers the active source worktree over an earlier durable root cwd', async () => {
+    const system = fakeRuntimeSystem({
+      log:
+        lifecycle('task_started', 'turn-root-config') +
+        applyPatchCall('turn-root-config', [
+          '*** Begin Patch',
+          '*** Update File: /home/zonghangli/Desktop/prima.cpp/MBZUAI_LOCAL_CONFIG.md',
+          '@@',
+          '-old',
+          '+new',
+          '*** End Patch',
+          '',
+        ].join('\n')) +
+        lifecycle('task_complete', 'turn-root-config') +
+        lifecycle('task_started', 'turn-source') +
+        execCommandCall('turn-source', '/home/zonghangli/Desktop/prima.cpp/.worktrees/kimi-family-k27-k3') +
+        turnContext('turn-source', '/home/zonghangli/Desktop/prima.cpp'),
+      fds: [writerFd()],
+    })
+
+    await expect(registeredProbe(system).inspect('thread-1', 99)).resolves.toMatchObject({
+      state: 'running',
+      turnId: 'turn-source',
+      interruptible: true,
+      source: 'external-session-writer',
+      cwd: '/home/zonghangli/Desktop/prima.cpp/.worktrees/kimi-family-k27-k3',
+    })
+  })
+
+  it('does not replace a source worktree durable cwd with a parent root config patch', async () => {
+    const system = fakeRuntimeSystem({
+      log:
+        lifecycle('task_started', 'turn-source') +
+        applyPatchCall('turn-source', [
+          '*** Begin Patch',
+          '*** Update File: /home/zonghangli/Desktop/prima.cpp/.worktrees/kimi-family-k27-k3/src/main.cpp',
+          '@@',
+          '-old',
+          '+new',
+          '*** End Patch',
+          '',
+        ].join('\n')) +
+        lifecycle('task_complete', 'turn-source') +
+        lifecycle('task_started', 'turn-root-config') +
+        applyPatchCall('turn-root-config', [
+          '*** Begin Patch',
+          '*** Update File: /home/zonghangli/Desktop/prima.cpp/MBZUAI_LOCAL_CONFIG.md',
+          '@@',
+          '-old',
+          '+new',
+          '*** End Patch',
+          '',
+        ].join('\n')) +
+        lifecycle('task_complete', 'turn-root-config'),
+      fds: [writerFd()],
+    })
+
+    await expect(registeredProbe(system).inspect('thread-1', 99)).resolves.toEqual({
+      state: 'idle',
+      cwd: '/home/zonghangli/Desktop/prima.cpp/.worktrees/kimi-family-k27-k3/src',
     })
   })
 
@@ -820,7 +1103,40 @@ describe('ExternalThreadRuntimeProbe', () => {
     })
   })
 
-  it('treats a recently updated unmatched rollout as running without scanning descriptors', async () => {
+  it('treats a recently updated unmatched rollout as running but not interruptible without scanning descriptors', async () => {
+    const system = fakeRuntimeSystem({
+      log: lifecycle('task_started', 'turn-a'),
+      mtimeMs: Date.now(),
+    })
+
+    await expect(registeredProbe(system).inspectMany(['thread-1'], 99)).resolves.toEqual({
+      'thread-1': {
+        state: 'running',
+        turnId: 'turn-a',
+        interruptible: false,
+        source: 'external-session-writer',
+      },
+    })
+    expect(system.scanCount).toBe(0)
+  })
+
+  it('confirms a recent single-thread writer before marking it interruptible', async () => {
+    const system = fakeRuntimeSystem({
+      log: lifecycle('task_started', 'turn-a'),
+      mtimeMs: Date.now(),
+      fds: [writerFd()],
+    })
+
+    await expect(registeredProbe(system).inspect('thread-1', 99)).resolves.toEqual({
+      state: 'running',
+      turnId: 'turn-a',
+      interruptible: true,
+      source: 'external-session-writer',
+    })
+    expect(system.scanCount).toBe(1)
+  })
+
+  it('keeps recent single-thread runtime non-interruptible when writer evidence is missing', async () => {
     const system = fakeRuntimeSystem({
       log: lifecycle('task_started', 'turn-a'),
       mtimeMs: Date.now(),
@@ -832,20 +1148,22 @@ describe('ExternalThreadRuntimeProbe', () => {
       interruptible: false,
       source: 'external-session-writer',
     })
-    expect(system.scanCount).toBe(0)
+    expect(system.scanCount).toBe(1)
   })
 
-  it('treats a quiet unmatched rollout within the active grace window as running without scanning descriptors', async () => {
+  it('treats a quiet unmatched rollout within the active grace window as running but not interruptible', async () => {
     const system = fakeRuntimeSystem({
       log: lifecycle('task_started', 'turn-a'),
       mtimeMs: Date.now() - (9 * 60 * 1000),
     })
 
-    await expect(registeredProbe(system).inspect('thread-1', 99)).resolves.toEqual({
-      state: 'running',
-      turnId: 'turn-a',
-      interruptible: false,
-      source: 'external-session-writer',
+    await expect(registeredProbe(system).inspectMany(['thread-1'], 99)).resolves.toEqual({
+      'thread-1': {
+        state: 'running',
+        turnId: 'turn-a',
+        interruptible: false,
+        source: 'external-session-writer',
+      },
     })
     expect(system.scanCount).toBe(0)
   })
@@ -876,13 +1194,104 @@ describe('ExternalThreadRuntimeProbe', () => {
   it('accepts a separate desktop app-server whose ancestors do not include the mobile launcher', async () => {
     const system = fakeRuntimeSystem({
       log: lifecycle('task_started', 'turn-a'),
-      fds: [writerFd({ pid: 200, ancestorPids: [150, 1] })],
+      fds: [writerFd({ pid: 200, ancestorPids: [150, 1], startTime: '918273' })],
     })
 
     await expect(registeredProbe(system).inspect('thread-1', 99)).resolves.toMatchObject({
       state: 'running',
       turnId: 'turn-a',
+      interruptible: true,
     })
+  })
+
+  it('interrupts a confirmed external writer with a single TERM after revalidation', async () => {
+    const system = fakeRuntimeSystem({
+      log: lifecycle('task_started', 'turn-a'),
+      fds: [writerFd({ pid: 200, ancestorPids: [150, 1], startTime: '918273' })],
+    })
+    const probe = registeredProbe(system)
+
+    await expect(probe.interrupt('thread-1', 'turn-a', 99)).resolves.toEqual({ interrupted: true })
+    expect(system.signalCalls).toEqual([{ pid: 200, signal: 'SIGTERM', expectedStartTime: '918273' }])
+  })
+
+  it('does not interrupt when writer fd evidence disappears before the signal revalidation', async () => {
+    const system = fakeRuntimeSystem({
+      log: lifecycle('task_started', 'turn-a'),
+      fds: [writerFd({ pid: 200, ancestorPids: [150, 1], startTime: '918273' })],
+    })
+    const firstFd = writerFd({ pid: 200, ancestorPids: [150, 1], startTime: '918273' })
+    const snapshots = vi.spyOn(system, 'listFdSnapshots')
+    snapshots
+      .mockImplementationOnce(async function* () {
+        yield firstFd
+      })
+      .mockImplementationOnce(async function* () {})
+    const probe = registeredProbe(system)
+
+    await expect(probe.interrupt('thread-1', 'turn-a', 99)).resolves.toEqual({
+      interrupted: false,
+      reason: 'writer-not-found',
+    })
+    expect(snapshots).toHaveBeenCalledTimes(2)
+    expect(system.signalCalls).toEqual([])
+  })
+
+  it('does not interrupt when writer scan is incomplete after yielding a candidate', async () => {
+    const system = fakeRuntimeSystem({
+      log: lifecycle('task_started', 'turn-a'),
+      fds: [writerFd({ pid: 200, ancestorPids: [150, 1], startTime: '918273' })],
+    })
+    const candidate = writerFd({ pid: 200, ancestorPids: [150, 1], startTime: '918273' })
+    const snapshots = vi.spyOn(system, 'listFdSnapshots')
+    snapshots.mockImplementation(async function* (): AsyncGenerator<RuntimeFdSnapshot, boolean, void> {
+      yield candidate
+      return false
+    })
+    const probe = registeredProbe(system)
+
+    await expect(probe.interrupt('thread-1', 'turn-a', 99)).resolves.toEqual({
+      interrupted: false,
+      reason: 'writer-not-found',
+    })
+    expect(system.signalCalls).toEqual([])
+  })
+
+  it('does not interrupt when the active turn becomes terminal before signal revalidation', async () => {
+    const system = fakeRuntimeSystem({
+      log: lifecycle('task_started', 'turn-a'),
+      fds: [writerFd({ pid: 200, ancestorPids: [150, 1], startTime: '918273' })],
+    })
+    const firstFd = writerFd({ pid: 200, ancestorPids: [150, 1], startTime: '918273' })
+    const snapshots = vi.spyOn(system, 'listFdSnapshots')
+    snapshots
+      .mockImplementationOnce(async function* () {
+        yield firstFd
+        system.append(lifecycle('task_complete', 'turn-a'))
+      })
+      .mockImplementationOnce(async function* () {
+        yield firstFd
+      })
+    const probe = registeredProbe(system)
+
+    await expect(probe.interrupt('thread-1', 'turn-a', 99)).resolves.toEqual({
+      interrupted: false,
+      reason: 'turn-not-running',
+    })
+    expect(system.signalCalls).toEqual([])
+  })
+
+  it('does not interrupt when writer evidence is missing', async () => {
+    const system = fakeRuntimeSystem({
+      log: lifecycle('task_started', 'turn-a'),
+      fds: [],
+    })
+
+    await expect(registeredProbe(system).interrupt('thread-1', 'turn-a', 99)).resolves.toEqual({
+      interrupted: false,
+      reason: 'writer-not-found',
+    })
+    expect(system.signalCalls).toEqual([])
   })
 
   it('does not treat a read-only descriptor as writer evidence', async () => {

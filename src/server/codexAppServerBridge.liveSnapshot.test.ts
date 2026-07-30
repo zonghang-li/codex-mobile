@@ -7,6 +7,7 @@ import {
   buildThreadLiveStateReadFailureFallback,
   mergeSessionModelSettingsIntoThreadResult,
   prepareRpcProxyRequest,
+  isTextOnlyExternalSteerTurnStartParams,
   readSessionModelSettingsFromFile,
   readSessionModelSettingsFromLog,
   shouldStoreThreadReadSnapshotForRpc,
@@ -27,7 +28,53 @@ describe('external live snapshot RPC preparation', () => {
       },
       skipSessionSkillEnrichment: true,
       forceFreshThreadList: false,
+      allowExternalSteer: false,
     })
+  })
+
+  it('strips the internal external-steer marker before forwarding turn/start', () => {
+    expect(prepareRpcProxyRequest('turn/start', {
+      threadId: 'thread-1',
+      input: [{ type: 'text', text: 'steer' }],
+      __codexMobileExternalSteer: true,
+    })).toEqual({
+      params: {
+        threadId: 'thread-1',
+        input: [{ type: 'text', text: 'steer' }],
+      },
+      skipSessionSkillEnrichment: false,
+      forceFreshThreadList: false,
+      allowExternalSteer: true,
+    })
+  })
+
+  it('accepts only text payloads for explicit external steer', () => {
+    expect(isTextOnlyExternalSteerTurnStartParams({
+      threadId: 'thread-1',
+      input: [{ type: 'text', text: 'steer' }],
+      __codexMobileExternalSteer: true,
+    })).toBe(true)
+    expect(isTextOnlyExternalSteerTurnStartParams({
+      threadId: 'thread-1',
+      input: [{ type: 'input_text', text: 'steer' }],
+      __codexMobileExternalSteer: true,
+    })).toBe(true)
+    expect(isTextOnlyExternalSteerTurnStartParams({
+      threadId: 'thread-1',
+      input: [{ type: 'text', text: 'steer' }],
+      attachments: [{ label: 'file', path: '/tmp/file', fsPath: '/tmp/file' }],
+      __codexMobileExternalSteer: true,
+    })).toBe(false)
+    expect(isTextOnlyExternalSteerTurnStartParams({
+      threadId: 'thread-1',
+      input: [{ type: 'image', image_url: 'data:image/png;base64,AA==' }],
+      __codexMobileExternalSteer: true,
+    })).toBe(false)
+    expect(isTextOnlyExternalSteerTurnStartParams({
+      threadId: 'thread-1',
+      input: [{ type: 'skill', name: 'workflow', path: '/skills/workflow' }],
+      __codexMobileExternalSteer: true,
+    })).toBe(false)
   })
 
   it('keeps ordinary thread/read enrichment semantics', async () => {

@@ -39,4 +39,19 @@ describe('selected thread header desktop parity wiring', () => {
     expect(branchSource).toContain("window.addEventListener('keydown', onDocumentKeyDown)")
     expect(branchSource).toContain("window.removeEventListener('keydown', onDocumentKeyDown)")
   })
+
+  it('labels detached HEAD by sha instead of showing the commit subject as a branch', () => {
+    expect(branchSource).not.toMatch(/if \(props\.headSubject\) return props\.headSubject/u)
+    expect(branchSource).toContain("if (props.detached && props.headSha) return `Detached ${props.headSha}`")
+  })
+
+  it('uses the running runtime cwd for thread branch controls before falling back to thread metadata cwd', () => {
+    expect(appSource).toContain('selectedThreadRuntimeCwd')
+    expect(appSource).toContain('const threadGitCwd = computed(() => {')
+    expect(appSource).toContain('const failedRuntimeGitCwd = ref')
+    expect(appSource).toContain('runtimeCwd && runtimeCwd !== failedRuntimeGitCwd.value')
+    expect(appSource).toContain('? runtimeCwd')
+    expect(appSource).toContain(': composerCwd.value.trim()')
+    expect(appSource).toContain('void loadThreadBranches(cwd, { fallbackCwd: composerCwd.value })')
+  })
 })

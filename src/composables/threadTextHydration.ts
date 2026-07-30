@@ -1,6 +1,8 @@
 import type { UiMessage } from '../types/codex'
+import { normalizeCodexDelegationText } from '../utils/codexDelegationText'
 
 const HYDRATED_TEXT_TYPES = new Set([
+  'userMessage',
   'agentMessage',
   'reasoning',
   'contextCompaction',
@@ -47,6 +49,8 @@ const TITLE_ONLY_REASONING_EXACT_TEXTS = new Set([
   'Existing tests',
 ])
 
+const CODEX_DELEGATION_OPEN_RE = /<codex_delegation\b[^>]*>/iu
+
 function hasSessionOrder(message: UiMessage): message is UiMessage & { sessionOrder: number } {
   return typeof message.sessionOrder === 'number'
     && Number.isFinite(message.sessionOrder)
@@ -75,15 +79,24 @@ function normalizePotentialReasoningStatusTitle(text: string): string {
     .trim()
 }
 
+function hasReasoningSentencePunctuation(text: string): boolean {
+  const withoutScopeSeparators = text.replace(/::/gu, '')
+  const withoutTerminalEllipsis = withoutScopeSeparators.replace(/\s*(?:\.{3,}|…)\s*$/u, '')
+  return /[。！？!?:；;，,]/u.test(withoutTerminalEllipsis) || /\.$/u.test(withoutTerminalEllipsis)
+}
+
 export function isTitleOnlyReasoningStatusText(value: string): boolean {
   const text = normalizePotentialReasoningStatusTitle(value)
   if (!text || text.length > 128) return false
   if (/[\p{Script=Han}]/u.test(text)) return false
-  if (/[。！？.!?:；;，,]/u.test(text)) return false
   if (TITLE_ONLY_REASONING_EXACT_TEXTS.has(text)) return true
-  if (TITLE_ONLY_REASONING_PREFIXES.some((prefix) => text.startsWith(`${prefix} `))) {
+  if (
+    !hasReasoningSentencePunctuation(text)
+    && TITLE_ONLY_REASONING_PREFIXES.some((prefix) => text === prefix || text.startsWith(`${prefix} `))
+  ) {
     return true
   }
+  if (hasReasoningSentencePunctuation(text)) return false
   if (/^(?:I|I'm|I'll|I’ll|We|The|This|That|It|They|There)\b/u.test(text)) {
     return false
   }
@@ -109,7 +122,7 @@ function isMergeableHydratedTextMessage(message: UiMessage): boolean {
 }
 
 function normalizedTextContent(message: UiMessage): string {
-  return message.text.replace(/\s+/gu, ' ').trim()
+  return normalizeCodexDelegationText(message.text).replace(/\s+/gu, ' ').trim()
 }
 
 function hydratedTextContentKey(message: UiMessage): string | null {
@@ -121,6 +134,128 @@ function hydratedTextContentKey(message: UiMessage): string | null {
     message.messageType ?? '',
     text,
   ].join('\u0000')
+}
+
+function isEventUserMessage(message: UiMessage): boolean {
+  return message.messageType === 'userMessage'
+    && message.id.startsWith('rollout:userMessage:event:')
+}
+
+function isLateDelegatedUserMessage(message: UiMessage): boolean {
+  return message.messageType === 'userMessage'
+    && isEventUserMessage(message)
+    && CODEX_DELEGATION_OPEN_RE.test(normalizeCodexDelegationText(message.text))
+}
+
+function likelyDuplicateUserInputs(left: UiMessage, right: UiMessage): boolean {
+  if (left.messageType !== 'userMessage' || right.messageType !== 'userMessage') return false
+  const leftEvent = isEventUserMessage(left)
+  const rightEvent = isEventUserMessage(right)
+  if (leftEvent === rightEvent) return false
+  const leftText = normalizedTextContent(left)
+  if (!leftText || leftText !== normalizedTextContent(right)) return false
+  if (!hasSessionOrder(left) || !hasSessionOrder(right)) return true
+  const maxDistance = Math.max(4 * 1024, (leftText.length * 4) + 2048)
+  return Math.abs(left.sessionOrder - right.sessionOrder) <= maxDistance
+}
+
+function deduplicateEventUserMessages(
+  entries: Array<{ message: UiMessage; insertionIndex: number }>,
+): Array<{ message: UiMessage; insertionIndex: number }> {
+  const deduped: Array<{ message: UiMessage; insertionIndex: number }> = []
+  for (const entry of entries) {
+    if (entry.message.messageType !== 'userMessage') {
+      deduped.push(entry)
+      continue
+    }
+
+    let duplicateIndex = -1
+    for (let index = deduped.length - 1; index >= 0; index -= 1) {
+      const existing = deduped[index]!
+      if (existing.message.messageType !== 'userMessage') break
+      if (likelyDuplicateUserInputs(existing.message, entry.message)) {
+        duplicateIndex = index
+        break
+      }
+    }
+
+    if (duplicateIndex < 0) {
+      deduped.push(entry)
+      continue
+    }
+
+    if (isEventUserMessage(deduped[duplicateIndex]!.message) && !isEventUserMessage(entry.message)) {
+      deduped[duplicateIndex] = entry
+    }
+  }
+  return deduped
+}
+
+function isContextCompactionMessage(message: UiMessage): boolean {
+  return message.messageType === 'contextCompaction'
+}
+
+function isCompletedContextCompactionMessage(message: UiMessage): boolean {
+  return isContextCompactionMessage(message)
+    && normalizedTextContent(message) === 'Context automatically compacted'
+}
+
+function shouldReplaceContextCompaction(previous: UiMessage, next: UiMessage): boolean {
+  const previousCompleted = isCompletedContextCompactionMessage(previous)
+  const nextCompleted = isCompletedContextCompactionMessage(next)
+  if (previousCompleted && !nextCompleted) return false
+  if (nextCompleted && !previousCompleted) return true
+  return hasSessionOrder(next) || !hasSessionOrder(previous)
+}
+
+function collapseContextCompactionUpdates(messages: UiMessage[]): UiMessage[] {
+  const collapsed: UiMessage[] = []
+  const byTurn = new Map<string, number>()
+  for (const message of messages) {
+    if (!isContextCompactionMessage(message)) {
+      collapsed.push(message)
+      continue
+    }
+
+    const key = message.turnId ?? ''
+    const existingIndex = byTurn.get(key)
+    if (existingIndex === undefined) {
+      byTurn.set(key, collapsed.length)
+      collapsed.push(message)
+      continue
+    }
+
+    const previous = collapsed[existingIndex]!
+    if (shouldReplaceContextCompaction(previous, message)) {
+      collapsed[existingIndex] = message
+    }
+  }
+  return collapsed
+}
+
+export function reorderLateDelegatedUserMessagesForDisplay(messages: UiMessage[]): UiMessage[] {
+  const ordered: UiMessage[] = []
+  let pairedResponseBoundary = 0
+  for (const message of messages) {
+    if (!isLateDelegatedUserMessage(message)) {
+      ordered.push(message)
+      continue
+    }
+
+    const previousLength = ordered.length
+    let insertionIndex = ordered.length
+    while (insertionIndex > pairedResponseBoundary) {
+      const previous = ordered[insertionIndex - 1]!
+      if (previous.turnId !== message.turnId) break
+      if (previous.messageType === 'userMessage' || previous.messageType === 'contextCompaction') break
+      insertionIndex -= 1
+    }
+    ordered.splice(insertionIndex, 0, message)
+    if (insertionIndex < previousLength) {
+      pairedResponseBoundary = previousLength + 1
+    }
+  }
+  return ordered
 }
 
 function reasoningSegments(message: UiMessage): string[] {
@@ -181,7 +316,7 @@ export function mergeThreadTextPage(
     }
   }
 
-  return collapseConsecutiveReasoningUpdates(Array.from(byId.values())
+  const sorted = Array.from(byId.values())
     .sort((left, right) => {
       const leftOrdered = hasSessionOrder(left.message)
       const rightOrdered = hasSessionOrder(right.message)
@@ -193,7 +328,9 @@ export function mergeThreadTextPage(
       if (rightOrdered) return 1
       return left.insertionIndex - right.insertionIndex
     })
-    .map(({ message }) => message))
+  return collapseConsecutiveReasoningUpdates(reorderLateDelegatedUserMessagesForDisplay(
+    collapseContextCompactionUpdates(deduplicateEventUserMessages(sorted).map(({ message }) => message)),
+  ))
 }
 
 function activeTurnMessageSortKey(
@@ -201,7 +338,7 @@ function activeTurnMessageSortKey(
   fallbackOrder: number,
   defaultGroup: number,
 ): [number, number, number] {
-  if (message.role === 'user') return [0, 0, fallbackOrder]
+  if (message.role === 'user' && !hasSessionOrder(message)) return [0, 0, fallbackOrder]
   if (defaultGroup === 1) return [defaultGroup, fallbackOrder, fallbackOrder]
   if (hasSessionOrder(message)) return [defaultGroup, message.sessionOrder, fallbackOrder]
   return [defaultGroup, 0, fallbackOrder]

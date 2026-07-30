@@ -13,6 +13,7 @@ import {
   getThreadRuntimeStates,
   getThreadTextPage,
   getThreadQueueState,
+  interruptThreadTurn,
   setThreadQueueState,
   listDirectoryComposioConnectors,
   readThreadDetailRuntime,
@@ -87,6 +88,18 @@ describe('startThreadTurn collaboration mode payloads', () => {
         developer_instructions: null,
       },
     })
+  })
+
+  it('marks explicit external steers without exposing the marker to ordinary starts', async () => {
+    const { requests } = mockRpcFetch()
+
+    await startThreadTurn('thread-1', 'mobile steer', [], 'gpt-5.4', 'medium', undefined, [], 'default', {
+      externalSteer: true,
+    })
+
+    expect(requests).toHaveLength(1)
+    expect(requests[0].method).toBe('turn/start')
+    expect(requests[0].params.__codexMobileExternalSteer).toBe(true)
   })
 
   it('allows max and ultra reasoning efforts in turn payloads and config reads', async () => {
@@ -803,6 +816,81 @@ describe('getThreadDetail', () => {
     ])
   })
 
+  it('marks a running external active turn omitted from the newest turn page as partial', async () => {
+    const requests: string[] = []
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input)
+      requests.push(url)
+      if (url === '/codex-api/rpc') {
+        const body = JSON.parse(String(init?.body)) as { method: string; params: Record<string, unknown> }
+        expect(body).toMatchObject({
+          method: 'thread/read',
+          params: { threadId: 'external-running', includeTurns: false },
+        })
+        return new Response(JSON.stringify({
+          result: {
+            thread: {
+              id: 'external-running',
+              turns: [],
+              externalRuntime: {
+                state: 'running',
+                turnId: 'turn-live',
+                interruptible: false,
+                source: 'external-session-writer',
+              },
+            },
+            model: 'gpt-5.6-sol',
+            modelProvider: 'openai',
+            reasoningEffort: 'max',
+          },
+        }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      if (url === '/codex-api/thread-turn-page?threadId=external-running&activeTurnId=turn-live&limit=3') {
+        return new Response(JSON.stringify({
+          result: {
+            thread: {
+              id: 'external-running',
+              turns: [{
+                id: 'turn-history',
+                status: 'completed',
+                items: [{
+                  id: 'agent-history',
+                  type: 'agentMessage',
+                  text: 'historical page text stays visible',
+                }],
+              }],
+            },
+          },
+          nextCursor: 'older-cursor',
+          hasMoreOlder: true,
+        }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      throw new Error(`Unexpected request ${url}`)
+    }))
+
+    await expect(getThreadDetail('external-running')).resolves.toMatchObject({
+      isPagedProjection: true,
+      isPartialTurnProjection: true,
+      ownership: 'external',
+      activeTurnId: 'turn-live',
+      inProgress: true,
+      model: 'gpt-5.6-sol',
+      reasoningEffort: 'max',
+      olderCursor: 'older-cursor',
+      hasMoreOlder: true,
+      messages: [
+        expect.objectContaining({
+          id: 'agent-history',
+          text: 'historical page text stays visible',
+        }),
+      ],
+    })
+    expect(requests).toEqual([
+      '/codex-api/rpc',
+      '/codex-api/thread-turn-page?threadId=external-running&activeTurnId=turn-live&limit=3',
+    ])
+  })
+
   it('marks a compressed locally running active turn page as partial', async () => {
     vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       const url = String(input)
@@ -1432,7 +1520,7 @@ describe('getThreadDetail', () => {
     })
   })
 
-  it('reports externally running idle app-server threads as non-interruptible', () => {
+  it('reports externally running idle app-server threads as non-interruptible by active turn id', () => {
     const payload = runtimePayload({
       id: 'thread-1',
       turns: [],
@@ -1449,6 +1537,70 @@ describe('getThreadDetail', () => {
       activeTurnId: 'turn-external',
       ownership: 'external',
       canInterrupt: false,
+      externalRuntimeState: 'running',
+    })
+  })
+
+  it('reports confirmed interruptible external writers as externally interruptible', () => {
+    const payload = runtimePayload({
+      id: 'thread-1',
+      turns: [],
+      externalRuntime: {
+        state: 'running',
+        turnId: 'turn-external',
+        interruptible: true,
+        source: 'external-session-writer',
+        cwd: '/tmp/runtime-worktree',
+      },
+    })
+
+    expect(readThreadDetailRuntime(payload)).toMatchObject({
+      inProgress: true,
+      activeTurnId: 'turn-external',
+      ownership: 'external',
+      canInterrupt: true,
+      externalRuntimeState: 'running',
+      runtimeCwd: '/tmp/runtime-worktree',
+    })
+  })
+
+  it('keeps runtime cwd from idle external runtime metadata', () => {
+    const payload = runtimePayload({
+      id: 'thread-1',
+      turns: [],
+      externalRuntime: {
+        state: 'idle',
+        cwd: '/tmp/runtime-worktree',
+      },
+    })
+
+    expect(readThreadDetailRuntime(payload)).toMatchObject({
+      inProgress: false,
+      activeTurnId: '',
+      ownership: 'idle',
+      canInterrupt: false,
+      externalRuntimeState: 'idle',
+      runtimeCwd: '/tmp/runtime-worktree',
+    })
+  })
+
+  it('preserves local ownership for a running mobile-started turn after refresh', () => {
+    const payload = runtimePayload({
+      id: 'thread-local',
+      turns: [{ id: 'turn-stale', status: 'completed', items: [] }],
+      externalRuntime: {
+        state: 'running',
+        turnId: 'turn-mobile',
+        interruptible: true,
+        source: 'local-app-server',
+      },
+    })
+
+    expect(readThreadDetailRuntime(payload)).toMatchObject({
+      inProgress: true,
+      activeTurnId: 'turn-mobile',
+      ownership: 'local',
+      canInterrupt: true,
       externalRuntimeState: 'running',
     })
   })
@@ -1503,6 +1655,32 @@ describe('getThreadDetail', () => {
       ownership: 'external',
       canInterrupt: false,
       externalRuntimeState: 'unknown',
+    })
+  })
+
+  it('does not treat a recovered in-progress turn with an idle external probe as locally interruptible', () => {
+    const payload = runtimePayload({
+      id: 'thread-recovered-external',
+      turns: [{
+        id: 'turn-recovered',
+        status: 'inProgress',
+        codexMobileRecoveredTurn: true,
+        rawItemCompression: {
+          originalItemCount: 240,
+          retainedItemCount: 0,
+          omittedItemCount: 240,
+        },
+        items: [],
+      }],
+      externalRuntime: { state: 'idle' },
+    })
+
+    expect(readThreadDetailRuntime(payload)).toEqual({
+      inProgress: true,
+      activeTurnId: 'turn-recovered',
+      ownership: 'external',
+      canInterrupt: false,
+      externalRuntimeState: 'idle',
     })
   })
 
@@ -1623,6 +1801,75 @@ describe('thread text page', () => {
     expect(requestUrl).toBe(
       '/codex-api/thread-text-page?threadId=thread+1&turnId=turn%2F1&knownTailSignature=tail-1&afterSessionOrder=140',
     )
+  })
+
+  it('normalizes active tail user anchors with input_text content into user messages', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({
+      threadId: 'thread-1',
+      turnId: 'turn-active',
+      items: [{
+        id: 'user-active',
+        type: 'userMessage',
+        content: [{ type: 'input_text', text: '设置 goal: 需要最终审核 0/0/0 通过' }],
+        sessionOrder: 100,
+      }, {
+        id: 'agent-latest',
+        type: 'agentMessage',
+        text: '继续执行验证。',
+        sessionOrder: 200,
+      }],
+      nextOlderCursor: null,
+      hasMoreOlder: false,
+    }), { status: 200, headers: { 'Content-Type': 'application/json' } })))
+
+    await expect(getThreadTextPage('thread-1', 'turn-active', undefined, 2)).resolves.toMatchObject({
+      messages: [
+        expect.objectContaining({
+          id: 'user-active',
+          role: 'user',
+          text: '设置 goal: 需要最终审核 0/0/0 通过',
+          messageType: 'userMessage',
+          turnId: 'turn-active',
+          sessionOrder: 100,
+        }),
+        expect.objectContaining({
+          id: 'agent-latest',
+          role: 'assistant',
+          text: '继续执行验证。',
+          messageType: 'agentMessage',
+          turnId: 'turn-active',
+          sessionOrder: 200,
+        }),
+      ],
+    })
+  })
+
+  it('preserves completed context compaction text from active tail pages', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({
+      threadId: 'thread-1',
+      turnId: 'turn-active',
+      items: [{
+        id: 'rollout:contextCompaction:120',
+        type: 'contextCompaction',
+        text: 'Context automatically compacted',
+        sessionOrder: 120,
+      }],
+      nextOlderCursor: null,
+      hasMoreOlder: false,
+    }), { status: 200, headers: { 'Content-Type': 'application/json' } })))
+
+    await expect(getThreadTextPage('thread-1', 'turn-active', undefined, 1)).resolves.toMatchObject({
+      messages: [
+        expect.objectContaining({
+          id: 'rollout:contextCompaction:120',
+          role: 'system',
+          text: 'Context automatically compacted',
+          messageType: 'contextCompaction',
+          turnId: 'turn-active',
+          sessionOrder: 120,
+        }),
+      ],
+    })
   })
 
   it('normalizes an aborted request through the thread text page API method', async () => {
@@ -1791,6 +2038,25 @@ describe('getThreadRuntimeState', () => {
     expect(requests).toEqual(['/codex-api/thread-runtime-state?threadId=thread+1'])
   })
 
+  it('normalizes local app-server runtime ownership from the single-thread endpoint', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({
+      state: 'running',
+      turnId: 'turn-local',
+      interruptible: true,
+      source: 'local-app-server',
+    }), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' },
+    })))
+
+    await expect(getThreadRuntimeState('thread-local')).resolves.toEqual({
+      state: 'running',
+      turnId: 'turn-local',
+      interruptible: true,
+      source: 'local-app-server',
+    })
+  })
+
   it('passes an abort signal to the runtime endpoint fetch', async () => {
     const controller = new AbortController()
     let receivedSignal: AbortSignal | null | undefined
@@ -1806,12 +2072,30 @@ describe('getThreadRuntimeState', () => {
     expect(receivedSignal).toBe(controller.signal)
   })
 
+  it('normalizes interruptible external polling payloads as running', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({
+      state: 'running',
+      turnId: 'turn-1',
+      interruptible: true,
+      source: 'external-session-writer',
+    }), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' },
+    })))
+
+    await expect(getThreadRuntimeState('thread-1')).resolves.toEqual({
+      state: 'running',
+      turnId: 'turn-1',
+      interruptible: true,
+      source: 'external-session-writer',
+    })
+  })
+
   it.each([
     null,
     {},
     { state: 'running' },
     { state: 'running', turnId: '', interruptible: false, source: 'external-session-writer' },
-    { state: 'running', turnId: 'turn-1', interruptible: true, source: 'external-session-writer' },
     { state: 'running', turnId: 'turn-1', interruptible: false, source: 'external-session-writer', extra: true },
     { state: 'idle', turnId: 'unexpected' },
     { state: 'other' },
@@ -1861,7 +2145,7 @@ describe('getThreadRuntimeStates', () => {
           'thread-a': {
             state: 'running',
             turnId: 'turn-a',
-            interruptible: false,
+            interruptible: true,
             source: 'external-session-writer',
           },
           'thread-b': { state: 'idle' },
@@ -1882,7 +2166,7 @@ describe('getThreadRuntimeStates', () => {
       'thread-a': {
         state: 'running',
         turnId: 'turn-a',
-        interruptible: false,
+        interruptible: true,
         source: 'external-session-writer',
       },
       'thread-b': { state: 'idle' },
@@ -1907,10 +2191,6 @@ describe('getThreadRuntimeStates', () => {
     [
       'non-interruptible local source',
       { state: 'running', turnId: 'turn-a', interruptible: false, source: 'local-app-server' },
-    ],
-    [
-      'interruptible external source',
-      { state: 'running', turnId: 'turn-a', interruptible: true, source: 'external-session-writer' },
     ],
     [
       'empty local turn ID',
@@ -2020,5 +2300,36 @@ describe('getThreadRuntimeStates', () => {
       'thread-a': { state: 'unknown' },
     })
     expect(receivedSignal).toBe(controller.signal)
+  })
+})
+
+describe('interruptThreadTurn', () => {
+  afterEach(() => {
+    vi.unstubAllGlobals()
+  })
+
+  it('routes external runtime interrupts to the external interrupt endpoint', async () => {
+    let requestUrl = ''
+    let requestInit: RequestInit | undefined
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      requestUrl = String(input)
+      requestInit = init
+      return new Response(JSON.stringify({ ok: true }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      })
+    }))
+
+    await expect(interruptThreadTurn('thread-a', 'turn-a', 'external')).resolves.toBeUndefined()
+
+    expect(requestUrl).toBe('/codex-api/thread-runtime-interrupt')
+    expect(requestInit).toMatchObject({
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+    })
+    expect(JSON.parse(String(requestInit?.body))).toEqual({
+      threadId: 'thread-a',
+      turnId: 'turn-a',
+    })
   })
 })

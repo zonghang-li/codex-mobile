@@ -1,5 +1,5 @@
-const CACHE_NAME = 'codexweb-shell-v3'
-const APP_SHELL_PATHS = ['/', '/manifest.webmanifest']
+const CACHE_NAME = 'codexweb-shell-v4'
+const APP_SHELL_PATHS = ['/manifest.webmanifest']
 const STATIC_DESTINATIONS = new Set(['document', 'script', 'style', 'image', 'font'])
 const BYPASS_PREFIXES = ['/codex-api/', '/codex-local-image', '/codex-local-file', '/codex-local-browse/', '/codex-local-edit/']
 
@@ -47,12 +47,10 @@ self.addEventListener('fetch', (event) => {
 })
 
 async function networkFirstNavigation(request) {
-  const cache = await caches.open(CACHE_NAME)
   try {
-    const response = await fetch(request)
-    cache.put('/', response.clone())
-    return response
+    return await fetch(request)
   } catch {
+    const cache = await caches.open(CACHE_NAME)
     return (await cache.match('/')) || Response.error()
   }
 }

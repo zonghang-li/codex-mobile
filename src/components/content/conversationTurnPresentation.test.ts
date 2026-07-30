@@ -173,6 +173,33 @@ describe('projectConversationTurns', () => {
     expect(sections[0]?.finalMessageId).toBe('final')
   })
 
+  it('promotes final_answer phase assistant output into final response actions', () => {
+    const completedAtMs = new Date(2026, 6, 29, 7, 52).getTime()
+    const sections = projectConversationTurns({
+      messages: [
+        { ...message('u1', 'user', 'Continue', '', undefined), turnId: undefined, turnIndex: 7 },
+        {
+          ...message('worked', 'system', 'Worked for 1m', '', 'worked'),
+          createdAtMs: completedAtMs,
+          turnId: undefined,
+          turnIndex: 7,
+        },
+        {
+          ...message('final', 'assistant', 'Final body only.', '', 'agentMessage'),
+          phase: 'final_answer',
+          turnId: undefined,
+          turnIndex: 7,
+        },
+      ],
+      activeTurnId: null,
+    })
+
+    expect(sections[0]?.turnId).toBe('turn-index:7')
+    expect(sections[0]?.finalMessageId).toBe('final')
+    expect(sections[0]?.completionMessageId).toBe('worked')
+    expect(sections[0]?.completionCreatedAtMs).toBe(completedAtMs)
+  })
+
   it('does not invent a final response for commentary-only retained windows', () => {
     const sections = projectConversationTurns({
       messages: [
@@ -252,6 +279,13 @@ describe('simplified mobile transcript visibility', () => {
         message('new-title-10', 'assistant', 'Parsing and validating cut wire bytes', 'turn-2', 'reasoning'),
         message('new-title-11', 'assistant', 'Comparing current and expected transaction shape', 'turn-2', 'reasoning'),
         message('new-title-12', 'assistant', 'Existing tests', 'turn-2', 'reasoning'),
+        message('new-title-13', 'assistant', '**Planning topology.cpp synchronization and testing**', 'turn-2', 'reasoning'),
+        message('new-title-14', 'assistant', 'Planning', 'turn-2', 'reasoning'),
+        message('new-title-15', 'assistant', 'Verifying std::array initialization and constexpr usage', 'turn-2', 'reasoning'),
+        message('new-title-16', 'assistant', 'Planning ...', 'turn-2', 'reasoning'),
+        message('new-title-17', 'assistant', 'Updating ...', 'turn-2', 'reasoning'),
+        message('new-title-18', 'assistant', 'Inspecting ...', 'turn-2', 'reasoning'),
+        message('new-title-19', 'assistant', 'Reviewing ...', 'turn-2', 'reasoning'),
         message('new-body-1', 'assistant', '确认：通用 loader 会先读取 rope.dimension_count 到 n_rot_full。', 'turn-2', 'reasoning'),
         message('new-body-2', 'assistant', 'The loader already preserves the auxiliary width; next I will verify the staged diff.', 'turn-2', 'reasoning'),
         {
@@ -284,6 +318,13 @@ describe('simplified mobile transcript visibility', () => {
     expect(hiddenIds.has('new-title-10')).toBe(true)
     expect(hiddenIds.has('new-title-11')).toBe(true)
     expect(hiddenIds.has('new-title-12')).toBe(true)
+    expect(hiddenIds.has('new-title-13')).toBe(true)
+    expect(hiddenIds.has('new-title-14')).toBe(true)
+    expect(hiddenIds.has('new-title-15')).toBe(true)
+    expect(hiddenIds.has('new-title-16')).toBe(true)
+    expect(hiddenIds.has('new-title-17')).toBe(true)
+    expect(hiddenIds.has('new-title-18')).toBe(true)
+    expect(hiddenIds.has('new-title-19')).toBe(true)
     expect(hiddenIds.has('new-body-1')).toBe(false)
     expect(hiddenIds.has('new-body-2')).toBe(false)
     expect(hiddenIds.has('new-user')).toBe(false)
@@ -302,6 +343,13 @@ describe('simplified mobile transcript visibility', () => {
       'Choosing plain mv for moving headers',
       'Locating README for profile model updates',
       'Comparing current and expected transaction shape',
+      '**Planning topology.cpp synchronization and testing**',
+      'Verifying std::array initialization and constexpr usage',
+      'Planning ...',
+      'Updating ...',
+      'Inspecting ...',
+      'Reviewing ...',
+      'Planning',
       'Existing tests',
       'memory_txn 的 worker 侧已经按 ((epoch, mutation_id, txn)) 去重。',
     ].join('\n'))).toBe('memory_txn 的 worker 侧已经按 ((epoch, mutation_id, txn)) 去重。')

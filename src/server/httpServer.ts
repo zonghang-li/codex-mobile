@@ -2,7 +2,8 @@ import { fileURLToPath } from 'node:url'
 import { dirname, extname, isAbsolute, join } from 'node:path'
 import type { Server as HttpServer, IncomingMessage } from 'node:http'
 import type { Duplex } from 'node:stream'
-import { existsSync } from 'node:fs'
+import { createHash } from 'node:crypto'
+import { existsSync, readFileSync, statSync } from 'node:fs'
 import { writeFile, stat } from 'node:fs/promises'
 import express, { type Express } from 'express'
 import { createCodexBridgeMiddleware } from './codexAppServerBridge.js'
@@ -24,6 +25,8 @@ import { FileNtfyStateStore } from '../safe/ntfyState.js'
 const __dirname = dirname(fileURLToPath(import.meta.url))
 const distDir = join(__dirname, '..', 'dist')
 const spaEntryFile = join(distDir, 'index.html')
+const spaBuildMetadataFile = join(distDir, 'codex-build.json')
+export const FRONTEND_ENTRY_CACHE_CONTROL = 'private, no-store, max-age=0'
 
 export type ServerOptions = {
   password?: string
@@ -157,6 +160,49 @@ export function shouldBypassSpaFallbackForStaticAsset(pathname: string): boolean
   )
 }
 
+let frontendBuildIdCache: {
+  mtimeMs: number
+  size: number
+  buildId: string
+} | null = null
+
+export function readFrontendBuildIdFromMetadata(raw: string): string {
+  try {
+    const parsed = JSON.parse(raw) as { buildId?: unknown }
+    return typeof parsed.buildId === 'string' ? parsed.buildId.trim() : ''
+  } catch {
+    return ''
+  }
+}
+
+export function getFrontendBuildIdForClient(): string {
+  try {
+    const metadataBuildId = readFrontendBuildIdFromMetadata(readFileSync(spaBuildMetadataFile, 'utf8'))
+    if (metadataBuildId) return metadataBuildId
+  } catch {
+    // Fall back to the entry hash for older builds without metadata.
+  }
+
+  try {
+    const entryStat = statSync(spaEntryFile)
+    const cached = frontendBuildIdCache
+    if (cached && cached.mtimeMs === entryStat.mtimeMs && cached.size === entryStat.size) {
+      return cached.buildId
+    }
+    const entry = readFileSync(spaEntryFile)
+    const digest = createHash('sha256').update(entry).digest('hex').slice(0, 16)
+    const buildId = `spa-${digest}-${entryStat.size}`
+    frontendBuildIdCache = {
+      mtimeMs: entryStat.mtimeMs,
+      size: entryStat.size,
+      buildId,
+    }
+    return buildId
+  } catch {
+    return 'spa-missing'
+  }
+}
+
 function normalizeLocalImagePath(rawPath: string): string {
   const trimmed = rawPath.trim()
   if (!trimmed) return ''
@@ -190,6 +236,15 @@ export function createServer(options: ServerOptions = {}): ServerInstance {
   if (authSession) {
     app.use(authSession.middleware)
   }
+
+  app.get('/codex-api/app-version', (_req, res) => {
+    res
+      .status(200)
+      .setHeader('Cache-Control', 'private, no-store, max-age=0')
+      .json({
+        buildId: getFrontendBuildIdForClient(),
+      })
+  })
 
   // 2. Bridge middleware for /codex-api/*
   app.use(bridge)
@@ -369,7 +424,16 @@ export function createServer(options: ServerOptions = {}): ServerInstance {
 
   // 8. Static files from Vue build
   if (hasFrontendAssets) {
-    app.use(express.static(distDir))
+    app.get(['/', '/index.html'], (_req, res) => {
+      res.setHeader('Cache-Control', FRONTEND_ENTRY_CACHE_CONTROL)
+      res.sendFile(spaEntryFile, (error) => {
+        if (!error) return
+        if (!res.headersSent) {
+          res.status(404).type('text/html; charset=utf-8').send(renderFrontendMissingHtml('Frontend entry file not found.'))
+        }
+      })
+    })
+    app.use(express.static(distDir, { index: false }))
   }
 
   // 9. SPA fallback
@@ -386,6 +450,7 @@ export function createServer(options: ServerOptions = {}): ServerInstance {
     if (!hasFrontendAssets) {
       res
         .status(503)
+        .setHeader('Cache-Control', FRONTEND_ENTRY_CACHE_CONTROL)
         .type('text/html; charset=utf-8')
         .send(
           renderFrontendMissingHtml('Codex web UI assets are missing.', [
@@ -397,6 +462,7 @@ export function createServer(options: ServerOptions = {}): ServerInstance {
       return
     }
 
+    res.setHeader('Cache-Control', FRONTEND_ENTRY_CACHE_CONTROL)
     res.sendFile(spaEntryFile, (error) => {
       if (!error) return
       if (!res.headersSent) {

@@ -1,4 +1,5 @@
 import type { UiMessage } from '../../types/codex'
+import { normalizeCodexDelegationText } from '../../utils/codexDelegationText'
 
 const CODEX_DELEGATION_OPEN_RE = /<codex_delegation\b[^>]*>/iu
 const CODEX_DELEGATION_BLOCK_RE = /<codex_delegation\b[^>]*>[\s\S]*<\/codex_delegation>/iu
@@ -21,11 +22,12 @@ function normalizeDelegationText(text: string): string {
 }
 
 export function parseCodexDelegationInput(text: string): string | null {
-  if (!CODEX_DELEGATION_OPEN_RE.test(text) && !CODEX_DELEGATION_BLOCK_RE.test(text)) return null
-  const inputMatch = text.match(CODEX_DELEGATION_INPUT_RE)
+  const normalizedText = normalizeCodexDelegationText(text)
+  if (!CODEX_DELEGATION_OPEN_RE.test(normalizedText) && !CODEX_DELEGATION_BLOCK_RE.test(normalizedText)) return null
+  const inputMatch = normalizedText.match(CODEX_DELEGATION_INPUT_RE)
   if (inputMatch?.[1]) return normalizeDelegationText(inputMatch[1])
   return normalizeDelegationText(
-    text
+    normalizedText
       .replace(/<\/?codex_delegation\b[^>]*>/giu, '')
       .replace(/<source_thread_id\b[^>]*>[\s\S]*?<\/source_thread_id>/giu, '')
       .replace(/<\/?input\b[^>]*>/giu, ''),

@@ -15,10 +15,16 @@ describe('QueuedMessages desktop parity', () => {
     expect(source).toContain('queued-row-move-down')
   })
 
-  it('guards every mutation while externally owned', () => {
+  it('guards edit, delete, and ordering while letting steer use its own disabled state', () => {
     expect(source).toMatch(/function onEdit\(messageId: string\): void \{\n  if \(props\.disabled\) return/u)
-    expect(source).toMatch(/function onSteer\(messageId: string\): void \{\n  if \(props\.disabled\) return/u)
+    expect(source).toMatch(/function onSteer\(messageId: string\): void \{\n  if \(isSteerDisabled\(messageId\)\) return/u)
     expect(source).toMatch(/function onDelete\(messageId: string\): void \{\n  if \(props\.disabled\) return/u)
     expect(source).toMatch(/function onMove\(messageId: string, direction: -1 \| 1\): void \{\n  if \(props\.disabled\) return/u)
+  })
+
+  it('can disable steer per queued message', () => {
+    expect(source).toContain('steerDisabledMessageIds?: string[]')
+    expect(source).toContain(':disabled="isSteerDisabled(msg.id)"')
+    expect(source).toMatch(/function isSteerDisabled\(messageId: string\): boolean \{\n  return props\.steerDisabled === true \|\| steerDisabledMessageIdSet\.value\.has\(messageId\)/u)
   })
 })

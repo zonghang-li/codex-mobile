@@ -15,6 +15,7 @@ const composerSource = readFileSync(
 const localIdle = {
   runtimeOwnership: 'idle' as const,
   isTurnInProgress: false,
+  canInterruptTurn: false,
   hasSubmitContent: true,
   disabled: false,
   hasPendingRequest: false,
@@ -47,6 +48,7 @@ describe('deriveComposerControlState', () => {
       ...localIdle,
       runtimeOwnership: 'local',
       isTurnInProgress: true,
+      canInterruptTurn: true,
       hasSubmitContent: false,
     })).toMatchObject({
       primaryAction: 'stop',
@@ -60,6 +62,7 @@ describe('deriveComposerControlState', () => {
       ...localIdle,
       runtimeOwnership: 'local',
       isTurnInProgress: true,
+      canInterruptTurn: true,
       hasSubmitContent: true,
     })).toMatchObject({
       primaryAction: 'send',
@@ -69,17 +72,43 @@ describe('deriveComposerControlState', () => {
     })
   })
 
-  it('does not pretend an externally owned turn can submit or stop', () => {
+  it('lets an externally owned running turn submit new input without exposing a local Stop control', () => {
     expect(deriveComposerControlState({
       ...localIdle,
       runtimeOwnership: 'external',
       isTurnInProgress: true,
       hasSubmitContent: false,
     })).toMatchObject({
-      primaryAction: 'externalRunning',
+      primaryAction: 'send',
       canSubmit: false,
       canStop: false,
-      canToggleGoal: true,
+      canToggleGoal: false,
+    })
+
+    expect(deriveComposerControlState({
+      ...localIdle,
+      runtimeOwnership: 'external',
+      isTurnInProgress: true,
+      hasSubmitContent: true,
+    })).toMatchObject({
+      primaryAction: 'send',
+      canSubmit: true,
+      canStop: false,
+      canEditConfiguration: false,
+      canToggleGoal: false,
+    })
+  })
+
+  it('shows Stop only when an external runtime is explicitly interruptible', () => {
+    expect(deriveComposerControlState({
+      ...localIdle,
+      runtimeOwnership: 'external',
+      isTurnInProgress: true,
+      canInterruptTurn: true,
+      hasSubmitContent: false,
+    })).toMatchObject({
+      primaryAction: 'stop',
+      canStop: true,
     })
   })
 
@@ -88,6 +117,7 @@ describe('deriveComposerControlState', () => {
       ...localIdle,
       runtimeOwnership: 'local',
       isTurnInProgress: true,
+      canInterruptTurn: true,
       hasSubmitContent: false,
     })).toMatchObject({
       canEditConfiguration: false,

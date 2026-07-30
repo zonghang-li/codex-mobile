@@ -63,7 +63,7 @@ import {
   resolveRipgrepCommand,
 } from '../commandResolution.js'
 import type { CollaborationModeKind, ReasoningEffort } from '../types/codex.js'
-import type { ThreadRuntimeObservation } from '../types/threadRuntime.js'
+import type { ExternalThreadRuntime, ThreadRuntimeObservation } from '../types/threadRuntime.js'
 import { isAbsoluteLikePath } from '../pathUtils.js'
 import {
   PERMISSIVE_SECURITY_POLICY,
@@ -95,8 +95,12 @@ type RpcProxyRequest = {
 
 const CODEX_MOBILE_LIVE_SNAPSHOT_PARAM = '__codexMobileLiveSnapshot'
 const CODEX_MOBILE_FORCE_FRESH_THREAD_LIST_PARAM = '__codexMobileForceFresh'
+const CODEX_MOBILE_EXTERNAL_STEER_PARAM = '__codexMobileExternalSteer'
 const SESSION_MODEL_SETTINGS_SCAN_BLOCK_BYTES = 512 * 1024
 const SESSION_TURN_CONTEXT_MARKER = Buffer.from('"type":"turn_context"', 'utf8')
+const LOCAL_ROLLOUT_TURN_PAGE_CURSOR_PREFIX = 'local-rollout-turns:'
+const LOCAL_ROLLOUT_TURN_PAGE_SCAN_BLOCK_BYTES = 256 * 1024
+const LOCAL_ROLLOUT_TURN_PAGE_MAX_SCAN_BYTES = 4 * 1024 * 1024
 const RUNNING_LIVE_STATE_HTTP_CACHE_TTL_MS = 350
 const IDLE_LIVE_STATE_HTTP_CACHE_TTL_MS = 3_000
 const THREAD_TEXT_PAGE_HTTP_CACHE_TTL_MS = 350
@@ -293,6 +297,7 @@ const PROVIDER_MODELS_FETCH_TIMEOUT_MS = 5_000
 const EXTERNAL_RUNTIME_OBSERVATION_CACHE_TTL_MS = 5_000
 
 const THREAD_TURN_PAGE_DEFAULT_LIMIT = 3
+const HISTORICAL_TURN_ASSISTANT_SUMMARY_ITEM_LIMIT = 8
 const THREAD_TURN_PAGE_READ_CACHE_TTL_MS = 30_000
 const THREAD_LIST_RPC_CACHE_TTL_MS = 2_000
 const THREAD_LIST_PERSISTED_CACHE_MAX_AGE_MS = 6 * 60 * 60 * 1000
@@ -456,7 +461,7 @@ function mergeSessionSkillInputsIntoTurnsFromMap(
     let targetUserMessageIndex = -1
     for (let index = items.length - 1; index >= 0; index -= 1) {
       const itemRecord = asRecord(items[index])
-      if (itemRecord?.type === 'userMessage' && Array.isArray(itemRecord.content)) {
+      if (itemRecord?.type === 'userMessage' && Array.isArray(itemRecord.content) && !isInjectedTurnUserMessageItem(itemRecord)) {
         targetUserMessageIndex = index
         break
       }
@@ -693,20 +698,64 @@ function asRecord(value: unknown): Record<string, unknown> | null {
     : null
 }
 
+function hasExternalSteerNonTextField(record: Record<string, unknown>, key: string): boolean {
+  const value = record[key]
+  if (value === null || value === undefined) return false
+  if (Array.isArray(value)) return value.length > 0
+  return true
+}
+
+function isTextOnlyExternalSteerInput(input: unknown): boolean {
+  if (typeof input === 'string') return input.trim().length > 0
+  if (!Array.isArray(input) || input.length === 0) return false
+
+  return input.every((item) => {
+    if (typeof item === 'string') return item.trim().length > 0
+    const record = asRecord(item)
+    if (!record) return false
+    const type = typeof record.type === 'string' ? record.type.trim() : ''
+    if (type !== 'text' && type !== 'input_text') return false
+    return typeof record.text === 'string'
+  })
+}
+
+export function isTextOnlyExternalSteerTurnStartParams(params: unknown): boolean {
+  const record = asRecord(params)
+  if (!record) return false
+  if (
+    hasExternalSteerNonTextField(record, 'attachments')
+    || hasExternalSteerNonTextField(record, 'fileAttachments')
+    || hasExternalSteerNonTextField(record, 'imageUrls')
+    || hasExternalSteerNonTextField(record, 'images')
+    || hasExternalSteerNonTextField(record, 'skills')
+  ) {
+    return false
+  }
+  return isTextOnlyExternalSteerInput(record.input)
+}
+
 export function prepareRpcProxyRequest(
   method: string,
   params: unknown,
-): { params: unknown; skipSessionSkillEnrichment: boolean; forceFreshThreadList: boolean } {
+): {
+  params: unknown
+  skipSessionSkillEnrichment: boolean
+  forceFreshThreadList: boolean
+  allowExternalSteer: boolean
+} {
   const record = asRecord(params)
   const isLiveSnapshot = method === 'thread/read'
     && record?.[CODEX_MOBILE_LIVE_SNAPSHOT_PARAM] === true
   const isForceFreshThreadList = method === 'thread/list'
     && record?.[CODEX_MOBILE_FORCE_FRESH_THREAD_LIST_PARAM] === true
-  if ((!isLiveSnapshot && !isForceFreshThreadList) || !record) {
+  const isExplicitExternalSteer = method === 'turn/start'
+    && record?.[CODEX_MOBILE_EXTERNAL_STEER_PARAM] === true
+  if ((!isLiveSnapshot && !isForceFreshThreadList && !isExplicitExternalSteer) || !record) {
     return {
       params: params ?? null,
       skipSessionSkillEnrichment: false,
       forceFreshThreadList: false,
+      allowExternalSteer: false,
     }
   }
 
@@ -717,10 +766,14 @@ export function prepareRpcProxyRequest(
   if (isForceFreshThreadList) {
     delete forwardedParams[CODEX_MOBILE_FORCE_FRESH_THREAD_LIST_PARAM]
   }
+  if (isExplicitExternalSteer) {
+    delete forwardedParams[CODEX_MOBILE_EXTERNAL_STEER_PARAM]
+  }
   return {
     params: forwardedParams,
     skipSessionSkillEnrichment: isLiveSnapshot,
     forceFreshThreadList: isForceFreshThreadList,
+    allowExternalSteer: isExplicitExternalSteer,
   }
 }
 
@@ -1052,6 +1105,10 @@ export async function sanitizeThreadTurnsInlinePayloads(method: string, result: 
         nextItems.push(item)
         continue
       }
+      if (isInjectedTurnUserMessageItem(itemRecord)) {
+        itemChanged = true
+        continue
+      }
       let itemForSanitization: unknown = item
       const compressedRawItem = compressThreadActivityRawPayloads(itemRecord)
       if (compressedRawItem.changed) {
@@ -1215,6 +1272,19 @@ function readRuntimeBatchThreadIds(value: unknown): string[] | null {
   return new Set(ids).size === ids.length ? ids : null
 }
 
+const THREAD_LIST_ROW_PREVIEW_LIMIT = 512
+
+function isInjectedThreadListPreviewText(value: string): boolean {
+  return isInjectedSessionUserText(value) || value.trimStart().startsWith('<codex_delegation>')
+}
+
+function truncateThreadListPreview(value: unknown): unknown {
+  if (typeof value !== 'string') return value
+  if (isInjectedThreadListPreviewText(value)) return ''
+  if (value.length <= THREAD_LIST_ROW_PREVIEW_LIMIT) return value
+  return `${value.slice(0, THREAD_LIST_ROW_PREVIEW_LIMIT).trimEnd()}...`
+}
+
 function readThreadResultInProgress(value: unknown): boolean {
   const thread = asRecord(value)
   if (!thread) return false
@@ -1234,6 +1304,7 @@ export async function augmentThreadResultWithExternalRuntime(
   result: unknown,
   runtimeProbe: ThreadRuntimeProbe,
   excludedPid: number | null,
+  localRuntimeLedger?: Pick<LocalThreadRuntimeLedger, 'getRunning'>,
 ): Promise<unknown> {
   if (method === 'thread/list') {
     const record = asRecord(result)
@@ -1273,15 +1344,23 @@ export async function augmentThreadResultWithExternalRuntime(
     ...record,
     thread: {
       ...thread,
-      externalRuntime: await runtimeProbe.inspect(threadId, excludedPid),
+      externalRuntime: localRuntimeLedger
+        ? await observeThreadRuntimeState(threadId, runtimeProbe, localRuntimeLedger, excludedPid)
+        : await runtimeProbe.inspect(threadId, excludedPid),
     },
   }
 }
 
 type ThreadWriterInspection =
   | { state: 'idle'; readResult: unknown }
-  | { state: 'blocked'; readResult: unknown }
+  | { state: 'blocked'; readResult: unknown; runtime: ExternalThreadRuntime }
   | { state: 'unmaterialized'; readResult: unknown; error?: unknown }
+
+function isRunningExternalWriterInspection(inspection: ThreadWriterInspection): boolean {
+  return inspection.state === 'blocked'
+    && inspection.runtime.state === 'running'
+    && inspection.runtime.source === 'external-session-writer'
+}
 
 async function inspectThreadWriter(
   appServer: RpcExecutor,
@@ -1312,7 +1391,7 @@ async function inspectThreadWriter(
   const runtime = await runtimeProbe.inspect(threadId, excludedPid)
   return runtime.state === 'idle'
     ? { state: 'idle', readResult }
-    : { state: 'blocked', readResult }
+    : { state: 'blocked', readResult, runtime }
 }
 
 async function guardThreadResumeAgainstExternalWriter(
@@ -1341,11 +1420,6 @@ function isReasoningTurnItem(item: unknown): boolean {
   return readNonEmptyString(itemRecord?.type) === 'reasoning'
 }
 
-function isLiveStateActiveTurnAnchorItem(item: unknown): boolean {
-  const itemType = readNonEmptyString(asRecord(item)?.type)
-  return itemType === 'userMessage'
-}
-
 function compactActiveTurnTextForLiveState(turns: unknown[], activeTurnId = ''): unknown[] {
   if (!activeTurnId) return turns
 
@@ -1356,7 +1430,7 @@ function compactActiveTurnTextForLiveState(turns: unknown[], activeTurnId = ''):
     const items = Array.isArray(turnRecord?.items) ? turnRecord.items : null
     if (!turnRecord || turnId !== activeTurnId || !items || items.length === 0) return turn
 
-    const retainedItems = items.filter(isLiveStateActiveTurnAnchorItem)
+    const retainedItems: unknown[] = []
     const existingCompression = asRecord(turnRecord.rawItemCompression)
     const existingOriginalItemCount = typeof existingCompression?.originalItemCount === 'number'
       && Number.isFinite(existingCompression.originalItemCount)
@@ -1396,19 +1470,288 @@ function buildLightweightRunningTurnProjection(turns: unknown[], activeTurnId = 
   if (!activeTurnId) return []
   const activeTurn = turns.find((turn) => readNonEmptyString(asRecord(turn)?.id) === activeTurnId)
   const activeTurnRecord = asRecord(activeTurn)
+  const retainedItems: unknown[] = []
   const originalItemCount = readOriginalTurnItemCountForCompression(activeTurn)
-  const status = readNonEmptyString(activeTurnRecord?.status) || 'inProgress'
   return [{
     ...(activeTurnRecord ?? {}),
     id: activeTurnId,
-    status,
-    items: [],
+    status: 'inProgress',
+    items: retainedItems,
     rawItemCompression: {
+      originalItemCount,
+      retainedItemCount: retainedItems.length,
+      omittedItemCount: Math.max(0, originalItemCount - retainedItems.length),
+    },
+  }]
+}
+
+function findTurnPageActiveTurnId(
+  turns: unknown[],
+  activeTurnId = '',
+  options: { compactRunningWhenActiveUnknown?: boolean } = {},
+): string {
+  const requestedActiveTurnId = activeTurnId.trim()
+  if (requestedActiveTurnId) return requestedActiveTurnId
+  if (options.compactRunningWhenActiveUnknown !== true) return ''
+  for (let index = turns.length - 1; index >= 0; index -= 1) {
+    const turn = turns[index]
+    if (!isThreadTurnRunning(turn)) continue
+    const turnId = readNonEmptyString(asRecord(turn)?.id)
+    if (turnId) return turnId
+  }
+  return ''
+}
+
+function compactActiveTurnTextForTurnPage(
+  turns: unknown[],
+  activeTurnId = '',
+  options: { compactRunningWhenActiveUnknown?: boolean } = {},
+): unknown[] {
+  const turnIdToCompact = findTurnPageActiveTurnId(turns, activeTurnId, options)
+  if (!turnIdToCompact) return turns
+
+  let changed = false
+  const nextTurns = turns.map((turn) => {
+    const turnRecord = asRecord(turn)
+    const turnId = readNonEmptyString(turnRecord?.id)
+    if (!turnRecord || turnId !== turnIdToCompact) return turn
+
+    const originalItemCount = readOriginalTurnItemCountForCompression(turn)
+    const compression = {
       originalItemCount,
       retainedItemCount: 0,
       omittedItemCount: originalItemCount,
-    },
-  }]
+    }
+    const existingItems = Array.isArray(turnRecord.items) ? turnRecord.items : []
+    const existingCompression = asRecord(turnRecord.rawItemCompression)
+    const alreadyCompact = existingItems.length === 0
+      && readNonEmptyString(turnRecord.status) === 'inProgress'
+      && existingCompression?.originalItemCount === compression.originalItemCount
+      && existingCompression?.retainedItemCount === compression.retainedItemCount
+      && existingCompression?.omittedItemCount === compression.omittedItemCount
+    if (alreadyCompact) return turn
+
+    changed = true
+    return {
+      ...turnRecord,
+      status: 'inProgress',
+      items: [],
+      rawItemCompression: compression,
+    }
+  })
+
+  return changed ? nextTurns : turns
+}
+
+function isUserMessageTurnItem(item: unknown): boolean {
+  const itemRecord = asRecord(item)
+  return readNonEmptyString(itemRecord?.type) === 'userMessage' && !isInjectedTurnUserMessageItem(itemRecord)
+}
+
+function isAssistantBodyTurnItem(item: unknown): boolean {
+  const itemRecord = asRecord(item)
+  const type = readNonEmptyString(itemRecord?.type)
+  if (type !== 'agentMessage' && type !== 'agentMessage.live') return false
+  return Boolean(readNonEmptyString(itemRecord?.text) || readNonEmptyString(itemRecord?.message))
+}
+
+function selectHistoricalTurnSummaryItems(items: unknown[]): unknown[] {
+  const retainedKeys = new Set<string>()
+  items.forEach((item, index) => {
+    if (!isUserMessageTurnItem(item)) return
+    retainedKeys.add(threadTurnItemRetentionKey(item, index))
+  })
+
+  let retainedAssistantBodyItems = 0
+  for (let index = items.length - 1; index >= 0; index -= 1) {
+    if (retainedAssistantBodyItems >= HISTORICAL_TURN_ASSISTANT_SUMMARY_ITEM_LIMIT) break
+    const item = items[index]
+    if (!isAssistantBodyTurnItem(item)) continue
+    retainedKeys.add(threadTurnItemRetentionKey(item, index))
+    retainedAssistantBodyItems += 1
+  }
+
+  return items.filter((item, index) => retainedKeys.has(threadTurnItemRetentionKey(item, index)))
+}
+
+function compactHistoricalTurnTextForTurnPage(turns: unknown[], activeTurnId = ''): unknown[] {
+  let changed = false
+  const nextTurns = turns.map((turn) => {
+    const turnRecord = asRecord(turn)
+    const turnId = readNonEmptyString(turnRecord?.id)
+    const items = Array.isArray(turnRecord?.items) ? turnRecord.items : null
+    if (!turnRecord || !items || turnId === activeTurnId || isThreadTurnRunning(turn)) return turn
+
+    const retainedItems = selectHistoricalTurnSummaryItems(items)
+    if (retainedItems.length === items.length) return turn
+
+    const originalItemCount = readOriginalTurnItemCountForCompression(turn)
+    changed = true
+    return {
+      ...turnRecord,
+      items: retainedItems,
+      rawItemCompression: {
+        originalItemCount,
+        retainedItemCount: retainedItems.length,
+        omittedItemCount: Math.max(0, originalItemCount - retainedItems.length),
+      },
+    }
+  })
+
+  return changed ? nextTurns : turns
+}
+
+function isLocalRolloutTurnPageCursor(cursor: string): boolean {
+  return cursor.trim().startsWith(LOCAL_ROLLOUT_TURN_PAGE_CURSOR_PREFIX)
+}
+
+function encodeLocalRolloutTurnPageCursor(endExclusive: number): string {
+  return `${LOCAL_ROLLOUT_TURN_PAGE_CURSOR_PREFIX}${Math.max(0, Math.floor(endExclusive))}`
+}
+
+function decodeLocalRolloutTurnPageCursor(cursor: string, maxEndOffset: number): number | null {
+  const trimmed = cursor.trim()
+  if (!trimmed.startsWith(LOCAL_ROLLOUT_TURN_PAGE_CURSOR_PREFIX)) return null
+  const raw = trimmed.slice(LOCAL_ROLLOUT_TURN_PAGE_CURSOR_PREFIX.length)
+  if (!/^\d+$/u.test(raw)) return null
+  const parsed = Number.parseInt(raw, 10)
+  if (!Number.isSafeInteger(parsed) || parsed <= 0 || parsed > maxEndOffset) return null
+  return parsed
+}
+
+function markLocalRolloutRecoveredTurn(turn: unknown): unknown {
+  const turnRecord = asRecord(turn)
+  return turnRecord
+    ? { ...turnRecord, codexMobileRecoveredTurn: true }
+    : turn
+}
+
+type LocalRolloutTurnWindow = {
+  sessionLogRaw: string
+  startOffset: number
+  turnStartOffsetById: Map<string, number>
+}
+
+function parseLocalRolloutWindowFromBuffer(buffer: Buffer, absoluteStartOffset: number): LocalRolloutTurnWindow {
+  let firstLineStart = 0
+  if (absoluteStartOffset > 0) {
+    const firstNewline = buffer.indexOf(0x0a)
+    if (firstNewline < 0) {
+      return { sessionLogRaw: '', startOffset: absoluteStartOffset + buffer.length, turnStartOffsetById: new Map() }
+    }
+    firstLineStart = firstNewline + 1
+  }
+
+  const lines: string[] = []
+  const turnStartOffsetById = new Map<string, number>()
+  let lineStart = firstLineStart
+  while (lineStart < buffer.length) {
+    const newlineIndex = buffer.indexOf(0x0a, lineStart)
+    const lineEnd = newlineIndex >= 0 ? newlineIndex : buffer.length
+    const lineBuffer = buffer.subarray(lineStart, lineEnd)
+    const lineText = lineBuffer.toString('utf8').trim()
+    const absoluteLineStart = absoluteStartOffset + lineStart
+    if (lineText) {
+      lines.push(lineText)
+      try {
+        const row = asRecord(JSON.parse(lineText))
+        const payload = asRecord(row?.payload)
+        const turnId = row?.type === 'turn_context'
+          ? readNonEmptyString(payload?.turn_id)
+          : row?.type === 'event_msg' && payload?.type === 'task_started'
+            ? readNonEmptyString(payload.turn_id)
+            : ''
+        if (turnId && !turnStartOffsetById.has(turnId)) {
+          turnStartOffsetById.set(turnId, absoluteLineStart)
+        }
+      } catch {
+        // Ignore partial or malformed rollout rows in the bounded scan window.
+      }
+    }
+    if (newlineIndex < 0) break
+    lineStart = newlineIndex + 1
+  }
+
+  return {
+    sessionLogRaw: lines.length > 0 ? `${lines.join('\n')}\n` : '',
+    startOffset: absoluteStartOffset + firstLineStart,
+    turnStartOffsetById,
+  }
+}
+
+async function readLocalRolloutTurnWindow(
+  file: FileHandle,
+  endOffset: number,
+  targetTurnCount: number,
+): Promise<LocalRolloutTurnWindow> {
+  const chunks: Buffer[] = []
+  let startOffset = Math.max(0, endOffset)
+  let scannedBytes = 0
+  let window: LocalRolloutTurnWindow = { sessionLogRaw: '', startOffset, turnStartOffsetById: new Map() }
+
+  while (startOffset > 0 && scannedBytes < LOCAL_ROLLOUT_TURN_PAGE_MAX_SCAN_BYTES) {
+    const bytesToRead = Math.min(
+      LOCAL_ROLLOUT_TURN_PAGE_SCAN_BLOCK_BYTES,
+      startOffset,
+      LOCAL_ROLLOUT_TURN_PAGE_MAX_SCAN_BYTES - scannedBytes,
+    )
+    if (bytesToRead <= 0) break
+    const nextStart = startOffset - bytesToRead
+    const chunk = Buffer.allocUnsafe(bytesToRead)
+    const { bytesRead } = await file.read(chunk, 0, bytesToRead, nextStart)
+    chunks.unshift(bytesRead === bytesToRead ? chunk : chunk.subarray(0, bytesRead))
+    startOffset = nextStart
+    scannedBytes += bytesRead
+    window = parseLocalRolloutWindowFromBuffer(Buffer.concat(chunks), startOffset)
+    if (window.turnStartOffsetById.size >= targetTurnCount) return window
+    if (bytesRead <= 0) break
+  }
+
+  if (startOffset === 0 || chunks.length === 0) {
+    window = parseLocalRolloutWindowFromBuffer(Buffer.concat(chunks), startOffset)
+  }
+  return window
+}
+
+async function readLocalRolloutThreadTurnPageFallback(
+  sessionPath: string,
+  limit: number,
+  cursor = '',
+): Promise<{ turns: unknown[]; nextCursor: string | null; backwardsCursor: string | null } | null> {
+  if (!sessionPath || !isAbsolute(sessionPath)) return null
+  let file: FileHandle | null = null
+  try {
+    const sessionStats = await stat(sessionPath)
+    if (!sessionStats.isFile()) return null
+    const normalizedLimit = Math.max(1, Math.min(50, Math.floor(limit) || THREAD_TURN_PAGE_DEFAULT_LIMIT))
+    const endOffset = cursor.trim()
+      ? decodeLocalRolloutTurnPageCursor(cursor, sessionStats.size)
+      : sessionStats.size
+    if (endOffset === null) return null
+    file = await open(sessionPath, 'r')
+    const window = await readLocalRolloutTurnWindow(file, endOffset, normalizedLimit + 1)
+    const turns = buildSessionRecoveredTurns(window.sessionLogRaw)
+    if (turns.length === 0) return null
+    const pageStartIndex = Math.max(0, turns.length - normalizedLimit)
+    const pageTurns = turns.slice(pageStartIndex)
+    const oldestPageTurnId = readNonEmptyString(asRecord(pageTurns[0])?.id)
+    const nextCursorOffset = oldestPageTurnId
+      ? window.turnStartOffsetById.get(oldestPageTurnId) ?? null
+      : null
+    const hasKnownOlderTurn = turns.length > normalizedLimit
+    const mayHaveOlderOutsideWindow = window.startOffset > 0 && nextCursorOffset !== null && nextCursorOffset > 0
+    return {
+      turns: pageTurns.map(markLocalRolloutRecoveredTurn),
+      nextCursor: (hasKnownOlderTurn || mayHaveOlderOutsideWindow) && nextCursorOffset !== null && nextCursorOffset > 0
+        ? encodeLocalRolloutTurnPageCursor(nextCursorOffset)
+        : null,
+      backwardsCursor: null,
+    }
+  } catch {
+    return null
+  } finally {
+    await file?.close().catch(() => undefined)
+  }
 }
 
 function findReasoningPreservedTurnIndex(turns: unknown[], activeTurnId = ''): number {
@@ -1564,8 +1907,9 @@ async function readThreadLiveStateActiveTextSignature(input: {
     }, {
       trustedActiveTurn: true,
       trustedSnapshotEndOffset: input.snapshotEndOffset,
+      includeTurnStartUserAnchor: false,
     })
-    const latestVisibleItem = page.items[0]
+    const latestVisibleItem = page.items.at(-1)
     return latestVisibleItem
       ? hashThreadTextPageItemForProjection(latestVisibleItem)
       : 'empty'
@@ -1602,6 +1946,7 @@ function buildThreadLiveStateProjectionKey(input: {
       turnId: readNonEmptyString(runtime?.turnId),
       interruptible: runtime?.interruptible === true,
       source: readNonEmptyString(runtime?.source),
+      cwd: readNonEmptyString(runtime?.cwd),
     },
     liveAuthority: input.liveAuthority,
     liveSnapshot: liveSnapshot
@@ -1705,6 +2050,55 @@ function externalRuntimeObservationFromLiveSnapshot(
     interruptible: false,
     source: 'external-session-writer',
   }
+}
+
+function isRunningThreadRuntimeObservation(value: unknown): boolean {
+  const record = asRecord(value)
+  return record?.state === 'running' && (
+    record.source === 'external-session-writer' ||
+    record.source === 'local-app-server'
+  )
+}
+
+function isInterruptibleThreadRuntimeObservation(value: unknown): boolean {
+  const record = asRecord(value)
+  return isRunningThreadRuntimeObservation(value) && record?.interruptible === true
+}
+
+function isReusableCachedRuntimeObservation(value: unknown): boolean {
+  if (!isInterruptibleThreadRuntimeObservation(value)) return false
+  const record = asRecord(value)
+  if (record?.source !== 'external-session-writer') return true
+  return readNonEmptyString(record.cwd).length > 0
+}
+
+async function observeThreadRuntimeStateForLiveState(input: {
+  threadId: string
+  runtimeProbe: ThreadRuntimeProbe
+  localRuntimeLedger: LocalThreadRuntimeLedger
+  excludedPid: number | null
+  liveSnapshot: ThreadLiveSnapshot | null
+  cachedObservation?: unknown | null
+}): Promise<ThreadRuntimeObservation> {
+  const local = input.localRuntimeLedger.getRunning(input.threadId)
+  if (local) {
+    return {
+      state: 'running',
+      turnId: local.turnId,
+      interruptible: true,
+      source: 'local-app-server',
+    }
+  }
+  const observed = isReusableCachedRuntimeObservation(input.cachedObservation)
+    ? input.cachedObservation as ThreadRuntimeObservation
+    : await observeThreadRuntimeState(
+      input.threadId,
+      input.runtimeProbe,
+      input.localRuntimeLedger,
+      input.excludedPid,
+    )
+  if (isRunningThreadRuntimeObservation(observed)) return observed
+  return externalRuntimeObservationFromLiveSnapshot(input.liveSnapshot) ?? observed
 }
 
 function getErrorMessage(payload: unknown, fallback: string): string {
@@ -3559,9 +3953,10 @@ export async function callRpcWithArchiveRecovery(
   appServer: RpcExecutor,
   method: string,
   params: unknown,
-  runtimeProbe?: Pick<ThreadRuntimeProbe, 'registerThread' | 'inspect'>,
+  runtimeProbe?: Pick<ThreadRuntimeProbe, 'registerThread' | 'inspect'> &
+    Partial<Pick<ExternalThreadRuntimeProbe, 'interrupt'>>,
   excludedPid: number | null = null,
-  options: { locallyCreatedFirstTurn?: boolean } = {},
+  options: { locallyCreatedFirstTurn?: boolean; allowExternalSteer?: boolean } = {},
 ): Promise<unknown> {
   const paramsRecord = asRecord(params)
   const threadId = readNonEmptyString(paramsRecord?.threadId)
@@ -3592,12 +3987,31 @@ export async function callRpcWithArchiveRecovery(
         if (
           inspection.state !== 'idle'
           && !(inspection.state === 'unmaterialized' && options.locallyCreatedFirstTurn === true)
+          && !(options.allowExternalSteer === true && isRunningExternalWriterInspection(inspection))
         ) {
           throw new Error('Cannot resume a task owned by another app-server process.')
         }
       }
       await appServer.rpc('thread/resume', { threadId })
       return appServer.rpc(method, params ?? null)
+    }
+
+    if (
+      method === 'turn/interrupt' &&
+      threadId &&
+      runtimeProbe &&
+      typeof runtimeProbe.interrupt === 'function' &&
+      isThreadNotFoundError(error)
+    ) {
+      const turnPayload = asRecord(paramsRecord?.turn)
+      const turnId =
+        readNonEmptyString(paramsRecord?.turnId) ||
+        readNonEmptyString(paramsRecord?.turn_id) ||
+        readNonEmptyString(turnPayload?.id)
+      if (turnId) {
+        const result = await runtimeProbe.interrupt(threadId, turnId, excludedPid)
+        if (result.interrupted) return { ok: true }
+      }
     }
 
     if (method !== 'thread/archive') {
@@ -4579,7 +4993,7 @@ const SESSION_COLLABORATION_KIND_BY_FUNCTION = new Map<string, SessionRecoveredC
 
 type SessionItemSlot =
   | { type: 'agentMessage' }
-  | { type: 'userMessage'; userMessage: SessionRecoveredUserMessage }
+  | { type: 'userMessage'; userMessage: SessionRecoveredUserMessage; source: 'event' | 'response' }
   | { type: 'commandExecution'; command: SessionRecoveredCommand }
   | { type: 'fileChange'; fileChange: SessionRecoveredFileChangeItem }
   | { type: 'collaborationActivity'; collaborationActivity: SessionRecoveredCollaborationActivity }
@@ -4592,6 +5006,44 @@ type SessionRecoveredItemsCacheEntry = {
 }
 
 const sessionRecoveredItemsCache = new Map<string, SessionRecoveredItemsCacheEntry>()
+const CODEX_DELEGATION_OPEN_RE = /<codex_delegation\b[^>]*>/iu
+
+function sessionUserMessageSlotText(slot: Extract<SessionItemSlot, { type: 'userMessage' }>): string {
+  return slot.userMessage.content
+    .map((part) => part.text)
+    .join('\n')
+    .trim()
+}
+
+function isLateDelegatedSessionUserMessageSlot(slot: SessionItemSlot): boolean {
+  return slot.type === 'userMessage'
+    && slot.source === 'event'
+    && CODEX_DELEGATION_OPEN_RE.test(sessionUserMessageSlotText(slot))
+}
+
+function reorderLateDelegatedSessionSlots(slots: SessionItemSlot[]): SessionItemSlot[] {
+  const ordered: SessionItemSlot[] = []
+  let pairedResponseBoundary = 0
+  for (const slot of slots) {
+    if (!isLateDelegatedSessionUserMessageSlot(slot)) {
+      ordered.push(slot)
+      continue
+    }
+
+    const previousLength = ordered.length
+    let insertionIndex = ordered.length
+    while (insertionIndex > pairedResponseBoundary) {
+      const previous = ordered[insertionIndex - 1]!
+      if (previous.type === 'userMessage') break
+      insertionIndex -= 1
+    }
+    ordered.splice(insertionIndex, 0, slot)
+    if (insertionIndex < previousLength) {
+      pairedResponseBoundary = previousLength + 1
+    }
+  }
+  return ordered
+}
 
 function isInjectedSessionUserText(value: string): boolean {
   const text = value.trimStart()
@@ -4599,7 +5051,7 @@ function isInjectedSessionUserText(value: string): boolean {
     || text.startsWith('<recommended_plugins>')
     || text.startsWith('<permissions instructions>')
     || text.startsWith('# AGENTS.md instructions')
-    || text.startsWith('<codex_delegation>')
+    || text.startsWith('<subagent_notification>')
     || text.startsWith('The following is the Codex agent history')
 }
 
@@ -4616,12 +5068,180 @@ function readSessionUserMessageText(payload: Record<string, unknown>): string {
     .trim()
 }
 
+function readTurnUserMessageText(payload: Record<string, unknown>): string {
+  const contentText = readSessionUserMessageText(payload)
+  if (contentText) return contentText
+  return readNonEmptyString(payload.text) ?? readNonEmptyString(payload.message) ?? ''
+}
+
+function isInjectedTurnUserMessageItem(item: unknown): boolean {
+  const itemRecord = asRecord(item)
+  if (readNonEmptyString(itemRecord?.type) !== 'userMessage') return false
+  const text = itemRecord ? readTurnUserMessageText(itemRecord) : ''
+  return Boolean(text && isInjectedSessionUserText(text))
+}
+
+function readSessionAssistantMessageText(payload: Record<string, unknown>): string {
+  const parts = Array.isArray(payload.content) ? payload.content : []
+  const contentText = parts
+    .map(asRecord)
+    .flatMap((part) => {
+      if (part?.type === 'output_text' && typeof part.text === 'string') return [part.text]
+      if (part?.type === 'text' && typeof part.text === 'string') return [part.text]
+      return []
+    })
+    .join('\n')
+    .trim()
+  return contentText || readNonEmptyString(payload.text) || readNonEmptyString(payload.message)
+}
+
+function isSessionFallbackInjectedUserText(value: string): boolean {
+  const text = value.trimStart()
+  return text.startsWith('<environment_context>')
+    || text.startsWith('<recommended_plugins>')
+    || text.startsWith('<permissions instructions>')
+    || text.startsWith('# AGENTS.md instructions')
+    || text.startsWith('<subagent_notification>')
+    || text.startsWith('The following is the Codex agent history')
+}
+
 function buildSessionRecoveredUserMessage(id: string, text: string): SessionRecoveredUserMessage {
   return {
     id,
     type: 'userMessage',
     content: [{ type: 'text', text, text_elements: [] }],
   }
+}
+
+function appendSessionRecoveredUserMessage(
+  turn: SessionRecoveredTurn,
+  id: string,
+  text: string,
+): boolean {
+  const previous = asRecord(turn.items[turn.items.length - 1])
+  if (
+    previous
+    && readNonEmptyString(previous.type) === 'userMessage'
+    && readTurnUserMessageText(previous) === text
+  ) {
+    return false
+  }
+  turn.items.push(buildSessionRecoveredUserMessage(id, text) as unknown as Record<string, unknown>)
+  return true
+}
+
+type SessionRecoveredTurn = {
+  id: string
+  status: 'inProgress' | 'completed' | 'interrupted'
+  items: Record<string, unknown>[]
+}
+
+function getOrCreateSessionRecoveredTurn(
+  turns: SessionRecoveredTurn[],
+  turnById: Map<string, SessionRecoveredTurn>,
+  turnId: string,
+): SessionRecoveredTurn {
+  const existing = turnById.get(turnId)
+  if (existing) return existing
+  const turn: SessionRecoveredTurn = {
+    id: turnId,
+    status: 'inProgress',
+    items: [],
+  }
+  turns.push(turn)
+  turnById.set(turnId, turn)
+  return turn
+}
+
+function buildSessionRecoveredTurns(sessionLogRaw: string): unknown[] {
+  let currentTurn: SessionRecoveredTurn | null = null
+  let recoveredUserMessageIndex = 0
+  let recoveredAssistantMessageIndex = 0
+  const turns: SessionRecoveredTurn[] = []
+  const turnById = new Map<string, SessionRecoveredTurn>()
+
+  for (const line of sessionLogRaw.split('\n')) {
+    if (!line.trim()) continue
+    let row: Record<string, unknown> | null = null
+    try {
+      row = JSON.parse(line) as Record<string, unknown>
+    } catch {
+      continue
+    }
+
+    if (row.type === 'turn_context') {
+      const payload = asRecord(row.payload)
+      const turnId = readNonEmptyString(payload?.turn_id)
+      if (turnId) currentTurn = getOrCreateSessionRecoveredTurn(turns, turnById, turnId)
+      continue
+    }
+
+    if (row.type === 'event_msg') {
+      const payload = asRecord(row.payload)
+      if (payload?.type === 'task_started') {
+        const turnId = readNonEmptyString(payload.turn_id)
+        if (turnId) currentTurn = getOrCreateSessionRecoveredTurn(turns, turnById, turnId)
+        continue
+      }
+      if (payload?.type === 'task_complete' || payload?.type === 'turn_aborted') {
+        const turnId = readNonEmptyString(payload.turn_id) || currentTurn?.id || ''
+        const terminalTurn = turnId ? turnById.get(turnId) : null
+        if (terminalTurn) {
+          terminalTurn.status = payload.type === 'task_complete' ? 'completed' : 'interrupted'
+          if (currentTurn?.id === terminalTurn.id) currentTurn = null
+        }
+        continue
+      }
+      if (payload?.type === 'user_message' && currentTurn) {
+        const text = readNonEmptyString(payload.message) || readNonEmptyString(payload.text)
+        if (!text || isSessionFallbackInjectedUserText(text)) continue
+        const clientId = readNonEmptyString(payload.client_id)
+        recoveredUserMessageIndex += 1
+        appendSessionRecoveredUserMessage(
+          currentTurn,
+          clientId
+            ? `session-user-event-${currentTurn.id}-${clientId}`
+            : `session-user-event-${currentTurn.id}-${recoveredUserMessageIndex}`,
+          text,
+        )
+        continue
+      }
+    }
+
+    if (row.type !== 'response_item' || !currentTurn) continue
+    const payload = asRecord(row.payload)
+    if (!payload || payload.type !== 'message') continue
+
+    const payloadId = readNonEmptyString(payload.id)
+    if (payload.role === 'user') {
+      const text = readSessionUserMessageText(payload)
+      if (!text || isSessionFallbackInjectedUserText(text)) continue
+      recoveredUserMessageIndex += 1
+      appendSessionRecoveredUserMessage(
+        currentTurn,
+        payloadId || `session-user-${currentTurn.id}-${recoveredUserMessageIndex}`,
+        text,
+      )
+      continue
+    }
+
+    if (payload.role === 'assistant') {
+      const text = readSessionAssistantMessageText(payload)
+      if (!text) continue
+      recoveredAssistantMessageIndex += 1
+      currentTurn.items.push({
+        id: payloadId || `session-agent-${currentTurn.id}-${recoveredAssistantMessageIndex}`,
+        type: 'agentMessage',
+        text,
+        ...(readNonEmptyString(payload.phase) ? { phase: readNonEmptyString(payload.phase) } : {}),
+      })
+    }
+  }
+
+  if (turns.length === 0) return []
+
+  const orderByTurnId = buildSessionItemOrder(sessionLogRaw, new Set(turns.map((turn) => turn.id)))
+  return mergeSessionCommandsIntoTurns(turns, '', orderByTurnId)
 }
 
 function buildSessionItemOrder(sessionLogRaw: string, turnIds: Set<string> | null): Map<string, SessionItemSlot[]> {
@@ -4648,6 +5268,28 @@ function buildSessionItemOrder(sessionLogRaw: string, turnIds: Set<string> | nul
       const p = asRecord(row.payload)
       if (p?.type === 'task_started') {
         currentTurnId = readNonEmptyString(p.turn_id) || currentTurnId
+        continue
+      }
+      if (p?.type === 'user_message' && currentTurnId && (!turnIds || turnIds.has(currentTurnId))) {
+        const text = readNonEmptyString(p.message) || readNonEmptyString(p.text)
+        if (!text || isInjectedSessionUserText(text)) continue
+        let slots = orderByTurnId.get(currentTurnId)
+        if (!slots) {
+          slots = []
+          orderByTurnId.set(currentTurnId, slots)
+        }
+        const clientId = readNonEmptyString(p.client_id)
+        recoveredUserMessageIndex += 1
+        slots.push({
+          type: 'userMessage',
+          source: 'event',
+          userMessage: buildSessionRecoveredUserMessage(
+            clientId
+              ? `session-user-event-${currentTurnId}-${clientId}`
+              : `session-user-event-${currentTurnId}-${recoveredUserMessageIndex}`,
+            text,
+          ),
+        })
       }
       continue
     }
@@ -4674,6 +5316,7 @@ function buildSessionItemOrder(sessionLogRaw: string, turnIds: Set<string> | nul
       recoveredUserMessageIndex += 1
       slots.push({
         type: 'userMessage',
+        source: 'response',
         userMessage: buildSessionRecoveredUserMessage(
           payloadId || `session-user-${currentTurnId}-${recoveredUserMessageIndex}`,
           text,
@@ -4756,6 +5399,9 @@ function buildSessionItemOrder(sessionLogRaw: string, turnIds: Set<string> | nul
     }
   }
 
+  for (const [turnId, slots] of orderByTurnId) {
+    orderByTurnId.set(turnId, reorderLateDelegatedSessionSlots(slots))
+  }
   return orderByTurnId
 }
 
@@ -5306,6 +5952,24 @@ function mergeSessionCommandsIntoTurns(
         })
         .filter((text): text is string => !!text),
     )
+    const slotUserMessageTexts = new Set(
+      slots
+        .filter((slot): slot is Extract<SessionItemSlot, { type: 'userMessage' }> =>
+          slot.type === 'userMessage',
+        )
+        .map((slot) => slot.userMessage.content.map((part) => part.text).join('\n').trim())
+        .filter((text): text is string => !!text),
+    )
+    const existingUserMessagesByText = new Map<string, Record<string, unknown>[]>()
+    for (const item of existingItems) {
+      if (item.type !== 'userMessage') continue
+      const text = readTurnUserMessageText(item)
+      if (!text || !slotUserMessageTexts.has(text)) continue
+      const existing = existingUserMessagesByText.get(text) ?? []
+      existing.push(item)
+      existingUserMessagesByText.set(text, existing)
+    }
+    const movedExistingUserMessageIds = new Set<string>()
 
     const nextItems: Record<string, unknown>[] = []
     let slotIndex = 0
@@ -5326,7 +5990,18 @@ function mergeSessionCommandsIntoTurns(
       let recovered: Record<string, unknown> | null = null
       if (slot.type === 'userMessage') {
         const text = slot.userMessage.content.map((part) => part.text).join('\n').trim()
-        if (!text || existingUserMessageTexts.has(text)) return
+        if (!text) return
+        const existingMessages = existingUserMessagesByText.get(text)
+        while (existingMessages && existingMessages.length > 0) {
+          const existingMessage = existingMessages.shift()!
+          const existingId = readNonEmptyString(existingMessage.id)
+          if (existingId && movedExistingUserMessageIds.has(existingId)) continue
+          if (existingId) movedExistingUserMessageIds.add(existingId)
+          nextItems.push(existingMessage)
+          didRecoverItem = true
+          return
+        }
+        if (existingUserMessageTexts.has(text)) return
         existingUserMessageTexts.add(text)
         recovered = slot.userMessage as unknown as Record<string, unknown>
       } else if (slot.type === 'commandExecution') {
@@ -5353,6 +6028,15 @@ function mergeSessionCommandsIntoTurns(
     }
 
     for (const item of existingItems) {
+      if (item.type === 'userMessage') {
+        const itemId = readNonEmptyString(item.id)
+        if (itemId && movedExistingUserMessageIds.has(itemId)) continue
+        const text = readTurnUserMessageText(item)
+        if (text && slotUserMessageTexts.has(text)) {
+          didRecoverItem = true
+          continue
+        }
+      }
       const itemId = readNonEmptyString(item.id)
       if (
         item.type === 'subAgentActivity'
@@ -7729,6 +8413,7 @@ function stripThreadListRowHeavyPayload(value: unknown): unknown {
   delete stripped.conversation
   delete stripped.transcript
   delete stripped.externalRuntime
+  stripped.preview = truncateThreadListPreview(stripped.preview)
   return stripped
 }
 
@@ -9902,7 +10587,12 @@ export function createCodexBridgeMiddleware(options: {
           setJson(res, 400, { error: 'Missing threadId' })
           return
         }
-        const state = await runtimeProbe.inspect(threadId, appServer.getPid())
+        const state = await observeThreadRuntimeState(
+          threadId,
+          runtimeProbe,
+          localRuntimeLedger,
+          appServer.getPid(),
+        )
         appServer.cacheExternalRuntimeObservation(threadId, state)
         setJson(res, 200, state)
         return
@@ -9929,6 +10619,31 @@ export function createCodexBridgeMiddleware(options: {
         )
         appServer.cacheExternalRuntimeObservations(states)
         setJson(res, 200, { states })
+        return
+      }
+
+      if (req.method === 'POST' && url.pathname === '/codex-api/thread-runtime-interrupt') {
+        let payload: unknown
+        try {
+          payload = await readJsonBody(req)
+        } catch {
+          setJson(res, 400, { error: 'Invalid JSON body' })
+          return
+        }
+        const record = asRecord(payload)
+        const threadId = readNonEmptyString(record?.threadId)
+        const turnId = readNonEmptyString(record?.turnId)
+        if (!threadId || !turnId) {
+          setJson(res, 400, { error: 'Missing threadId or turnId' })
+          return
+        }
+        const result = await runtimeProbe.interrupt(threadId, turnId, appServer.getPid())
+        if (!result.interrupted) {
+          const reason = result.reason ?? 'writer-not-found'
+          setJson(res, 409, { error: `External runtime interrupt unavailable: ${reason}` })
+          return
+        }
+        setJson(res, 200, { ok: true })
         return
       }
 
@@ -10372,6 +11087,10 @@ export function createCodexBridgeMiddleware(options: {
         }
 
         const preparedRpcRequest = prepareRpcProxyRequest(body.method, body.params ?? null)
+        if (preparedRpcRequest.allowExternalSteer && !isTextOnlyExternalSteerTurnStartParams(body.params ?? null)) {
+          setJson(res, 400, { error: 'External steer only supports text input.' })
+          return
+        }
 
 	        if (body.method === 'generate-thread-title') {
 	          setJson(res, 200, { result: { title: '' } })
@@ -10407,6 +11126,7 @@ export function createCodexBridgeMiddleware(options: {
             if (
               inspection.state !== 'idle'
               && !(inspection.state === 'unmaterialized' && isPendingFirstTurn)
+              && !(preparedRpcRequest.allowExternalSteer === true && isRunningExternalWriterInspection(inspection))
             ) {
               throw new Error('Cannot start a turn because task writer ownership is not idle.')
             }
@@ -10424,7 +11144,10 @@ export function createCodexBridgeMiddleware(options: {
                 preparedRpcRequest.params,
                 runtimeProbe,
                 appServer.getPid(),
-                { locallyCreatedFirstTurn: isPendingFirstTurn },
+                {
+                  locallyCreatedFirstTurn: isPendingFirstTurn,
+                  allowExternalSteer: preparedRpcRequest.allowExternalSteer,
+                },
               )
               appServer.cacheThreadListRpcResult(threadListCacheKey, threadListCacheSignature, freshResult)
               await writePersistedThreadListRpcCache(threadListCacheKey, freshResult)
@@ -10456,7 +11179,10 @@ export function createCodexBridgeMiddleware(options: {
               preparedRpcRequest.params,
               runtimeProbe,
               appServer.getPid(),
-              { locallyCreatedFirstTurn: isPendingFirstTurn },
+              {
+                locallyCreatedFirstTurn: isPendingFirstTurn,
+                allowExternalSteer: preparedRpcRequest.allowExternalSteer,
+              },
             )
           }
           if (body.method === 'thread/start') {
@@ -10497,7 +11223,10 @@ export function createCodexBridgeMiddleware(options: {
           }
 		          throw error
 		        }
-        const trimmedResult = trimThreadTurnsInRpcResult(body.method, rpcResult)
+        const canonicalRpcResult = body.method === 'thread/list'
+          ? await canonicalizeThreadListResponseForRead(rpcResult)
+          : rpcResult
+        const trimmedResult = trimThreadTurnsInRpcResult(body.method, canonicalRpcResult)
         const errorMergedResult = THREAD_METHODS_WITH_TURNS.has(body.method)
           ? mergeStreamTurnErrorsIntoThreadResult(appServer, trimmedResult)
           : trimmedResult
@@ -10530,6 +11259,7 @@ export function createCodexBridgeMiddleware(options: {
             result,
             runtimeProbe,
             appServer.getPid(),
+            localRuntimeLedger,
           )
 
         setJson(res, 200, { result: resultWithExternalRuntime })
@@ -10540,6 +11270,7 @@ export function createCodexBridgeMiddleware(options: {
         try {
           const threadId = url.searchParams.get('threadId')?.trim() ?? ''
           const cursor = url.searchParams.get('cursor')?.trim() ?? ''
+          const activeTurnId = url.searchParams.get('activeTurnId')?.trim() ?? ''
           const limitRaw = url.searchParams.get('limit')?.trim() ?? String(THREAD_TURN_PAGE_DEFAULT_LIMIT)
           const limit = Math.max(1, Math.min(50, Number.parseInt(limitRaw, 10) || THREAD_TURN_PAGE_DEFAULT_LIMIT))
           if (!threadId) {
@@ -10547,18 +11278,52 @@ export function createCodexBridgeMiddleware(options: {
             return
           }
 
-          const page = await readNativeThreadTurnPage(
-            (method, params) => appServer.rpc(method, params),
-            {
-              threadId,
-              cursor: cursor || undefined,
+          const isLocalRolloutCursor = isLocalRolloutTurnPageCursor(cursor)
+          let pageWasLocalFallback = false
+          let page = isLocalRolloutCursor
+            ? { turns: [] as unknown[], nextCursor: null as string | null, backwardsCursor: null as string | null }
+            : await readNativeThreadTurnPage(
+              (method, params) => appServer.rpc(method, params),
+              {
+                threadId,
+                cursor: cursor || undefined,
+                limit,
+              },
+            )
+          if (isLocalRolloutCursor || (!cursor && page.turns.length === 0)) {
+            let sessionPath = await findLocalRolloutPathForThreadId(threadId)
+            if (!sessionPath) {
+              try {
+                const metadataResult = await appServer.rpc('thread/read', {
+                  threadId,
+                  includeTurns: false,
+                })
+                sessionPath = readNonEmptyString(asRecord(asRecord(metadataResult)?.thread)?.path)
+              } catch {
+                sessionPath = ''
+              }
+            }
+            const fallbackPage = await readLocalRolloutThreadTurnPageFallback(
+              sessionPath,
               limit,
-            },
-          )
+              isLocalRolloutCursor ? cursor : '',
+            )
+            if (fallbackPage && fallbackPage.turns.length > 0) {
+              page = fallbackPage
+              pageWasLocalFallback = true
+            } else if (isLocalRolloutCursor) {
+              setJson(res, 400, { error: 'Invalid thread turn cursor' })
+              return
+            }
+          }
+          const activeCompactedTurns = compactActiveTurnTextForTurnPage(page.turns, activeTurnId, {
+            compactRunningWhenActiveUnknown: pageWasLocalFallback,
+          })
+          const turns = compactHistoricalTurnTextForTurnPage(activeCompactedTurns, activeTurnId)
           const pagedResult = mergeStreamTurnErrorsIntoThreadResult(appServer, {
             thread: {
               id: threadId,
-              turns: pruneHistoricalReasoningItemsFromTurns(page.turns),
+              turns: pruneHistoricalReasoningItemsFromTurns(turns, activeTurnId),
             },
           })
           const result = await prepareThreadRpcResultForClient('thread/read', pagedResult, true)
@@ -10675,13 +11440,10 @@ export function createCodexBridgeMiddleware(options: {
             localRuntimeLedger,
             appServer.getPid(),
           )
-          if (
-            asRecord(runtime)?.state !== 'running'
-            || readNonEmptyString(asRecord(runtime)?.turnId) !== turnId
-          ) {
-            sendThreadTextPageJson(409, { error: 'Requested turn is not active' })
-            return
-          }
+          const runtimeRecord = asRecord(runtime)
+          const runtimeMatchesRequestedTurn =
+            runtimeRecord?.state === 'running'
+            && readNonEmptyString(runtimeRecord?.turnId) === turnId
           const page = await readThreadTextPage({
             sessionPath,
             threadId,
@@ -10693,7 +11455,7 @@ export function createCodexBridgeMiddleware(options: {
               ? undefined
               : Number.parseInt(afterSessionOrderRaw, 10),
           }, {
-            trustedActiveTurn: true,
+            trustedActiveTurn: runtimeMatchesRequestedTurn,
             trustedSnapshotEndOffset: sessionStats.size,
           })
           sendThreadTextPageJson(200, page)
@@ -10808,87 +11570,108 @@ export function createCodexBridgeMiddleware(options: {
               && cached?.isInProgress === true
               && cachedExternalRuntime?.state === 'running'
             ) {
-              const activeExternalTurnId = readNonEmptyString(cachedExternalRuntime.turnId)
-              const liveSnapshot = activeExternalTurnId
-                ? await readThreadLiveSnapshotFile(getThreadLiveStateDir(), threadId, {
-                    activeTurnId: activeExternalTurnId,
-                    nowMs: Date.now(),
-                  })
-                : null
-              const liveAuthority = liveSnapshot ? 'writer-snapshot' : 'missing'
-              const cachedThreadTurnStartIndex = Math.max(0, Math.floor(
-                typeof cached?.threadTurnStartIndex === 'number' ? cached.threadTurnStartIndex : 0,
-              ))
-              const cachedOlderCursor = readNonEmptyString(cached.olderCursor) || null
-              const activeTextSignature = await readThreadLiveStateActiveTextSignature({
-                sessionPath: snapshotSessionPath,
+              const runtimeForKnownProjection = await observeThreadRuntimeStateForLiveState({
                 threadId,
-                turnId: activeExternalTurnId,
-                snapshotEndOffset: snapshotSessionSize,
+                runtimeProbe,
+                localRuntimeLedger,
+                excludedPid: appServer.getPid(),
+                liveSnapshot: null,
+                cachedObservation: null,
               })
-              const projectionKey = buildThreadLiveStateProjectionKey({
-                threadId,
-                threadTurnStartIndex: cachedThreadTurnStartIndex,
-                turnCount: snapshotTurns.length,
-                olderCursor: cachedOlderCursor,
-                sessionSize: snapshotSessionSize,
-                isInProgress: true,
-                activeTextSignature,
-                externalRuntime: cachedExternalRuntime,
-                liveAuthority,
-                liveSnapshot,
-              })
-              if (knownProjectionKey === projectionKey) {
+              precheckedExternalRuntime = runtimeForKnownProjection
+              if (!isRunningThreadRuntimeObservation(runtimeForKnownProjection)) {
+                // Fall through to a fresh lightweight read; the cached running
+                // projection lost writer authority.
+              } else {
+                const runtimeRecord = asRecord(runtimeForKnownProjection)
+                const activeRuntimeTurnId = readNonEmptyString(runtimeRecord?.turnId)
+                const runtimeSource = readNonEmptyString(runtimeRecord?.source)
+                const isExternalRuntime = runtimeSource === 'external-session-writer'
+                const liveSnapshot = isExternalRuntime && activeRuntimeTurnId
+                  ? await readThreadLiveSnapshotFile(getThreadLiveStateDir(), threadId, {
+                      activeTurnId: activeRuntimeTurnId,
+                      nowMs: Date.now(),
+                    })
+                  : null
+                const liveAuthority = isExternalRuntime
+                  ? liveSnapshot ? 'writer-snapshot' : 'missing'
+                  : 'local-stream'
+                const cachedThreadTurnStartIndex = Math.max(0, Math.floor(
+                  typeof cached?.threadTurnStartIndex === 'number' ? cached.threadTurnStartIndex : 0,
+                ))
+                const cachedOlderCursor = readNonEmptyString(cached.olderCursor) || null
+                const activeTextSignature = await readThreadLiveStateActiveTextSignature({
+                  sessionPath: snapshotSessionPath,
+                  threadId,
+                  turnId: activeRuntimeTurnId,
+                  snapshotEndOffset: snapshotSessionSize,
+                })
+                const projectionKey = buildThreadLiveStateProjectionKey({
+                  threadId,
+                  threadTurnStartIndex: cachedThreadTurnStartIndex,
+                  turnCount: snapshotTurns.length,
+                  olderCursor: cachedOlderCursor,
+                  sessionSize: snapshotSessionSize,
+                  isInProgress: true,
+                  activeTextSignature,
+                  externalRuntime: runtimeForKnownProjection,
+                  liveAuthority,
+                  liveSnapshot,
+                })
+                if (knownProjectionKey === projectionKey) {
+                  sendLiveStateJson(200, buildThreadLiveStateNotModifiedResponse({
+                    threadId,
+                    projectionKey,
+                    isInProgress: true,
+                    externalRuntime: runtimeForKnownProjection,
+                    liveAuthority,
+                    liveSnapshot,
+                  }))
+                  return
+                }
                 sendLiveStateJson(200, buildThreadLiveStateNotModifiedResponse({
                   threadId,
                   projectionKey,
                   isInProgress: true,
-                  externalRuntime: cachedExternalRuntime,
+                  externalRuntime: runtimeForKnownProjection,
                   liveAuthority,
                   liveSnapshot,
                 }))
                 return
               }
-              sendLiveStateJson(200, buildThreadLiveStateNotModifiedResponse({
-                threadId,
-                projectionKey,
-                isInProgress: true,
-                externalRuntime: cachedExternalRuntime,
-                liveAuthority,
-                liveSnapshot,
-              }))
-              return
             }
             precheckedThreadLiveSnapshot = await readThreadLiveSnapshotFileForThread(
               getThreadLiveStateDir(),
               threadId,
               { nowMs: Date.now() },
             )
-            const snapshotExternalRuntime = cached
-              ? null
-              : externalRuntimeObservationFromLiveSnapshot(precheckedThreadLiveSnapshot)
-            const externalRuntime = appServer.getCachedExternalRuntimeObservation(threadId)
-              ?? snapshotExternalRuntime
-              ?? await observeThreadRuntimeState(
-                threadId,
-                runtimeProbe,
-                localRuntimeLedger,
-                appServer.getPid(),
-              )
+            const externalRuntime = await observeThreadRuntimeStateForLiveState({
+              threadId,
+              runtimeProbe,
+              localRuntimeLedger,
+              excludedPid: appServer.getPid(),
+              liveSnapshot: cached ? null : precheckedThreadLiveSnapshot,
+              cachedObservation: appServer.getCachedExternalRuntimeObservation(threadId),
+            })
             precheckedExternalRuntime = externalRuntime
-            if (asRecord(externalRuntime)?.state === 'running') {
-              const activeExternalTurnId = readNonEmptyString(asRecord(externalRuntime)?.turnId)
-              const liveSnapshot = activeExternalTurnId
+            if (isRunningThreadRuntimeObservation(externalRuntime)) {
+              const runtimeRecord = asRecord(externalRuntime)
+              const activeRuntimeTurnId = readNonEmptyString(runtimeRecord?.turnId)
+              const runtimeSource = readNonEmptyString(runtimeRecord?.source)
+              const isExternalRuntime = runtimeSource === 'external-session-writer'
+              const liveSnapshot = isExternalRuntime && activeRuntimeTurnId
                 ? (
-                    precheckedThreadLiveSnapshot?.activeTurnId === activeExternalTurnId
+                    precheckedThreadLiveSnapshot?.activeTurnId === activeRuntimeTurnId
                       ? precheckedThreadLiveSnapshot
                       : await readThreadLiveSnapshotFile(getThreadLiveStateDir(), threadId, {
-                          activeTurnId: activeExternalTurnId,
+                          activeTurnId: activeRuntimeTurnId,
                           nowMs: Date.now(),
                         })
                   )
                 : null
-              const liveAuthority = liveSnapshot ? 'writer-snapshot' : 'missing'
+              const liveAuthority = isExternalRuntime
+                ? liveSnapshot ? 'writer-snapshot' : 'missing'
+                : 'local-stream'
               const cachedThreadTurnStartIndexRaw = cached?.threadTurnStartIndex
               const cachedThreadTurnStartIndex = Math.max(0, Math.floor(
                 typeof cachedThreadTurnStartIndexRaw === 'number' ? cachedThreadTurnStartIndexRaw : 0,
@@ -10896,12 +11679,12 @@ export function createCodexBridgeMiddleware(options: {
               const activeTextSignature = await readThreadLiveStateActiveTextSignature({
                 sessionPath: snapshotSessionPath,
                 threadId,
-                turnId: activeExternalTurnId,
+                turnId: activeRuntimeTurnId,
                 snapshotEndOffset: snapshotSessionSize,
               })
               const projectedTurns = buildLightweightRunningTurnProjection(
-                pruneHistoricalReasoningItemsFromTurns(snapshotTurns, activeExternalTurnId),
-                activeExternalTurnId,
+                pruneHistoricalReasoningItemsFromTurns(snapshotTurns, activeRuntimeTurnId),
+                activeRuntimeTurnId,
               )
               const projectionKey = buildThreadLiveStateProjectionKey({
                 threadId,
@@ -10918,7 +11701,7 @@ export function createCodexBridgeMiddleware(options: {
               const responseData = {
                 ...(asRecord(cached) ?? {}),
                 threadId,
-                activeTurnId: activeExternalTurnId,
+                activeTurnId: activeRuntimeTurnId,
                 projectionKey,
                 threadTurnStartIndex: cachedThreadTurnStartIndex,
                 olderCursor: readNonEmptyString(cached?.olderCursor) || null,
@@ -10968,13 +11751,14 @@ export function createCodexBridgeMiddleware(options: {
                 const localSessionStats = await stat(localSessionPath)
                 if (localSessionStats.isFile()) {
                   runtimeProbe.registerThread(threadId, localSessionPath)
-                  const externalRuntime = appServer.getCachedExternalRuntimeObservation(threadId)
-                    ?? await observeThreadRuntimeState(
-                      threadId,
-                      runtimeProbe,
-                      localRuntimeLedger,
-                      appServer.getPid(),
-                    )
+                  const externalRuntime = await observeThreadRuntimeStateForLiveState({
+                    threadId,
+                    runtimeProbe,
+                    localRuntimeLedger,
+                    excludedPid: appServer.getPid(),
+                    liveSnapshot: null,
+                    cachedObservation: appServer.getCachedExternalRuntimeObservation(threadId),
+                  })
                   precheckedExternalRuntime = externalRuntime
                   if (asRecord(externalRuntime)?.state === 'running') {
                     const activeExternalTurnId = readNonEmptyString(asRecord(externalRuntime)?.turnId)
@@ -11030,13 +11814,23 @@ export function createCodexBridgeMiddleware(options: {
           let olderCursor: string | null = null
           let usedNativeTurnPagination = false
           try {
-            const page = await readNativeThreadTurnPage(
+            let page = await readNativeThreadTurnPage(
               (method, params) => appServer.rpc(method, params),
               {
                 threadId,
                 limit: THREAD_TURN_PAGE_DEFAULT_LIMIT,
               },
             )
+            if (page.turns.length === 0) {
+              const metadataSessionPath = readNonEmptyString(metadataThread?.path)
+              const fallbackPage = await readLocalRolloutThreadTurnPageFallback(
+                metadataSessionPath,
+                THREAD_TURN_PAGE_DEFAULT_LIMIT,
+              )
+              if (fallbackPage && fallbackPage.turns.length > 0) {
+                page = fallbackPage
+              }
+            }
             olderCursor = page.nextCursor
             usedNativeTurnPagination = true
             rawThreadReadResult = {
@@ -11110,25 +11904,27 @@ export function createCodexBridgeMiddleware(options: {
             )
           }
           const cachedLiveState = appServer.getCachedLiveState(threadId, rawTurns.length, sessionSize)
-          const snapshotExternalRuntime = cachedLiveState
-            ? null
-            : externalRuntimeObservationFromLiveSnapshot(precheckedThreadLiveSnapshot)
           const externalRuntime = precheckedExternalRuntime
-            ?? appServer.getCachedExternalRuntimeObservation(threadId)
-            ?? snapshotExternalRuntime
-            ?? await observeThreadRuntimeState(
+            ?? await observeThreadRuntimeStateForLiveState({
               threadId,
               runtimeProbe,
               localRuntimeLedger,
-              appServer.getPid(),
-            )
+              excludedPid: appServer.getPid(),
+              liveSnapshot: cachedLiveState ? null : precheckedThreadLiveSnapshot,
+              cachedObservation: appServer.getCachedExternalRuntimeObservation(threadId),
+            })
           const externalRuntimeState = readNonEmptyString(asRecord(externalRuntime)?.state)
-          const isExternalInProgress = asRecord(externalRuntime)?.state === 'running'
+          const externalRuntimeSource = readNonEmptyString(asRecord(externalRuntime)?.source)
+          const runtimeTurnId = readNonEmptyString(asRecord(externalRuntime)?.turnId)
+          const isExternalInProgress = externalRuntimeState === 'running'
+            && externalRuntimeSource === 'external-session-writer'
+          const isLocalRuntimeInProgress = externalRuntimeState === 'running'
+            && externalRuntimeSource === 'local-app-server'
           const isOrphanedLocalInProgress = rawLocallyInProgress && externalRuntimeState === 'idle'
           if (isOrphanedLocalInProgress) {
             turns = markLastLocalInProgressTurnOrphaned(turns)
           }
-          const isLocallyInProgress = rawLocallyInProgress && !isOrphanedLocalInProgress
+          const isLocallyInProgress = (rawLocallyInProgress && !isOrphanedLocalInProgress) || isLocalRuntimeInProgress
           const cached = isExternalInProgress
             ? null
             : cachedLiveState
@@ -11157,13 +11953,13 @@ export function createCodexBridgeMiddleware(options: {
             return
           }
           const isInProgress = isLocallyInProgress || isExternalInProgress
-          const activeExternalTurnId = isExternalInProgress
-            ? readNonEmptyString(asRecord(externalRuntime)?.turnId)
+          const activeRuntimeTurnId = isExternalInProgress || isLocalRuntimeInProgress
+            ? runtimeTurnId
             : ''
-          const activeTextTurnId = activeExternalTurnId || (isLocallyInProgress
+          const activeTextTurnId = activeRuntimeTurnId || (isLocallyInProgress
             ? readNonEmptyString(lastTurn?.id)
             : '')
-          turns = pruneHistoricalReasoningItemsFromTurns(turns, activeExternalTurnId)
+          turns = pruneHistoricalReasoningItemsFromTurns(turns, activeTextTurnId)
           const responseTurns = isInProgress && activeTextTurnId
             ? buildLightweightRunningTurnProjection(turns, activeTextTurnId)
             : turns
@@ -11174,12 +11970,12 @@ export function createCodexBridgeMiddleware(options: {
               turns,
             },
           })
-          const liveSnapshot = activeExternalTurnId
+          const liveSnapshot = isExternalInProgress && activeTextTurnId
             ? (
-                precheckedThreadLiveSnapshot?.activeTurnId === activeExternalTurnId
+                precheckedThreadLiveSnapshot?.activeTurnId === activeTextTurnId
                   ? precheckedThreadLiveSnapshot
                   : await readThreadLiveSnapshotFile(getThreadLiveStateDir(), threadId, {
-                      activeTurnId: activeExternalTurnId,
+                      activeTurnId: activeTextTurnId,
                       nowMs: Date.now(),
                     })
               )

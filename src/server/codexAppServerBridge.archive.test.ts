@@ -137,6 +137,31 @@ describe('callRpcWithArchiveRecovery', () => {
       },
     ])
   })
+
+  it('falls back to external runtime interrupt when local turn/interrupt cannot materialize the thread', async () => {
+    const appServer = {
+      async rpc(method: string): Promise<unknown> {
+        if (method === 'turn/interrupt') {
+          throw new Error('thread not found: thread-external')
+        }
+        throw new Error(`unexpected method ${method}`)
+      },
+    }
+    const runtimeProbe = {
+      registerThread: vi.fn(),
+      inspect: vi.fn(),
+      interrupt: vi.fn().mockResolvedValue({ interrupted: true }),
+    }
+
+    await expect(callRpcWithArchiveRecovery(
+      appServer,
+      'turn/interrupt',
+      { threadId: 'thread-external', turnId: 'turn-external' },
+      runtimeProbe,
+      4242,
+    )).resolves.toEqual({ ok: true })
+    expect(runtimeProbe.interrupt).toHaveBeenCalledWith('thread-external', 'turn-external', 4242)
+  })
 })
 
 describe('buildProjectlessFolderName', () => {
@@ -266,6 +291,43 @@ describe('canonicalizeThreadListResponseForRead', () => {
       ],
       nextCursor: null,
     })
+  })
+
+  it('truncates long thread-list previews while keeping metadata lightweight', async () => {
+    const longPreview = `${'x'.repeat(600)} trailing text`
+    const payload = await canonicalizeThreadListResponseForRead({
+      data: [
+        {
+          id: 'thread-with-long-preview',
+          cwd: '/workspace/project',
+          title: 'Long preview thread',
+          preview: longPreview,
+        },
+      ],
+      nextCursor: null,
+    }, async (value) => value)
+
+    const row = (payload as { data?: Array<{ preview?: unknown }> }).data?.[0]
+    expect(row?.preview).toEqual(`${'x'.repeat(512)}...`)
+  })
+
+  it('removes injected handoff text from thread-list previews', async () => {
+    const payload = await canonicalizeThreadListResponseForRead({
+      data: [
+        {
+          id: 'thread-with-handoff-preview',
+          cwd: '/workspace/project',
+          title: 'Handoff thread',
+          preview: '<codex_delegation>\n<input>hidden handoff</input>\n</codex_delegation>',
+        },
+      ],
+      nextCursor: null,
+    }, async (value) => value)
+
+    const row = (payload as { data?: Array<{ preview?: unknown }> }).data?.[0]
+    expect(row?.preview).toBe('')
+    expect(JSON.stringify(payload)).not.toContain('codex_delegation')
+    expect(JSON.stringify(payload)).not.toContain('hidden handoff')
   })
 
   it('realpaths thread cwd values to match canonicalized workspace roots', async () => {

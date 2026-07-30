@@ -90,12 +90,12 @@ describe('ThreadComposer desktop parity wiring', () => {
     expect(spacerRule).not.toContain('flex-1')
   })
 
-  it('keeps skills, speed, and plan inside desktop-style menus while running sends stay queue-only', () => {
+  it('keeps skills, speed, and plan inside desktop-style menus while running sends use the selected mode', () => {
     expect(source).toContain('thread-composer-attach-skills')
     expect(source).toContain("t('Fast mode')")
     expect(source).toContain("t('Plan mode')")
     expect(source).not.toContain("t('In-progress send')")
-    expect(source).toContain("props.isTurnInProgress ? 'queue' : 'steer'")
+    expect(source).toContain("props.isTurnInProgress ? props.inProgressSubmitMode ?? 'queue' : 'steer'")
   })
 
   it('uses the selected-thread placeholder and forwards Goal mutations through App', () => {

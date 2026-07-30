@@ -18,7 +18,7 @@
             class="thread-composer-attachment-remove"
             type="button"
             :aria-label="`Remove ${image.name || 'image'}`"
-            :disabled="isInteractionDisabled"
+            :disabled="isAttachmentControlDisabled"
             @click="removeImage(image.id)"
           >
             ×
@@ -42,7 +42,7 @@
             class="thread-composer-folder-chip-remove"
             type="button"
             :aria-label="`Remove folder ${group.name}`"
-            :disabled="isInteractionDisabled"
+            :disabled="isAttachmentControlDisabled"
             @click="removeFolderAttachment(group.id)"
           >×</button>
         </span>
@@ -56,7 +56,7 @@
             class="thread-composer-file-chip-remove"
             type="button"
             :aria-label="`Remove ${att.label}`"
-            :disabled="isInteractionDisabled"
+            :disabled="isAttachmentControlDisabled"
             @click="removeFileAttachment(att.fsPath)"
           >×</button>
         </span>
@@ -69,7 +69,7 @@
             type="button"
             :title="skillMarkdownPath(skill.path)"
             :aria-label="`Open ${skill.displayName || skill.name} SKILL.md`"
-            :disabled="isInteractionDisabled"
+            :disabled="isAttachmentControlDisabled"
             @click="openSkillMarkdown(skill)"
           >
             {{ skill.displayName || skill.name }}
@@ -78,7 +78,7 @@
             class="thread-composer-skill-chip-remove"
             type="button"
             :aria-label="`Remove skill ${skill.displayName || skill.name}`"
-            :disabled="isInteractionDisabled"
+            :disabled="isAttachmentControlDisabled"
             @click="removeSkill(skill.path)"
           >×</button>
         </span>
@@ -158,7 +158,7 @@
             class="thread-composer-attach-trigger"
             type="button"
             :aria-label="t('Add photos & files')"
-            :disabled="isInteractionDisabled"
+            :disabled="isAttachmentControlDisabled"
             @click="toggleAttachMenu"
           >
             <span class="thread-composer-attach-plus">+</span>
@@ -168,7 +168,7 @@
             <button
               class="thread-composer-attach-item"
               type="button"
-              :disabled="isInteractionDisabled"
+              :disabled="isAttachmentControlDisabled"
               @click="triggerPhotoLibrary"
             >
               {{ t('Add photos & files') }}
@@ -176,7 +176,7 @@
             <button
               class="thread-composer-attach-item"
               type="button"
-              :disabled="isInteractionDisabled"
+              :disabled="isAttachmentControlDisabled"
               @click="triggerFolderPicker"
             >
               {{ t('Add folder') }}
@@ -184,7 +184,7 @@
             <button
               class="thread-composer-attach-item"
               type="button"
-              :disabled="isInteractionDisabled"
+              :disabled="isAttachmentControlDisabled"
               @click="triggerCameraCapture"
             >
               {{ t('Take photo') }}
@@ -344,11 +344,11 @@
           </button>
 
           <button
-            v-if="composerControlState.primaryAction === 'stop' || composerControlState.primaryAction === 'externalRunning'"
+            v-if="composerControlState.primaryAction === 'stop'"
             class="thread-composer-stop"
             type="button"
-            :aria-label="isExternallyOwned ? t('Running in another client') : stopControlLabel"
-            :title="isExternallyOwned ? t('Running in another client') : stopControlLabel"
+            :aria-label="stopControlLabel"
+            :title="stopControlLabel"
             :disabled="!composerControlState.canStop || isInterruptingTurn || isStopPending"
             @click="onInterrupt"
           >
@@ -376,7 +376,7 @@
       class="thread-composer-hidden-input"
       type="file"
       multiple
-      :disabled="isInteractionDisabled"
+      :disabled="isAttachmentControlDisabled"
       @change="onPhotoLibraryChange"
     />
     <input
@@ -385,7 +385,7 @@
       type="file"
       accept="image/*"
       capture="environment"
-      :disabled="isInteractionDisabled"
+      :disabled="isAttachmentControlDisabled"
       @change="onCameraCaptureChange"
     />
     <input
@@ -395,7 +395,7 @@
       multiple
       webkitdirectory
       directory
-      :disabled="isInteractionDisabled"
+      :disabled="isAttachmentControlDisabled"
       @change="onFolderPickerChange"
     />
   </form>
@@ -469,6 +469,7 @@ const props = defineProps<{
   threadTokenUsage?: UiThreadTokenUsage | null
   codexQuota?: UiRateLimitSnapshot | null
   isTurnInProgress?: boolean
+  canInterruptTurn?: boolean
   isStopPending?: boolean
   isInterruptingTurn?: boolean
   isUpdatingSpeedMode?: boolean
@@ -637,6 +638,8 @@ function formatModelLabel(modelId: string): string {
 const composerControlState = computed(() => deriveComposerControlState({
   runtimeOwnership: props.runtimeOwnership ?? 'idle',
   isTurnInProgress: props.isTurnInProgress === true,
+  canInterruptTurn: props.canInterruptTurn
+    ?? (props.isTurnInProgress === true && (props.runtimeOwnership ?? 'local') !== 'external'),
   hasSubmitContent: hasSubmitContent.value,
   disabled: props.disabled === true || !props.activeThreadId,
   hasPendingRequest: false,
@@ -696,13 +699,14 @@ const skillDropdownOptions = computed(() =>
   ],
 )
 
+const isExternallyOwned = computed(() => props.runtimeOwnership === 'external')
 const canSubmit = computed(() => {
-  if (isExternallyOwned.value) return false
   if (props.disabled) return false
   if (props.isUpdatingSpeedMode) return false
   if (!props.activeThreadId) return false
   if (isPlanModeWaitingForModel.value) return false
   if (pendingAttachmentCount.value > 0) return false
+  if (isExternallyOwned.value) return draft.value.trim().length > 0
   return draft.value.trim().length > 0 || selectedImages.value.length > 0 || fileAttachments.value.length > 0
 })
 const hasUnsavedDraft = computed(() =>
@@ -719,12 +723,12 @@ const standaloneFileAttachments = computed(() => {
   }
   return fileAttachments.value.filter((att) => !grouped.has(att.fsPath))
 })
-const isExternallyOwned = computed(() => props.runtimeOwnership === 'external')
-const isInteractionDisabled = computed(() => isExternallyOwned.value || props.disabled || !props.activeThreadId)
+const isInteractionDisabled = computed(() => props.disabled || !props.activeThreadId)
+const isAttachmentControlDisabled = computed(() => isExternallyOwned.value || isInteractionDisabled.value)
 const isComposerConfigDisabled = computed(() => !composerControlState.value.canEditConfiguration)
 const isFastModeSupported = computed(() => /^gpt-5\.(?:4|5|6)(?:$|-)/.test(props.selectedModel.trim()))
 const isSpeedToggleDisabled = computed(() =>
-  isInteractionDisabled.value || props.isUpdatingSpeedMode === true,
+  isExternallyOwned.value || isInteractionDisabled.value || props.isUpdatingSpeedMode === true,
 )
 const speedModeDescription = computed(() => {
   if (props.isUpdatingSpeedMode) {
@@ -735,7 +739,7 @@ const speedModeDescription = computed(() => {
     : t('Default speed with normal credit usage')
 })
 const submitMode = computed<'steer' | 'queue'>(() =>
-  props.isTurnInProgress ? 'queue' : 'steer',
+  props.isTurnInProgress ? props.inProgressSubmitMode ?? 'queue' : 'steer',
 )
 const isDictationRecording = computed(() => dictationState.value === 'recording')
 const dictationButtonLabel = computed(() => {
@@ -1017,14 +1021,16 @@ function buildContextUsageView(
 }
 
 function onSubmit(mode: 'steer' | 'queue' = 'steer'): void {
-  if (isExternallyOwned.value) return
   const text = draft.value.trim()
   if (!canSubmit.value) return
+  const imageUrls = isExternallyOwned.value ? [] : selectedImages.value.map(toSelectedImageUrl)
+  const submitFileAttachments = isExternallyOwned.value ? [] : [...fileAttachments.value]
+  const submitSkills = isExternallyOwned.value ? [] : selectedSkills.value.map((s) => ({ name: s.name, path: s.path }))
   emit('submit', {
     text,
-    imageUrls: selectedImages.value.map(toSelectedImageUrl),
-    fileAttachments: [...fileAttachments.value],
-    skills: selectedSkills.value.map((s) => ({ name: s.name, path: s.path })),
+    imageUrls,
+    fileAttachments: submitFileAttachments,
+    skills: submitSkills,
     mode,
   })
   clearPersistedDraftForThread(props.activeThreadId)
@@ -1175,7 +1181,6 @@ function getCurrentDraftPayload(): ComposerDraftPayload {
 }
 
 function onInterrupt(): void {
-  if (isExternallyOwned.value) return
   emit('interrupt')
 }
 
@@ -1268,7 +1273,7 @@ function onDictationPressEnd(): void {
 }
 
 function toggleAttachMenu(): void {
-  if (isInteractionDisabled.value) return
+  if (isAttachmentControlDisabled.value) return
   isGoalMenuOpen.value = false
   isAttachMenuOpen.value = !isAttachMenuOpen.value
 }
@@ -1299,17 +1304,17 @@ function submitGoal(): void {
 }
 
 function triggerPhotoLibrary(): void {
-  if (isInteractionDisabled.value) return
+  if (isAttachmentControlDisabled.value) return
   photoLibraryInputRef.value?.click()
 }
 
 function triggerCameraCapture(): void {
-  if (isInteractionDisabled.value) return
+  if (isAttachmentControlDisabled.value) return
   cameraCaptureInputRef.value?.click()
 }
 
 function triggerFolderPicker(): void {
-  if (isInteractionDisabled.value) return
+  if (isAttachmentControlDisabled.value) return
   folderPickerInputRef.value?.click()
 }
 
@@ -1342,12 +1347,14 @@ function selectedImageFromUrl(url: string, index: number): SelectedImage | null 
 }
 
 function removeImage(id: string): void {
+  if (isAttachmentControlDisabled.value) return
   const image = selectedImages.value.find((item) => item.id === id)
   selectedImages.value = selectedImages.value.filter((item) => item.id !== id)
   if (image) void cleanupUploadedFile(image.uploadHandle)
 }
 
 function removeSkill(path: string): void {
+  if (isAttachmentControlDisabled.value) return
   selectedSkills.value = selectedSkills.value.filter((s) => s.path !== path)
 }
 
@@ -1358,18 +1365,21 @@ function skillMarkdownPath(path: string): string {
 }
 
 function openSkillMarkdown(skill: SkillItem): void {
+  if (isAttachmentControlDisabled.value) return
   const markdownPath = skillMarkdownPath(skill.path)
   if (!markdownPath || typeof window === 'undefined') return
   window.open(`/codex-local-browse${encodeURI(markdownPath)}`, '_blank', 'noopener,noreferrer')
 }
 
 function removeFileAttachment(fsPath: string): void {
+  if (isAttachmentControlDisabled.value) return
   const attachment = fileAttachments.value.find((item) => item.fsPath === fsPath)
   fileAttachments.value = fileAttachments.value.filter((a) => a.fsPath !== fsPath)
   if (attachment?.uploadHandle) void cleanupUploadedFile(attachment.uploadHandle)
 }
 
 function removeFolderAttachment(groupId: string): void {
+  if (isAttachmentControlDisabled.value) return
   const group = folderUploadGroups.value.find((item) => item.id === groupId)
   if (!group) return
   const toRemove = new Set(group.filePaths)
@@ -1545,7 +1555,7 @@ async function attachUploadedFile(file: File, sessionToken: number): Promise<voi
 }
 
 function attachIncomingFiles(files: FileList | File[] | null | undefined): void {
-  if (isInteractionDisabled.value) return
+  if (isAttachmentControlDisabled.value) return
   const normalizedFiles = normalizeSelectedFiles(files)
   if (normalizedFiles.length === 0) return
   beginAttachmentBatch(normalizedFiles.length)
@@ -1572,7 +1582,7 @@ function hasFilePayload(dataTransfer: DataTransfer | null): boolean {
 }
 
 async function addFolderFiles(files: FileList | null): Promise<void> {
-  if (isInteractionDisabled.value) return
+  if (isAttachmentControlDisabled.value) return
   if (!files || files.length === 0) return
   const generation = draftGeneration.value
   const sessionToken = attachmentSessionToken
@@ -1656,14 +1666,14 @@ function onFolderPickerChange(event: Event): void {
 }
 
 function onInputDragEnter(event: DragEvent): void {
-  if (isInteractionDisabled.value || !hasFilePayload(event.dataTransfer)) return
+  if (isAttachmentControlDisabled.value || !hasFilePayload(event.dataTransfer)) return
   event.preventDefault()
   dragDepth += 1
   isDragActive.value = true
 }
 
 function onInputDragOver(event: DragEvent): void {
-  if (isInteractionDisabled.value || !hasFilePayload(event.dataTransfer)) return
+  if (isAttachmentControlDisabled.value || !hasFilePayload(event.dataTransfer)) return
   event.preventDefault()
   if (event.dataTransfer) {
     event.dataTransfer.dropEffect = 'copy'
@@ -1681,7 +1691,7 @@ function onInputDragLeave(event: DragEvent): void {
 }
 
 function onInputDrop(event: DragEvent): void {
-  if (isInteractionDisabled.value || !hasFilePayload(event.dataTransfer)) return
+  if (isAttachmentControlDisabled.value || !hasFilePayload(event.dataTransfer)) return
   event.preventDefault()
   resetDragState()
   attachIncomingFiles(event.dataTransfer?.files ?? null)
@@ -1695,7 +1705,7 @@ function onWindowDragCleanup(): void {
 function onInputPaste(event: ClipboardEvent): void {
   if (isInteractionDisabled.value) return
   const plainText = event.clipboardData?.getData('text/plain') ?? ''
-  if (plainText.length >= PASTED_TEXT_FILE_THRESHOLD) {
+  if (plainText.length >= PASTED_TEXT_FILE_THRESHOLD && !isAttachmentControlDisabled.value) {
     event.preventDefault()
     const textFile = new File([plainText], createPastedTextFileName(), {
       type: 'text/plain',
@@ -1727,7 +1737,7 @@ function onInputChange(): void {
 }
 
 function onInputKeydown(event: KeyboardEvent): void {
-  if (isFileMentionOpen.value) {
+  if (isFileMentionOpen.value && !isAttachmentControlDisabled.value) {
     if (event.key === 'Escape') {
       event.preventDefault()
       closeFileMention()
@@ -1780,6 +1790,10 @@ function closeFileMention(): void {
 }
 
 function updateFileMentionState(): void {
+  if (isAttachmentControlDisabled.value) {
+    closeFileMention()
+    return
+  }
   const input = inputRef.value
   if (!input) {
     closeFileMention()
@@ -1803,7 +1817,7 @@ function updateFileMentionState(): void {
 }
 
 async function queueFileMentionSearch(): Promise<void> {
-  if (!isFileMentionOpen.value) return
+  if (!isFileMentionOpen.value || isAttachmentControlDisabled.value) return
   const cwd = (props.cwd ?? '').trim()
   if (!cwd) {
     fileMentionSuggestions.value = []
@@ -1814,6 +1828,10 @@ async function queueFileMentionSearch(): Promise<void> {
   }
   const token = ++fileMentionSearchToken
   fileMentionDebounceTimer = setTimeout(async () => {
+    if (isAttachmentControlDisabled.value) {
+      closeFileMention()
+      return
+    }
     try {
       const rows = await searchComposerFiles(cwd, mentionQuery.value, 20)
       if (!isFileMentionOpen.value || token !== fileMentionSearchToken) return
@@ -1827,7 +1845,7 @@ async function queueFileMentionSearch(): Promise<void> {
 }
 
 function applyFileMention(suggestion: ComposerFileSuggestion): void {
-  if (isInteractionDisabled.value) return
+  if (isAttachmentControlDisabled.value) return
   const input = inputRef.value
   const start = mentionStartIndex.value
   if (start !== null && input) {
@@ -1991,7 +2009,8 @@ function onDocumentClick(event: MouseEvent): void {
 function invalidatePendingAttachments(): void {
   cleanupSelectedImages()
   cleanupManagedFileAttachments()
-  fileAttachments.value = fileAttachments.value.filter((attachment) => !attachment.uploadHandle)
+  fileAttachments.value = []
+  selectedSkills.value = []
   attachmentSessionToken += 1
   pendingAttachmentCount.value = 0
   attachmentBatchStats.value = null
@@ -2037,6 +2056,7 @@ onBeforeUnmount(() => {
 watch(
   () => props.activeThreadId,
   (nextThreadId) => {
+    const normalizedThreadId = nextThreadId.trim()
     cancelDictation()
     if (lastActiveThreadId) {
       persistDraftForThread(lastActiveThreadId, getCurrentDraftPayload())
@@ -2047,7 +2067,8 @@ watch(
       replaceDraftState(restored)
       onInputChange()
     }
-    lastActiveThreadId = nextThreadId.trim()
+    lastActiveThreadId = normalizedThreadId
+    if (isExternallyOwned.value) invalidatePendingAttachments()
   },
   { immediate: true },
 )
@@ -2081,6 +2102,7 @@ watch(
       invalidateAttachments: invalidatePendingAttachments,
     })
   },
+  { immediate: true },
 )
 
 </script>

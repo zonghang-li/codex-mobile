@@ -1,5 +1,5 @@
 import { open, readdir, readFile, realpath, stat } from 'node:fs/promises'
-import { basename, isAbsolute, relative, sep } from 'node:path'
+import { basename, dirname, isAbsolute, relative, sep } from 'node:path'
 import type { ExternalThreadRuntime } from '../types/threadRuntime'
 
 export type RuntimeFileIdentity = {
@@ -13,6 +13,7 @@ export type RuntimeFileIdentity = {
 export type RuntimeFdSnapshot = {
   path: string
   pid: number
+  startTime?: string
   ancestorPids: number[]
   uid: number
   cmdline: string
@@ -42,6 +43,7 @@ export interface ExternalRuntimeSystem {
     expectedIdentity: RuntimeFileIdentity,
   ): Promise<Buffer>
   listFdSnapshots(): AsyncGenerator<RuntimeFdSnapshot, boolean | void, void>
+  signalProcess(pid: number, signal: NodeJS.Signals, expectedStartTime?: string): Promise<void>
 }
 
 type RuntimeParseCache = {
@@ -51,6 +53,8 @@ type RuntimeParseCache = {
   offset: number
   trailingBytes: Buffer
   unmatchedTurnId: string
+  runtimeCwd: string
+  durableRuntimeCwd: string
   checkpointBytes: Buffer
 }
 
@@ -60,10 +64,12 @@ type RegisteredThread = {
 }
 
 type PreparedRuntimeInspection =
-  | { state: 'idle' | 'unknown' }
+  | { state: 'idle'; cwd?: string }
+  | { state: 'unknown' }
   | {
       state: 'unmatched'
       turnId: string
+      cwd: string
       identity: RuntimeFileIdentity
     }
 
@@ -111,19 +117,126 @@ function readNonEmptyString(value: unknown): string {
   return typeof value === 'string' && value.length > 0 ? value : ''
 }
 
-function applyLifecycleLine(currentTurnId: string, line: string): string {
-  const row = asRecord(safeJsonParse(line))
-  if (row?.type !== 'event_msg') return currentTurnId
+function readTurnIdFromRecord(row: Record<string, unknown>): string {
+  const payload = asRecord(row.payload)
+  const directTurnId = readNonEmptyString(payload?.turn_id)
+  if (directTurnId) return directTurnId
+  return readNonEmptyString(asRecord(payload?.internal_chat_message_metadata_passthrough)?.turn_id)
+}
+
+function readExecCommandWorkdir(row: Record<string, unknown>, currentTurnId: string): string {
+  if (row.type !== 'response_item') return ''
+  const payload = asRecord(row.payload)
+  if (payload?.type !== 'function_call' || payload.name !== 'exec_command') return ''
+  const turnId = readTurnIdFromRecord(row)
+  if (currentTurnId && turnId && turnId !== currentTurnId) return ''
+  const args = asRecord(safeJsonParse(readNonEmptyString(payload.arguments)))
+  const workdir = readNonEmptyString(args?.workdir).trim()
+  return isAbsolute(workdir) ? workdir : ''
+}
+
+function readApplyPatchTargetDirectory(input: string): string {
+  let fallbackDirectory = ''
+  let worktreeDirectory = ''
+  for (const rawLine of input.split(/\r?\n/u)) {
+    const line = rawLine.trim()
+    const match = /^\*\*\* (?:Add File|Delete File|Update File|Move to): (.+)$/u.exec(line)
+    const path = match?.[1]?.trim() ?? ''
+    if (!isAbsolute(path)) continue
+    const directory = dirname(path)
+    fallbackDirectory = directory
+    if (directory.includes(`${sep}.worktrees${sep}`)) {
+      worktreeDirectory = directory
+    }
+  }
+  return worktreeDirectory || fallbackDirectory
+}
+
+function isWorktreeRuntimeCwd(cwd: string): boolean {
+  return cwd.includes(`${sep}.worktrees${sep}`)
+}
+
+function containsPath(parent: string, child: string): boolean {
+  if (!parent || !child) return false
+  const pathFromParent = relative(parent, child)
+  return pathFromParent === ''
+    || (
+      pathFromParent.length > 0
+      && pathFromParent !== '..'
+      && !pathFromParent.startsWith(`..${sep}`)
+      && !isAbsolute(pathFromParent)
+    )
+}
+
+function preferRuntimeCwd(candidate: string, current: string): string {
+  if (!candidate) return current
+  if (!current) return candidate
+
+  const candidateIsWorktree = isWorktreeRuntimeCwd(candidate)
+  const currentIsWorktree = isWorktreeRuntimeCwd(current)
+  if (candidateIsWorktree && !currentIsWorktree) return candidate
+  if (!candidateIsWorktree && currentIsWorktree && containsPath(candidate, current)) {
+    return current
+  }
+  return candidate
+}
+
+function readToolTargetCwd(row: Record<string, unknown>, currentTurnId: string): string {
+  if (row.type !== 'response_item') return ''
+  const payload = asRecord(row.payload)
+  if (!payload) return ''
+  const payloadType = readNonEmptyString(payload.type)
+  if (payloadType !== 'custom_tool_call' && payloadType !== 'function_call') return ''
+  if (payload.name !== 'apply_patch') return ''
+  const turnId = readTurnIdFromRecord(row)
+  if (currentTurnId && turnId && turnId !== currentTurnId) return ''
+  const directInput = readNonEmptyString(payload.input)
+  const argumentInput = readNonEmptyString(asRecord(safeJsonParse(readNonEmptyString(payload.arguments)))?.input)
+  const targetDirectory = readApplyPatchTargetDirectory(directInput || argumentInput)
+  return isAbsolute(targetDirectory) ? targetDirectory : ''
+}
+
+function readTurnContextCwd(row: Record<string, unknown>, currentTurnId: string): string {
+  if (row.type !== 'turn_context') return ''
   const payload = asRecord(row.payload)
   const turnId = readNonEmptyString(payload?.turn_id)
-  if (payload?.type === 'task_started' && turnId) return turnId
+  if (currentTurnId && turnId !== currentTurnId) return ''
+  const cwd = readNonEmptyString(payload?.cwd).trim()
+  return isAbsolute(cwd) ? cwd : ''
+}
+
+function applyLifecycleLine(
+  current: { turnId: string; cwd: string; durableCwd: string },
+  line: string,
+): { turnId: string; cwd: string; durableCwd: string } {
+  const row = asRecord(safeJsonParse(line))
+  if (!row) return current
+
+  const execWorkdir = readExecCommandWorkdir(row, current.turnId)
+  if (execWorkdir) return { ...current, cwd: execWorkdir }
+
+  const toolTargetCwd = readToolTargetCwd(row, current.turnId)
+  if (toolTargetCwd) {
+    const durableCwd = preferRuntimeCwd(toolTargetCwd, current.durableCwd)
+    return { ...current, cwd: preferRuntimeCwd(toolTargetCwd, current.cwd), durableCwd }
+  }
+
+  const contextCwd = readTurnContextCwd(row, current.turnId)
+  if (contextCwd && !current.cwd) return { ...current, cwd: contextCwd }
+
+  if (row.type !== 'event_msg') return current
+  const payload = asRecord(row.payload)
+  const turnId = readNonEmptyString(payload?.turn_id)
+  if (payload?.type === 'task_started' && turnId) {
+    return { turnId, cwd: '', durableCwd: current.durableCwd }
+  }
   if (
     (payload?.type === 'task_complete' || payload?.type === 'turn_aborted')
-    && turnId === currentTurnId
+    && turnId === current.turnId
   ) {
-    return ''
+    return { turnId: '', cwd: '', durableCwd: current.durableCwd }
   }
-  return currentTurnId
+  return current
 }
 
 function errorCode(error: unknown): string {
@@ -460,6 +573,7 @@ async function* listLinuxFdSnapshots(
       snapshots.push({
         path: descriptor.path,
         pid,
+        startTime: process.startTime,
         ancestorPids,
         uid,
         cmdline,
@@ -523,6 +637,18 @@ export function createExternalRuntimeSystem(
       }
     },
     listFdSnapshots: () => listLinuxFdSnapshots(uid, now),
+    async signalProcess(pid, signal, expectedStartTime) {
+      if (expectedStartTime) {
+        const actualStartTime = await readProcStartTime(`/proc/${pid}`, pid)
+        if (actualStartTime === null) {
+          const error = new Error(`Process ${pid} disappeared before signal`)
+          ;(error as NodeJS.ErrnoException).code = 'ESRCH'
+          throw error
+        }
+        assertStableProcessIdentity(expectedStartTime, actualStartTime)
+      }
+      process.kill(pid, signal)
+    },
   }
 }
 
@@ -542,6 +668,8 @@ function resetCache(identity: RuntimeFileIdentity): RuntimeParseCache {
     offset: 0,
     trailingBytes: Buffer.alloc(0),
     unmatchedTurnId: '',
+    runtimeCwd: '',
+    durableRuntimeCwd: '',
     checkpointBytes: Buffer.alloc(0),
   }
 }
@@ -570,10 +698,17 @@ function applyChunk(cache: RuntimeParseCache, chunk: Buffer): void {
   let lineStart = 0
   let newline = bytes.indexOf(0x0a, lineStart)
   while (newline !== -1) {
-    cache.unmatchedTurnId = applyLifecycleLine(
-      cache.unmatchedTurnId,
+    const next = applyLifecycleLine(
+      {
+        turnId: cache.unmatchedTurnId,
+        cwd: cache.runtimeCwd,
+        durableCwd: cache.durableRuntimeCwd,
+      },
       bytes.subarray(lineStart, newline).toString('utf8'),
     )
+    cache.unmatchedTurnId = next.turnId
+    cache.runtimeCwd = next.cwd
+    cache.durableRuntimeCwd = next.durableCwd
     lineStart = newline + 1
     newline = bytes.indexOf(0x0a, lineStart)
   }
@@ -587,6 +722,8 @@ function matchesWriter(
   excludedPid: number | null,
 ): boolean {
   return fd.uid === uid
+    && typeof fd.startTime === 'string'
+    && fd.startTime.length > 0
     && !belongsToExcludedProcessTree(fd, excludedPid)
     && isCodexAppServerCommand(fd.cmdline)
     && fd.dev === identity.dev
@@ -608,13 +745,33 @@ function isRecentActiveRollout(identity: RuntimeFileIdentity, nowMs = Date.now()
 
 function runningRuntimeFromUnmatched(
   runtime: Extract<PreparedRuntimeInspection, { state: 'unmatched' }>,
+  interruptible: boolean,
 ): ExternalThreadRuntime {
   return {
     state: 'running',
     turnId: runtime.turnId,
-    interruptible: false,
+    interruptible,
     source: 'external-session-writer',
+    ...(runtime.cwd ? { cwd: runtime.cwd } : {}),
   }
+}
+
+function idleRuntimeFromPrepared(
+  runtime: Extract<PreparedRuntimeInspection, { state: 'idle' }>,
+): ExternalThreadRuntime {
+  return {
+    state: 'idle',
+    ...(runtime.cwd ? { cwd: runtime.cwd } : {}),
+  }
+}
+
+function isSameRuntimeIdentity(
+  first: RuntimeFileIdentity,
+  second: RuntimeFileIdentity,
+): boolean {
+  return first.path === second.path &&
+    first.dev === second.dev &&
+    first.ino === second.ino
 }
 
 function belongsToExcludedProcessTree(
@@ -719,6 +876,7 @@ export class ExternalThreadRuntimeProbe {
   async inspectMany(
     threadIds: readonly string[],
     excludedPid: number | null,
+    options: { verifyRecentActive?: boolean } = {},
   ): Promise<Record<string, ExternalThreadRuntime>> {
     const uniqueIds = [...new Set(threadIds)]
     const prepared = await Promise.all(uniqueIds.map(async (threadId) => ({
@@ -729,21 +887,29 @@ export class ExternalThreadRuntimeProbe {
     const unmatched = prepared.filter((entry) => entry.runtime.state === 'unmatched')
 
     for (const entry of prepared) {
-      if (entry.runtime.state === 'idle') states[entry.threadId] = { state: 'idle' }
+      if (entry.runtime.state === 'idle') states[entry.threadId] = idleRuntimeFromPrepared(entry.runtime)
       if (entry.runtime.state === 'unknown') states[entry.threadId] = { state: 'unknown' }
     }
     const unmatchedNeedingWriterEvidence = unmatched.filter((entry) => {
       const runtime = entry.runtime
       if (runtime.state !== 'unmatched') return false
-      if (!isRecentActiveRollout(runtime.identity)) return true
-      states[entry.threadId] = runningRuntimeFromUnmatched(runtime)
+      if (options.verifyRecentActive || !isRecentActiveRollout(runtime.identity)) return true
+      states[entry.threadId] = runningRuntimeFromUnmatched(runtime, false)
       return false
     })
     if (unmatchedNeedingWriterEvidence.length === 0) return states
 
     try {
       const writers = new Set<string>()
-      for await (const fd of this.system.listFdSnapshots()) {
+      let complete = true
+      const iterator = this.system.listFdSnapshots()[Symbol.asyncIterator]()
+      while (true) {
+        const next = await iterator.next()
+        if (next.done) {
+          complete = next.value !== false
+          break
+        }
+        const fd = next.value
         for (const entry of unmatchedNeedingWriterEvidence) {
           const runtime = entry.runtime
           if (runtime.state !== 'unmatched') continue
@@ -755,9 +921,11 @@ export class ExternalThreadRuntimeProbe {
       for (const entry of unmatchedNeedingWriterEvidence) {
         const runtime = entry.runtime
         if (runtime.state !== 'unmatched') continue
-        states[entry.threadId] = writers.has(entry.threadId)
-          ? runningRuntimeFromUnmatched(runtime)
-          : { state: 'unknown' }
+        states[entry.threadId] = complete && writers.has(entry.threadId)
+          ? runningRuntimeFromUnmatched(runtime, true)
+          : isRecentActiveRollout(runtime.identity)
+            ? runningRuntimeFromUnmatched(runtime, false)
+            : { state: 'unknown' }
       }
     } catch {
       for (const entry of unmatchedNeedingWriterEvidence) states[entry.threadId] = { state: 'unknown' }
@@ -766,8 +934,108 @@ export class ExternalThreadRuntimeProbe {
   }
 
   async inspect(threadId: string, excludedPid: number | null): Promise<ExternalThreadRuntime> {
-    const states = await this.inspectMany([threadId], excludedPid)
+    const states = await this.inspectMany([threadId], excludedPid, { verifyRecentActive: true })
     return states[threadId] ?? { state: 'unknown' }
+  }
+
+  async interrupt(
+    threadId: string,
+    turnId: string,
+    excludedPid: number | null,
+  ): Promise<{ interrupted: boolean; reason?: string }> {
+    const normalizedTurnId = turnId.trim()
+    if (!normalizedTurnId || this.system.uid === null) {
+      return { interrupted: false, reason: 'writer-not-found' }
+    }
+
+    const runtime = await this.prepareInspection(threadId)
+    if (runtime.state !== 'unmatched') {
+      return {
+        interrupted: false,
+        reason: runtime.state === 'idle' ? 'turn-not-running' : 'writer-not-found',
+      }
+    }
+    if (runtime.turnId !== normalizedTurnId) {
+      return { interrupted: false, reason: 'turn-mismatch' }
+    }
+
+    const writer = await this.findSingleInterruptWriter(runtime, excludedPid)
+    if ('reason' in writer) return { interrupted: false, reason: writer.reason }
+
+    const revalidatedRuntime = await this.prepareInspection(threadId)
+    if (revalidatedRuntime.state !== 'unmatched') {
+      return {
+        interrupted: false,
+        reason: revalidatedRuntime.state === 'idle' ? 'turn-not-running' : 'writer-not-found',
+      }
+    }
+    if (revalidatedRuntime.turnId !== normalizedTurnId) {
+      return { interrupted: false, reason: 'turn-mismatch' }
+    }
+    if (!isSameRuntimeIdentity(runtime.identity, revalidatedRuntime.identity)) {
+      return { interrupted: false, reason: 'writer-not-found' }
+    }
+
+    const revalidatedWriter = await this.findSingleInterruptWriter(
+      revalidatedRuntime,
+      excludedPid,
+      writer.fd,
+    )
+    if ('reason' in revalidatedWriter) return { interrupted: false, reason: revalidatedWriter.reason }
+
+    const pid = revalidatedWriter.fd.pid
+    const expectedStartTime = revalidatedWriter.fd.startTime ?? writer.fd.startTime
+    try {
+      await this.system.signalProcess(pid, 'SIGTERM', expectedStartTime)
+    } catch (error) {
+      if (isProcessGone(error)) return { interrupted: false, reason: 'writer-not-found' }
+      throw error
+    }
+    return { interrupted: true }
+  }
+
+  private async findSingleInterruptWriter(
+    runtime: Extract<PreparedRuntimeInspection, { state: 'unmatched' }>,
+    excludedPid: number | null,
+    expectedWriter?: RuntimeFdSnapshot,
+  ): Promise<{ fd: RuntimeFdSnapshot } | { reason: string }> {
+    const writerFds: RuntimeFdSnapshot[] = []
+    let complete = true
+    const iterator = this.system.listFdSnapshots()[Symbol.asyncIterator]()
+    try {
+      while (true) {
+        const next = await iterator.next()
+        if (next.done) {
+          complete = next.value !== false
+          break
+        }
+        const fd = next.value
+        if (!matchesWriter(fd, runtime.identity, this.system.uid!, excludedPid)) continue
+        if (expectedWriter) {
+          if (fd.pid !== expectedWriter.pid) continue
+          if (expectedWriter.startTime && fd.startTime !== expectedWriter.startTime) continue
+        }
+        writerFds.push(fd)
+      }
+    } catch {
+      return { reason: 'writer-not-found' }
+    }
+    if (!complete) return { reason: 'writer-not-found' }
+
+    const writerPids = new Set(writerFds.map((fd) => fd.pid))
+    if (writerPids.size === 0) return { reason: 'writer-not-found' }
+    if (writerPids.size > 1) return { reason: 'ambiguous-writer' }
+
+    const [pid] = writerPids
+    const expectedStartTimes = new Set(
+      writerFds
+        .filter((fd) => fd.pid === pid && fd.startTime)
+        .map((fd) => fd.startTime),
+    )
+    if (expectedStartTimes.size > 1) return { reason: 'ambiguous-writer' }
+    const [expectedStartTime] = expectedStartTimes
+    const fd = writerFds.find((candidate) => candidate.startTime === expectedStartTime) ?? writerFds[0]
+    return { fd }
   }
 
   private async prepareInspection(threadId: string): Promise<PreparedRuntimeInspection> {
@@ -842,10 +1110,16 @@ export class ExternalThreadRuntimeProbe {
       }
       thread.cache = nextCache
 
-      if (!nextCache.unmatchedTurnId) return { state: 'idle' }
+      if (!nextCache.unmatchedTurnId) {
+        return {
+          state: 'idle',
+          ...(nextCache.durableRuntimeCwd ? { cwd: nextCache.durableRuntimeCwd } : {}),
+        }
+      }
       return {
         state: 'unmatched',
         turnId: nextCache.unmatchedTurnId,
+        cwd: preferRuntimeCwd(nextCache.runtimeCwd, nextCache.durableRuntimeCwd),
         identity: {
           path: revalidatedIdentity.path,
           dev: revalidatedIdentity.dev,

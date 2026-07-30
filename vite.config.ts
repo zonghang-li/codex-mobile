@@ -128,6 +128,16 @@ export default defineConfig({
     vue(),
     tailwindcss(),
     {
+      name: "codex-build-metadata",
+      generateBundle() {
+        this.emitFile({
+          type: "asset",
+          fileName: "codex-build.json",
+          source: `${JSON.stringify({ buildId: appBuildId })}\n`,
+        });
+      },
+    },
+    {
       name: "codex-bridge",
       configureServer(server) {
         process.env.CODEXUI_SERVER_PORT = String(server.config.server.port ?? 5173);

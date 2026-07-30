@@ -31,7 +31,7 @@
       <span class="queued-row-text">{{ getMessagePreview(msg) }}</span>
       <div class="queued-row-actions">
         <button class="queued-row-edit" type="button" :title="t('Edit queued message')" :disabled="disabled" @click="onEdit(msg.id)">{{ t('Edit') }}</button>
-        <button class="queued-row-steer" type="button" :title="t('Send now without interrupting work')" :disabled="disabled" @click="onSteer(msg.id)">{{ t('Steer') }}</button>
+        <button class="queued-row-steer" type="button" :title="t('Send now without interrupting work')" :disabled="isSteerDisabled(msg.id)" @click="onSteer(msg.id)">{{ t('Steer') }}</button>
         <button class="queued-row-delete" type="button" :aria-label="t('Delete queued message')" :title="t('Delete queued message')" :disabled="disabled" @click="onDelete(msg.id)">
           <IconTablerTrash />
         </button>
@@ -42,6 +42,7 @@
 </template>
 
 <script setup lang="ts">
+import { computed } from 'vue'
 import { useUiLanguage } from '../../composables/useUiLanguage'
 import IconTablerChevronDown from '../icons/IconTablerChevronDown.vue'
 import IconTablerTrash from '../icons/IconTablerTrash.vue'
@@ -57,6 +58,8 @@ type QueuedMessageRow = {
 const props = defineProps<{
   messages: QueuedMessageRow[]
   disabled?: boolean
+  steerDisabled?: boolean
+  steerDisabledMessageIds?: string[]
 }>()
 
 const emit = defineEmits<{
@@ -67,6 +70,7 @@ const emit = defineEmits<{
 }>()
 
 const { t } = useUiLanguage()
+const steerDisabledMessageIdSet = computed(() => new Set(props.steerDisabledMessageIds ?? []))
 
 function onEdit(messageId: string): void {
   if (props.disabled) return
@@ -74,8 +78,12 @@ function onEdit(messageId: string): void {
 }
 
 function onSteer(messageId: string): void {
-  if (props.disabled) return
+  if (isSteerDisabled(messageId)) return
   emit('steer', messageId)
+}
+
+function isSteerDisabled(messageId: string): boolean {
+  return props.steerDisabled === true || steerDisabledMessageIdSet.value.has(messageId)
 }
 
 function onDelete(messageId: string): void {

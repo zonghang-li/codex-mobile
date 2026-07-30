@@ -10,12 +10,12 @@ describe('external thread runtime UI guards', () => {
     [undefined, true],
     ['idle', true],
     ['local', true],
-    ['external', false],
-  ] as const)('allows UI mutation for ownership %s: %s', (ownership, expected) => {
+    ['external', true],
+  ] as const)('allows text draft mutation for ownership %s: %s', (ownership, expected) => {
     expect(canApplyThreadUiMutation(ownership)).toBe(expected)
   })
 
-  it('requires both a current attachment session and mutable ownership', () => {
+  it('requires both a current attachment session and non-external ownership', () => {
     expect(canApplyAttachmentMutation('local', 4, 4)).toBe(true)
     expect(canApplyAttachmentMutation('idle', 4, 4)).toBe(true)
     expect(canApplyAttachmentMutation('local', 3, 4)).toBe(false)

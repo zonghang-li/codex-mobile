@@ -10,9 +10,9 @@ Thread route load failures are visible in the conversation instead of silently s
 #### Steps
 1. In light theme, open `http://127.0.0.1:4173/#/thread/<missing-thread-id>`.
 2. Wait for thread loading to finish.
-3. Confirm the conversation area shows the `thread/resume` or `thread/read` failure text and a `Send feedback` link.
+3. Confirm the conversation area shows the `thread/resume` or `thread/read` failure text without a `Send feedback` link.
 4. Confirm the model selector still loads the active provider model list instead of staying on disabled `Model`.
-5. Repeat in dark theme and confirm the error text, feedback link, and model selector remain readable.
+5. Repeat in dark theme and confirm the error text and model selector remain readable.
 
 #### Expected Results
 - The route does not fail silently with only `No messages in this thread yet`.
