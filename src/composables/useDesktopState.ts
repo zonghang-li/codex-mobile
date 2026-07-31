@@ -120,6 +120,7 @@ type ActiveTextHydration = {
   controller: AbortController | null
   recoverableConflictProjectionKey?: string
   tailSignature?: string
+  lastUnsignedTailProbeAt?: number
 }
 
 type OptimisticUserSubmission = {
@@ -159,6 +160,7 @@ const BACKGROUND_THREAD_PAGINATION_DELAY_MS = 250
 const ENABLE_AUTOMATIC_BACKGROUND_THREAD_PAGINATION = true
 const RATE_LIMIT_REFRESH_DEBOUNCE_MS = 500
 const SELECTED_EXTERNAL_LIVE_PROJECTION_POLL_MS = 150
+const UNSIGNED_ACTIVE_TEXT_TAIL_POLL_MS = 500
 const BACKGROUND_RUNTIME_POLL_MS = 2_000
 const SELECTED_IDLE_LIVE_PROJECTION_POLL_MS = BACKGROUND_RUNTIME_POLL_MS
 const BACKGROUND_RUNTIME_BATCH_LIMIT = 16
@@ -4911,11 +4913,16 @@ export function useDesktopState() {
     tailOptions: { knownTailSignature?: string; afterSessionOrder?: number } | undefined,
   ): string {
     if (cursor) return `cursor:${cursor}`
-    if (!tailOptions?.knownTailSignature) return 'newest:full:limit=default'
-    const afterSessionOrder = typeof tailOptions.afterSessionOrder === 'number'
-      && Number.isFinite(tailOptions.afterSessionOrder)
-      ? Math.max(0, Math.floor(tailOptions.afterSessionOrder))
+    const rawAfterSessionOrder = tailOptions?.afterSessionOrder
+    const afterSessionOrder = typeof rawAfterSessionOrder === 'number'
+      && Number.isFinite(rawAfterSessionOrder)
+      ? Math.max(0, Math.floor(rawAfterSessionOrder))
       : ''
+    if (!tailOptions?.knownTailSignature) {
+      return afterSessionOrder === ''
+        ? 'newest:full:limit=default'
+        : `newest:after=${afterSessionOrder}:limit=default`
+    }
     return `newest:tail:${tailOptions.knownTailSignature}:after=${afterSessionOrder}:limit=default`
   }
 
@@ -4936,10 +4943,17 @@ export function useDesktopState() {
     const controller = new AbortController()
     hydration.controller = controller
     try {
-      const tailOptions = !cursor && hydration.tailSignature
+      const requestHadTailSignature = Boolean(hydration.tailSignature)
+      const newestSessionOrder = !cursor
+        ? newestHydratedSessionOrder(hydration.messages)
+        : undefined
+      const tailOptions = !cursor && (
+        hydration.tailSignature
+        || newestSessionOrder !== undefined
+      )
         ? {
-            knownTailSignature: hydration.tailSignature,
-            afterSessionOrder: newestHydratedSessionOrder(hydration.messages),
+            ...(hydration.tailSignature ? { knownTailSignature: hydration.tailSignature } : {}),
+            ...(newestSessionOrder !== undefined ? { afterSessionOrder: newestSessionOrder } : {}),
           }
         : undefined
       const loadPage = (): Promise<ThreadTextPageSnapshot> => tailOptions
@@ -4970,6 +4984,9 @@ export function useDesktopState() {
       hydration.consumedCursors.add(cursorKey)
       if (!cursor && page.tailSignature) {
         hydration.tailSignature = page.tailSignature
+        hydration.lastUnsignedTailProbeAt = undefined
+      } else if (!cursor && !requestHadTailSignature) {
+        hydration.lastUnsignedTailProbeAt = Date.now()
       }
       if (page.notModified === true) {
         recordActiveTextOlderCursorFromPage(threadId, hydration, page, {
@@ -5024,6 +5041,7 @@ export function useDesktopState() {
       hydration.hasMoreOlder = true
       hydration.consumedCursors.clear()
       hydration.recoverableConflictProjectionKey = undefined
+      hydration.lastUnsignedTailProbeAt = undefined
       activeTextHydrationGenerationByThreadId.set(
         threadId,
         (activeTextHydrationGenerationByThreadId.get(threadId) ?? 0) + 1,
@@ -5042,6 +5060,7 @@ export function useDesktopState() {
       hydration.hasMoreOlder = true
       hydration.consumedCursors.clear()
       hydration.recoverableConflictProjectionKey = undefined
+      hydration.lastUnsignedTailProbeAt = undefined
       activeTextHydrationGenerationByThreadId.set(
         threadId,
         (activeTextHydrationGenerationByThreadId.get(threadId) ?? 0) + 1,
@@ -7826,11 +7845,24 @@ export function useDesktopState() {
           [threadId]: activeTurnId,
         }
         const activeTailHydration = activeTextHydrationByThreadId.get(threadId)
+        const activeTailHasSignature = typeof activeTailHydration?.tailSignature === 'string'
+          && activeTailHydration.tailSignature.length > 0
+        const activeTailCanProbeWithoutSignature = activeTailHydration?.turnId === activeTurnId
+          && !activeTailHasSignature
+          && activeTailHydration.controller === null
+          && activeTailHydration.hasMoreOlder === false
+          && activeTailHydration.nextOlderCursor === null
+          && newestHydratedSessionOrder(activeTailHydration.messages) !== undefined
+          && (
+            Date.now() - (activeTailHydration.lastUnsignedTailProbeAt ?? Number.NEGATIVE_INFINITY)
+          ) >= UNSIGNED_ACTIVE_TEXT_TAIL_POLL_MS
         const shouldForceSelectedTailProbe = shouldProbeSelectedActiveTextTail
           && activeTailHydration?.turnId === activeTurnId
-          && typeof activeTailHydration.tailSignature === 'string'
-          && activeTailHydration.tailSignature.length > 0
           && !isActiveTextHydrationConflictBlocked(threadId, activeTailHydration)
+          && (
+            activeTailHasSignature
+            || activeTailCanProbeWithoutSignature
+          )
         ensureActiveTextHydration(threadId, activeTurnId, {
           refreshExhausted: true,
           forceRefreshExhausted: liveProjectionKeyChanged || shouldForceSelectedTailProbe,
