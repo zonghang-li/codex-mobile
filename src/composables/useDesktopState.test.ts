@@ -8097,6 +8097,65 @@ describe('active turn text hydration', () => {
       .toEqual(['reason-2', 'agent-2', 'agent-live'])
   })
 
+  it('loads older text from the same active turn when a one-turn thread is scrolled upward', async () => {
+    installTestWindow()
+    vi.stubGlobal('document', {
+      visibilityState: 'visible',
+      addEventListener: vi.fn(),
+      removeEventListener: vi.fn(),
+    })
+    gatewayMocks.getThreadDetail.mockResolvedValue(partialExternalDetail([
+      activeText('agent-live', 'agentMessage'),
+    ]))
+    gatewayMocks.getThreadTextPage
+      .mockResolvedValueOnce({
+        threadId: 'thread-external',
+        turnId: 'turn-external',
+        messages: [
+          activeText('agent-tail', 'agentMessage', 300),
+        ],
+        nextOlderCursor: 'older-active-1',
+        hasMoreOlder: true,
+        tailSignature: 'tail-1',
+      })
+      .mockResolvedValueOnce({
+        threadId: 'thread-external',
+        turnId: 'turn-external',
+        messages: [
+          activeUser('rollout:userMessage:event:initial', 'initial prompt', 100),
+          activeText('agent-early', 'agentMessage', 200),
+        ],
+        nextOlderCursor: null,
+        hasMoreOlder: false,
+        tailSignature: 'tail-1',
+      })
+
+    const state = useDesktopState()
+    state.primeSelectedThread('thread-external')
+    await state.loadMessages('thread-external')
+    await flushMicrotasks()
+
+    expect(state.hasMoreOlderMessages.value).toBe(true)
+    await state.loadOlderMessages('thread-external')
+
+    expect(gatewayMocks.getThreadTextPage).toHaveBeenNthCalledWith(
+      2,
+      'thread-external',
+      'turn-external',
+      'older-active-1',
+      undefined,
+      expect.any(AbortSignal),
+    )
+    expect(gatewayMocks.getOlderThreadMessages).not.toHaveBeenCalled()
+    expect(state.hasMoreOlderMessages.value).toBe(false)
+    expect(state.messages.value.map((message) => message.id)).toEqual([
+      'rollout:userMessage:event:initial',
+      'agent-early',
+      'agent-tail',
+      'agent-live',
+    ])
+  })
+
   it('hydrates an omitted running active turn after a paged cold detail load', async () => {
     installTestWindow()
     vi.stubGlobal('document', {

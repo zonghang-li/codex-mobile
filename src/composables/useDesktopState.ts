@@ -2171,6 +2171,7 @@ export function useDesktopState() {
   const loadedMessagesByThreadId = ref<Record<string, boolean>>({})
   const hasMoreOlderMessagesByThreadId = ref<Record<string, boolean>>({})
   const olderTurnCursorByThreadId = ref<Record<string, string | null>>({})
+  const activeTextOlderCursorByThreadId = ref<Record<string, string | null>>({})
   const consumedOlderTurnCursorsByThreadId = new Map<string, Set<string>>()
   const loadingOlderMessagesByThreadId = ref<Record<string, boolean>>({})
   const resumedThreadById = ref<Record<string, boolean>>({})
@@ -3464,6 +3465,8 @@ export function useDesktopState() {
     loadedMessagesByThreadId.value = omitKey(loadedMessagesByThreadId.value, normalizedThreadId)
     loadedVersionByThreadId.value = omitKey(loadedVersionByThreadId.value, normalizedThreadId)
     olderTurnCursorByThreadId.value = omitKey(olderTurnCursorByThreadId.value, normalizedThreadId)
+    activeTextOlderCursorByThreadId.value = omitKey(activeTextOlderCursorByThreadId.value, normalizedThreadId)
+    hasMoreOlderMessagesByThreadId.value = omitKey(hasMoreOlderMessagesByThreadId.value, normalizedThreadId)
     consumedOlderTurnCursorsByThreadId.delete(normalizedThreadId)
     resumedThreadById.value = omitKey(resumedThreadById.value, normalizedThreadId)
     turnIndexByTurnIdByThreadId.value = omitKey(turnIndexByTurnIdByThreadId.value, normalizedThreadId)
@@ -3555,6 +3558,14 @@ export function useDesktopState() {
     loadedMessagesByThreadId.value = pruneThreadStateMap(loadedMessagesByThreadId.value, activeThreadIds)
     loadedVersionByThreadId.value = pruneThreadStateMap(loadedVersionByThreadId.value, activeThreadIds)
     olderTurnCursorByThreadId.value = pruneThreadStateMap(olderTurnCursorByThreadId.value, activeThreadIds)
+    activeTextOlderCursorByThreadId.value = pruneThreadStateMap(
+      activeTextOlderCursorByThreadId.value,
+      activeThreadIds,
+    )
+    hasMoreOlderMessagesByThreadId.value = pruneThreadStateMap(
+      hasMoreOlderMessagesByThreadId.value,
+      activeThreadIds,
+    )
     for (const threadId of consumedOlderTurnCursorsByThreadId.keys()) {
       if (!activeThreadIds.has(threadId)) consumedOlderTurnCursorsByThreadId.delete(threadId)
     }
@@ -4750,11 +4761,86 @@ export function useDesktopState() {
     reconcileOptimisticUserMessages(threadId, nextMessages)
   }
 
+  function activeTextOlderCursorForThread(threadId: string): string | null {
+    if (!threadId) return null
+    const cursor = activeTextOlderCursorByThreadId.value[threadId] ?? null
+    return cursor && cursor.trim().length > 0 ? cursor : null
+  }
+
+  function olderTurnCursorForThread(threadId: string): string | null {
+    if (!threadId) return null
+    const cursor = olderTurnCursorByThreadId.value[threadId] ?? null
+    return cursor && cursor.trim().length > 0 ? cursor : null
+  }
+
+  function updateHasMoreOlderMessagesForThread(threadId: string): void {
+    if (!threadId) return
+    const nextValue = activeTextOlderCursorForThread(threadId) !== null
+      || olderTurnCursorForThread(threadId) !== null
+    if (hasMoreOlderMessagesByThreadId.value[threadId] === nextValue) return
+    hasMoreOlderMessagesByThreadId.value = {
+      ...hasMoreOlderMessagesByThreadId.value,
+      [threadId]: nextValue,
+    }
+  }
+
+  function setActiveTextOlderCursorForThread(threadId: string, cursor: string | null): void {
+    if (!threadId) return
+    const nextCursor = cursor && cursor.trim().length > 0 ? cursor : null
+    if ((activeTextOlderCursorByThreadId.value[threadId] ?? null) !== nextCursor) {
+      activeTextOlderCursorByThreadId.value = nextCursor === null
+        ? omitKey(activeTextOlderCursorByThreadId.value, threadId)
+        : {
+            ...activeTextOlderCursorByThreadId.value,
+            [threadId]: nextCursor,
+          }
+    }
+    updateHasMoreOlderMessagesForThread(threadId)
+  }
+
+  function setOlderTurnCursorForThread(threadId: string, cursor: string | null): void {
+    if (!threadId) return
+    const nextCursor = cursor && cursor.trim().length > 0 ? cursor : null
+    if ((olderTurnCursorByThreadId.value[threadId] ?? null) !== nextCursor) {
+      olderTurnCursorByThreadId.value = nextCursor === null
+        ? omitKey(olderTurnCursorByThreadId.value, threadId)
+        : {
+            ...olderTurnCursorByThreadId.value,
+            [threadId]: nextCursor,
+          }
+    }
+    updateHasMoreOlderMessagesForThread(threadId)
+  }
+
+  function recordActiveTextOlderCursorFromPage(
+    threadId: string,
+    hydration: ActiveTextHydration,
+    page: ThreadTextPageSnapshot,
+    options: { preserveExistingOnNotModified?: boolean } = {},
+  ): void {
+    const pageCursor = page.hasMoreOlder === true ? page.nextOlderCursor ?? null : null
+    if (
+      page.notModified === true
+      && options.preserveExistingOnNotModified === true
+      && pageCursor === null
+      && hydration.nextOlderCursor !== null
+    ) {
+      setActiveTextOlderCursorForThread(threadId, hydration.nextOlderCursor)
+      return
+    }
+    hydration.nextOlderCursor = pageCursor
+    setActiveTextOlderCursorForThread(threadId, pageCursor)
+  }
+
   function cancelActiveTextHydration(threadId: string): void {
     const hydration = activeTextHydrationByThreadId.get(threadId)
-    if (!hydration) return
+    if (!hydration) {
+      setActiveTextOlderCursorForThread(threadId, null)
+      return
+    }
     hydration.controller?.abort()
     activeTextHydrationByThreadId.delete(threadId)
+    setActiveTextOlderCursorForThread(threadId, null)
     activeTextHydrationGenerationByThreadId.set(
       threadId,
       (activeTextHydrationGenerationByThreadId.get(threadId) ?? 0) + 1,
@@ -4881,12 +4967,14 @@ export function useDesktopState() {
         hydration.tailSignature = page.tailSignature
       }
       if (page.notModified === true) {
-        hydration.nextOlderCursor = page.nextOlderCursor
+        recordActiveTextOlderCursorFromPage(threadId, hydration, page, {
+          preserveExistingOnNotModified: cursor === undefined,
+        })
         hydration.hasMoreOlder = false
         return
       }
       hydration.messages = mergeThreadTextPage(hydration.messages, page.messages)
-      hydration.nextOlderCursor = page.nextOlderCursor
+      recordActiveTextOlderCursorFromPage(threadId, hydration, page)
       hydration.hasMoreOlder = false
       publishActiveTextHydration(threadId, hydration)
     } catch (error) {
@@ -4899,6 +4987,7 @@ export function useDesktopState() {
         hydration.hasMoreOlder = true
         hydration.consumedCursors.clear()
         hydration.recoverableConflictProjectionKey = projectionKeyByThreadId.value[threadId] ?? ''
+        setActiveTextOlderCursorForThread(threadId, null)
       }
     } finally {
       if (hydration.controller === controller) {
@@ -7751,14 +7840,10 @@ export function useDesktopState() {
       return
     }
     if (!isIncrementalProjection || !hadLoadedMessages) {
-      hasMoreOlderMessagesByThreadId.value = {
-        ...hasMoreOlderMessagesByThreadId.value,
-        [threadId]: detail.hasMoreOlder === true,
-      }
-      olderTurnCursorByThreadId.value = {
-        ...olderTurnCursorByThreadId.value,
-        [threadId]: detail.olderCursor ?? null,
-      }
+      setOlderTurnCursorForThread(
+        threadId,
+        detail.hasMoreOlder === true ? detail.olderCursor ?? null : null,
+      )
     }
     markThreadMessagesPersisted(threadId, nextMessages)
     replaceTurnIndexLookupForThread(threadId, isIncrementalProjection
@@ -8072,18 +8157,83 @@ export function useDesktopState() {
     await loadPromise
   }
 
+  async function loadOlderActiveTextMessages(threadId: string): Promise<boolean> {
+    const hydration = activeTextHydrationByThreadId.get(threadId)
+    const cursor = activeTextOlderCursorForThread(threadId) ?? hydration?.nextOlderCursor ?? null
+    if (!hydration || !cursor) return false
+    if (!isActiveTextHydrationCurrent(
+      threadId,
+      hydration,
+      activeTextHydrationGenerationByThreadId.get(threadId) ?? 0,
+    )) {
+      setActiveTextOlderCursorForThread(threadId, null)
+      return false
+    }
+    if (hydration.controller !== null) return true
+    if (hydration.consumedCursors.has(cursor)) {
+      setActiveTextOlderCursorForThread(threadId, null)
+      return false
+    }
+
+    const generation = activeTextHydrationGenerationByThreadId.get(threadId) ?? 0
+    const controller = new AbortController()
+    hydration.controller = controller
+    try {
+      const page = await multiWindowThreadSync.loadActiveTextPage({
+        threadId,
+        turnId: hydration.turnId,
+        requestKey: activeTextPageRequestKey(cursor, undefined),
+        signal: controller.signal,
+        load: () => getThreadTextPage(
+          threadId,
+          hydration.turnId,
+          cursor,
+          undefined,
+          controller.signal,
+        ),
+      })
+      if (!isActiveTextHydrationCurrent(threadId, hydration, generation)) return true
+
+      hydration.consumedCursors.add(cursor)
+      if (page.notModified === true) {
+        recordActiveTextOlderCursorFromPage(threadId, hydration, page)
+        hydration.hasMoreOlder = false
+        return true
+      }
+      hydration.messages = mergeThreadTextPage(hydration.messages, page.messages)
+      recordActiveTextOlderCursorFromPage(threadId, hydration, page)
+      hydration.hasMoreOlder = false
+      publishActiveTextHydration(threadId, hydration)
+      return true
+    } catch (loadError) {
+      if (
+        isActiveTextHydrationCurrent(threadId, hydration, generation)
+        && loadError instanceof CodexApiError
+        && (loadError.status === 400 || loadError.status === 409)
+      ) {
+        hydration.nextOlderCursor = null
+        hydration.hasMoreOlder = false
+        hydration.consumedCursors.clear()
+        hydration.recoverableConflictProjectionKey = projectionKeyByThreadId.value[threadId] ?? ''
+        setActiveTextOlderCursorForThread(threadId, null)
+      }
+      throw loadError
+    } finally {
+      if (hydration.controller === controller) {
+        hydration.controller = null
+      }
+    }
+  }
+
   async function loadOlderMessages(threadId: string = selectedThreadId.value): Promise<void> {
     if (!threadId) return
     if (loadingOlderMessagesByThreadId.value[threadId] === true) return
-    if (hasMoreOlderMessagesByThreadId.value[threadId] !== true) return
-
-    const cursor = olderTurnCursorByThreadId.value[threadId] ?? null
-    if (!cursor) {
-      hasMoreOlderMessagesByThreadId.value = {
-        ...hasMoreOlderMessagesByThreadId.value,
-        [threadId]: false,
-      }
-      return
+    if (hasMoreOlderMessagesByThreadId.value[threadId] !== true) {
+      updateHasMoreOlderMessagesForThread(threadId)
+      if (
+        activeTextOlderCursorForThread(threadId) === null
+        && olderTurnCursorForThread(threadId) === null
+      ) return
     }
 
     loadingOlderMessagesByThreadId.value = {
@@ -8092,6 +8242,14 @@ export function useDesktopState() {
     }
 
     try {
+      if (await loadOlderActiveTextMessages(threadId)) return
+
+      const cursor = olderTurnCursorForThread(threadId)
+      if (!cursor) {
+        updateHasMoreOlderMessagesForThread(threadId)
+        return
+      }
+
       const page = await getOlderThreadMessages(threadId, cursor)
       const consumedCursors = consumedOlderTurnCursorsByThreadId.get(threadId) ?? new Set<string>()
       if (
@@ -8100,14 +8258,7 @@ export function useDesktopState() {
       ) {
         consumedCursors.add(cursor)
         consumedOlderTurnCursorsByThreadId.set(threadId, consumedCursors)
-        olderTurnCursorByThreadId.value = {
-          ...olderTurnCursorByThreadId.value,
-          [threadId]: null,
-        }
-        hasMoreOlderMessagesByThreadId.value = {
-          ...hasMoreOlderMessagesByThreadId.value,
-          [threadId]: false,
-        }
+        setOlderTurnCursorForThread(threadId, null)
         return
       }
       const currentLookup = turnIndexByTurnIdByThreadId.value[threadId] ?? {}
@@ -8179,14 +8330,7 @@ export function useDesktopState() {
       rebindLiveFileChangeTurnIndices(threadId)
       consumedCursors.add(cursor)
       consumedOlderTurnCursorsByThreadId.set(threadId, consumedCursors)
-      olderTurnCursorByThreadId.value = {
-        ...olderTurnCursorByThreadId.value,
-        [threadId]: page.nextCursor,
-      }
-      hasMoreOlderMessagesByThreadId.value = {
-        ...hasMoreOlderMessagesByThreadId.value,
-        [threadId]: page.nextCursor !== null,
-      }
+      setOlderTurnCursorForThread(threadId, page.nextCursor)
     } catch (loadError) {
       error.value = loadError instanceof Error ? loadError.message : 'Failed to load earlier messages'
       throw loadError
@@ -10049,6 +10193,8 @@ export function useDesktopState() {
     liveFileChangeMessagesByThreadId.value = {}
     turnIndexByTurnIdByThreadId.value = {}
     olderTurnCursorByThreadId.value = {}
+    activeTextOlderCursorByThreadId.value = {}
+    hasMoreOlderMessagesByThreadId.value = {}
     consumedOlderTurnCursorsByThreadId.clear()
     turnActivityByThreadId.value = {}
     turnSummaryByThreadId.value = {}
