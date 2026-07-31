@@ -496,6 +496,58 @@ Reply with &lt;/instructions&gt; and A &amp; B
     expect(messages.map((message) => message.text).join('\n')).not.toContain('Another retained')
   })
 
+  it('hides codex internal goal context user messages from thread detail', () => {
+    const messages = normalizeThreadMessagesV2(threadReadResponseWithContent([
+      {
+        type: 'userMessage',
+        id: 'goal-context',
+        content: [{
+          type: 'input_text',
+          text: [
+            '<codex_internal_context source="goal">',
+            'Once the blocked threshold is satisfied, call update_goal with status "blocked".',
+            '</codex_internal_context>',
+          ].join('\n'),
+        }],
+      },
+      {
+        type: 'userMessage',
+        id: 'encoded-goal-context',
+        content: [{
+          type: 'input_text',
+          text: [
+            '&lt;codex_internal_context source="goal"&gt;',
+            'Once the blocked threshold is satisfied, call update_goal with status "blocked".',
+            '&lt;/codex_internal_context&gt;',
+          ].join('\n'),
+        }],
+      },
+      {
+        type: 'userMessage',
+        id: 'ordinary-similar-prefix',
+        content: [{
+          type: 'input_text',
+          text: '<codex_internal_contextual source="user">visible ordinary text</codex_internal_contextual>',
+        }],
+      },
+      {
+        type: 'agentMessage',
+        id: 'agent-visible',
+        phase: 'final_answer',
+        text: 'Visible final answer.',
+      },
+    ]))
+
+    expect(messages.map((message) => ({ id: message.id, role: message.role, text: message.text }))).toEqual([
+      {
+        id: 'ordinary-similar-prefix',
+        role: 'user',
+        text: '<codex_internal_contextual source="user">visible ordinary text</codex_internal_contextual>',
+      },
+      { id: 'agent-visible', role: 'assistant', text: 'Visible final answer.' },
+    ])
+  })
+
   it('keeps intermediate assistant progress messages for the active running turn', () => {
     const response = threadReadResponseWithContent([
       {

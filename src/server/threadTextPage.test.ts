@@ -154,6 +154,39 @@ describe('readThreadTextPage', () => {
     ])
   })
 
+  it('does not project codex internal goal context as user messages', async () => {
+    const goalContext = [
+      '<codex_internal_context source="goal">',
+      'Once the blocked threshold is satisfied, call update_goal with status "blocked".',
+      '</codex_internal_context>',
+    ].join('\n')
+    const encodedGoalContext = [
+      '&lt;codex_internal_context source="goal"&gt;',
+      'Once the blocked threshold is satisfied, call update_goal with status "blocked".',
+      '&lt;/codex_internal_context&gt;',
+    ].join('\n')
+    const ordinarySimilarPrefix = '<codex_internal_contextual source="user">visible ordinary text</codex_internal_contextual>'
+    const sessionPath = await writeRollout([
+      event('task_started', { turn_id: 'turn-active' }),
+      userMessage(goalContext, 'goal-context-response'),
+      userMessageEvent(goalContext, 'goal-context-event'),
+      userMessage(encodedGoalContext, 'encoded-goal-context-response'),
+      userMessage(ordinarySimilarPrefix, 'ordinary-similar-prefix'),
+      assistant('Visible update after goal context', 'agent-1'),
+    ])
+
+    const result = await readThreadTextPage({
+      sessionPath,
+      threadId: 'thread-1',
+      turnId: 'turn-active',
+    })
+
+    expect(result.items.map((item) => ({ id: item.id, type: item.type, text: item.text }))).toEqual([
+      { id: 'ordinary-similar-prefix', type: 'userMessage', text: ordinarySimilarPrefix },
+      { id: 'agent-1', type: 'agentMessage', text: 'Visible update after goal context' },
+    ])
+  })
+
   it('projects delegated handoff envelopes as collapsed-capable active-turn user messages', async () => {
     const sessionPath = await writeRollout([
       event('task_started', { turn_id: 'turn-active' }),

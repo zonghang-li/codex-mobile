@@ -44,6 +44,8 @@ function readTurnErrorText(turn: Turn): string {
 const FILE_ATTACHMENT_LINE = /^##\s+(.+?):\s+(.+?)\s*$/
 const FILES_MENTIONED_MARKER = /^#\s*files mentioned by the user\s*:?\s*$/i
 const ASSISTANT_FILE_CHANGE_HEADING = /^(?:#{1,6}\s*)?(?:本次修改文件(?:和操作)?(?:如下)?|修改文件和操作)\s*[:：]?\s*$/u
+const CODEX_INTERNAL_GOAL_CONTEXT_OPEN_RE =
+  /^(?:<|&(?:amp;)*lt;)\s*codex_internal_context\b(?=[^>\n]*(?:source\s*=\s*(?:"goal"|'goal'|goal|&quot;goal&quot;|&#34;goal&#34;|&#39;goal&#39;)))/iu
 
 function extractFileAttachments(value: string): UiFileAttachment[] {
   const markerIdx = value.split('\n').findIndex((line) => FILES_MENTIONED_MARKER.test(line.trim()))
@@ -76,6 +78,16 @@ function extractCodexUserRequestText(value: string): string {
 
   const markerOffset = lastMatch.index + lastMatch[0].length
   return value.slice(markerOffset).trim()
+}
+
+function isInjectedUserContextText(value: string): boolean {
+  const text = value.trimStart()
+  return text.startsWith('<environment_context>')
+    || text.startsWith('<recommended_plugins>')
+    || text.startsWith('<permissions instructions>')
+    || CODEX_INTERNAL_GOAL_CONTEXT_OPEN_RE.test(text)
+    || text.startsWith('# AGENTS.md instructions')
+    || text.startsWith('<subagent_notification>')
 }
 
 function toLocalImageUrl(path: string): string {
@@ -322,6 +334,18 @@ function parseUserMessageContent(
   }
 
   const fullText = textChunks.join('\n')
+  if (isInjectedUserContextText(fullText)) {
+    return {
+      text: '',
+      images: [],
+      skills: [],
+      fileAttachments: [],
+      rawBlocks: [],
+      isAutomationRun: false,
+      automationDisplayName: null,
+    }
+  }
+
   const fileAttachments = extractFileAttachments(fullText)
   const heartbeat = parseHeartbeatEnvelope(fullText)
   const requestText = heartbeat?.instructions ?? extractCodexUserRequestText(fullText)

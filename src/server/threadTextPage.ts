@@ -89,6 +89,8 @@ const TITLE_ONLY_REASONING_EXACT_TEXTS = new Set([
 ])
 
 const CODEX_DELEGATION_OPEN_RE = /<codex_delegation\b[^>]*>/iu
+const CODEX_INTERNAL_GOAL_CONTEXT_OPEN_RE =
+  /^(?:<|&(?:amp;)*lt;)\s*codex_internal_context\b(?=[^>\n]*(?:source\s*=\s*(?:"goal"|'goal'|goal|&quot;goal&quot;|&#34;goal&#34;|&#39;goal&#39;)))/iu
 
 export class ThreadTextPageError extends Error {
   readonly statusCode: 400 | 409 | 413
@@ -166,6 +168,7 @@ function isInjectedUserContextText(value: string): boolean {
   return text.startsWith('<environment_context>')
     || text.startsWith('<recommended_plugins>')
     || text.startsWith('<permissions instructions>')
+    || CODEX_INTERNAL_GOAL_CONTEXT_OPEN_RE.test(text)
     || text.startsWith('# AGENTS.md instructions')
     || text.startsWith('<subagent_notification>')
 }

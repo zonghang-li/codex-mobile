@@ -565,6 +565,42 @@ describe('GET /codex-api/thread-turn-page native pagination', () => {
         type: 'response_item',
         payload: {
           type: 'message',
+          id: 'msg-goal-context-hidden',
+          role: 'user',
+          content: [{
+            type: 'input_text',
+            text: '<codex_internal_context source="goal">\nDo not render this internal goal context.\n</codex_internal_context>',
+          }],
+        },
+      },
+      {
+        type: 'response_item',
+        payload: {
+          type: 'message',
+          id: 'msg-encoded-goal-context-hidden',
+          role: 'user',
+          content: [{
+            type: 'input_text',
+            text: '&lt;codex_internal_context source="goal"&gt;\nDo not render this encoded internal goal context.\n&lt;/codex_internal_context&gt;',
+          }],
+        },
+      },
+      {
+        type: 'response_item',
+        payload: {
+          type: 'message',
+          id: 'msg-ordinary-similar-prefix',
+          role: 'user',
+          content: [{
+            type: 'input_text',
+            text: '<codex_internal_contextual source="user">visible ordinary text</codex_internal_contextual>',
+          }],
+        },
+      },
+      {
+        type: 'response_item',
+        payload: {
+          type: 'message',
           id: 'msg-delegation-visible',
           role: 'user',
           content: [{ type: 'input_text', text: '<codex_delegation>\n<input>visible handoff</input>\n</codex_delegation>' }],
@@ -649,8 +685,15 @@ describe('GET /codex-api/thread-turn-page native pagination', () => {
       includeTurns: true,
     }))
     expect(turns.map((turn) => turn.id)).toEqual(['turn-old', 'turn-active'])
-    expect(turns[0]?.items?.map((item) => item.id)).toEqual(['msg-user-old', 'msg-assistant-old', 'msg-delegation-visible'])
+    expect(turns[0]?.items?.map((item) => item.id)).toEqual([
+      'msg-user-old',
+      'msg-assistant-old',
+      'msg-ordinary-similar-prefix',
+      'msg-delegation-visible',
+    ])
     expect(turns[0]?.items?.map((item) => item.text)).toContain('old visible progress')
+    expect(turns[0]?.items?.find((item) => item.id === 'msg-ordinary-similar-prefix')?.content?.[0]?.text)
+      .toBe('<codex_internal_contextual source="user">visible ordinary text</codex_internal_contextual>')
     expect(turns[0]?.items?.find((item) => item.id === 'msg-delegation-visible')?.content?.[0]?.text)
       .toBe('<codex_delegation>\n<input>visible handoff</input>\n</codex_delegation>')
     expect(turns[1]).toMatchObject({
@@ -659,6 +702,9 @@ describe('GET /codex-api/thread-turn-page native pagination', () => {
       items: [],
     })
     expect(JSON.stringify(payload)).not.toContain('subagent_notification')
+    expect(JSON.stringify(payload)).not.toContain('codex_internal_context source')
+    expect(JSON.stringify(payload)).not.toContain('Do not render this internal goal context')
+    expect(JSON.stringify(payload)).not.toContain('Do not render this encoded internal goal context')
     expect(JSON.stringify(payload)).toContain('codex_delegation')
     expect(JSON.stringify(payload)).toContain('visible handoff')
     expect(JSON.stringify(payload)).not.toContain('active text served by text page')

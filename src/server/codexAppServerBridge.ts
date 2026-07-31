@@ -5007,6 +5007,8 @@ type SessionRecoveredItemsCacheEntry = {
 
 const sessionRecoveredItemsCache = new Map<string, SessionRecoveredItemsCacheEntry>()
 const CODEX_DELEGATION_OPEN_RE = /<codex_delegation\b[^>]*>/iu
+const CODEX_INTERNAL_GOAL_CONTEXT_OPEN_RE =
+  /^(?:<|&(?:amp;)*lt;)\s*codex_internal_context\b(?=[^>\n]*(?:source\s*=\s*(?:"goal"|'goal'|goal|&quot;goal&quot;|&#34;goal&#34;|&#39;goal&#39;)))/iu
 
 function sessionUserMessageSlotText(slot: Extract<SessionItemSlot, { type: 'userMessage' }>): string {
   return slot.userMessage.content
@@ -5050,6 +5052,7 @@ function isInjectedSessionUserText(value: string): boolean {
   return text.startsWith('<environment_context>')
     || text.startsWith('<recommended_plugins>')
     || text.startsWith('<permissions instructions>')
+    || CODEX_INTERNAL_GOAL_CONTEXT_OPEN_RE.test(text)
     || text.startsWith('# AGENTS.md instructions')
     || text.startsWith('<subagent_notification>')
     || text.startsWith('The following is the Codex agent history')
@@ -5100,6 +5103,7 @@ function isSessionFallbackInjectedUserText(value: string): boolean {
   return text.startsWith('<environment_context>')
     || text.startsWith('<recommended_plugins>')
     || text.startsWith('<permissions instructions>')
+    || CODEX_INTERNAL_GOAL_CONTEXT_OPEN_RE.test(text)
     || text.startsWith('# AGENTS.md instructions')
     || text.startsWith('<subagent_notification>')
     || text.startsWith('The following is the Codex agent history')
