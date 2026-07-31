@@ -4447,6 +4447,11 @@ export function useDesktopState() {
           markRead: true,
           requestedVersion: '',
           detailEpoch: detailRequest.epoch,
+          allowIdleExternalLeaseRelease:
+            ownershipBeforePoll === 'external'
+            && detail.isLiveProjection === true
+            && detail.ownership === 'idle'
+            && detail.externalRuntimeState === 'idle',
         })
         shouldRefreshThreadsAfterPoll = ownershipBeforePoll === 'external'
           && (
@@ -7593,6 +7598,7 @@ export function useDesktopState() {
       requestedVersion: string
       detailEpoch: number
       allowIdleLocalLeaseRelease?: boolean
+      allowIdleExternalLeaseRelease?: boolean
     },
   ): void {
     if (!isCurrentThreadDetailEpoch(threadId, options.detailEpoch)) return
@@ -7728,6 +7734,8 @@ export function useDesktopState() {
       })
     const allowLocalLeaseRelease = options.allowIdleLocalLeaseRelease === true
       && detailOwnership === 'idle'
+    const allowExternalLeaseRelease = options.allowIdleExternalLeaseRelease === true
+      && detailOwnership === 'idle'
     const retainLocal =
       !allowLocalLeaseRelease
       && (
@@ -7739,6 +7747,7 @@ export function useDesktopState() {
       )
     const retainEstablishedExternal =
       !retainLocal &&
+      !allowExternalLeaseRelease &&
       runtimeOwnershipByThreadId.value[threadId] === 'external' &&
       detailOwnership === 'idle' &&
       externalActiveTurnId.length > 0 &&

@@ -6578,6 +6578,57 @@ describe('external runtime ownership', () => {
     expect(state.selectedLiveOverlay.value).toBe(null)
   })
 
+  it('releases an external lease when selected live-state confirms idle without terminal text', async () => {
+    const { state } = await setupExternalRuntimeState()
+    gatewayMocks.getThreadDetail.mockResolvedValueOnce({
+      ...externalDetail('turn-external'),
+      messages: [
+        {
+          id: 'agent-current',
+          role: 'assistant',
+          text: 'Already synced desktop output',
+          messageType: 'agentMessage',
+          turnId: 'turn-external',
+          sessionOrder: 200,
+        },
+      ],
+    })
+    gatewayMocks.getExternalThreadLiveSnapshot
+      .mockResolvedValueOnce({
+        ...idleDetail(),
+        isLiveProjection: true,
+        projectionKey: 'projection-idle',
+        messages: [
+          {
+            id: 'agent-current',
+            role: 'assistant',
+            text: 'Older desktop output',
+            messageType: 'agentMessage',
+            turnId: 'turn-external',
+            sessionOrder: 100,
+          },
+        ],
+      })
+
+    await state.loadMessages('thread-1')
+    gatewayMocks.getExternalThreadLiveSnapshot.mockClear()
+
+    await vi.advanceTimersByTimeAsync(150)
+    await flushMicrotasks()
+
+    expect(gatewayMocks.getExternalThreadLiveSnapshot).toHaveBeenCalledWith(
+      'thread-1',
+      expect.any(AbortSignal),
+      undefined,
+    )
+    expect(state.messages.value).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: 'agent-current', text: 'Already synced desktop output' }),
+    ]))
+    expect(state.selectedThreadRuntimeOwnership.value).toBe('idle')
+    expect(state.selectedThread.value?.inProgress).toBe(false)
+    expect(state.selectedLiveOverlay.value).toBe(null)
+  })
+
   it('keeps the external lease until a delayed terminal detail refresh completes', async () => {
     const { state } = await setupExternalRuntimeState()
     const terminalDetail = deferred<ReturnType<typeof idleDetail> & {
