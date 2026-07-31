@@ -73,6 +73,7 @@ import type {
 import type { ThreadRuntimeOwnership } from '../types/threadRuntime'
 import { getPathParent, isProjectlessChatPath, normalizePathForUi, toProjectName } from '../pathUtils.js'
 import { commandDisplayLabel } from '../utils/commandActivity'
+import { normalizeCodexDelegationText } from '../utils/codexDelegationText'
 import { parseCodexDirectiveText } from '../utils/codexDirectives'
 import {
   ALL_REASONING_EFFORTS,
@@ -104,8 +105,11 @@ type ThreadTextPageSnapshot = Awaited<ReturnType<typeof getThreadTextPage>>
 type ThreadDetailRequestLease = {
   epoch: number
   ownsRequest: boolean
+  requestKey: string
   promise: Promise<ThreadDetailSnapshot>
 }
+
+type ThreadDetailRequestKind = 'detail' | 'live'
 
 type ActiveTextHydration = {
   turnId: string
@@ -889,6 +893,137 @@ function hasFiniteSessionOrder(message: UiMessage): boolean {
   return typeof message.sessionOrder === 'number' && Number.isFinite(message.sessionOrder)
 }
 
+function hasFiniteTurnIndex(message: UiMessage): boolean {
+  return typeof message.turnIndex === 'number' && Number.isFinite(message.turnIndex)
+}
+
+function uniqueTurnIds(turnIds: Iterable<string>): string[] {
+  const unique: string[] = []
+  const seen = new Set<string>()
+  for (const turnId of turnIds) {
+    const normalized = turnId.trim()
+    if (!normalized || seen.has(normalized)) continue
+    seen.add(normalized)
+    unique.push(normalized)
+  }
+  return unique
+}
+
+function mergePagedTurnIndexLookup(
+  existingLookup: Record<string, number>,
+  pagedTurnIds: string[],
+  options: { prependUnanchored?: boolean } = {},
+): Record<string, number> {
+  const pageOrder = uniqueTurnIds(pagedTurnIds)
+  const existingOrder = Object.entries(existingLookup)
+    .filter(([, turnIndex]) => Number.isFinite(turnIndex))
+    .sort((left, right) => left[1] - right[1])
+    .map(([turnId]) => turnId)
+  const existingPosition = new Map(existingOrder.map((turnId, index) => [turnId, index]))
+  const hasKnownPageAnchor = pageOrder.some((turnId) => existingPosition.has(turnId))
+
+  if (!hasKnownPageAnchor) {
+    if (options.prependUnanchored === true) {
+      const pageSet = new Set(pageOrder)
+      const nextOrder = [
+        ...pageOrder,
+        ...existingOrder.filter((turnId) => !pageSet.has(turnId)),
+      ]
+      return Object.fromEntries(nextOrder.map((turnId, index) => [turnId, index]))
+    }
+
+    const nextOrder = [...existingOrder]
+    for (const turnId of pageOrder) {
+      if (existingPosition.has(turnId)) continue
+      existingPosition.set(turnId, nextOrder.length)
+      nextOrder.push(turnId)
+    }
+    return Object.fromEntries(nextOrder.map((turnId, index) => [turnId, index]))
+  }
+
+  const mergedOrder: string[] = []
+  const used = new Set<string>()
+  let pendingPageOnly: string[] = []
+  let existingCursor = 0
+
+  const pushExistingUntil = (exclusiveIndex: number): void => {
+    while (existingCursor < exclusiveIndex) {
+      const turnId = existingOrder[existingCursor]!
+      existingCursor += 1
+      if (used.has(turnId)) continue
+      used.add(turnId)
+      mergedOrder.push(turnId)
+    }
+  }
+  const pushPendingPageOnly = (): void => {
+    for (const turnId of pendingPageOnly) {
+      if (used.has(turnId)) continue
+      used.add(turnId)
+      mergedOrder.push(turnId)
+    }
+    pendingPageOnly = []
+  }
+
+  for (const turnId of pageOrder) {
+    const anchorIndex = existingPosition.get(turnId)
+    if (anchorIndex === undefined) {
+      pendingPageOnly.push(turnId)
+      continue
+    }
+
+    pushExistingUntil(anchorIndex)
+    pushPendingPageOnly()
+    if (!used.has(turnId)) {
+      used.add(turnId)
+      mergedOrder.push(turnId)
+    }
+    existingCursor = Math.max(existingCursor, anchorIndex + 1)
+  }
+
+  pushExistingUntil(existingOrder.length)
+  pushPendingPageOnly()
+
+  return Object.fromEntries(mergedOrder.map((turnId, index) => [turnId, index]))
+}
+
+function reindexMessagesByTurnLookup(
+  messages: UiMessage[],
+  lookup: Record<string, number>,
+): UiMessage[] {
+  let changed = false
+  const reindexed = messages.map((message) => {
+    if (!message.turnId) return message
+    const turnIndex = lookup[message.turnId]
+    if (typeof turnIndex !== 'number' || !Number.isFinite(turnIndex) || message.turnIndex === turnIndex) {
+      return message
+    }
+    changed = true
+    return { ...message, turnIndex }
+  })
+  return changed ? reindexed : messages
+}
+
+const CODEX_DELEGATION_OPEN_RE = /<codex_delegation\b[^>]*>/iu
+
+function isLateDelegatedUserEventMessage(message: UiMessage): boolean {
+  return message.messageType === 'userMessage'
+    && message.id.startsWith('rollout:userMessage:event:')
+    && CODEX_DELEGATION_OPEN_RE.test(normalizeCodexDelegationText(message.text))
+}
+
+function shouldPrependUnanchoredDelegationPage(
+  hadLoadedMessages: boolean,
+  serverInProgress: boolean,
+  existingLookup: Record<string, number>,
+  pagedTurnIds: string[],
+  detailMessages: readonly UiMessage[],
+): boolean {
+  if (!hadLoadedMessages || serverInProgress) return false
+  if (Object.keys(existingLookup).length === 0 || pagedTurnIds.length === 0) return false
+  if (pagedTurnIds.some((turnId) => existingLookup[turnId] !== undefined)) return false
+  return detailMessages.some(isLateDelegatedUserEventMessage)
+}
+
 function buildMaxSessionOrderByTurn(messages: readonly UiMessage[]): Map<string, number> {
   const maxByTurnId = new Map<string, number>()
   for (const message of messages) {
@@ -927,10 +1062,34 @@ function isStaleOrderedAppend(
   return typeof maxSessionOrder === 'number' && (incoming.sessionOrder as number) <= maxSessionOrder
 }
 
+function shouldInsertBeforeOrderedMessage(candidate: UiMessage, incoming: UiMessage): boolean {
+  if (hasFiniteTurnIndex(incoming) && hasFiniteTurnIndex(candidate)) {
+    if ((candidate.turnIndex as number) !== (incoming.turnIndex as number)) {
+      return (candidate.turnIndex as number) > (incoming.turnIndex as number)
+    }
+    if (
+      candidate.turnId === incoming.turnId
+      && hasFiniteSessionOrder(candidate)
+      && hasFiniteSessionOrder(incoming)
+    ) {
+      return (candidate.sessionOrder as number) > (incoming.sessionOrder as number)
+    }
+    return false
+  }
+  if (
+    candidate.turnId === incoming.turnId
+    && hasFiniteSessionOrder(candidate)
+    && hasFiniteSessionOrder(incoming)
+  ) {
+    return (candidate.sessionOrder as number) > (incoming.sessionOrder as number)
+  }
+  return false
+}
+
 function insertOrderedMessagesByTurn(messages: UiMessage[], appended: UiMessage[]): UiMessage[] {
   const merged = [...messages]
   for (const message of appended) {
-    if (!message.turnId || !hasFiniteSessionOrder(message)) {
+    if (!message.turnId || (!hasFiniteTurnIndex(message) && !hasFiniteSessionOrder(message))) {
       merged.push(message)
       continue
     }
@@ -939,14 +1098,12 @@ function insertOrderedMessagesByTurn(messages: UiMessage[], appended: UiMessage[
     let insertionIndex = -1
     for (let index = 0; index < merged.length; index += 1) {
       const candidate = merged[index]!
-      if (candidate.turnId !== message.turnId) continue
-      lastSameTurnIndex = index
-      if (
-        insertionIndex < 0
-        && hasFiniteSessionOrder(candidate)
-        && (candidate.sessionOrder as number) > (message.sessionOrder as number)
-      ) {
+      if (candidate.turnId === message.turnId) {
+        lastSameTurnIndex = index
+      }
+      if (shouldInsertBeforeOrderedMessage(candidate, message)) {
         insertionIndex = index
+        break
       }
     }
 
@@ -2105,6 +2262,7 @@ export function useDesktopState() {
     promise: Promise<void>
     controller: AbortController
     threadId: string
+    detailRequestKey: string | null
     detailEpoch: number | null
   } | null = null
   let externalRuntimePollingEnabled = true
@@ -2135,8 +2293,10 @@ export function useDesktopState() {
   const detailRequestEpochByThreadId = new Map<string, number>()
   const threadGoalRequestEpochByThreadId = new Map<string, number>()
   let threadGoalRequestGeneration = 0
-  const detailRequestByThreadId = new Map<string, {
+  const detailRequestByKey = new Map<string, {
     epoch: number
+    kind: ThreadDetailRequestKind
+    threadId: string
     promise: Promise<ThreadDetailSnapshot>
     controller?: AbortController
     consumers: number
@@ -2403,8 +2563,14 @@ export function useDesktopState() {
     )
     activeReasoningItemId = ''
     shouldAutoScrollOnNextAgentEvent = false
-    if (runtimeOwnershipByThreadId.value[nextThreadId] === 'external') {
-      scheduleExternalRuntimePolling(nextThreadId)
+    if (
+      runtimeOwnershipByThreadId.value[nextThreadId] === 'external' ||
+      canStartSelectedLiveProjectionPolling(nextThreadId)
+    ) {
+      scheduleExternalRuntimePolling(
+        nextThreadId,
+        runtimeOwnershipByThreadId.value[nextThreadId] === 'external' ? undefined : 0,
+      )
     }
   }
 
@@ -3601,6 +3767,26 @@ export function useDesktopState() {
     return unknownError instanceof Error && unknownError.name === 'AbortError'
   }
 
+  function threadDetailRequestKey(
+    threadId: string,
+    kind: ThreadDetailRequestKind = 'detail',
+    cacheKey = '',
+  ): string {
+    return `${kind}\u0000${threadId}\u0000${cacheKey}`
+  }
+
+  function hasThreadDetailRequest(
+    threadId: string,
+    kind?: ThreadDetailRequestKind,
+  ): boolean {
+    for (const request of detailRequestByKey.values()) {
+      if (request.threadId === threadId && (kind === undefined || request.kind === kind)) {
+        return true
+      }
+    }
+    return false
+  }
+
   function scheduleCompressedLiveProjectionBackfill(threadId: string, projectionKey: string): void {
     if (!threadId || !projectionKey || typeof window === 'undefined') return
     if (selectedThreadId.value !== threadId) return
@@ -3636,40 +3822,64 @@ export function useDesktopState() {
     threadId: string,
     request: () => Promise<ThreadDetailSnapshot>,
     controller?: AbortController,
+    options: { kind?: ThreadDetailRequestKind; cacheKey?: string } = {},
   ): ThreadDetailRequestLease {
-    const existing = detailRequestByThreadId.get(threadId)
+    const kind = options.kind ?? 'detail'
+    const requestKey = threadDetailRequestKey(threadId, kind, options.cacheKey ?? '')
+    const existing = detailRequestByKey.get(requestKey)
     if (existing) {
       existing.consumers += 1
-      return { epoch: existing.epoch, ownsRequest: false, promise: existing.promise }
+      return { epoch: existing.epoch, ownsRequest: false, requestKey, promise: existing.promise }
     }
 
     const epoch = (detailRequestEpochByThreadId.get(threadId) ?? 0) + 1
     detailRequestEpochByThreadId.set(threadId, epoch)
     const promise = request()
-    detailRequestByThreadId.set(threadId, { epoch, promise, controller, consumers: 1 })
-    return { epoch, ownsRequest: true, promise }
+    detailRequestByKey.set(requestKey, { epoch, kind, threadId, promise, controller, consumers: 1 })
+    return { epoch, ownsRequest: true, requestKey, promise }
   }
 
   function invalidateThreadDetailRequest(threadId: string): void {
-    const current = detailRequestByThreadId.get(threadId)
-    if (!current) return
-    detailRequestByThreadId.delete(threadId)
-    detailRequestEpochByThreadId.set(threadId, current.epoch + 1)
-    current.controller?.abort()
+    let invalidated = false
+    let nextEpoch = (detailRequestEpochByThreadId.get(threadId) ?? 0) + 1
+    for (const [requestKey, current] of detailRequestByKey.entries()) {
+      if (current.threadId !== threadId) continue
+      invalidated = true
+      nextEpoch = Math.max(nextEpoch, current.epoch + 1)
+      detailRequestByKey.delete(requestKey)
+      current.controller?.abort()
+    }
+    if (invalidated) {
+      detailRequestEpochByThreadId.set(threadId, nextEpoch)
+    }
   }
 
   function releaseThreadDetailRequest(threadId: string, lease: ThreadDetailRequestLease): void {
-    const current = detailRequestByThreadId.get(threadId)
-    if (!current || current.epoch !== lease.epoch || current.promise !== lease.promise) return
+    const current = detailRequestByKey.get(lease.requestKey)
+    if (
+      !current
+      || current.threadId !== threadId
+      || current.epoch !== lease.epoch
+      || current.promise !== lease.promise
+    ) return
     current.consumers -= 1
-    if (current.consumers <= 0) detailRequestByThreadId.delete(threadId)
+    if (current.consumers <= 0) detailRequestByKey.delete(lease.requestKey)
   }
 
-  function invalidateOwnedThreadDetailRequest(threadId: string, epoch: number | null): void {
-    if (epoch === null) return
-    const current = detailRequestByThreadId.get(threadId)
-    if (!current || current.epoch !== epoch) return
-    invalidateThreadDetailRequest(threadId)
+  function invalidateOwnedThreadDetailRequest(
+    threadId: string,
+    requestKey: string | null,
+    epoch: number | null,
+  ): void {
+    if (requestKey === null || epoch === null) return
+    const current = detailRequestByKey.get(requestKey)
+    if (!current || current.threadId !== threadId || current.epoch !== epoch) return
+    detailRequestByKey.delete(requestKey)
+    detailRequestEpochByThreadId.set(
+      threadId,
+      Math.max((detailRequestEpochByThreadId.get(threadId) ?? 0) + 1, current.epoch + 1),
+    )
+    current.controller?.abort()
   }
 
   function cancelExternalRuntimePolling(): void {
@@ -3681,9 +3891,16 @@ export function useDesktopState() {
     const request = externalRuntimeRequest
     externalRuntimeRequest = null
     if (request) {
-      invalidateOwnedThreadDetailRequest(request.threadId, request.detailEpoch)
+      invalidateOwnedThreadDetailRequest(request.threadId, request.detailRequestKey, request.detailEpoch)
     }
     request?.controller.abort()
+  }
+
+  function clearExternalRuntimeTimer(): void {
+    if (externalRuntimeTimer !== null && typeof window !== 'undefined') {
+      window.clearTimeout(externalRuntimeTimer)
+    }
+    externalRuntimeTimer = null
   }
 
   function backgroundRuntimeCandidateIds(): string[] {
@@ -3766,8 +3983,15 @@ export function useDesktopState() {
     backgroundRuntimeRequest = null
   }
 
+  function clearBackgroundRuntimeTimer(): void {
+    if (backgroundRuntimeTimer !== null && typeof window !== 'undefined') {
+      window.clearTimeout(backgroundRuntimeTimer)
+    }
+    backgroundRuntimeTimer = null
+  }
+
   function isThreadDetailLoadActive(threadId: string): boolean {
-    return detailRequestByThreadId.has(threadId) || loadMessagePromiseByThreadId.has(threadId)
+    return hasThreadDetailRequest(threadId) || loadMessagePromiseByThreadId.has(threadId)
   }
 
   function isSelectedLiveProjectionPollingEligible(threadId: string): boolean {
@@ -3797,7 +4021,6 @@ export function useDesktopState() {
 
   function scheduleBackgroundRuntimePolling(delayMs = BACKGROUND_RUNTIME_POLL_MS): void {
     if (!backgroundRuntimePollingEnabled || typeof window === 'undefined') return
-    if (typeof document !== 'undefined' && document.visibilityState === 'hidden') return
     if (backgroundRuntimeTimer !== null || backgroundRuntimeRequest !== null) return
     if (isLoadingThreads.value || loadThreadsPromise !== null) {
       backgroundRuntimeTimer = window.setTimeout(() => {
@@ -3808,12 +4031,16 @@ export function useDesktopState() {
     }
     backgroundRuntimeTimer = window.setTimeout(() => {
       backgroundRuntimeTimer = null
-      const candidateThreadIds = backgroundRuntimeCandidateIds()
+      const selectedId = selectedThreadId.value
+      const allCandidateThreadIds = backgroundRuntimeCandidateIds()
+      const candidateThreadIds =
+        typeof document !== 'undefined' && document.visibilityState === 'hidden'
+          ? (selectedId && allCandidateThreadIds.includes(selectedId) ? [selectedId] : [])
+          : allCandidateThreadIds
       if (candidateThreadIds.length === 0) {
         scheduleBackgroundRuntimePolling()
         return
       }
-      const selectedId = selectedThreadId.value
       const selectedVersion = selectedId ? selectionVersionByThreadId.get(selectedId) ?? 0 : 0
       const shouldIsolateSelectedProbe =
         selectedId.length > 0
@@ -3861,14 +4088,24 @@ export function useDesktopState() {
   function onRuntimeVisibilityChange(): void {
     if (typeof document === 'undefined') return
     multiWindowThreadSync.setVisible(document.visibilityState === 'visible')
-    cancelBackgroundRuntimeRequest()
-    cancelExternalRuntimePolling()
+    clearBackgroundRuntimeTimer()
+    clearExternalRuntimeTimer()
     if (document.visibilityState !== 'visible') {
       if (threadListBackgroundTimer !== null && typeof window !== 'undefined') {
         window.clearTimeout(threadListBackgroundTimer)
         threadListBackgroundTimer = null
       }
-      pauseActiveTextHydration(selectedThreadId.value)
+      scheduleBackgroundRuntimePolling(0)
+      const selectedId = selectedThreadId.value
+      if (
+        selectedId &&
+        (
+          runtimeOwnershipByThreadId.value[selectedId] === 'external' ||
+          canStartSelectedLiveProjectionPolling(selectedId)
+        )
+      ) {
+        scheduleExternalRuntimePolling(selectedId, 0)
+      }
       return
     }
     resumeActiveTextHydration()
@@ -4115,7 +4352,6 @@ export function useDesktopState() {
     delayMs = SELECTED_EXTERNAL_LIVE_PROJECTION_POLL_MS,
   ): void {
     if (!externalRuntimePollingEnabled || typeof window === 'undefined') return
-    if (typeof document !== 'undefined' && document.visibilityState === 'hidden') return
     if (!threadId || selectedThreadId.value !== threadId) return
     if (
       runtimeOwnershipByThreadId.value[threadId] !== 'external' &&
@@ -4134,6 +4370,7 @@ export function useDesktopState() {
         threadId,
         () => getExternalThreadLiveSnapshot(threadId, controller.signal, knownProjectionKey),
         controller,
+        { kind: 'live', cacheKey: knownProjectionKey ?? '' },
       )
       const request = pollExternalRuntime(threadId, generation, detailRequest)
       externalRuntimeRequest = {
@@ -4141,6 +4378,7 @@ export function useDesktopState() {
         promise: request,
         controller,
         threadId,
+        detailRequestKey: detailRequest.ownsRequest ? detailRequest.requestKey : null,
         detailEpoch: detailRequest.ownsRequest ? detailRequest.epoch : null,
       }
       void request.finally(() => {
@@ -4596,7 +4834,6 @@ export function useDesktopState() {
     generation: number,
   ): Promise<void> {
     if (!hydration.hasMoreOlder || !isActiveTextHydrationCurrent(threadId, hydration, generation)) return
-    if (typeof document !== 'undefined' && document.visibilityState === 'hidden') return
     if (isActiveTextHydrationConflictBlocked(threadId, hydration)) return
 
     const cursor = hydration.consumedCursors.size === 0
@@ -7303,38 +7540,51 @@ export function useDesktopState() {
     let reconciledDetailMessages = detailMessages
     if (isIncrementalProjection) {
       const existingLookup = turnIndexByTurnIdByThreadId.value[threadId] ?? {}
-      const nextLookup = { ...existingLookup }
-      let nextTurnIndex = Object.values(existingLookup).reduce(
-        (maximum, turnIndex) => Math.max(maximum, turnIndex),
-        -1,
-      ) + 1
       const pagedTurnIds = Object.entries(detailTurnIndexByTurnId)
         .sort((left, right) => left[1] - right[1])
         .map(([turnId]) => turnId)
-      for (const turnId of pagedTurnIds) {
-        if (nextLookup[turnId] !== undefined) continue
-        nextLookup[turnId] = nextTurnIndex
-        nextTurnIndex += 1
-      }
+      const nextLookup = isPagedProjection
+        ? mergePagedTurnIndexLookup(existingLookup, pagedTurnIds, {
+            prependUnanchored: shouldPrependUnanchoredDelegationPage(
+              hadLoadedMessages,
+              serverInProgress === true,
+              existingLookup,
+              pagedTurnIds,
+              detailMessages,
+            ),
+          })
+        : (() => {
+            const appendedLookup = { ...existingLookup }
+            let nextTurnIndex = Object.values(existingLookup).reduce(
+              (maximum, turnIndex) => Math.max(maximum, turnIndex),
+              -1,
+            ) + 1
+            for (const turnId of pagedTurnIds) {
+              if (appendedLookup[turnId] !== undefined) continue
+              appendedLookup[turnId] = nextTurnIndex
+              nextTurnIndex += 1
+            }
+            return appendedLookup
+          })()
       reconciledTurnIndexByTurnId = nextLookup
-      reconciledDetailMessages = detailMessages.map((message) => {
-        if (!message.turnId) return message
-        const turnIndex = nextLookup[message.turnId]
-        return typeof turnIndex === 'number' && message.turnIndex !== turnIndex
-          ? { ...message, turnIndex }
-          : message
-      })
+      reconciledDetailMessages = reindexMessagesByTurnLookup(detailMessages, nextLookup)
     }
     const mergedCompletionSummaries = mergeTurnSummariesWithPersistedDurations(
       threadId,
       completionSummaries,
     )
     rememberTerminalSummariesForThread(threadId, mergedCompletionSummaries)
-    const nextMessages = insertTurnSummaryMessages(
-      reconciledDetailMessages,
-      mergedCompletionSummaries,
+    const nextMessages = reindexMessagesByTurnLookup(
+      insertTurnSummaryMessages(
+        reconciledDetailMessages,
+        mergedCompletionSummaries,
+      ),
+      reconciledTurnIndexByTurnId,
     )
-    let previousPersisted = persistedMessagesByThreadId.value[threadId] ?? []
+    let previousPersisted = reindexMessagesByTurnLookup(
+      persistedMessagesByThreadId.value[threadId] ?? [],
+      reconciledTurnIndexByTurnId,
+    )
     const localActiveTurnId = runtimeOwnershipByThreadId.value[threadId] === 'local'
       ? activeTurnIdByThreadId.value[threadId] ?? ''
       : ''
@@ -9626,6 +9876,19 @@ export function useDesktopState() {
       pendingThreadMessageRefresh.add(selectedThreadId.value)
     }
     await syncFromNotifications()
+    const selectedId = selectedThreadId.value
+    if (
+      selectedId &&
+      (
+        runtimeOwnershipByThreadId.value[selectedId] === 'external' ||
+        canStartSelectedLiveProjectionPolling(selectedId)
+      )
+    ) {
+      scheduleExternalRuntimePolling(
+        selectedId,
+        runtimeOwnershipByThreadId.value[selectedId] === 'external' ? undefined : 0,
+      )
+    }
   }
 
   function startPolling(): void {
