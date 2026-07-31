@@ -1420,11 +1420,20 @@ export async function getThreadTextPage(
       }],
     },
   } as ThreadReadResponse)
+  const messages = normalized
+    .filter((message) => message.turnId === turnId)
+    .map((message) => (
+      message.role === 'assistant'
+      && message.messageType === 'agentMessage'
+      && !message.phase
+        ? { ...message, phase: 'commentary' }
+        : message
+    ))
 
   return {
     threadId: payloadThreadId,
     turnId: payloadTurnId,
-    messages: normalized.filter((message) => message.turnId === turnId),
+    messages,
     nextOlderCursor: readString(payload?.nextOlderCursor),
     hasMoreOlder: payload?.hasMoreOlder === true,
     notModified: payload?.notModified === true ? true : undefined,

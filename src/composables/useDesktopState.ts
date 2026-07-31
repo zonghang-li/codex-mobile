@@ -871,6 +871,7 @@ function areMessageFieldsEqual(first: UiMessage, second: UiMessage): boolean {
     areUiFileChangesEqual(first.fileChanges, second.fileChanges) &&
     first.fileChangeStatus === second.fileChangeStatus &&
     first.messageType === second.messageType &&
+    first.phase === second.phase &&
     first.rawPayload === second.rawPayload &&
     first.isUnhandled === second.isUnhandled &&
     areCommandExecutionsEqual(first.commandExecution, second.commandExecution) &&
@@ -1250,6 +1251,135 @@ function mergeLiveProjectionMessages(
     return !message.turnId || !incomingTurnIds.has(message.turnId)
   })
   return mergeMessages(preserved, incoming, { preserveMissing: true })
+}
+
+function authoritativeTurnSets(
+  incoming: readonly UiMessage[],
+  incomingTurnIdsOverride: Iterable<string> = [],
+): { turnIds: Set<string>; turnIndexes: Set<number> } {
+  const turnIds = new Set(
+    Array.from(incomingTurnIdsOverride)
+      .filter((turnId) => typeof turnId === 'string' && turnId.length > 0),
+  )
+  const turnIndexes = new Set<number>()
+  for (const message of incoming) {
+    if (typeof message.turnId === 'string' && message.turnId.length > 0) {
+      turnIds.add(message.turnId)
+    } else if (
+      typeof message.turnIndex === 'number'
+      && Number.isFinite(message.turnIndex)
+    ) {
+      turnIndexes.add(message.turnIndex)
+    }
+  }
+  return { turnIds, turnIndexes }
+}
+
+function matchesAuthoritativeTurn(
+  message: UiMessage,
+  turnIds: ReadonlySet<string>,
+  turnIndexes: ReadonlySet<number>,
+): boolean {
+  if (typeof message.turnId === 'string' && message.turnId.length > 0) {
+    return turnIds.has(message.turnId)
+  }
+  return (
+    typeof message.turnIndex === 'number'
+    && Number.isFinite(message.turnIndex)
+    && turnIndexes.has(message.turnIndex)
+  )
+}
+
+function filterStaleAuthoritativeIncomingMessages(
+  previous: UiMessage[],
+  incoming: UiMessage[],
+  incomingTurnIdsOverride: Iterable<string> = [],
+  options: { allowEqualOrderTextGrowth?: boolean } = {},
+): UiMessage[] {
+  const { turnIds, turnIndexes } = authoritativeTurnSets(incoming, incomingTurnIdsOverride)
+  if (turnIds.size === 0 && turnIndexes.size === 0) return incoming
+
+  const finalAgentTurnIds = hasIncomingFinalAgentMessageByTurn(incoming)
+  const finalFilteredIncoming = finalAgentTurnIds.size === 0
+    ? incoming
+    : incoming.filter((message) => !(
+        message.role === 'assistant'
+        && message.messageType === 'agentMessage'
+        && message.phase === 'commentary'
+        && message.turnId
+        && finalAgentTurnIds.has(message.turnId)
+        && matchesAuthoritativeTurn(message, turnIds, turnIndexes)
+      ))
+
+  const previousById = new Map(previous.map((message) => [message.id, message]))
+  const hasOrderedRegression = finalFilteredIncoming.some((message) => {
+    if (!matchesAuthoritativeTurn(message, turnIds, turnIndexes)) return false
+    const previousMessage = previousById.get(message.id)
+    return Boolean(previousMessage && shouldKeepPreviousOrderedMessage(previousMessage, message, {
+      allowEqualOrderTextGrowth: options.allowEqualOrderTextGrowth,
+    }))
+  })
+  if (!hasOrderedRegression) return finalFilteredIncoming
+
+  const previousMaxSessionOrderByTurn = buildMaxSessionOrderByTurn(previous)
+  const filtered = finalFilteredIncoming.filter((message) => {
+    if (!matchesAuthoritativeTurn(message, turnIds, turnIndexes)) return true
+    if (previousById.has(message.id)) return true
+    return !isStaleOrderedAppend(message, previousMaxSessionOrderByTurn)
+  })
+  return filtered.length === finalFilteredIncoming.length ? finalFilteredIncoming : filtered
+}
+
+function hasIncomingFinalAgentMessageByTurn(messages: readonly UiMessage[]): Set<string> {
+  const turnIds = new Set<string>()
+  for (const message of messages) {
+    if (
+      message.turnId
+      && message.role === 'assistant'
+      && message.messageType === 'agentMessage'
+      && (message.phase === 'final' || message.phase === 'final_answer')
+    ) {
+      turnIds.add(message.turnId)
+    }
+  }
+  return turnIds
+}
+
+function isPrunableCompletedActiveTextMessage(message: UiMessage): boolean {
+  if (!message.turnId || message.role !== 'assistant') return false
+  if (message.messageType === 'reasoning') return true
+  if (message.messageType !== 'agentMessage') return false
+  if (message.phase === 'final' || message.phase === 'final_answer') return false
+  if (message.phase === 'commentary') return true
+  return false
+}
+
+function prunePreviousMessagesForAuthoritativeTurns(
+  previous: UiMessage[],
+  incoming: UiMessage[],
+  incomingTurnIdsOverride: Iterable<string> = [],
+  options: { prunableTurnIds?: Iterable<string> } = {},
+): UiMessage[] {
+  const { turnIds, turnIndexes } = authoritativeTurnSets(incoming, incomingTurnIdsOverride)
+  if (turnIds.size === 0 && turnIndexes.size === 0) return previous
+
+  const prunableTurnIds = new Set(
+    Array.from(options.prunableTurnIds ?? [])
+      .filter((turnId) => typeof turnId === 'string' && turnId.length > 0),
+  )
+  if (prunableTurnIds.size === 0) return previous
+
+  const incomingById = new Set(incoming.map((message) => message.id))
+  const pruned = previous.filter((message) => {
+    if (incomingById.has(message.id)) return true
+    if (message.role === 'user' || isOptimisticUserMessage(message)) return true
+    if (!message.turnId || !prunableTurnIds.has(message.turnId)) return true
+    if (!isPrunableCompletedActiveTextMessage(message)) {
+      return true
+    }
+    return !matchesAuthoritativeTurn(message, turnIds, turnIndexes)
+  })
+  return pruned.length === previous.length ? previous : pruned
 }
 
 function areUiFileChangesEqual(first?: UiFileChange[], second?: UiFileChange[]): boolean {
@@ -2183,6 +2313,7 @@ export function useDesktopState() {
     loadPersistedTurnSummaryMap(),
   )
   const terminalTurnIdsByThreadId = new Map<string, Set<string>>()
+  const recentlyCompletedActiveTurnIdByThreadId = new Map<string, string>()
   const turnActivityByThreadId = ref<Record<string, TurnActivityState>>({})
   const turnErrorByThreadId = ref<Record<string, TurnErrorState>>({})
   const activeTurnIdByThreadId = ref<Record<string, string>>({})
@@ -3474,6 +3605,7 @@ export function useDesktopState() {
     turnIndexByTurnIdByThreadId.value = omitKey(turnIndexByTurnIdByThreadId.value, normalizedThreadId)
     turnSummaryByThreadId.value = omitKey(turnSummaryByThreadId.value, normalizedThreadId)
     terminalTurnIdsByThreadId.delete(normalizedThreadId)
+    recentlyCompletedActiveTurnIdByThreadId.delete(normalizedThreadId)
     turnActivityByThreadId.value = omitKey(turnActivityByThreadId.value, normalizedThreadId)
     turnErrorByThreadId.value = omitKey(turnErrorByThreadId.value, normalizedThreadId)
     activeTurnIdByThreadId.value = omitKey(activeTurnIdByThreadId.value, normalizedThreadId)
@@ -3584,6 +3716,9 @@ export function useDesktopState() {
     liveCommandsByThreadId.value = pruneThreadStateMap(liveCommandsByThreadId.value, activeThreadIds)
     liveFileChangeMessagesByThreadId.value = pruneThreadStateMap(liveFileChangeMessagesByThreadId.value, activeThreadIds)
     turnSummaryByThreadId.value = pruneThreadStateMap(turnSummaryByThreadId.value, activeThreadIds)
+    for (const threadId of recentlyCompletedActiveTurnIdByThreadId.keys()) {
+      if (!activeThreadIds.has(threadId)) recentlyCompletedActiveTurnIdByThreadId.delete(threadId)
+    }
     turnActivityByThreadId.value = pruneThreadStateMap(turnActivityByThreadId.value, activeThreadIds)
     turnErrorByThreadId.value = pruneThreadStateMap(turnErrorByThreadId.value, activeThreadIds)
     activeTurnIdByThreadId.value = pruneThreadStateMap(activeTurnIdByThreadId.value, activeThreadIds)
@@ -6718,6 +6853,7 @@ export function useDesktopState() {
       maybeUnblockInterruptForActiveTurn(startedTurn.threadId, startedTurn.turnId)
       clearLivePlansForThread(startedTurn.threadId)
       clearLiveFileChangesForThread(startedTurn.threadId)
+      recentlyCompletedActiveTurnIdByThreadId.delete(startedTurn.threadId)
       setTurnSummaryForThread(startedTurn.threadId, null)
       setTurnErrorForThread(startedTurn.threadId, null)
       setThreadInProgress(startedTurn.threadId, true)
@@ -6787,6 +6923,7 @@ export function useDesktopState() {
       }
       persistTurnSummaryForThread(completedTurn.threadId, summary)
       if (completionDisposition.ownsActiveLease) {
+        recentlyCompletedActiveTurnIdByThreadId.set(completedTurn.threadId, completedTurn.turnId)
         if (!shouldRetryWithFallback) {
           const activeTextHydration = activeTextHydrationByThreadId.get(completedTurn.threadId)
           if (activeTextHydration?.turnId === completedTurn.turnId) {
@@ -7737,6 +7874,7 @@ export function useDesktopState() {
         if (message.role !== 'assistant') return false
         if (message.messageType !== 'agentMessage') return false
         if (!message.text.trim()) return false
+        if (message.phase === 'final' || message.phase === 'final_answer') return true
         if (typeof message.sessionOrder !== 'number' || !Number.isFinite(message.sessionOrder)) {
           return false
         }
@@ -7930,24 +8068,51 @@ export function useDesktopState() {
     // Paged projections without ordered active text remain authoritative so
     // stale rebased rows can still be dropped.
     const shouldPreserveLiveProjection = isLiveProjection
+      && inProgress
       && (
         isPartialTurnProjection
         || (
-          inProgress
-          && (
-            !rawLiveProjectionHasAuthoritativeTurnIndices
-            || liveProjectionHasOrderedActiveTextRows
-          )
+          !rawLiveProjectionHasAuthoritativeTurnIndices
+          || liveProjectionHasOrderedActiveTextRows
         )
       )
     const shouldPreserveLoadedIdleOrderedRows = hadLoadedMessages && !inProgress
     const shouldAllowEqualOrderTextGrowth =
       shouldPreserveLoadedIdleOrderedRows && mergedCompletionSummaries.length > 0
+    const shouldUseAuthoritativeIdleMerge = !inProgress && hadLoadedMessages && !shouldPreserveLiveProjection
+    const authoritativeIdleTurnIds = shouldUseAuthoritativeIdleMerge
+      ? Object.keys(detailTurnIndexByTurnId)
+      : []
+    const authoritativeIdlePrunableTurnIds = shouldUseAuthoritativeIdleMerge
+      ? uniqueTurnIds([
+          activeTextHydration?.turnId ?? '',
+          externalActiveTurnId,
+          recentlyCompletedActiveTurnIdByThreadId.get(threadId) ?? '',
+          activeTurnIdByThreadId.value[threadId] ?? '',
+          activeTurnId,
+        ])
+      : []
+    const effectiveNextMessages = shouldUseAuthoritativeIdleMerge
+      ? filterStaleAuthoritativeIncomingMessages(
+          previousPersisted,
+          nextMessages,
+          authoritativeIdleTurnIds,
+          { allowEqualOrderTextGrowth: shouldAllowEqualOrderTextGrowth },
+        )
+      : nextMessages
+    const previousForAuthoritativeIdleMerge = shouldUseAuthoritativeIdleMerge
+      ? prunePreviousMessagesForAuthoritativeTurns(
+          previousPersisted,
+          effectiveNextMessages,
+          authoritativeIdleTurnIds,
+          { prunableTurnIds: authoritativeIdlePrunableTurnIds },
+        )
+      : previousPersisted
     const mergedMessages = shouldPreserveLiveProjection
       ? mergeMessages(previousPersisted, nextMessages, { preserveMissing: true })
       : isIncrementalProjection
         ? shouldPreserveLoadedIdleOrderedRows
-          ? mergeMessages(previousPersisted, nextMessages, {
+          ? mergeMessages(previousForAuthoritativeIdleMerge, effectiveNextMessages, {
               preserveMissing: true,
               preserveOrderedRows: true,
               allowEqualOrderTextGrowth: shouldAllowEqualOrderTextGrowth,
@@ -7957,12 +8122,12 @@ export function useDesktopState() {
               nextMessages,
               isPagedProjection ? Object.keys(detailTurnIndexByTurnId) : [],
             )
-      : mergeMessages(previousPersisted, nextMessages, {
+      : mergeMessages(previousForAuthoritativeIdleMerge, effectiveNextMessages, {
           preserveMissing: options.preserveMissing || hasOptimisticUserMessages(previousPersisted),
           preserveOrderedRows: shouldPreserveLoadedIdleOrderedRows,
           allowEqualOrderTextGrowth: shouldAllowEqualOrderTextGrowth,
         })
-    const messagesWithHydratedText = activeTextHydration
+    const messagesWithHydratedText = activeTextHydration && inProgress
       ? mergeHydratedTurnTextIntoTranscript(
           mergedMessages,
           activeTextHydration.messages,
@@ -8013,6 +8178,7 @@ export function useDesktopState() {
       }
     }
     if (!inProgress) {
+      recentlyCompletedActiveTurnIdByThreadId.delete(threadId)
       clearTransientTurnErrorForThread(threadId)
       clearCompletedTurnLiveState(threadId)
       if (activeTextHydration) {

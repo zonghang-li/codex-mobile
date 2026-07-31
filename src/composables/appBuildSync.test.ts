@@ -61,7 +61,7 @@ describe('app build sync', () => {
     })
   })
 
-  it('checks immediately when a hidden tab becomes visible', async () => {
+  it('keeps checking build changes while a tab is hidden', async () => {
     const reload = vi.fn()
     const fetchMock = vi.fn()
       .mockResolvedValueOnce(new Response(JSON.stringify({ buildId: 'build-a' }), {
@@ -89,20 +89,16 @@ describe('app build sync', () => {
 
     const dispose = installAppBuildSync({ currentBuildId: 'build-a', intervalMs: 1_000 })
     await vi.advanceTimersByTimeAsync(0)
-    expect(fetchMock).toHaveBeenCalledTimes(0)
+    expect(fetchMock).toHaveBeenCalledTimes(1)
 
-    documentMock.visibilityState = 'visible'
-    const visibilityHandler = documentMock.addEventListener.mock.calls
-      .find(([eventName]) => eventName === 'visibilitychange')?.[1] as (() => void) | undefined
-    visibilityHandler?.()
-    await vi.advanceTimersByTimeAsync(0)
+    await vi.advanceTimersByTimeAsync(1_000)
     dispose()
 
-    expect(fetchMock).toHaveBeenCalledTimes(1)
-    expect(reload).not.toHaveBeenCalled()
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+    expect(reload).toHaveBeenCalledTimes(1)
   })
 
-  it('reloads on the first visible check when a hidden old tab sees a newer backend build', async () => {
+  it('reloads on the first hidden check when an old tab sees a newer backend build', async () => {
     const reload = vi.fn()
     const fetchMock = vi.fn()
       .mockResolvedValueOnce(new Response(JSON.stringify({ buildId: 'build-b' }), {
@@ -125,12 +121,6 @@ describe('app build sync', () => {
     })
 
     const dispose = installAppBuildSync({ currentBuildId: 'build-a', intervalMs: 1_000 })
-    await vi.advanceTimersByTimeAsync(0)
-
-    documentMock.visibilityState = 'visible'
-    const visibilityHandler = documentMock.addEventListener.mock.calls
-      .find(([eventName]) => eventName === 'visibilitychange')?.[1] as (() => void) | undefined
-    visibilityHandler?.()
     await vi.advanceTimersByTimeAsync(0)
     dispose()
 

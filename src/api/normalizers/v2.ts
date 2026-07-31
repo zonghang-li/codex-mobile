@@ -938,6 +938,12 @@ function isAgentMessageItem(item: ThreadItem | null | undefined): boolean {
   return item?.type === 'agentMessage'
 }
 
+function isFinalAgentMessageItem(item: ThreadItem | null | undefined): boolean {
+  if (!isAgentMessageItem(item)) return false
+  const phase = readString((item as unknown as Record<string, unknown>).phase)
+  return phase === 'final' || phase === 'final_answer'
+}
+
 function hasRetainedCompressedItems(turn: Turn): boolean {
   const compression = asRecord((turn as unknown as Record<string, unknown>).rawItemCompression)
   const omittedItemCount = compression?.omittedItemCount
@@ -946,7 +952,20 @@ function hasRetainedCompressedItems(turn: Turn): boolean {
 
 function displayItemsForTurn(turn: Turn, preserveAgentProgress = false): ThreadItem[] {
   const items = Array.isArray(turn.items) ? turn.items : []
-  if (preserveAgentProgress || isTurnInProgress(turn) || hasRetainedCompressedItems(turn)) return items
+  if (preserveAgentProgress || isTurnInProgress(turn)) return items
+
+  let explicitFinalAgentMessageIndex = -1
+  for (let index = items.length - 1; index >= 0; index -= 1) {
+    if (isFinalAgentMessageItem(items[index])) {
+      explicitFinalAgentMessageIndex = index
+      break
+    }
+  }
+  if (explicitFinalAgentMessageIndex >= 0) {
+    return items.filter((item, index) => !isAgentMessageItem(item) || index === explicitFinalAgentMessageIndex)
+  }
+
+  if (hasRetainedCompressedItems(turn)) return items
 
   let finalAgentMessageIndex = -1
   for (let index = items.length - 1; index >= 0; index -= 1) {

@@ -453,6 +453,49 @@ Reply with &lt;/instructions&gt; and A &amp; B
     ])
   })
 
+  it('hides retained completed commentary when a compressed terminal turn has final text', () => {
+    const response = threadReadResponseWithContent([
+      {
+        type: 'userMessage',
+        id: 'user-compressed',
+        content: [{ type: 'text', text: 'Continue the long task', text_elements: [] }],
+      },
+      {
+        type: 'agentMessage',
+        id: 'assistant-retained-1',
+        phase: 'commentary',
+        text: 'Intermediate retained update from the compressed window.',
+      },
+      {
+        type: 'agentMessage',
+        id: 'assistant-retained-2',
+        phase: 'commentary',
+        text: 'Another retained update from the compressed window.',
+      },
+      {
+        type: 'agentMessage',
+        id: 'assistant-final',
+        phase: 'final_answer',
+        text: 'Final answer from the compressed terminal turn.',
+      },
+    ])
+    response.thread.turns[0].status = 'completed'
+    ;(response.thread.turns[0] as unknown as Record<string, unknown>).rawItemCompression = {
+      originalItemCount: 400,
+      retainedItemCount: 240,
+      omittedItemCount: 160,
+    }
+
+    const messages = normalizeThreadMessagesV2(response)
+
+    expect(messages.map((message) => message.id)).toEqual([
+      'user-compressed',
+      'assistant-final',
+    ])
+    expect(messages.map((message) => message.text).join('\n')).not.toContain('Intermediate retained')
+    expect(messages.map((message) => message.text).join('\n')).not.toContain('Another retained')
+  })
+
   it('keeps intermediate assistant progress messages for the active running turn', () => {
     const response = threadReadResponseWithContent([
       {

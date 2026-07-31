@@ -1837,6 +1837,7 @@ describe('thread text page', () => {
           role: 'assistant',
           text: '继续执行验证。',
           messageType: 'agentMessage',
+          phase: 'commentary',
           turnId: 'turn-active',
           sessionOrder: 200,
         }),

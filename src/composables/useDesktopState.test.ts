@@ -8824,7 +8824,10 @@ describe('active turn text hydration', () => {
       removeEventListener: vi.fn(),
     })
     gatewayMocks.getThreadDetail
-      .mockResolvedValueOnce(partialExternalDetail([activeText('agent-live', 'agentMessage', 300)]))
+      .mockResolvedValueOnce(partialExternalDetail([{
+        ...activeText('agent-live', 'agentMessage', 300),
+        phase: 'commentary',
+      }]))
       .mockResolvedValueOnce(partialExternalDetail([activeText('agent-new', 'agentMessage')]))
     gatewayMocks.getThreadTextPage.mockResolvedValueOnce({
       threadId: 'thread-external',
@@ -9949,7 +9952,10 @@ describe('active turn text hydration', () => {
         isLiveProjection: true,
         isPartialTurnProjection: true,
         messages: [
-          activeText('agent-current-live', 'agentMessage', 300, 'turn-current'),
+          {
+            ...activeText('agent-current-live', 'agentMessage', 300, 'turn-current'),
+            phase: 'commentary',
+          },
         ],
         turnIndexByTurnId: { 'turn-current': 0 },
       })
@@ -9981,9 +9987,8 @@ describe('active turn text hydration', () => {
     expect(state.messages.value.map((message) => message.id)).toEqual([
       'rollout:userMessage:event:delegated-history',
       'agent-history-response',
-      'agent-current-live',
-      'agent-current-final',
       'turn-summary:turn-current',
+      'agent-current-final',
     ])
   })
 
@@ -10103,6 +10108,67 @@ describe('active turn text hydration', () => {
       'agent-middle',
       'agent-tail-old',
       'agent-tail-new',
+    ])
+  })
+
+  it('preserves completed summaries, activity, and terminal backfill rows across later idle refreshes', async () => {
+    installTestWindow()
+    vi.stubGlobal('document', {
+      visibilityState: 'visible',
+      addEventListener: vi.fn(),
+      removeEventListener: vi.fn(),
+    })
+    gatewayMocks.getPendingServerRequests.mockResolvedValue([])
+    gatewayMocks.getThreadDetail
+      .mockResolvedValueOnce({
+        ...idleDetail(),
+        messages: [
+          {
+            id: 'cmd-existing',
+            role: 'system',
+            text: 'Ran commands',
+            messageType: 'commandExecution',
+            turnId: 'turn-terminal',
+            sessionOrder: 100,
+            commandExecution: {
+              id: 'cmd-existing',
+              command: 'git diff --check',
+              status: 'completed',
+              exitCode: 0,
+              aggregatedOutput: '',
+              displayLabel: 'Ran commands',
+              activityCategories: ['read'],
+            },
+          },
+          activeText('agent-backfill', 'agentMessage', 200, 'turn-terminal'),
+          activeText('agent-final', 'agentMessage', 400, 'turn-terminal'),
+        ],
+        turnIndexByTurnId: { 'turn-terminal': 0 },
+        completionSummaries: [
+          { turnId: 'turn-terminal', status: 'completed', durationMs: 12_000 },
+        ],
+      })
+      .mockResolvedValueOnce({
+        ...idleDetail(),
+        messages: [
+          activeText('agent-final', 'agentMessage', 400, 'turn-terminal'),
+        ],
+        turnIndexByTurnId: { 'turn-terminal': 0 },
+        completionSummaries: [],
+      })
+
+    const state = useDesktopState()
+    state.primeSelectedThread('thread-external')
+    await state.loadMessages('thread-external')
+    await flushMicrotasks()
+    await state.loadMessages('thread-external', { silent: true, force: true })
+    await flushMicrotasks()
+
+    expect(state.messages.value.map((message) => message.id)).toEqual([
+      'cmd-existing',
+      'agent-backfill',
+      'turn-summary:turn-terminal',
+      'agent-final',
     ])
   })
 
@@ -10243,7 +10309,7 @@ describe('active turn text hydration', () => {
     ])
   })
 
-  it('finalizes hydrated text on completion without dropping assistant commentary', async () => {
+  it('replaces hydrated active commentary with authoritative final text on completion', async () => {
     installTestWindow()
     vi.stubGlobal('document', {
       visibilityState: 'visible',
@@ -10251,7 +10317,10 @@ describe('active turn text hydration', () => {
       removeEventListener: vi.fn(),
     })
     gatewayMocks.getThreadDetail
-      .mockResolvedValueOnce(partialExternalDetail([activeText('agent-live', 'agentMessage', 300)]))
+      .mockResolvedValueOnce(partialExternalDetail([{
+        ...activeText('agent-live', 'agentMessage', 300),
+        phase: 'commentary',
+      }]))
       .mockResolvedValueOnce({
         ...idleDetail(),
         messages: [
@@ -10267,7 +10336,10 @@ describe('active turn text hydration', () => {
       turnId: 'turn-external',
       messages: [
         activeText('reason-1', 'reasoning', 100),
-        activeText('agent-commentary', 'agentMessage', 200),
+        {
+          ...activeText('agent-commentary', 'agentMessage', 200),
+          phase: 'commentary',
+        },
       ],
       nextOlderCursor: null,
       hasMoreOlder: false,
@@ -10280,11 +10352,11 @@ describe('active turn text hydration', () => {
     await state.loadMessages('thread-external', { silent: true, force: true })
 
     expect(state.messages.value.map((message) => message.id)).toEqual([
-      'agent-commentary',
-      'agent-live',
-      'agent-final',
       'reason-historical',
+      'agent-final',
     ])
+    expect(state.messages.value.map((message) => message.id)).not.toContain('agent-commentary')
+    expect(state.messages.value.map((message) => message.id)).not.toContain('agent-live')
 
     await state.loadMessages('thread-external', { silent: true, force: true })
     await flushMicrotasks()
@@ -10292,6 +10364,105 @@ describe('active turn text hydration', () => {
       'reason-historical',
       'agent-previous-live',
     ]))
+  })
+
+  it('does not preserve stale active rows from completed partial live-state snapshots', async () => {
+    installTestWindow()
+    vi.stubGlobal('document', {
+      visibilityState: 'visible',
+      addEventListener: vi.fn(),
+      removeEventListener: vi.fn(),
+    })
+    gatewayMocks.getThreadDetail
+      .mockResolvedValueOnce(partialExternalDetail([
+        {
+          ...activeText('agent-live', 'agentMessage', 300),
+          phase: 'commentary',
+        },
+      ]))
+      .mockResolvedValueOnce({
+        ...idleDetail(),
+        isLiveProjection: true,
+        isPartialTurnProjection: true,
+        messages: [
+          {
+            ...activeText('agent-commentary', 'agentMessage', 200),
+            phase: 'commentary',
+          },
+          {
+            ...activeText('agent-final', 'agentMessage', 400),
+            phase: 'final_answer',
+          },
+        ],
+        turnIndexByTurnId: { 'turn-external': 0 },
+      })
+    gatewayMocks.getThreadTextPage.mockResolvedValueOnce({
+      threadId: 'thread-external',
+      turnId: 'turn-external',
+      messages: [
+        activeText('reason-1', 'reasoning', 100),
+        {
+          ...activeText('agent-commentary', 'agentMessage', 200),
+          phase: 'commentary',
+        },
+      ],
+      nextOlderCursor: null,
+      hasMoreOlder: false,
+    })
+
+    const state = useDesktopState()
+    state.primeSelectedThread('thread-external')
+    await state.loadMessages('thread-external')
+    await flushMicrotasks()
+    expect(state.messages.value.map((message) => message.id)).toEqual([
+      'reason-1',
+      'agent-commentary',
+      'agent-live',
+    ])
+
+    await state.loadMessages('thread-external', { silent: true, force: true })
+    await flushMicrotasks()
+
+    expect(state.messages.value.map((message) => message.id)).toEqual([
+      'agent-final',
+    ])
+    expect(state.messages.value[0]?.phase).toBe('final_answer')
+  })
+
+  it('updates assistant phase when a final snapshot reuses an active text id', async () => {
+    installTestWindow()
+    vi.stubGlobal('document', {
+      visibilityState: 'visible',
+      addEventListener: vi.fn(),
+      removeEventListener: vi.fn(),
+    })
+    const sharedActiveText = {
+      ...activeText('agent-shared', 'agentMessage', 300),
+      phase: 'commentary',
+    }
+    const sharedFinalText = {
+      ...activeText('agent-shared', 'agentMessage', 300),
+      phase: 'final_answer',
+    }
+    gatewayMocks.getThreadDetail
+      .mockResolvedValueOnce(partialExternalDetail([sharedActiveText]))
+      .mockResolvedValueOnce({
+        ...idleDetail(),
+        messages: [sharedFinalText],
+        turnIndexByTurnId: { 'turn-external': 0 },
+      })
+
+    const state = useDesktopState()
+    state.primeSelectedThread('thread-external')
+    await state.loadMessages('thread-external')
+    await flushMicrotasks()
+    expect(state.messages.value[0]?.phase).toBe('commentary')
+
+    await state.loadMessages('thread-external', { silent: true, force: true })
+    await flushMicrotasks()
+
+    expect(state.messages.value.map((message) => message.id)).toEqual(['agent-shared'])
+    expect(state.messages.value[0]?.phase).toBe('final_answer')
   })
 
   it('immediately finalizes matching hydrated reasoning when completion refresh fails', async () => {
@@ -10309,7 +10480,10 @@ describe('active turn text hydration', () => {
       turnId: 'turn-external',
       messages: [
         activeText('reason-1', 'reasoning', 100),
-        activeText('agent-commentary', 'agentMessage', 200),
+        {
+          ...activeText('agent-commentary', 'agentMessage', 200),
+          phase: 'commentary',
+        },
       ],
       nextOlderCursor: 'older-pending',
       hasMoreOlder: true,
@@ -10357,7 +10531,10 @@ describe('active turn text hydration', () => {
     })
     gatewayMocks.getThreadDetail
       .mockResolvedValueOnce(partialExternalDetail([
-        activeText('agent-live', 'agentMessage', 300),
+        {
+          ...activeText('agent-live', 'agentMessage', 300),
+          phase: 'commentary',
+        },
       ]))
       .mockResolvedValueOnce({
         ...idleDetail(),
@@ -10366,7 +10543,10 @@ describe('active turn text hydration', () => {
     gatewayMocks.getThreadTextPage.mockResolvedValueOnce({
       threadId: 'thread-external',
       turnId: 'turn-external',
-      messages: [activeText('agent-commentary', 'agentMessage', 200)],
+      messages: [{
+        ...activeText('agent-commentary', 'agentMessage', 200),
+        phase: 'commentary',
+      }],
       nextOlderCursor: null,
       hasMoreOlder: false,
     })
@@ -10386,11 +10566,70 @@ describe('active turn text hydration', () => {
     await flushMicrotasks()
 
     expect(gatewayMocks.getThreadDetail).toHaveBeenCalledTimes(2)
-    expect(state.messages.value.map((message) => message.id)).toEqual(expect.arrayContaining([
-      'agent-commentary',
-      'agent-live',
+    expect(state.messages.value.map((message) => message.id)).toEqual([
+      'turn-summary:turn-external',
       'agent-final',
-    ]))
+    ])
+  })
+
+  it('preserves terminal backfill when a completed notification prunes stale active text', async () => {
+    const { state, emit } = await setupExternalRuntimeState()
+    vi.stubGlobal('document', {
+      visibilityState: 'visible',
+      addEventListener: vi.fn(),
+      removeEventListener: vi.fn(),
+    })
+    const terminalBackfill: UiMessage = {
+      id: 'agent-backfill',
+      role: 'assistant',
+      text: 'Terminal backfill row from the completed run.',
+      messageType: 'agentMessage',
+      turnId: 'turn-external',
+      sessionOrder: 150,
+    }
+    gatewayMocks.getThreadDetail
+      .mockResolvedValueOnce(partialExternalDetail([
+        terminalBackfill,
+        {
+          ...activeText('agent-live', 'agentMessage', 300),
+          phase: 'commentary',
+        },
+      ]))
+      .mockResolvedValueOnce({
+        ...idleDetail(),
+        messages: [activeText('agent-final', 'agentMessage', 400)],
+        turnIndexByTurnId: { 'turn-external': 0 },
+      })
+    gatewayMocks.getThreadTextPage.mockResolvedValueOnce({
+      threadId: 'thread-external',
+      turnId: 'turn-external',
+      messages: [{
+        ...activeText('agent-commentary', 'agentMessage', 200),
+        phase: 'commentary',
+      }],
+      nextOlderCursor: null,
+      hasMoreOlder: false,
+    })
+
+    state.primeSelectedThread('thread-external')
+    await state.loadMessages('thread-external')
+    await flushMicrotasks()
+
+    emit({
+      method: 'turn/completed',
+      params: {
+        turnId: 'turn-external',
+        turn: { id: 'turn-external', status: 'completed' },
+      },
+    })
+    await vi.advanceTimersByTimeAsync(0)
+    await flushMicrotasks()
+
+    expect(state.messages.value.map((message) => message.id)).toEqual([
+      'agent-backfill',
+      'turn-summary:turn-external',
+      'agent-final',
+    ])
   })
 
   it('finalizes the previous hydration when the active turn changes without going idle', async () => {

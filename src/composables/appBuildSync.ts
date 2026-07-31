@@ -21,7 +21,6 @@ export function installAppBuildSync(options: {
 
   const check = async (): Promise<void> => {
     if (disposed || checking || reloading) return
-    if (document.visibilityState !== 'visible') return
     checking = true
     try {
       const response = await fetch(endpoint, {
@@ -48,9 +47,7 @@ export function installAppBuildSync(options: {
   }
 
   const handleVisibilityChange = (): void => {
-    if (document.visibilityState === 'visible') {
-      void check()
-    }
+    void check()
   }
 
   document.addEventListener('visibilitychange', handleVisibilityChange)
