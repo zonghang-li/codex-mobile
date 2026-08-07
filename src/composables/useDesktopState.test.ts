@@ -6921,6 +6921,205 @@ describe('external runtime ownership', () => {
     expect(state.error.value).toBe('')
   })
 
+  it('retries a text-only local steer through external ownership instead of moving it to the queue', async () => {
+    const { state, emit } = await setupExternalRuntimeState()
+    gatewayMocks.getThreadDetail.mockResolvedValue(localDetail('turn-local'))
+    gatewayMocks.resumeThread.mockResolvedValue(idleDetail())
+    const firstStart = deferred<string>()
+    gatewayMocks.startThreadTurn
+      .mockReturnValueOnce(firstStart.promise)
+      .mockResolvedValueOnce('turn-external-steer')
+
+    emit({ method: 'turn/started', params: { threadId: 'thread-1', turn: { id: 'turn-local' } } })
+    await flushMicrotasks()
+    gatewayMocks.setThreadQueueState.mockClear()
+
+    await state.sendMessageToSelectedThread('steer across ownership race', [], [], 'steer')
+    await flushMicrotasks()
+    const beforeRetry = state.messages.value.filter((message) => message.text === 'steer across ownership race')
+    expect(beforeRetry).toHaveLength(1)
+    const optimisticMessageId = beforeRetry[0]!.id
+
+    firstStart.reject(new CodexApiError(
+      'RPC turn/start failed with HTTP 502: Cannot start a turn because task writer ownership is not idle.',
+      {
+        code: 'http_error',
+        method: 'turn/start',
+        status: 502,
+      },
+    ))
+    await flushMicrotasks()
+
+    expect(gatewayMocks.startThreadTurn).toHaveBeenCalledTimes(2)
+    expect(gatewayMocks.startThreadTurn).toHaveBeenNthCalledWith(
+      2,
+      'thread-1',
+      'steer across ownership race',
+      [],
+      undefined,
+      'medium',
+      undefined,
+      [],
+      'default',
+      { externalSteer: true },
+    )
+    expect(gatewayMocks.setThreadQueueState).not.toHaveBeenCalled()
+    expect(state.selectedThreadQueuedMessages.value).toEqual([])
+    const afterRetry = state.messages.value.filter((message) => message.text === 'steer across ownership race')
+    expect(afterRetry).toHaveLength(1)
+    expect(afterRetry[0]).toMatchObject({
+      id: optimisticMessageId,
+      role: 'user',
+      messageType: 'userMessage.optimistic',
+    })
+    expect(state.selectedThreadRuntimeOwnership.value).toBe('external')
+    expect(state.error.value).toBe('')
+  })
+
+  it('keeps concurrent steer payloads isolated when writer ownership changes', async () => {
+    const { state, emit } = await setupExternalRuntimeState()
+    gatewayMocks.getThreadDetail.mockResolvedValue(localDetail('turn-local'))
+    gatewayMocks.resumeThread.mockResolvedValue(idleDetail())
+    const attachmentStart = deferred<string>()
+    const textStart = deferred<string>()
+    let startCallCount = 0
+    gatewayMocks.startThreadTurn.mockImplementation(() => {
+      startCallCount += 1
+      if (startCallCount === 1) return attachmentStart.promise
+      if (startCallCount === 2) return textStart.promise
+      return Promise.resolve('turn-external-steer')
+    })
+    const managedImageUrl = '/codex-local-image?path=%2Ftmp%2Fcodex-web-uploads%2Fupload%2Fconcurrent.png&uploadHandle=concurrent-image'
+
+    emit({ method: 'turn/started', params: { threadId: 'thread-1', turn: { id: 'turn-local' } } })
+    await flushMicrotasks()
+    gatewayMocks.setThreadQueueState.mockClear()
+
+    await state.sendMessageToSelectedThread('attachment steer', [managedImageUrl], [], 'steer')
+    await state.sendMessageToSelectedThread('text steer', [], [], 'steer')
+    await flushMicrotasks()
+
+    const ownershipError = new CodexApiError(
+      'RPC turn/start failed with HTTP 502: Cannot start a turn because task writer ownership is not idle.',
+      {
+        code: 'http_error',
+        method: 'turn/start',
+        status: 502,
+      },
+    )
+    attachmentStart.reject(ownershipError)
+    await flushMicrotasks()
+
+    expect(gatewayMocks.startThreadTurn).toHaveBeenCalledTimes(2)
+    expect(state.selectedThreadQueuedMessages.value).toEqual([
+      expect.objectContaining({ text: 'attachment steer' }),
+    ])
+    expect(gatewayMocks.cleanupManagedUploads).toHaveBeenCalledWith([managedImageUrl], [])
+
+    textStart.reject(ownershipError)
+    await flushMicrotasks()
+
+    expect(gatewayMocks.startThreadTurn).toHaveBeenCalledTimes(3)
+    expect(gatewayMocks.startThreadTurn).toHaveBeenNthCalledWith(
+      3,
+      'thread-1',
+      'text steer',
+      [],
+      undefined,
+      'medium',
+      undefined,
+      [],
+      'default',
+      { externalSteer: true },
+    )
+    expect(state.selectedThreadQueuedMessages.value).toEqual([
+      expect.objectContaining({ text: 'attachment steer' }),
+    ])
+  })
+
+  it('retries an idle text-only submit through external ownership after turn/start is issued', async () => {
+    const { state } = await setupExternalRuntimeState()
+    gatewayMocks.resumeThread.mockResolvedValue(idleDetail())
+    gatewayMocks.startThreadTurn
+      .mockRejectedValueOnce(new CodexApiError(
+        'RPC turn/start failed with HTTP 502: Cannot start a turn because task writer ownership is not idle.',
+        {
+          code: 'http_error',
+          method: 'turn/start',
+          status: 502,
+        },
+      ))
+      .mockResolvedValueOnce('turn-external-steer')
+    gatewayMocks.setThreadQueueState.mockClear()
+
+    await state.sendMessageToSelectedThread('idle steer ownership race', [], [], 'steer')
+    await flushMicrotasks()
+
+    expect(gatewayMocks.startThreadTurn).toHaveBeenCalledTimes(2)
+    expect(gatewayMocks.startThreadTurn).toHaveBeenLastCalledWith(
+      'thread-1',
+      'idle steer ownership race',
+      [],
+      undefined,
+      'medium',
+      undefined,
+      [],
+      'default',
+      { externalSteer: true },
+    )
+    expect(gatewayMocks.setThreadQueueState).not.toHaveBeenCalled()
+    expect(state.selectedThreadQueuedMessages.value).toEqual([])
+  })
+
+  it('queues a steer that implicitly reuses an attached image when ownership changes', async () => {
+    const { state } = await setupExternalRuntimeState()
+    const managedImageUrl = '/codex-local-image?path=%2Ftmp%2Fcodex-web-uploads%2Fupload%2Fprior.png&uploadHandle=prior-image'
+    gatewayMocks.getThreadDetail.mockResolvedValue({
+      ...localDetail('turn-local'),
+      messages: [{
+        id: 'prior-user-image',
+        role: 'user',
+        text: 'prior image',
+        images: [managedImageUrl],
+        messageType: 'userMessage',
+      }],
+    })
+    gatewayMocks.resumeThread.mockResolvedValue(idleDetail())
+    gatewayMocks.startThreadTurn.mockRejectedValue(new CodexApiError(
+      'RPC turn/start failed with HTTP 502: Cannot start a turn because task writer ownership is not idle.',
+      {
+        code: 'http_error',
+        method: 'turn/start',
+        status: 502,
+      },
+    ))
+    await state.loadMessages('thread-1')
+    gatewayMocks.setThreadQueueState.mockClear()
+
+    await state.sendMessageToSelectedThread('copy the screenshot', [], [], 'steer')
+    await flushMicrotasks()
+
+    expect(gatewayMocks.startThreadTurn).toHaveBeenCalledTimes(1)
+    expect(gatewayMocks.startThreadTurn).toHaveBeenCalledWith(
+      'thread-1',
+      'copy the screenshot',
+      [managedImageUrl],
+      undefined,
+      'medium',
+      undefined,
+      [],
+      'default',
+    )
+    expect(state.selectedThreadQueuedMessages.value).toEqual([
+      expect.objectContaining({
+        text: 'copy the screenshot',
+        imageUrls: [],
+        skills: [],
+        fileAttachments: [],
+      }),
+    ])
+  })
+
   it('queues a steer when turn/start reports a non-idle writer owner', async () => {
     const { state } = await setupExternalRuntimeState()
     gatewayMocks.resumeThread.mockResolvedValue(idleDetail())

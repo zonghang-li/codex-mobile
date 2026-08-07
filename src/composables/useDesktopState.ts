@@ -2258,6 +2258,7 @@ export function useDesktopState() {
     generation: number
     optimisticMessageId: string
     turnStartIssued: boolean
+    pendingTurnRequest?: PendingTurnRequest
   }
   type PendingStopRequest = {
     generation: number
@@ -2473,6 +2474,7 @@ export function useDesktopState() {
   }
   const completionReconciliationGenerationByThreadId = new Map<string, number>()
   const localSubmissionByThreadId = new Map<string, LocalSubmissionState>()
+  const releasedPendingTurnRequests = new WeakSet<PendingTurnRequest>()
   const pendingStopRequestByThreadId = new Map<string, PendingStopRequest>()
   let pendingNewThreadSubmission: PendingNewThreadSubmission | null = null
   let nextSubmissionGeneration = 0
@@ -3015,7 +3017,7 @@ export function useDesktopState() {
     }
 
     removeOptimisticUserMessage(threadId, submission.optimisticMessageId)
-    releasePendingTurnRequest(threadId)
+    releasePendingTurnRequest(threadId, submission.pendingTurnRequest)
     clearLocalSubmission(threadId, submission.generation)
     clearPendingStopRequest(threadId, submission.generation)
     setThreadRuntimeOwnership(threadId, 'idle')
@@ -3024,10 +3026,17 @@ export function useDesktopState() {
     return true
   }
 
-  function setPendingTurnRequest(threadId: string, request: PendingTurnRequest): void {
+  function setPendingTurnRequest(
+    threadId: string,
+    request: PendingTurnRequest,
+    submission?: LocalSubmissionState,
+  ): void {
     pendingTurnRequestByThreadId.value = {
       ...pendingTurnRequestByThreadId.value,
       [threadId]: request,
+    }
+    if (submission) {
+      submission.pendingTurnRequest = pendingTurnRequestByThreadId.value[threadId]
     }
   }
 
@@ -3097,8 +3106,15 @@ export function useDesktopState() {
     threadId: string,
     request: PendingTurnRequest | undefined = pendingTurnRequestByThreadId.value[threadId],
   ): void {
-    clearPendingTurnRequest(threadId)
-    if (!request || !hasManagedUploadCapabilities(request.imageUrls, request.fileAttachments)) return
+    if (pendingTurnRequestByThreadId.value[threadId] === request) {
+      clearPendingTurnRequest(threadId)
+    }
+    if (
+      !request
+      || releasedPendingTurnRequests.has(request)
+      || !hasManagedUploadCapabilities(request.imageUrls, request.fileAttachments)
+    ) return
+    releasedPendingTurnRequests.add(request)
     void cleanupManagedUploads(request.imageUrls, request.fileAttachments)
   }
 
@@ -3108,10 +3124,16 @@ export function useDesktopState() {
     if (!pending || pending.fallbackRetried) return
 
     fallbackRetryInFlightThreadIds.add(threadId)
-    setPendingTurnRequest(threadId, {
+    const fallbackPending: PendingTurnRequest = {
       ...pending,
       fallbackRetried: true,
-    })
+    }
+    const submission = localSubmissionByThreadId.get(threadId)
+    setPendingTurnRequest(
+      threadId,
+      fallbackPending,
+      submission?.pendingTurnRequest === pending ? submission : undefined,
+    )
 
     try {
       await applyFallbackModelSelection(threadId)
@@ -8914,10 +8936,26 @@ export function useDesktopState() {
     return imageUrls.length === 0 && skills.length === 0 && fileAttachments.length === 0
   }
 
+  function canRetryPendingTurnAsExternalTextSteer(
+    mode: 'steer' | 'queue',
+    submission: LocalSubmissionState,
+    pendingTurnRequest: PendingTurnRequest | undefined,
+  ): boolean {
+    return mode === 'steer'
+      && submission.turnStartIssued
+      && pendingTurnRequest !== undefined
+      && canStartExternalTextSteer(
+        pendingTurnRequest.imageUrls,
+        pendingTurnRequest.skills,
+        pendingTurnRequest.fileAttachments,
+      )
+  }
+
   async function startExternalTextSteer(
     threadId: string,
     nextText: string,
     collaborationModeOverride?: CollaborationModeKind,
+    optimisticMessageIdOverride = '',
   ): Promise<boolean> {
     const normalizedText = nextText.trim()
     if (!threadId || !normalizedText) return false
@@ -8933,7 +8971,8 @@ export function useDesktopState() {
       canInterrupt: runtimeCanInterruptByThreadId.value[threadId] === true,
     })
     setThreadInProgress(threadId, true)
-    const optimisticMessageId = appendOptimisticUserMessage(threadId, normalizedText)
+    const optimisticMessageId = optimisticMessageIdOverride
+      || appendOptimisticUserMessage(threadId, normalizedText)
 
     try {
       await startThreadTurn(
@@ -9067,12 +9106,29 @@ export function useDesktopState() {
         collaborationModeOverride,
         uploadLease.transfer,
         submission,
-      ).catch((unknownError) => {
+      ).catch(async (unknownError) => {
         if (isWriterOwnershipNotIdleError(unknownError)) {
-          removeOptimisticUserMessage(threadId, optimisticMessageId)
+          const pendingTurnRequest = submission.pendingTurnRequest
+          const shouldRetryExternalTextSteer = canRetryPendingTurnAsExternalTextSteer(
+            mode,
+            submission,
+            pendingTurnRequest,
+          )
           clearPendingStopRequest(threadId, submission.generation)
           clearLocalSubmission(threadId, submission.generation)
-          releasePendingTurnRequest(threadId)
+          releasePendingTurnRequest(threadId, pendingTurnRequest)
+          if (
+            shouldRetryExternalTextSteer
+            && await startExternalTextSteer(
+              threadId,
+              nextText,
+              collaborationModeOverride,
+              optimisticMessageId,
+            )
+          ) {
+            return
+          }
+          removeOptimisticUserMessage(threadId, optimisticMessageId)
           enqueueExternalTextOnlyThreadMessage(
             threadId,
             nextText,
@@ -9142,11 +9198,28 @@ export function useDesktopState() {
       await uploadLease.release()
     } catch (unknownError) {
       if (isWriterOwnershipNotIdleError(unknownError)) {
-        releasePendingTurnRequest(threadId)
+        const pendingTurnRequest = submission.pendingTurnRequest
+        const shouldRetryExternalTextSteer = canRetryPendingTurnAsExternalTextSteer(
+          mode,
+          submission,
+          pendingTurnRequest,
+        )
+        releasePendingTurnRequest(threadId, pendingTurnRequest)
         await uploadLease.release()
-        removeOptimisticUserMessage(threadId, optimisticMessageId)
         clearPendingStopRequest(threadId, submission.generation)
         clearLocalSubmission(threadId, submission.generation)
+        if (
+          shouldRetryExternalTextSteer
+          && await startExternalTextSteer(
+            threadId,
+            nextText,
+            collaborationModeOverride,
+            optimisticMessageId,
+          )
+        ) {
+          return
+        }
+        removeOptimisticUserMessage(threadId, optimisticMessageId)
         enqueueExternalTextOnlyThreadMessage(
           threadId,
           nextText,
@@ -9407,7 +9480,7 @@ export function useDesktopState() {
       effort: reasoningEffort,
       collaborationMode,
       fallbackRetried: false,
-    })
+    }, submission)
     onPendingTurnEstablished?.()
 
     try {
@@ -9456,7 +9529,7 @@ export function useDesktopState() {
             effort: reasoningEffort,
             collaborationMode,
             fallbackRetried: true,
-          })
+          }, submission)
           startedTurnId = await startThreadTurn(
             threadId,
             nextText,
@@ -9490,7 +9563,11 @@ export function useDesktopState() {
       scheduleDelayedTurnSync(threadId)
     } catch (unknownError) {
       if (!isAmbiguousTurnStartError(unknownError) && !isWriterOwnershipNotIdleError(unknownError)) {
-        releasePendingTurnRequest(threadId)
+        if (submission) {
+          releasePendingTurnRequest(threadId, submission.pendingTurnRequest)
+        } else {
+          releasePendingTurnRequest(threadId)
+        }
       }
       throw unknownError
     }
