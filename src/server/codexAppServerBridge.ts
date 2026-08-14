@@ -58,7 +58,7 @@ import {
 } from './threadTextPage.js'
 import { ThreadTerminalManager } from './terminalManager.js'
 import { getSpawnInvocation } from '../utils/commandInvocation.js'
-import { mutateJsonStateFile } from '../utils/atomicJsonState.js'
+import { isProcessAlive, mutateJsonStateFile } from '../utils/atomicJsonState.js'
 import {
   resolveCodexCommand,
   resolveRipgrepCommand,
@@ -7736,6 +7736,8 @@ const THREAD_QUEUE_RECEIPTS_KEY = 'thread-queue-receipts'
 const THREAD_QUEUE_PROCESSING_KEY = 'thread-queue-processing'
 const THREAD_QUEUE_REVISION_KEY = 'thread-queue-revision'
 const THREAD_QUEUE_CHANGED_THREAD_IDS_KEY = 'thread-queue-changed-thread-ids'
+const THREAD_QUEUE_RECEIPT_LIMIT = 2048
+const THREAD_QUEUE_DEPENDENCY_WAIT_MS = 30_000
 const threadQueueRevisionListeners = new Set<(event: { threadIds: string[]; revision: number }) => void>()
 
 function subscribeThreadQueueRevisions(
@@ -7749,6 +7751,7 @@ type StoredQueuedMessage = {
   id: string
   queueAfterId?: string
   queueBeforeId?: string
+  dependencyWaitUntil?: number
   text: string
   imageUrls: string[]
   skills: Array<{ name: string; path: string }>
@@ -7763,12 +7766,14 @@ type ThreadQueueState = Record<string, StoredQueuedMessage[]>
 type ThreadQueueReceipt = {
   threadId: string
   messageId: string
+  acceptedAtMs?: number
 }
 
 type ThreadQueueProcessingState = Record<string, {
   messageId: string
   attempted: boolean
   ownerId?: string
+  ownerPid?: number
   leaseExpiresAt?: number
 }>
 
@@ -7828,6 +7833,9 @@ function normalizeStoredQueuedMessage(value: unknown): StoredQueuedMessage | nul
     id,
     ...(readNonEmptyString(record.queueAfterId) ? { queueAfterId: readNonEmptyString(record.queueAfterId) } : {}),
     ...(readNonEmptyString(record.queueBeforeId) ? { queueBeforeId: readNonEmptyString(record.queueBeforeId) } : {}),
+    ...(typeof record.dependencyWaitUntil === 'number' && Number.isFinite(record.dependencyWaitUntil)
+      ? { dependencyWaitUntil: record.dependencyWaitUntil }
+      : {}),
     text: typeof record.text === 'string' ? record.text : '',
     imageUrls: normalizeStringArray(record.imageUrls),
     skills: normalizeNamedPathItems(record.skills),
@@ -7903,7 +7911,13 @@ function normalizeThreadQueueReceipts(value: unknown): ThreadQueueReceipt[] {
     const key = `${threadId}\u0000${messageId}`
     if (!threadId || !messageId || seen.has(key)) return []
     seen.add(key)
-    return [{ threadId, messageId }]
+    return [{
+      threadId,
+      messageId,
+      ...(typeof record?.acceptedAtMs === 'number' && Number.isFinite(record.acceptedAtMs)
+        ? { acceptedAtMs: record.acceptedAtMs }
+        : {}),
+    }]
   })
 }
 
@@ -7920,6 +7934,9 @@ function normalizeThreadQueueProcessingState(value: unknown): ThreadQueueProcess
       messageId,
       attempted: entry?.attempted === true,
       ...(readNonEmptyString(entry?.ownerId) ? { ownerId: readNonEmptyString(entry?.ownerId) } : {}),
+      ...(typeof entry?.ownerPid === 'number' && Number.isSafeInteger(entry.ownerPid) && entry.ownerPid > 0
+        ? { ownerPid: entry.ownerPid }
+        : {}),
       ...(typeof entry?.leaseExpiresAt === 'number' && Number.isFinite(entry.leaseExpiresAt)
         ? { leaseExpiresAt: entry.leaseExpiresAt }
         : {}),
@@ -7934,6 +7951,32 @@ function hasThreadQueueReceipt(
   messageId: string,
 ): boolean {
   return receipts.some((receipt) => receipt.threadId === threadId && receipt.messageId === messageId)
+}
+
+function pruneThreadQueueReceipts(
+  receipts: ThreadQueueReceipt[],
+  state: ThreadQueueState,
+): ThreadQueueReceipt[] {
+  const protectedKeys = new Set<string>()
+  for (const [threadId, messages] of Object.entries(state)) {
+    for (const message of messages) {
+      for (const messageId of [message.id, message.queueAfterId, message.queueBeforeId]) {
+        if (messageId) protectedKeys.add(`${threadId}\u0000${messageId}`)
+      }
+    }
+  }
+  const normalized = normalizeThreadQueueReceipts(receipts)
+  const protectedReceipts = normalized.filter((receipt) => (
+    protectedKeys.has(`${receipt.threadId}\u0000${receipt.messageId}`)
+  ))
+  const remaining = Math.max(0, THREAD_QUEUE_RECEIPT_LIMIT - protectedReceipts.length)
+  const recentReceipts = remaining === 0
+    ? []
+    : normalized
+        .filter((receipt) => !protectedKeys.has(`${receipt.threadId}\u0000${receipt.messageId}`))
+        .sort((left, right) => (left.acceptedAtMs ?? 0) - (right.acceptedAtMs ?? 0))
+        .slice(-remaining)
+  return [...recentReceipts, ...protectedReceipts]
 }
 
 function isManagedQueuedImageUrl(value: string): boolean {
@@ -8017,7 +8060,7 @@ function writeThreadQueueStoreToPayload(
   } else {
     delete payload[THREAD_QUEUE_STATE_KEY]
   }
-  const normalizedReceipts = normalizeThreadQueueReceipts(nextReceipts)
+  const normalizedReceipts = pruneThreadQueueReceipts(nextReceipts, normalized)
   if (normalizedReceipts.length > 0) {
     payload[THREAD_QUEUE_RECEIPTS_KEY] = normalizedReceipts
   } else {
@@ -8150,6 +8193,7 @@ export async function appendThreadQueuedMessage(
     const nextReceipts = [...receipts, {
       threadId: normalizedThreadId,
       messageId: message.id,
+      acceptedAtMs: Date.now(),
     }]
     if (queue.some((queuedMessage) => queuedMessage.id === message.id)) {
       return { nextState: state, nextReceipts, result: undefined }
@@ -8158,7 +8202,14 @@ export async function appendThreadQueuedMessage(
     const insertIndex = typeof queueInsertIndex === 'number'
       ? Math.max(0, Math.min(Math.trunc(queueInsertIndex), nextQueue.length))
       : nextQueue.length
-    nextQueue.splice(insertIndex, 0, message)
+    const storedMessage = message.queueAfterId
+      && !hasThreadQueueReceipt(receipts, normalizedThreadId, message.queueAfterId)
+      ? {
+          ...message,
+          dependencyWaitUntil: message.dependencyWaitUntil ?? Date.now() + THREAD_QUEUE_DEPENDENCY_WAIT_MS,
+        }
+      : message
+    nextQueue.splice(insertIndex, 0, storedMessage)
     return {
       nextState: {
         ...state,
@@ -9018,8 +9069,38 @@ export async function reapExpiredManagedUploads(options: {
   const ttlMs = Math.max(0, options.ttlMs ?? MANAGED_UPLOAD_TTL_MS)
   const maxEntries = Math.max(0, Math.floor(options.maxEntries ?? MANAGED_UPLOAD_REAPER_MAX_ENTRIES))
   if (maxEntries === 0) return 0
+  const protectedDirectoryNames = new Set<string>()
+  try {
+    const queueState = await readThreadQueueState()
+    for (const messages of Object.values(queueState)) {
+      for (const message of messages) {
+        for (const handle of managedQueuedUploadHandles(message)) {
+          const match = handle.match(/^v1\.[0-9a-z]+\.([0-9a-f-]{36})\./iu)
+          if (match?.[1]) protectedDirectoryNames.add(`upload-${match[1]}`)
+        }
+        const candidatePaths = [
+          ...message.imageUrls.flatMap((imageUrl) => {
+            try {
+              const parsed = new URL(imageUrl, 'http://localhost')
+              return parsed.searchParams.get('path') ? [parsed.searchParams.get('path')!] : []
+            } catch {
+              return []
+            }
+          }),
+          ...message.fileAttachments.flatMap((attachment) => [attachment.path, attachment.fsPath]),
+        ]
+        for (const candidatePath of candidatePaths) {
+          const directory = resolve(dirname(candidatePath))
+          if (resolve(dirname(directory)) === root) protectedDirectoryNames.add(basename(directory))
+        }
+      }
+    }
+  } catch {
+    return 0
+  }
   let removed = 0
   for (const [handle, upload] of managedUploads) {
+    if (protectedDirectoryNames.has(basename(upload.directory))) continue
     if (
       resolve(upload.root) === root
       && upload.deleteAfter !== undefined
@@ -9064,6 +9145,7 @@ export async function reapExpiredManagedUploads(options: {
       if (
         !entry.isDirectory()
         || entry.isSymbolicLink()
+        || protectedDirectoryNames.has(entry.name)
         || (
           !/^upload-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu.test(entry.name)
           && !/^f-[A-Za-z0-9_-]+$/u.test(entry.name)
@@ -10058,6 +10140,7 @@ export class BackendQueueProcessor {
     private readonly appServer: AppServerProcess,
     private readonly runtimeProbe: Pick<ThreadRuntimeProbe, 'registerThread' | 'inspect'> | null = null,
   ) {
+    liveBackendQueueClaimOwnerIds.add(this.claimOwnerId)
     this.unsubscribe = appServer.onNotification((notification) => {
       if (!isTurnCompletedNotification(notification)) return
       const threadId = extractThreadIdFromNotificationParams(notification.params)
@@ -10069,6 +10152,7 @@ export class BackendQueueProcessor {
   }
 
   dispose(): void {
+    liveBackendQueueClaimOwnerIds.delete(this.claimOwnerId)
     this.unsubscribe()
     for (const timer of this.queueDrainTimersByThreadId.values()) {
       clearTimeout(timer)
@@ -10171,13 +10255,13 @@ export class BackendQueueProcessor {
       const runtimeKey = this.runtimeQueueKey(threadId, next.message.id)
       const managedMessage = this.runtimeQueuedMessages.get(runtimeKey)
         ?? (hasManagedQueuedCapabilities(next.message) ? next.message : undefined)
-      if (managedMessage) {
-        this.activeManagedMessagesByThreadId.set(threadId, managedMessage)
-      }
       const beforeStart = await this.inspectQueuedTurn(next)
       if (beforeStart.accepted) {
         await this.finalizeQueuedTurn(next)
-        if (managedMessage) this.runtimeQueuedMessages.delete(runtimeKey)
+        if (managedMessage) {
+          this.runtimeQueuedMessages.delete(runtimeKey)
+          this.releaseManagedMessage(managedMessage)
+        }
         if (await this.hasQueuedTurns(threadId)) this.scheduleThreadQueueDrain(threadId)
         return
       }
@@ -10188,6 +10272,9 @@ export class BackendQueueProcessor {
       if (!(await this.markQueuedTurnAttempted(next))) {
         this.scheduleThreadQueueDrain(threadId)
         return
+      }
+      if (managedMessage) {
+        this.activeManagedMessagesByThreadId.set(threadId, managedMessage)
       }
       try {
         await this.startQueuedTurn(next)
@@ -10201,6 +10288,8 @@ export class BackendQueueProcessor {
         if (afterFailure.accepted) {
           await this.finalizeQueuedTurn(next)
           if (managedMessage) this.runtimeQueuedMessages.delete(runtimeKey)
+        } else if (managedMessage && this.activeManagedMessagesByThreadId.get(threadId) === managedMessage) {
+          this.activeManagedMessagesByThreadId.delete(threadId)
         }
         this.scheduleThreadQueueDrain(threadId)
       }
@@ -10261,7 +10350,14 @@ export class BackendQueueProcessor {
       if (
         existing?.ownerId
         && existing.ownerId !== this.claimOwnerId
-        && (existing.leaseExpiresAt ?? 0) > Date.now()
+        && (
+          (
+            existing.ownerPid === process.pid
+              ? liveBackendQueueClaimOwnerIds.has(existing.ownerId)
+              : existing.ownerPid !== undefined && isProcessAlive(existing.ownerPid)
+          )
+          || (existing.ownerPid === undefined && (existing.leaseExpiresAt ?? 0) > Date.now())
+        )
       ) {
         return { nextState: state, result: null }
       }
@@ -10277,6 +10373,7 @@ export class BackendQueueProcessor {
         !existing
         && message.queueAfterId
         && !hasThreadQueueReceipt(receipts, threadId, message.queueAfterId)
+        && (message.dependencyWaitUntil ?? 0) > Date.now()
       ) {
         return { nextState: state, result: null }
       }
@@ -10287,6 +10384,7 @@ export class BackendQueueProcessor {
           messageId: message.id,
           attempted: existing?.attempted === true,
           ownerId: this.claimOwnerId,
+          ownerPid: process.pid,
           leaseExpiresAt: Date.now() + BackendQueueProcessor.CLAIM_LEASE_MS,
         },
       }
@@ -10344,8 +10442,12 @@ export class BackendQueueProcessor {
     })
   }
 
-  private async finalizeQueuedTurn(turn: BackendQueuedTurn): Promise<void> {
-    await withThreadQueueStateUpdate((state, _receipts, processing) => {
+  private async finalizeQueuedTurn(turn: BackendQueuedTurn): Promise<boolean> {
+    return withThreadQueueStateUpdate((state, _receipts, processing) => {
+      const current = processing[turn.threadId]
+      if (current?.messageId !== turn.message.id || current.ownerId !== turn.ownerId) {
+        return { nextState: state, result: false }
+      }
       const queue = state[turn.threadId] ?? []
       const nextQueue = queue.filter((message) => message.id !== turn.message.id)
       const nextState = { ...state }
@@ -10358,7 +10460,7 @@ export class BackendQueueProcessor {
       ) {
         delete nextProcessing[turn.threadId]
       }
-      return { nextState, nextProcessing, result: undefined }
+      return { nextState, nextProcessing, result: true }
     })
   }
 
@@ -10640,15 +10742,26 @@ type SharedBridgeState = {
 
 const SHARED_BRIDGE_KEY = '__codexRemoteSharedBridge__'
 const SHARED_BRIDGE_VERSION = 'experimental-api-v5-durable-queue'
+const liveBackendQueueClaimOwnerIds = new Set<string>()
 
-function watchThreadQueueStateFile(): FSWatcher | null {
+export function handleThreadQueueStoreChanged(
+  processor: Pick<BackendQueueProcessor, 'scheduleThreadQueueDrain'>,
+  event: { threadIds: string[]; revision: number },
+): void {
+  for (const listener of threadQueueRevisionListeners) listener(event)
+  for (const threadId of event.threadIds) processor.scheduleThreadQueueDrain(threadId, 0)
+}
+
+function watchThreadQueueStateFile(
+  processor: Pick<BackendQueueProcessor, 'scheduleThreadQueueDrain'>,
+): FSWatcher | null {
   const statePath = getCodexGlobalStatePath()
   try {
     return watch(dirname(statePath), { persistent: false }, (_eventType, fileName) => {
       if (fileName !== null && String(fileName) !== basename(statePath)) return
       void readThreadQueueStore().then(({ changedThreadIds, revision }) => {
         const event = { threadIds: changedThreadIds, revision }
-        for (const listener of threadQueueRevisionListeners) listener(event)
+        handleThreadQueueStoreChanged(processor, event)
       }).catch(() => {})
     })
   } catch {
@@ -10688,7 +10801,7 @@ function getSharedBridgeState(): SharedBridgeState {
     backendQueueProcessor,
     runtimeProbe,
     localRuntimeLedger,
-    queueStateWatcher: watchThreadQueueStateFile(),
+    queueStateWatcher: watchThreadQueueStateFile(backendQueueProcessor),
     telegramBridge: new TelegramThreadBridge(appServer, {
       onChatSeen: (chatId) => {
         void rememberTelegramChatId(chatId).catch(() => {})

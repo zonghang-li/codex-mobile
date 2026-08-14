@@ -1,4 +1,4 @@
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { mkdtemp, readFile, rm, utimes, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { describe, expect, it } from 'vitest'
@@ -38,6 +38,39 @@ describe('mutateJsonStateFile', () => {
         second: true,
       })
     } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('does not steal an old lock while its owning mutation is still alive', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'codex-mobile-json-state-live-lock-'))
+    const statePath = join(root, 'state.json')
+    const firstEntered = deferred()
+    const releaseFirst = deferred()
+    let secondEntered = false
+
+    try {
+      const first = mutateJsonStateFile(statePath, async (payload) => {
+        firstEntered.resolve()
+        await releaseFirst.promise
+        payload.first = true
+      })
+      await firstEntered.promise
+      const old = new Date(Date.now() - 60_000)
+      await utimes(`${statePath}.lock`, old, old)
+
+      const second = mutateJsonStateFile(statePath, (payload) => {
+        secondEntered = true
+        payload.second = true
+      })
+      await new Promise((resolve) => setTimeout(resolve, 25))
+
+      expect(secondEntered).toBe(false)
+      releaseFirst.resolve()
+      await Promise.all([first, second])
+      expect(JSON.parse(await readFile(statePath, 'utf8'))).toEqual({ first: true, second: true })
+    } finally {
+      releaseFirst.resolve()
       await rm(root, { recursive: true, force: true })
     }
   })

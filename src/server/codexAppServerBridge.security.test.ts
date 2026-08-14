@@ -3,6 +3,7 @@ import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import {
+  appendThreadQueuedMessage,
   createCodexBridgeMiddleware,
   createManagedUpload,
   deleteManagedUpload,
@@ -63,6 +64,65 @@ describe('Codex bridge security-policy wiring', () => {
       nowMs: issuedAtMs + (5 * 60 * 1000) + 1,
     })).resolves.toBe(1)
     await expect(lstat(dirname(upload.path))).rejects.toThrow()
+  })
+
+  it('does not reap an expired upload referenced by a durable queued message', async () => {
+    const originalCodexHome = process.env.CODEX_HOME
+    const codexHome = await mkdtemp(join(tmpdir(), 'codex-managed-upload-queue-home-'))
+    const root = await mkdtemp(join(tmpdir(), 'codex-managed-upload-queued-'))
+    cleanupRoots.push(codexHome, root)
+    process.env.CODEX_HOME = codexHome
+
+    try {
+      const upload = await createManagedUpload('queued.png', Buffer.from('queued-image'), root)
+      await appendThreadQueuedMessage('thread-with-upload', {
+        id: 'queued-with-upload',
+        text: 'wait safely',
+        imageUrls: [`/codex-local-image?path=${encodeURIComponent(upload.path)}&uploadHandle=${encodeURIComponent(upload.uploadHandle)}`],
+        skills: [],
+        fileAttachments: [],
+        collaborationMode: 'default',
+        model: 'gpt-test',
+        effort: '',
+      })
+      const old = new Date(Date.now() - (2 * 60 * 60 * 1000))
+      await utimes(dirname(upload.path), old, old)
+
+      await expect(reapExpiredManagedUploads({
+        uploadRoot: root,
+        nowMs: Date.now(),
+        ttlMs: 60 * 60 * 1000,
+      })).resolves.toBe(0)
+      await expect(readFile(upload.path, 'utf8')).resolves.toBe('queued-image')
+    } finally {
+      if (originalCodexHome === undefined) delete process.env.CODEX_HOME
+      else process.env.CODEX_HOME = originalCodexHome
+    }
+  })
+
+  it('fails closed when durable queue state cannot be read before reaping uploads', async () => {
+    const originalCodexHome = process.env.CODEX_HOME
+    const codexHome = await mkdtemp(join(tmpdir(), 'codex-managed-upload-invalid-home-'))
+    const root = await mkdtemp(join(tmpdir(), 'codex-managed-upload-invalid-state-'))
+    cleanupRoots.push(codexHome, root)
+    process.env.CODEX_HOME = codexHome
+
+    try {
+      const upload = await createManagedUpload('queued.png', Buffer.from('keep-image'), root)
+      const old = new Date(Date.now() - (2 * 60 * 60 * 1000))
+      await utimes(dirname(upload.path), old, old)
+      await writeFile(join(codexHome, '.codex-global-state.json'), '{broken', 'utf8')
+
+      await expect(reapExpiredManagedUploads({
+        uploadRoot: root,
+        nowMs: Date.now(),
+        ttlMs: 60 * 60 * 1000,
+      })).resolves.toBe(0)
+      await expect(readFile(upload.path, 'utf8')).resolves.toBe('keep-image')
+    } finally {
+      if (originalCodexHome === undefined) delete process.env.CODEX_HOME
+      else process.env.CODEX_HOME = originalCodexHome
+    }
   })
 
   it.each([

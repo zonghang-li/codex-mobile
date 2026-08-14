@@ -380,6 +380,63 @@ beforeEach(() => {
 })
 
 describe('existing thread loading', () => {
+  it('reloads durable queue state after polling is stopped and restarted', async () => {
+    installTestWindow()
+    gatewayMocks.getThreadGroupsPage.mockResolvedValue({
+      groups: [{ projectName: 'Project', threads: [thread('thread-1', '/tmp/project')] }],
+      nextCursor: null,
+    })
+    gatewayMocks.getThreadQueueState.mockResolvedValue({
+      'thread-1': [{
+        id: 'queued-reloaded',
+        text: 'still queued',
+        imageUrls: [],
+        skills: [],
+        fileAttachments: [],
+        collaborationMode: 'default',
+        model: 'gpt-test',
+        effort: '',
+      }],
+    })
+    const state = useDesktopState()
+    state.primeSelectedThread('thread-1')
+    await state.refreshAll({ includeSelectedThreadMessages: false })
+    expect(state.selectedThreadQueuedMessages.value.map((message) => message.id)).toEqual(['queued-reloaded'])
+
+    state.stopPolling()
+    state.startPolling()
+    await state.refreshAll({ includeSelectedThreadMessages: false })
+
+    expect(gatewayMocks.getThreadQueueSnapshot).toHaveBeenCalledTimes(2)
+    expect(state.selectedThreadQueuedMessages.value.map((message) => message.id)).toEqual(['queued-reloaded'])
+    state.stopPolling()
+  })
+
+  it('refreshes queue state when the notification stream becomes ready', async () => {
+    const { state, emit } = await setupExternalRuntimeState()
+    gatewayMocks.getThreadQueueSnapshot.mockResolvedValue({
+      state: {
+        'thread-1': [{
+          id: 'queued-during-subscribe',
+          text: 'arrived in the startup gap',
+          imageUrls: [],
+          skills: [],
+          fileAttachments: [],
+          collaborationMode: 'default',
+          model: 'gpt-test',
+          effort: '',
+        }],
+      },
+      revision: 1,
+    })
+
+    emit({ method: 'ready' })
+    await vi.waitFor(() => expect(gatewayMocks.getThreadQueueSnapshot).toHaveBeenCalledTimes(2))
+
+    expect(state.selectedThreadQueuedMessages.value.map((message) => message.id))
+      .toEqual(['queued-during-subscribe'])
+  })
+
   it('reads an existing thread without resuming it on selection or forced refresh', async () => {
     installTestWindow()
     gatewayMocks.getThreadDetail.mockResolvedValue(idleDetail())

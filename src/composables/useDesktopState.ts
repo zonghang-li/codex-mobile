@@ -7689,10 +7689,16 @@ export function useDesktopState() {
   async function loadPersistedQueueStateIfNeeded(): Promise<void> {
     if (hasLoadedPersistedQueueState) return
     hasLoadedPersistedQueueState = true
+    await refreshPersistedQueueState()
+  }
+
+  async function refreshPersistedQueueState(): Promise<void> {
     try {
       const snapshot = await getThreadQueueSnapshot()
-      queuedMessagesByThreadId.value = snapshot.state
-      latestQueueRevision = snapshot.revision
+      if (snapshot.revision >= latestQueueRevision) {
+        queuedMessagesByThreadId.value = mergePendingQueueAppends(snapshot.state)
+        latestQueueRevision = snapshot.revision
+      }
     } catch {
       // Backend queue state is optional during startup.
     }
@@ -10344,7 +10350,10 @@ export function useDesktopState() {
   }
 
   async function recoverBridgeState(): Promise<void> {
-    await loadPendingServerRequestsFromBridge()
+    await Promise.all([
+      loadPendingServerRequestsFromBridge(),
+      refreshPersistedQueueState(),
+    ])
     pendingThreadsRefresh = !hasLoadedThreads.value
     if (
       selectedThreadId.value &&
@@ -10557,6 +10566,7 @@ export function useDesktopState() {
     threadListedByServerById.value = {}
     persistedUserMessageByThreadId.value = {}
     queuedMessagesByThreadId.value = {}
+    hasLoadedPersistedQueueState = false
     queueProcessingByThreadId.value = {}
     pendingQueueRefreshThreadIds.clear()
     pendingQueueAppendMessageIdsByThreadId.clear()

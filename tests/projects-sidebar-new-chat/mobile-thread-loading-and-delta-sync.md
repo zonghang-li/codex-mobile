@@ -41,7 +41,12 @@ Mobile sidebar and conversation loading use metadata-only sidebar pages, active-
 27. With "When busy, send as" set to Steer, submit a plain-text mobile prompt during an externally owned running turn and confirm it is persisted as a text-only queued message without an optimistic sent bubble or `turn/start`. Repeat while runtime ownership changes from local to external between submit and `turn/start`; confirm the rejected local attempt is removed and exactly one queued row remains. Repeat with an attachment or skill selected and confirm managed uploads are released while the text is queued rather than racing the writer.
 28. Confirm Stop cannot interrupt a direct CLI-owned turn. For a separately validated interruptible app-server-owned turn, confirm Stop uses the exact current active turn id and refreshes state without clearing visible output.
 29. Confirm queued-message Steer, edit, delete, and reorder controls all remain disabled while an external writer owns the thread.
-30. Repeat the visible checks in dark theme.
+30. Queue a normal message with a managed image/file attachment behind a long-running turn, restart the safe service, and confirm the queued row and attachment remain available until that queued turn starts; advancing beyond the normal upload reaper TTL must not delete an attachment still referenced by durable queue state.
+31. Stop and restart frontend polling through an account refresh/switch while a durable queued row exists; confirm the row is reloaded instead of leaving the queue panel empty.
+32. During cold startup, mutate the durable queue after the first queue GET but before the notification stream reports ready; confirm the ready recovery snapshot shows the new queue state and does not resurrect an older revision.
+33. Run two service processes against the same temporary CODEX_HOME, append/reorder/remove queue rows concurrently, and terminate one process after its durable append but before local scheduling; confirm no rows are lost or duplicated and the surviving process drains the committed row.
+34. Submit an inverse-arrival queue row whose declared predecessor never reaches the server; confirm it waits for the bounded dependency grace period and then becomes eligible instead of remaining stuck forever.
+35. Repeat the visible checks in dark theme.
 
 #### Expected Results
 - Cold sidebar load and background sidebar pagination remain metadata-only.
@@ -73,10 +78,15 @@ Mobile sidebar and conversation loading use metadata-only sidebar pages, active-
 - Mobile submissions during external ownership are always append-only queued, including Steer mode and local-to-external ownership races; no external-steer marker or competing `turn/start` is issued. Unsupported attachment/skill payloads are sanitized to queued text and their managed uploads are released.
 - Direct CLI ownership is non-interruptible. A validated interruptible app-server owner may still be stopped by exact active turn id, and the follow-up refresh does not clear or overwrite visible transcript history.
 - Queued-message Steer and mutation controls stay disabled while an external writer owns the thread.
+- Durable queue rows reload after polling/account lifecycle resets and after notification-stream startup gaps; revision checks prevent stale snapshots from replacing newer queue state.
+- Queue mutations remain serialized across service/CLI processes, live owners cannot be lease-stolen during slow RPC work, and a surviving service schedules rows committed by another process.
+- Managed attachments referenced by durable queue rows survive service restart and upload-reaper TTL until their queued turn actually starts or the row is removed.
+- Missing client-order predecessors delay execution only for the bounded grace period, while received predecessors still preserve submission order.
 - The behavior is readable and stable in light and dark themes.
 
 #### Rollback/Cleanup
 - Stop any manually started dev server or safe service if it is not normally running.
 - Close any extra mobile test windows or tabs opened for the multi-window sync check.
+- Delete disposable queued rows and managed uploads created for queue-lifecycle checks, and stop the extra temporary service process.
 
 ---
