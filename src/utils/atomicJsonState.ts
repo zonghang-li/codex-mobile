@@ -124,10 +124,27 @@ export async function isProcessOwnerAlive(owner: {
   pid: number
   processStartIdentity?: string | null
 }): Promise<boolean> {
-  if (!isProcessAlive(owner.pid)) return false
-  if (!owner.processStartIdentity) return true
+  const pidAlive = isProcessAlive(owner.pid)
+  if (!pidAlive || !owner.processStartIdentity) return pidAlive
   const currentIdentity = await readProcessStartIdentity(owner.pid)
-  return currentIdentity === null ? process.platform !== 'linux' : currentIdentity === owner.processStartIdentity
+  return isProcessIdentityAlive(
+    pidAlive,
+    owner.processStartIdentity,
+    currentIdentity,
+    process.platform,
+  )
+}
+
+export function isProcessIdentityAlive(
+  pidAlive: boolean,
+  expectedIdentity: string | null,
+  currentIdentity: string | null,
+  platform: NodeJS.Platform,
+): boolean {
+  if (!pidAlive) return false
+  if (!expectedIdentity) return true
+  if (currentIdentity === null) return true
+  return platform !== 'linux' || currentIdentity === expectedIdentity
 }
 
 let currentProcessStartIdentityPromise: Promise<string | null> | null = null

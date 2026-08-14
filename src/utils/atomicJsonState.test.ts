@@ -3,6 +3,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { describe, expect, it } from 'vitest'
 import {
+  isProcessIdentityAlive,
   isProcessOwnerAlive,
   mutateJsonStateFile,
   readProcessStartIdentity,
@@ -18,6 +19,10 @@ function deferred() {
 }
 
 describe('mutateJsonStateFile', () => {
+  it('treats an unreadable identity for a demonstrably live pid as still owned', () => {
+    expect(isProcessIdentityAlive(true, '123:456', null, 'linux')).toBe(true)
+  })
+
   it('serializes independent mutations to the same state file', async () => {
     const root = await mkdtemp(join(tmpdir(), 'codex-mobile-json-state-'))
     const statePath = join(root, 'state.json')

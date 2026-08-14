@@ -168,6 +168,7 @@ const BACKGROUND_RUNTIME_POLL_MS = 2_000
 const SELECTED_IDLE_LIVE_PROJECTION_POLL_MS = BACKGROUND_RUNTIME_POLL_MS
 const BACKGROUND_RUNTIME_BATCH_LIMIT = 16
 const TURN_START_FOLLOW_UP_SYNC_DELAY_MS = 3000
+const THREAD_QUEUE_REQUEST_TIMEOUT_MS = 10_000
 const RECENT_THREAD_MESSAGE_LOAD_REUSE_MS = 2000
 const RECENT_THREAD_LIST_LOAD_REUSE_MS = 2000
 const RECENT_SKILLS_LOAD_REUSE_MS = 2000
@@ -2292,6 +2293,7 @@ export function useDesktopState() {
     timer: ReturnType<typeof setTimeout>
     resolve: (continueRetrying: boolean) => void
   }>()
+  const pendingQueueRequestControllers = new Set<AbortController>()
   const eventUnreadByThreadId = ref<Record<string, boolean>>({})
   const availableModelIds = ref<string[]>([])
   const availableCollaborationModes = ref<CollaborationModeOption[]>([
@@ -7595,6 +7597,32 @@ export function useDesktopState() {
     return error
   }
 
+  async function runQueueRequest<T>(
+    lifecycleGeneration: number,
+    request: (signal: AbortSignal) => Promise<T>,
+  ): Promise<T> {
+    if (lifecycleGeneration !== queueLifecycleGeneration) throw queueAppendCancelledError()
+    const controller = new AbortController()
+    pendingQueueRequestControllers.add(controller)
+    const timeout = globalThis.setTimeout(() => controller.abort(), THREAD_QUEUE_REQUEST_TIMEOUT_MS)
+    try {
+      const result = await request(controller.signal)
+      if (lifecycleGeneration !== queueLifecycleGeneration) throw queueAppendCancelledError()
+      return result
+    } catch (requestError) {
+      if (lifecycleGeneration !== queueLifecycleGeneration) throw queueAppendCancelledError()
+      if (controller.signal.aborted) {
+        const error = new Error('Thread queue request timed out.')
+        error.name = 'ThreadQueueAppendAmbiguousError'
+        throw error
+      }
+      throw requestError
+    } finally {
+      globalThis.clearTimeout(timeout)
+      pendingQueueRequestControllers.delete(controller)
+    }
+  }
+
   async function waitForQueueAppendRetry(delayMs: number, generation: number): Promise<boolean> {
     if (generation !== queueLifecycleGeneration) return false
     return new Promise<boolean>((resolve) => {
@@ -7620,7 +7648,9 @@ export function useDesktopState() {
     while (ambiguousAttempts < 6) {
       if (lifecycleGeneration !== queueLifecycleGeneration) throw queueAppendCancelledError()
       try {
-        await appendThreadQueuedMessage(threadId, queuedMessage, queueInsertIndex)
+        await runQueueRequest(lifecycleGeneration, (signal) => (
+          appendThreadQueuedMessage(threadId, queuedMessage, queueInsertIndex, signal)
+        ))
         return
       } catch (queueError) {
         if (!isAmbiguousQueueAppendError(queueError)) throw queueError
@@ -7628,7 +7658,9 @@ export function useDesktopState() {
         ambiguousAttempts += 1
         if (ambiguousAttempts >= 2) {
           try {
-            if (await getThreadQueueAppendReceipt(threadId, queuedMessage.id)) return
+            if (await runQueueRequest(lifecycleGeneration, (signal) => (
+              getThreadQueueAppendReceipt(threadId, queuedMessage.id, signal)
+            ))) return
           } catch {
             // Keep the optimistic row pending and retry the idempotent append.
           }
@@ -10394,10 +10426,12 @@ export function useDesktopState() {
   }
 
   async function recoverBridgeState(): Promise<void> {
+    const lifecycleGeneration = queueLifecycleGeneration
     await Promise.all([
-      loadPendingServerRequestsFromBridge(),
+      loadPendingServerRequestsFromBridge(lifecycleGeneration),
       refreshPersistedQueueState(),
     ])
+    if (lifecycleGeneration !== queueLifecycleGeneration) return
     pendingThreadsRefresh = !hasLoadedThreads.value
     if (
       selectedThreadId.value &&
@@ -10406,6 +10440,7 @@ export function useDesktopState() {
       pendingThreadMessageRefresh.add(selectedThreadId.value)
     }
     await syncFromNotifications()
+    if (lifecycleGeneration !== queueLifecycleGeneration) return
     const selectedId = selectedThreadId.value
     if (
       selectedId &&
@@ -10478,9 +10513,13 @@ export function useDesktopState() {
     })
   }
 
-  async function loadPendingServerRequestsFromBridge(): Promise<void> {
+  async function loadPendingServerRequestsFromBridge(expectedLifecycleGeneration?: number): Promise<void> {
     try {
       const rows = await getPendingServerRequests()
+      if (
+        expectedLifecycleGeneration !== undefined
+        && expectedLifecycleGeneration !== queueLifecycleGeneration
+      ) return
       const normalizedRequests = rows
         .map((row) => normalizeServerRequest(row))
         .filter((request): request is UiServerRequest => request !== null)
@@ -10520,6 +10559,8 @@ export function useDesktopState() {
       wait.resolve(false)
     }
     pendingQueueAppendRetryWaits.clear()
+    for (const controller of pendingQueueRequestControllers) controller.abort()
+    pendingQueueRequestControllers.clear()
     threadGoalRequestGeneration += 1
     threadGoalRequestEpochByThreadId.clear()
     externalRuntimePollingEnabled = false

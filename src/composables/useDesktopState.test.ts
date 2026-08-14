@@ -537,6 +537,39 @@ describe('existing thread loading', () => {
     expect(state.selectedThreadQueuedMessages.value).toEqual([])
   })
 
+  it('invalidates the whole ready recovery when polling stops', async () => {
+    installTestWindow()
+    let notificationHandler: ((notification: { method: string; params?: unknown }) => void) | undefined
+    gatewayMocks.subscribeCodexNotifications.mockImplementation((handler) => {
+      notificationHandler = handler as typeof notificationHandler
+      return vi.fn()
+    })
+    const staleRequests = deferred<Array<{ id: number; method: string; params: { threadId: string } }>>()
+    gatewayMocks.getPendingServerRequests
+      .mockResolvedValueOnce([])
+      .mockReturnValueOnce(staleRequests.promise)
+    gatewayMocks.getThreadQueueSnapshot.mockResolvedValue({ state: {}, revision: 1 })
+    gatewayMocks.getThreadGroupsPage.mockResolvedValue({
+      groups: [{ projectName: 'Project', threads: [thread('thread-1', '/tmp/project')] }],
+      nextCursor: null,
+    })
+    const state = useDesktopState()
+    state.primeSelectedThread('thread-1')
+    await state.refreshAll({ includeSelectedThreadMessages: false })
+    state.startPolling()
+    notificationHandler?.({ method: 'ready' })
+    await flushMicrotasks()
+    state.stopPolling()
+    staleRequests.resolve([{
+      id: 77,
+      method: 'item/tool/requestUserInput',
+      params: { threadId: 'thread-1' },
+    }])
+    await flushMicrotasks()
+
+    expect(state.selectedThreadServerRequests.value).toEqual([])
+  })
+
   it('reads an existing thread without resuming it on selection or forced refresh', async () => {
     installTestWindow()
     gatewayMocks.getThreadDetail.mockResolvedValue(idleDetail())
@@ -3203,6 +3236,7 @@ describe('turn completion lifecycle', () => {
         imageUrls: [managedImageUrl],
       }),
       undefined,
+      expect.any(AbortSignal),
     )
     expect(state.selectedThreadQueuedMessages.value).toEqual([
       expect.objectContaining({ text: 'send later', imageUrls: [managedImageUrl] }),
@@ -6992,6 +7026,7 @@ describe('external runtime ownership', () => {
         text: 'do not race desktop',
       }),
       undefined,
+      expect.any(AbortSignal),
     )
     expect(state.selectedThreadQueuedMessages.value).toEqual([
       expect.objectContaining({ text: 'do not race desktop' }),
@@ -7049,6 +7084,7 @@ describe('external runtime ownership', () => {
         text: 'queue while desktop owns writer',
       }),
       undefined,
+      expect.any(AbortSignal),
     )
     expect(state.selectedThreadQueuedMessages.value).toEqual([
       expect.objectContaining({ text: 'queue while desktop owns writer' }),
@@ -7076,6 +7112,7 @@ describe('external runtime ownership', () => {
       'thread-1',
       expect.objectContaining({ text: 'steer while desktop owns writer' }),
       undefined,
+      expect.any(AbortSignal),
     )
     expect(state.selectedThreadQueuedMessages.value).toEqual([
       expect.objectContaining({ text: 'steer while desktop owns writer' }),
@@ -7139,6 +7176,7 @@ describe('external runtime ownership', () => {
     expect(gatewayMocks.getThreadQueueAppendReceipt).toHaveBeenCalledWith(
       'thread-1',
       gatewayMocks.appendThreadQueuedMessage.mock.calls[0]?.[1].id,
+      expect.any(AbortSignal),
     )
     expect(state.selectedThreadQueuedMessages.value).toEqual([
       expect.objectContaining({ text: 'persisted despite response loss' }),
@@ -7208,6 +7246,27 @@ describe('external runtime ownership', () => {
 
     expect(gatewayMocks.appendThreadQueuedMessage).toHaveBeenCalledTimes(callsAtStop)
     await send
+  })
+
+  it('aborts an in-flight queue append when polling stops', async () => {
+    const { state } = await setupExternalRuntimeState()
+    gatewayMocks.getThreadDetail.mockResolvedValue(externalDetail())
+    await state.loadMessages('thread-1')
+    const append = deferred<void>()
+    let observedSignal: AbortSignal | undefined
+    gatewayMocks.appendThreadQueuedMessage.mockImplementation((...args) => {
+      observedSignal = args[3] as AbortSignal | undefined
+      return append.promise
+    })
+
+    const send = state.sendMessageToSelectedThread('cancel in-flight append', [], [], 'steer')
+    await flushMicrotasks()
+    state.stopPolling()
+    append.reject(new DOMException('Aborted', 'AbortError'))
+    await send
+
+    expect(observedSignal).toBeInstanceOf(AbortSignal)
+    expect(observedSignal?.aborted).toBe(true)
   })
 
   it('keeps an optimistic queue row while its append is still in flight', async () => {
@@ -7281,6 +7340,7 @@ describe('external runtime ownership', () => {
       'thread-1',
       expect.objectContaining({ text: 'steer across ownership race' }),
       undefined,
+      expect.any(AbortSignal),
     )
     expect(state.selectedThreadQueuedMessages.value).toEqual([
       expect.objectContaining({ text: 'steer across ownership race' }),
@@ -7470,6 +7530,7 @@ describe('external runtime ownership', () => {
       'thread-1',
       expect.objectContaining({ text: 'idle steer ownership race' }),
       undefined,
+      expect.any(AbortSignal),
     )
     expect(state.selectedThreadQueuedMessages.value).toEqual([
       expect.objectContaining({ text: 'idle steer ownership race' }),
@@ -7566,6 +7627,7 @@ describe('external runtime ownership', () => {
         fileAttachments: [],
       }),
       undefined,
+      expect.any(AbortSignal),
     )
     expect(state.selectedThreadQueuedMessages.value).toEqual([
       expect.objectContaining({
@@ -7621,6 +7683,7 @@ describe('external runtime ownership', () => {
         fileAttachments: [],
       }),
       undefined,
+      expect.any(AbortSignal),
     )
     expect(state.selectedThreadQueuedMessages.value).toEqual([
       expect.objectContaining({
@@ -8501,6 +8564,7 @@ describe('external runtime ownership', () => {
         effort: 'max',
       }),
       undefined,
+      expect.any(AbortSignal),
     )
   })
 })

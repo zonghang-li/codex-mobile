@@ -3461,8 +3461,7 @@ async function importProjectZip(buffer: Buffer, destinationParent: string): Prom
     }
     importedSessionRecords.push(importedRecord)
     if (importedRecord.title) {
-      const cache = await readThreadTitleCache()
-      await writeThreadTitleCache(updateThreadTitleCache(cache, importedThreadId, importedRecord.title))
+      await updateThreadTitleState(importedThreadId, importedRecord.title)
     }
     importedSessions += 1
   }
@@ -3996,17 +3995,12 @@ export async function callRpcWithArchiveRecovery(
       throw error
     }
 
-    let threadReadResult: unknown = null
-    try {
-      threadReadResult = await appServer.rpc('thread/read', {
-        threadId,
-        includeTurns: false,
-      })
-      if (isArchivedThreadReadResult(threadReadResult)) {
-        return null
-      }
-    } catch {
-      // If metadata cannot be read, still try materializing a title before retrying archive.
+    const threadReadResult = await appServer.rpc('thread/read', {
+      threadId,
+      includeTurns: false,
+    })
+    if (isArchivedThreadReadResult(threadReadResult)) {
+      return null
     }
 
     await appServer.rpc('thread/name/set', {
@@ -7711,9 +7705,12 @@ async function readThreadTitleCache(): Promise<ThreadTitleCache> {
   }
 }
 
-async function writeThreadTitleCache(cache: ThreadTitleCache): Promise<void> {
+export async function updateThreadTitleState(id: string, title: string): Promise<void> {
   await updateCodexGlobalState((payload) => {
-    payload['thread-titles'] = cache
+    const cache = normalizeThreadTitleCache(payload['thread-titles'])
+    payload['thread-titles'] = title
+      ? updateThreadTitleCache(cache, id, title)
+      : removeFromThreadTitleCache(cache, id)
   })
 }
 
@@ -7741,6 +7738,8 @@ const THREAD_QUEUE_PROCESSING_KEY = 'thread-queue-processing'
 const THREAD_QUEUE_REVISION_KEY = 'thread-queue-revision'
 const THREAD_QUEUE_CHANGED_THREAD_IDS_KEY = 'thread-queue-changed-thread-ids'
 const THREAD_QUEUE_WRITER_ID_KEY = 'thread-queue-writer-id'
+const THREAD_QUEUE_CHANGED_REVISIONS_KEY = 'thread-queue-changed-revisions'
+const THREAD_ACTIVE_MANAGED_MESSAGES_KEY = 'thread-active-managed-messages'
 const THREAD_START_CLAIMS_KEY = 'thread-start-claims'
 const THREAD_QUEUE_RECEIPT_LIMIT = 2048
 const THREAD_QUEUE_DEPENDENCY_WAIT_MS = 30_000
@@ -7797,7 +7796,13 @@ type ThreadQueueStateUpdate<T> = {
   nextReceipts?: ThreadQueueReceipt[]
   nextProcessing?: ThreadQueueProcessingState
   result: T
+  resolveResult?: (nextRevision: number) => T
 }
+
+type ThreadQueueChangedRevisionState = Record<string, {
+  revision: number
+  writerId: string
+}>
 
 type ThreadStartClaimState = Record<string, {
   ownerId: string
@@ -7962,6 +7967,40 @@ function normalizeThreadQueueProcessingState(value: unknown): ThreadQueueProcess
   return processing
 }
 
+function normalizeThreadQueueChangedRevisions(value: unknown): ThreadQueueChangedRevisionState {
+  const record = asRecord(value)
+  if (!record) return {}
+  const result: ThreadQueueChangedRevisionState = {}
+  for (const [threadId, rawEntry] of Object.entries(record)) {
+    const entry = asRecord(rawEntry)
+    const revision = entry?.revision
+    const writerId = readNonEmptyString(entry?.writerId)
+    if (
+      threadId.trim()
+      && typeof revision === 'number'
+      && Number.isSafeInteger(revision)
+      && revision >= 0
+      && writerId
+    ) {
+      result[threadId.trim()] = { revision, writerId }
+    }
+  }
+  return result
+}
+
+function normalizeActiveManagedMessages(value: unknown): Record<string, StoredQueuedMessage> {
+  const record = asRecord(value)
+  if (!record) return {}
+  const result: Record<string, StoredQueuedMessage> = {}
+  for (const [threadId, rawMessage] of Object.entries(record)) {
+    const message = normalizeStoredQueuedMessage(rawMessage)
+    if (threadId.trim() && message && hasManagedQueuedCapabilities(message)) {
+      result[threadId.trim()] = message
+    }
+  }
+  return result
+}
+
 function hasThreadQueueReceipt(
   receipts: ThreadQueueReceipt[],
   threadId: string,
@@ -8047,6 +8086,8 @@ async function readThreadQueueStore(): Promise<{
   revision: number
   changedThreadIds: string[]
   writerId: string
+  changedRevisions: ThreadQueueChangedRevisionState
+  activeManagedMessages: Record<string, StoredQueuedMessage>
 }> {
   const payload = await readCodexGlobalStateSnapshot()
   const rawRevision = payload[THREAD_QUEUE_REVISION_KEY]
@@ -8059,6 +8100,8 @@ async function readThreadQueueStore(): Promise<{
       : 0,
     changedThreadIds: normalizeStringArray(payload[THREAD_QUEUE_CHANGED_THREAD_IDS_KEY]),
     writerId: readNonEmptyString(payload[THREAD_QUEUE_WRITER_ID_KEY]),
+    changedRevisions: normalizeThreadQueueChangedRevisions(payload[THREAD_QUEUE_CHANGED_REVISIONS_KEY]),
+    activeManagedMessages: normalizeActiveManagedMessages(payload[THREAD_ACTIVE_MANAGED_MESSAGES_KEY]),
   }
 }
 
@@ -8116,17 +8159,25 @@ async function withThreadQueueStateUpdate<T>(
       nextReceipts = receipts,
       nextProcessing = processing,
       result,
+      resolveResult,
     } = await update(currentState, receipts, processing, revision)
     const changedThreadIds = [...new Set([...Object.keys(currentState), ...Object.keys(nextState)])]
-      .filter((threadId) => currentState[threadId] !== nextState[threadId])
+      .filter((threadId) => JSON.stringify(currentState[threadId] ?? []) !== JSON.stringify(nextState[threadId] ?? []))
     const nextRevision = changedThreadIds.length > 0 ? revision + 1 : revision
     writeThreadQueueStoreToPayload(payload, nextState, nextReceipts, nextProcessing, nextRevision)
-    payload[THREAD_QUEUE_CHANGED_THREAD_IDS_KEY] = changedThreadIds
-    payload[THREAD_QUEUE_WRITER_ID_KEY] = threadQueueWriterId
+    if (changedThreadIds.length > 0) {
+      const changedRevisions = normalizeThreadQueueChangedRevisions(payload[THREAD_QUEUE_CHANGED_REVISIONS_KEY])
+      for (const threadId of changedThreadIds) {
+        changedRevisions[threadId] = { revision: nextRevision, writerId: threadQueueWriterId }
+      }
+      payload[THREAD_QUEUE_CHANGED_REVISIONS_KEY] = changedRevisions
+      payload[THREAD_QUEUE_CHANGED_THREAD_IDS_KEY] = changedThreadIds
+      payload[THREAD_QUEUE_WRITER_ID_KEY] = threadQueueWriterId
+    }
     committedEvent = changedThreadIds.length > 0
       ? { threadIds: changedThreadIds, revision: nextRevision }
       : null
-    return result
+    return resolveResult ? resolveResult(nextRevision) : result
   })
   if (committedEvent) {
     for (const listener of threadQueueRevisionListeners) listener(committedEvent)
@@ -8138,15 +8189,27 @@ export async function replaceThreadQueueState(
   nextState: ThreadQueueState,
   expectedRevision: number,
 ): Promise<number> {
-  return withThreadQueueStateUpdate((_state, _receipts, _processing, revision) => {
+  return withThreadQueueStateUpdate((state, _receipts, processing, revision) => {
     if (revision !== expectedRevision) {
       const error = new Error(`Thread queue revision changed from ${expectedRevision} to ${revision}`)
       error.name = 'ThreadQueueRevisionConflictError'
       throw error
     }
+    const normalizedNextState = normalizeThreadQueueState(nextState)
+    for (const [threadId, entry] of Object.entries(processing)) {
+      if (entry.attempted !== true) continue
+      const currentMessage = state[threadId]?.find((message) => message.id === entry.messageId)
+      const nextMessage = normalizedNextState[threadId]?.[0]
+      if (!currentMessage || !nextMessage || JSON.stringify(currentMessage) !== JSON.stringify(nextMessage)) {
+        const error = new Error('Cannot mutate an attempted queued message.')
+        error.name = 'ThreadQueueMutationConflictError'
+        throw error
+      }
+    }
     return {
-      nextState: normalizeThreadQueueState(nextState),
-      result: revision + 1,
+      nextState: normalizedNextState,
+      result: revision,
+      resolveResult: (nextRevision) => nextRevision,
     }
   })
 }
@@ -8158,6 +8221,15 @@ export async function removeThreadQueuedMessage(threadId: string, messageId: str
   return withThreadQueueStateUpdate((state, _receipts, processing) => {
     const queue = state[normalizedThreadId] ?? []
     const removedMessage = queue.find((message) => message.id === normalizedMessageId) ?? null
+    if (
+      removedMessage
+      && processing[normalizedThreadId]?.messageId === normalizedMessageId
+      && processing[normalizedThreadId]?.attempted === true
+    ) {
+      const error = new Error('Cannot remove a queued message after dispatch has started.')
+      error.name = 'ThreadQueueMutationConflictError'
+      throw error
+    }
     const nextQueue = queue.filter((message) => message.id !== normalizedMessageId)
     const nextState = { ...state }
     if (nextQueue.length > 0) nextState[normalizedThreadId] = nextQueue
@@ -8180,7 +8252,17 @@ export async function reorderThreadQueuedMessages(threadId: string, orderedMessa
       .filter((message) => order.has(message.id))
       .sort((left, right) => order.get(left.id)! - order.get(right.id)!)
     const unknown = queue.filter((message) => !order.has(message.id))
-    const reordered = [...known, ...unknown].map((message, index, messages) => {
+    let orderedMessages = [...known, ...unknown]
+    const attemptedMessageId = processing[normalizedThreadId]?.attempted === true
+      ? processing[normalizedThreadId]?.messageId
+      : ''
+    if (attemptedMessageId) {
+      const attemptedMessage = queue.find((message) => message.id === attemptedMessageId)
+      if (attemptedMessage) {
+        orderedMessages = [attemptedMessage, ...orderedMessages.filter((message) => message.id !== attemptedMessageId)]
+      }
+    }
+    const reordered = orderedMessages.map((message, index, messages) => {
       const { queueAfterId: _queueAfterId, queueBeforeId: _queueBeforeId, ...rest } = message
       return {
         ...rest,
@@ -8224,9 +8306,15 @@ export async function appendThreadQueuedMessage(
       return { nextState: state, nextReceipts, result: undefined }
     }
     const nextQueue = [...queue]
-    const insertIndex = typeof queueInsertIndex === 'number'
+    let insertIndex = typeof queueInsertIndex === 'number'
       ? Math.max(0, Math.min(Math.trunc(queueInsertIndex), nextQueue.length))
       : nextQueue.length
+    const attemptedMessageId = processing[normalizedThreadId]?.attempted === true
+      ? processing[normalizedThreadId]?.messageId
+      : ''
+    if (attemptedMessageId && nextQueue[0]?.id === attemptedMessageId) {
+      insertIndex = Math.max(1, insertIndex)
+    }
     const storedMessage = message.queueAfterId
       && !hasThreadQueueReceipt(receipts, normalizedThreadId, message.queueAfterId)
       ? {
@@ -8235,7 +8323,13 @@ export async function appendThreadQueuedMessage(
         }
       : message
     nextQueue.splice(insertIndex, 0, storedMessage)
-    const orderedQueue = orderQueuedMessagesByClientPosition(nextQueue)
+    let orderedQueue = orderQueuedMessagesByClientPosition(nextQueue)
+    if (attemptedMessageId) {
+      const attemptedMessage = orderedQueue.find((queuedMessage) => queuedMessage.id === attemptedMessageId)
+      if (attemptedMessage) {
+        orderedQueue = [attemptedMessage, ...orderedQueue.filter((queuedMessage) => queuedMessage.id !== attemptedMessageId)]
+      }
+    }
     const nextProcessing = { ...processing }
     if (
       nextProcessing[normalizedThreadId]?.attempted !== true
@@ -8319,7 +8413,6 @@ export async function withThreadStartClaim<T>(
         ...(ownerProcessStartIdentity ? { ownerProcessStartIdentity } : {}),
       },
     }
-    payload[THREAD_QUEUE_CHANGED_THREAD_IDS_KEY] = []
     return true
     })
   } catch (error) {
@@ -8343,7 +8436,6 @@ export async function withThreadStartClaim<T>(
       delete claims[normalizedThreadId]
       if (Object.keys(claims).length > 0) payload[THREAD_START_CLAIMS_KEY] = claims
       else delete payload[THREAD_START_CLAIMS_KEY]
-      payload[THREAD_QUEUE_CHANGED_THREAD_IDS_KEY] = []
     })
   }
 }
@@ -8818,13 +8910,32 @@ async function readWorkspaceRootsState(): Promise<WorkspaceRootsState> {
   })
 }
 
+async function readWorkspaceRootsStateFromPayload(
+  payload: Record<string, unknown>,
+): Promise<WorkspaceRootsState> {
+  return canonicalizeWorkspaceRootsState({
+    order: normalizeStringArray(payload['electron-saved-workspace-roots']),
+    labels: normalizeStringRecord(payload['electron-workspace-root-labels']),
+    active: normalizeStringArray(payload['active-workspace-roots']),
+    projectOrder: normalizeStringArray(payload['project-order']),
+    remoteProjects: normalizeRemoteProjects(payload['remote-projects']),
+  })
+}
+
+function writeWorkspaceRootsStateToPayload(
+  payload: Record<string, unknown>,
+  state: WorkspaceRootsState,
+): void {
+  payload['electron-saved-workspace-roots'] = normalizeStringArray(state.order)
+  payload['electron-workspace-root-labels'] = normalizeStringRecord(state.labels)
+  payload['active-workspace-roots'] = normalizeStringArray(state.active)
+  payload['project-order'] = normalizeStringArray(state.projectOrder)
+}
+
 export async function writeWorkspaceRootsState(nextState: WorkspaceRootsState): Promise<void> {
   const state = await canonicalizeWorkspaceRootsState(nextState)
   await updateCodexGlobalState((payload) => {
-    payload['electron-saved-workspace-roots'] = normalizeStringArray(state.order)
-    payload['electron-workspace-root-labels'] = normalizeStringRecord(state.labels)
-    payload['active-workspace-roots'] = normalizeStringArray(state.active)
-    payload['project-order'] = normalizeStringArray(state.projectOrder)
+    writeWorkspaceRootsStateToPayload(payload, state)
   })
 }
 
@@ -8847,8 +8958,11 @@ async function updateWorkspaceRootsState(
   updater: (existingState: WorkspaceRootsState) => WorkspaceRootsState,
 ): Promise<void> {
   await queueWorkspaceRootsMutation(async () => {
-    const existingState = await readWorkspaceRootsState()
-    await writeWorkspaceRootsState(updater(existingState))
+    await updateCodexGlobalState(async (payload) => {
+      const existingState = await readWorkspaceRootsStateFromPayload(payload)
+      const nextState = await canonicalizeWorkspaceRootsState(updater(existingState))
+      writeWorkspaceRootsStateToPayload(payload, nextState)
+    })
   })
 }
 
@@ -9190,8 +9304,11 @@ export async function reapExpiredManagedUploads(options: {
   if (maxEntries === 0) return 0
   const protectedDirectoryNames = new Set<string>()
   try {
-    const queueState = await readThreadQueueState()
-    for (const messages of Object.values(queueState)) {
+    const queueStore = await readThreadQueueStore()
+    for (const messages of [
+      ...Object.values(queueStore.state),
+      Object.values(queueStore.activeManagedMessages),
+    ]) {
       for (const message of messages) {
         for (const handle of managedQueuedUploadHandles(message)) {
           const match = handle.match(/^v1\.[0-9a-z]+\.([0-9a-f-]{36})\./iu)
@@ -10264,7 +10381,7 @@ export class BackendQueueProcessor {
       if (!isTurnCompletedNotification(notification)) return
       const threadId = extractThreadIdFromNotificationParams(notification.params)
       if (!threadId) return
-      this.releaseActiveManagedMessage(threadId)
+      void this.releaseActiveManagedMessage(threadId)
       void this.processThreadQueue(threadId)
     })
     void this.scheduleAllQueuedThreads(1000)
@@ -10396,7 +10513,7 @@ export class BackendQueueProcessor {
           const finalized = await this.finalizeQueuedTurn(next)
           if (managedMessage && finalized) this.runtimeQueuedMessages.delete(runtimeKey)
         } else if (managedMessage && this.activeManagedMessagesByThreadId.get(threadId) === managedMessage) {
-          this.activeManagedMessagesByThreadId.delete(threadId)
+          await this.deactivateManagedMessage(threadId, managedMessage)
         }
         this.scheduleThreadQueueDrain(threadId)
       }
@@ -10582,10 +10699,35 @@ export class BackendQueueProcessor {
     }
   }
 
-  private releaseActiveManagedMessage(threadId: string): void {
-    const message = this.activeManagedMessagesByThreadId.get(threadId)
-    if (!message) return
+  private async persistActiveManagedMessage(threadId: string, message: StoredQueuedMessage): Promise<void> {
+    await updateCodexGlobalState((payload) => {
+      payload[THREAD_ACTIVE_MANAGED_MESSAGES_KEY] = {
+        ...normalizeActiveManagedMessages(payload[THREAD_ACTIVE_MANAGED_MESSAGES_KEY]),
+        [threadId]: message,
+      }
+    })
+  }
+
+  private async deactivateManagedMessage(threadId: string, expectedMessage?: StoredQueuedMessage): Promise<StoredQueuedMessage | null> {
+    let persistedMessage: StoredQueuedMessage | null = null
+    await updateCodexGlobalState((payload) => {
+      const activeMessages = normalizeActiveManagedMessages(payload[THREAD_ACTIVE_MANAGED_MESSAGES_KEY])
+      const current = activeMessages[threadId]
+      if (expectedMessage && current?.id !== expectedMessage.id) return
+      persistedMessage = current ?? null
+      delete activeMessages[threadId]
+      if (Object.keys(activeMessages).length > 0) payload[THREAD_ACTIVE_MANAGED_MESSAGES_KEY] = activeMessages
+      else delete payload[THREAD_ACTIVE_MANAGED_MESSAGES_KEY]
+    })
     this.activeManagedMessagesByThreadId.delete(threadId)
+    return persistedMessage
+  }
+
+  private async releaseActiveManagedMessage(threadId: string): Promise<void> {
+    const inMemoryMessage = this.activeManagedMessagesByThreadId.get(threadId)
+    const persistedMessage = await this.deactivateManagedMessage(threadId, inMemoryMessage)
+    const message = inMemoryMessage ?? persistedMessage
+    if (!message) return
     this.releaseManagedMessage(message)
   }
 
@@ -10700,6 +10842,11 @@ export class BackendQueueProcessor {
     managedMessage?: StoredQueuedMessage,
   ): Promise<void> {
     await withThreadStartClaim(turn.threadId, async () => {
+      const currentState = await this.inspectQueuedTurn(turn)
+      if (currentState.accepted) return
+      if (!currentState.canStart) {
+        throw new Error('Cannot start a queued turn while another turn is active.')
+      }
       if (this.runtimeProbe) {
         const guard = await guardThreadResumeAgainstExternalWriter(
           this.appServer,
@@ -10717,6 +10864,7 @@ export class BackendQueueProcessor {
         throw new Error('Queued turn claim was lost before turn/start.')
       }
       if (managedMessage) {
+        await this.persistActiveManagedMessage(turn.threadId, managedMessage)
         this.activeManagedMessagesByThreadId.set(turn.threadId, managedMessage)
       }
       await this.appServer.rpc('turn/start', params)
@@ -10884,9 +11032,11 @@ function watchThreadQueueStateFile(
   try {
     return watch(dirname(statePath), { persistent: false }, (_eventType, fileName) => {
       if (fileName !== null && String(fileName) !== basename(statePath)) return
-      void readThreadQueueStore().then(({ changedThreadIds, revision, writerId }) => {
-        if (writerId === threadQueueWriterId) return
+      void readThreadQueueStore().then(({ changedRevisions, revision }) => {
         if (revision <= lastObservedRevision) return
+        const changedThreadIds = Object.entries(changedRevisions)
+          .filter(([, entry]) => entry.revision > lastObservedRevision && entry.writerId !== threadQueueWriterId)
+          .map(([threadId]) => threadId)
         lastObservedRevision = revision
         if (changedThreadIds.length === 0) return
         const event = { threadIds: changedThreadIds, revision }
@@ -13592,7 +13742,10 @@ export function createCodexBridgeMiddleware(options: {
         try {
           revision = await replaceThreadQueueState(runtimeState, baseRevision)
         } catch (error) {
-          if (error instanceof Error && error.name === 'ThreadQueueRevisionConflictError') {
+          if (error instanceof Error && (
+            error.name === 'ThreadQueueRevisionConflictError'
+            || error.name === 'ThreadQueueMutationConflictError'
+          )) {
             setJson(res, 409, { error: error.message })
             return
           }
@@ -13618,13 +13771,24 @@ export function createCodexBridgeMiddleware(options: {
             setJson(res, 400, { error: 'Missing messageId' })
             return
           }
-          const removedMessage = await removeThreadQueuedMessage(threadId, messageId)
-          backendQueueProcessor.forgetRuntimeQueuedMessage(
-            threadId,
-            messageId,
-            record?.transferManagedUploads === true,
-            removedMessage,
-          )
+          let removedMessage: StoredQueuedMessage | null
+          try {
+            removedMessage = await removeThreadQueuedMessage(threadId, messageId)
+          } catch (error) {
+            if (error instanceof Error && error.name === 'ThreadQueueMutationConflictError') {
+              setJson(res, 409, { error: error.message })
+              return
+            }
+            throw error
+          }
+          if (removedMessage) {
+            backendQueueProcessor.forgetRuntimeQueuedMessage(
+              threadId,
+              messageId,
+              record?.transferManagedUploads === true,
+              removedMessage,
+            )
+          }
         } else if (operation === 'reorder') {
           await reorderThreadQueuedMessages(threadId, normalizeStringArray(record?.orderedMessageIds))
         } else {
@@ -14005,9 +14169,7 @@ export function createCodexBridgeMiddleware(options: {
           setJson(res, 400, { error: 'Missing id' })
           return
         }
-        const cache = await readThreadTitleCache()
-        const next = title ? updateThreadTitleCache(cache, id, title) : removeFromThreadTitleCache(cache, id)
-        await writeThreadTitleCache(next)
+        await updateThreadTitleState(id, title)
         setJson(res, 200, { ok: true })
         return
       }

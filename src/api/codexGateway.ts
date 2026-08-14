@@ -3335,9 +3335,13 @@ export async function getThreadQueueState(): Promise<ThreadQueueState> {
   return (await getThreadQueueSnapshot()).state
 }
 
-export async function getThreadQueueAppendReceipt(threadId: string, messageId: string): Promise<boolean> {
+export async function getThreadQueueAppendReceipt(
+  threadId: string,
+  messageId: string,
+  signal?: AbortSignal,
+): Promise<boolean> {
   const params = new URLSearchParams({ threadId, messageId })
-  const response = await fetch(`/codex-api/thread-queue-receipt?${params.toString()}`)
+  const response = await fetch(`/codex-api/thread-queue-receipt?${params.toString()}`, { signal })
   const payload = (await response.json()) as unknown
   if (!response.ok) {
     throw new Error('Failed to load thread queue append receipt')
@@ -3411,6 +3415,7 @@ export async function appendThreadQueuedMessage(
   threadId: string,
   message: StoredQueuedMessage,
   queueInsertIndex?: number,
+  signal?: AbortSignal,
 ): Promise<void> {
   const response = await fetch('/codex-api/thread-queue-state', {
     method: 'POST',
@@ -3420,6 +3425,7 @@ export async function appendThreadQueuedMessage(
       message,
       ...(typeof queueInsertIndex === 'number' ? { queueInsertIndex } : {}),
     }),
+    signal,
   })
   if (!response.ok) {
     const error = new Error('Failed to append thread queue message')

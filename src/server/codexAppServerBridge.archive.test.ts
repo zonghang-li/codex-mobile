@@ -90,6 +90,25 @@ describe('callRpcWithArchiveRecovery', () => {
     ])
   })
 
+  it('does not write a fallback title when archive metadata cannot be verified', async () => {
+    const calls: string[] = []
+    const appServer = {
+      async rpc(method: string): Promise<unknown> {
+        calls.push(method)
+        if (method === 'thread/archive') throw new Error('no rollout found for thread uncertain-thread')
+        if (method === 'thread/read') throw new Error('metadata temporarily unavailable')
+        throw new Error(`unexpected writer ${method}`)
+      },
+    }
+
+    await expect(callRpcWithArchiveRecovery(
+      appServer,
+      'thread/archive',
+      { threadId: 'uncertain-thread' },
+    )).rejects.toThrow('metadata temporarily unavailable')
+    expect(calls).toEqual(['thread/archive', 'thread/read'])
+  })
+
   it('does not recover unrelated RPC failures', async () => {
     const appServer = {
       async rpc(): Promise<unknown> {

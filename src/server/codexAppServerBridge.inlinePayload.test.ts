@@ -6,16 +6,19 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import {
   BackendQueueProcessor,
   appendThreadQueuedMessage,
+  createManagedUpload,
   handleThreadQueueStoreChanged,
   withThreadStartClaim,
   mergeSessionSkillInputsIntoTurns,
   parseAutomationToml,
   prepareThreadRpcResultForClient,
   removeThreadQueuedMessage,
+  reapExpiredManagedUploads,
   reorderThreadQueuedMessages,
   replaceThreadQueueState,
   sanitizeThreadTurnsInlinePayloads,
   toAutomationApiRecord,
+  updateThreadTitleState,
   writeWorkspaceRootsState,
 } from './codexAppServerBridge'
 
@@ -688,6 +691,97 @@ describe('backend queue scheduling', () => {
     expect(scheduleThreadQueueDrain).toHaveBeenCalledWith('thread-cross-process', 0)
   })
 
+  it('retains per-thread queue change revisions across later processing-only writes', async () => {
+    const originalCodexHome = process.env.CODEX_HOME
+    const codexHome = await mkdtemp(join(tmpdir(), 'codex-mobile-queue-change-revisions-'))
+    process.env.CODEX_HOME = codexHome
+    try {
+      await appendThreadQueuedMessage('thread-cross-process', {
+        id: 'queued-cross-process',
+        text: 'persist notification',
+        imageUrls: [],
+        skills: [],
+        fileAttachments: [],
+        collaborationMode: 'default',
+        model: 'gpt-test',
+        effort: '',
+      })
+      await withThreadStartClaim('unrelated-thread', async () => undefined)
+
+      const payload = JSON.parse(await readFile(join(codexHome, '.codex-global-state.json'), 'utf8')) as Record<string, unknown>
+      expect(payload['thread-queue-changed-revisions']).toMatchObject({
+        'thread-cross-process': expect.objectContaining({ revision: 1 }),
+      })
+    } finally {
+      if (originalCodexHome === undefined) delete process.env.CODEX_HOME
+      else process.env.CODEX_HOME = originalCodexHome
+      await rm(codexHome, { recursive: true, force: true })
+    }
+  })
+
+  it('keeps an attempted queue head immutable during remove, reorder, and insertion', async () => {
+    const originalCodexHome = process.env.CODEX_HOME
+    const codexHome = await mkdtemp(join(tmpdir(), 'codex-mobile-queue-attempted-immutable-'))
+    process.env.CODEX_HOME = codexHome
+    const statePath = join(codexHome, '.codex-global-state.json')
+    const queued = (id: string) => ({
+      id,
+      text: id,
+      imageUrls: [],
+      skills: [],
+      fileAttachments: [],
+      collaborationMode: 'default' as const,
+      model: 'gpt-test',
+      effort: '' as const,
+    })
+    try {
+      await writeFile(statePath, JSON.stringify({
+        'thread-queue-state': { thread: [queued('attempted'), queued('later')] },
+        'thread-queue-processing': {
+          thread: { messageId: 'attempted', attempted: true, ownerId: 'live', ownerPid: process.pid },
+        },
+        'thread-queue-revision': 1,
+      }))
+
+      await expect(removeThreadQueuedMessage('thread', 'attempted'))
+        .rejects.toMatchObject({ name: 'ThreadQueueMutationConflictError' })
+      await reorderThreadQueuedMessages('thread', ['later', 'attempted'])
+      await appendThreadQueuedMessage('thread', queued('inserted'), 0)
+
+      const payload = JSON.parse(await readFile(statePath, 'utf8')) as {
+        'thread-queue-state': Record<string, Array<{ id: string }>>
+        'thread-queue-processing': Record<string, { messageId: string; attempted: boolean }>
+      }
+      expect(payload['thread-queue-state'].thread?.map((message) => message.id))
+        .toEqual(['attempted', 'inserted', 'later'])
+      expect(payload['thread-queue-processing'].thread).toMatchObject({ messageId: 'attempted', attempted: true })
+    } finally {
+      if (originalCodexHome === undefined) delete process.env.CODEX_HOME
+      else process.env.CODEX_HOME = originalCodexHome
+      await rm(codexHome, { recursive: true, force: true })
+    }
+  })
+
+  it('returns the stored revision for a semantically unchanged queue replacement', async () => {
+    const originalCodexHome = process.env.CODEX_HOME
+    const codexHome = await mkdtemp(join(tmpdir(), 'codex-mobile-queue-noop-revision-'))
+    process.env.CODEX_HOME = codexHome
+    const state = {
+      thread: [{
+        id: 'same', text: 'same', imageUrls: [], skills: [], fileAttachments: [],
+        collaborationMode: 'default' as const, model: 'gpt-test', effort: '' as const,
+      }],
+    }
+    try {
+      await expect(replaceThreadQueueState(state, 0)).resolves.toBe(1)
+      await expect(replaceThreadQueueState(state, 1)).resolves.toBe(1)
+    } finally {
+      if (originalCodexHome === undefined) delete process.env.CODEX_HOME
+      else process.env.CODEX_HOME = originalCodexHome
+      await rm(codexHome, { recursive: true, force: true })
+    }
+  })
+
   it('orders inverse-arrival appends by their client submission key', async () => {
     const originalCodexHome = process.env.CODEX_HOME
     const codexHome = await mkdtemp(join(tmpdir(), 'codex-mobile-queue-order-'))
@@ -1020,6 +1114,97 @@ describe('backend queue scheduling', () => {
     }
   })
 
+  it('rechecks thread activity after acquiring the shared start claim', async () => {
+    const originalCodexHome = process.env.CODEX_HOME
+    const codexHome = await mkdtemp(join(tmpdir(), 'codex-mobile-queue-start-recheck-'))
+    process.env.CODEX_HOME = codexHome
+    let readCalls = 0
+    const rpc = vi.fn(async (method: string) => {
+      if (method === 'thread/read') {
+        readCalls += 1
+        return readCalls === 1
+          ? { thread: { id: 'thread-recheck', turns: [] } }
+          : { thread: { id: 'thread-recheck', turns: [{ id: 'direct-turn', status: 'inProgress', items: [] }] } }
+      }
+      if (method === 'config/read') return { config: { model: 'gpt-test' } }
+      return {}
+    })
+    const processor = new BackendQueueProcessor({
+      rpc,
+      getPid: () => process.pid,
+      onNotification: () => () => undefined,
+    } as never)
+    try {
+      await appendThreadQueuedMessage('thread-recheck', {
+        id: 'queued-recheck', text: 'wait', imageUrls: [], skills: [], fileAttachments: [],
+        collaborationMode: 'default', model: 'gpt-test', effort: '',
+      })
+      await processor.processThreadQueue('thread-recheck')
+      expect(rpc).not.toHaveBeenCalledWith('turn/start', expect.anything())
+      const payload = JSON.parse(await readFile(join(codexHome, '.codex-global-state.json'), 'utf8')) as Record<string, unknown>
+      expect(payload['thread-queue-state']).toMatchObject({
+        'thread-recheck': [expect.objectContaining({ id: 'queued-recheck' })],
+      })
+    } finally {
+      processor.dispose()
+      if (originalCodexHome === undefined) delete process.env.CODEX_HOME
+      else process.env.CODEX_HOME = originalCodexHome
+      await rm(codexHome, { recursive: true, force: true })
+    }
+  })
+
+  it('durably protects accepted-turn uploads until terminal completion', async () => {
+    const originalCodexHome = process.env.CODEX_HOME
+    const codexHome = await mkdtemp(join(tmpdir(), 'codex-mobile-queue-active-upload-'))
+    const uploadRoot = join(codexHome, 'uploads')
+    process.env.CODEX_HOME = codexHome
+    const upload = await createManagedUpload('photo.png', Buffer.from('image'), uploadRoot)
+    const rpc = vi.fn(async (method: string) => {
+      if (method === 'thread/read') return { thread: { id: 'thread-upload', turns: [] } }
+      if (method === 'config/read') return { config: { model: 'gpt-test' } }
+      return {}
+    })
+    let notify: ((notification: { method: string; params?: unknown }) => void) | undefined
+    const processor = new BackendQueueProcessor({
+      rpc,
+      getPid: () => process.pid,
+      onNotification: (listener: typeof notify) => {
+        notify = listener
+        return () => undefined
+      },
+    } as never)
+    try {
+      await appendThreadQueuedMessage('thread-upload', {
+        id: 'queued-upload', text: 'inspect image', imageUrls: [], skills: [],
+        fileAttachments: [{ label: 'photo.png', path: upload.path, fsPath: upload.path, uploadHandle: upload.uploadHandle }],
+        collaborationMode: 'default', model: 'gpt-test', effort: '',
+      })
+      await processor.processThreadQueue('thread-upload')
+
+      const payload = JSON.parse(await readFile(join(codexHome, '.codex-global-state.json'), 'utf8')) as Record<string, unknown>
+      expect(payload['thread-active-managed-messages']).toMatchObject({
+        'thread-upload': expect.objectContaining({ id: 'queued-upload' }),
+      })
+      await expect(reapExpiredManagedUploads({
+        uploadRoot,
+        nowMs: Date.now() + 60_000,
+        ttlMs: 0,
+      })).resolves.toBe(0)
+      expect(existsSync(upload.path)).toBe(true)
+
+      notify?.({ method: 'turn/completed', params: { threadId: 'thread-upload' } })
+      await vi.waitFor(async () => {
+        const completedPayload = JSON.parse(await readFile(join(codexHome, '.codex-global-state.json'), 'utf8')) as Record<string, unknown>
+        expect(completedPayload['thread-active-managed-messages']).toBeUndefined()
+      })
+    } finally {
+      processor.dispose()
+      if (originalCodexHome === undefined) delete process.env.CODEX_HOME
+      else process.env.CODEX_HOME = originalCodexHome
+      await rm(codexHome, { recursive: true, force: true })
+    }
+  })
+
   it('rejects stale full replacement and preserves concurrent rows in exact mutations', async () => {
     const originalCodexHome = process.env.CODEX_HOME
     const codexHome = await mkdtemp(join(tmpdir(), 'codex-mobile-queue-cas-'))
@@ -1226,7 +1411,7 @@ describe('backend queue scheduling', () => {
           'thread-queue-revision'?: number
         }
         expect(afterClaims['thread-queue-revision']).toBe(revision)
-        expect(afterClaims['thread-queue-changed-thread-ids']).toEqual([])
+        expect(afterClaims['thread-queue-changed-thread-ids']).toEqual(['thread-a'])
       } finally {
         first.dispose()
         second.dispose()
@@ -1301,6 +1486,29 @@ describe('backend queue scheduling', () => {
         expect.objectContaining({ id: message.id }),
       ])
       expect(persisted['electron-saved-workspace-roots']).toEqual([])
+    } finally {
+      if (originalCodexHome === undefined) delete process.env.CODEX_HOME
+      else process.env.CODEX_HOME = originalCodexHome
+      await rm(codexHome, { recursive: true, force: true })
+    }
+  })
+
+  it('merges concurrent thread title mutations under the global-state lock', async () => {
+    const originalCodexHome = process.env.CODEX_HOME
+    const codexHome = await mkdtemp(join(tmpdir(), 'codex-mobile-title-state-race-'))
+    process.env.CODEX_HOME = codexHome
+    try {
+      await Promise.all([
+        updateThreadTitleState('thread-a', 'Title A'),
+        updateThreadTitleState('thread-b', 'Title B'),
+      ])
+      const payload = JSON.parse(await readFile(join(codexHome, '.codex-global-state.json'), 'utf8')) as {
+        'thread-titles'?: { titles?: Record<string, string> }
+      }
+      expect(payload['thread-titles']?.titles).toMatchObject({
+        'thread-a': 'Title A',
+        'thread-b': 'Title B',
+      })
     } finally {
       if (originalCodexHome === undefined) delete process.env.CODEX_HOME
       else process.env.CODEX_HOME = originalCodexHome
@@ -1471,7 +1679,7 @@ describe('backend queue scheduling', () => {
     const rpc = vi.fn(async (method: string, params?: unknown) => {
       if (method === 'thread/read') {
         readCount += 1
-        return readCount === 1
+        return readCount <= 2
           ? { thread: { id: 'thread-1', turns: [] } }
           : {
               thread: {

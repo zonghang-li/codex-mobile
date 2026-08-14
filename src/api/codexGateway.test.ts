@@ -438,6 +438,25 @@ describe('managed uploads', () => {
     })
   })
 
+  it('forwards cancellation signals to queue append and receipt requests', async () => {
+    const requests: RequestInit[] = []
+    vi.stubGlobal('fetch', vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+      requests.push(init ?? {})
+      return new Response(JSON.stringify({ ok: true, data: { accepted: true } }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      })
+    }))
+    const controller = new AbortController()
+    await appendThreadQueuedMessage('thread-1', {
+      id: 'queued-signal', text: 'signal', imageUrls: [], skills: [], fileAttachments: [],
+      collaborationMode: 'default', model: 'gpt-test', effort: '',
+    }, undefined, controller.signal)
+    await getThreadQueueAppendReceipt('thread-1', 'queued-signal', controller.signal)
+
+    expect(requests.map((request) => request.signal)).toEqual([controller.signal, controller.signal])
+  })
+
   it('marks a server-side append failure as ambiguous when a proxy may have lost the response', async () => {
     vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({ error: 'bad gateway' }), {
       status: 502,
