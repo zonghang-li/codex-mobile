@@ -25,7 +25,7 @@ import {
   rollbackThread,
   getThreadGroupsPage,
   getThreadQueueAppendReceipt,
-  getThreadQueueState,
+  getThreadQueueSnapshot,
   getWorkspaceRootsState,
   setCodexSpeedMode,
   setThreadGoal,
@@ -2281,6 +2281,8 @@ export function useDesktopState() {
   const queueRefreshDuringPendingAppendThreadIds = new Set<string>()
   let hasLoadedPersistedQueueState = false
   let queueMutationVersion = 0
+  let queueRefreshRequestVersion = 0
+  let latestQueueRevision = 0
   const eventUnreadByThreadId = ref<Record<string, boolean>>({})
   const availableModelIds = ref<string[]>([])
   const availableCollaborationModes = ref<CollaborationModeOption[]>([
@@ -7581,6 +7583,38 @@ export function useDesktopState() {
     return mergedState
   }
 
+  function isAmbiguousQueueAppendError(queueError: unknown): boolean {
+    return queueError instanceof TypeError
+      || (queueError instanceof Error && queueError.name === 'ThreadQueueAppendAmbiguousError')
+  }
+
+  async function persistQueuedMessageUntilConfirmed(
+    threadId: string,
+    queuedMessage: QueuedMessage,
+    queueInsertIndex?: number,
+  ): Promise<void> {
+    let ambiguousAttempts = 0
+    while (true) {
+      try {
+        await appendThreadQueuedMessage(threadId, queuedMessage, queueInsertIndex)
+        return
+      } catch (queueError) {
+        if (!isAmbiguousQueueAppendError(queueError)) throw queueError
+        ambiguousAttempts += 1
+        if (ambiguousAttempts >= 2) {
+          try {
+            if (await getThreadQueueAppendReceipt(threadId, queuedMessage.id)) return
+          } catch {
+            // Keep the optimistic row pending and retry the idempotent append.
+          }
+        }
+        if (ambiguousAttempts >= 2) {
+          await new Promise<void>((resolve) => globalThis.setTimeout(resolve, 250))
+        }
+      }
+    }
+  }
+
   async function enqueueThreadMessageDurably(
     threadId: string,
     nextText: string,
@@ -7601,17 +7635,7 @@ export function useDesktopState() {
     )
     setQueueAppendPending(threadId, queuedMessage.id, true)
     try {
-      try {
-        await appendThreadQueuedMessage(threadId, queuedMessage, queueInsertIndex)
-      } catch (queueError) {
-        if (!(queueError instanceof TypeError)) throw queueError
-        try {
-          await appendThreadQueuedMessage(threadId, queuedMessage, queueInsertIndex)
-        } catch (retryError) {
-          if (!(retryError instanceof TypeError)) throw retryError
-          if (!await getThreadQueueAppendReceipt(threadId, queuedMessage.id)) throw queueError
-        }
-      }
+      await persistQueuedMessageUntilConfirmed(threadId, queuedMessage, queueInsertIndex)
       return queuedMessage
     } catch (queueError) {
       removeLocallyQueuedMessage(threadId, queuedMessage.id)
@@ -7654,7 +7678,9 @@ export function useDesktopState() {
     if (hasLoadedPersistedQueueState) return
     hasLoadedPersistedQueueState = true
     try {
-      queuedMessagesByThreadId.value = await getThreadQueueState()
+      const snapshot = await getThreadQueueSnapshot()
+      queuedMessagesByThreadId.value = snapshot.state
+      latestQueueRevision = snapshot.revision
     } catch {
       // Backend queue state is optional during startup.
     }
@@ -9561,6 +9587,7 @@ export function useDesktopState() {
     threadId: string,
     scheduledMutationVersion = queueMutationVersion,
   ): Promise<void> {
+    const refreshRequestVersion = ++queueRefreshRequestVersion
     if (queueMutationVersion !== scheduledMutationVersion) return
     if ((pendingQueueAppendMessageIdsByThreadId.get(threadId)?.size ?? 0) > 0) {
       queueRefreshDuringPendingAppendThreadIds.add(threadId)
@@ -9575,9 +9602,15 @@ export function useDesktopState() {
     }
     const mutationVersionAtStart = queueMutationVersion
     try {
-      const refreshedQueueState = await getThreadQueueState()
-      if (queueMutationVersion === mutationVersionAtStart) {
-        queuedMessagesByThreadId.value = mergePendingQueueAppends(refreshedQueueState)
+      const snapshot = await getThreadQueueSnapshot()
+      if (queueRefreshRequestVersion !== refreshRequestVersion) {
+        pendingQueueRefreshThreadIds.add(threadId)
+      } else if (
+        queueMutationVersion === mutationVersionAtStart
+        && snapshot.revision >= latestQueueRevision
+      ) {
+        queuedMessagesByThreadId.value = mergePendingQueueAppends(snapshot.state)
+        latestQueueRevision = snapshot.revision
       } else {
         pendingQueueRefreshThreadIds.add(threadId)
       }
@@ -10502,6 +10535,8 @@ export function useDesktopState() {
     pendingQueueRefreshThreadIds.clear()
     pendingQueueAppendMessageIdsByThreadId.clear()
     queueRefreshDuringPendingAppendThreadIds.clear()
+    queueRefreshRequestVersion = 0
+    latestQueueRevision = 0
     persistQueueState()
     codexRateLimit.value = null
     threadTokenUsageByThreadId.value = {}

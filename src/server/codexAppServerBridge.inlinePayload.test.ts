@@ -11,6 +11,7 @@ import {
   prepareThreadRpcResultForClient,
   sanitizeThreadTurnsInlinePayloads,
   toAutomationApiRecord,
+  writeWorkspaceRootsState,
 } from './codexAppServerBridge'
 
 const pngBase64 = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII='
@@ -18,6 +19,16 @@ const pngDataUrl = `data:image/png;base64,${pngBase64}`
 const gifBase64 = 'R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQABAAACAUwAOw=='
 const jpegBase64 = '/9j/4AAQSkZJRgABAQAAAQABAAD/2w=='
 const webpBase64 = 'UklGRiIAAABXRUJQVlA4IC4AAAAwAQCdASoBAAEAAQAcJaQAA3AA/vuUAAA='
+
+function deferred<T>() {
+  let resolve!: (value: T) => void
+  let reject!: (reason?: unknown) => void
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise
+    reject = rejectPromise
+  })
+  return { promise, resolve, reject }
+}
 
 afterEach(() => {
   vi.useRealTimers()
@@ -610,6 +621,48 @@ describe('thread session skill recovery', () => {
 })
 
 describe('backend queue scheduling', () => {
+  it('preserves queue data when workspace roots are written concurrently', async () => {
+    const originalCodexHome = process.env.CODEX_HOME
+    const codexHome = await mkdtemp(join(tmpdir(), 'codex-mobile-global-state-race-'))
+    process.env.CODEX_HOME = codexHome
+    const message = {
+      id: 'queued-concurrent-state',
+      text: 'preserve me',
+      imageUrls: [],
+      skills: [],
+      fileAttachments: [],
+      collaborationMode: 'default' as const,
+      model: 'gpt-test',
+      effort: '' as const,
+    }
+
+    try {
+      await Promise.all([
+        appendThreadQueuedMessage('thread-1', message),
+        writeWorkspaceRootsState({
+          order: [],
+          labels: {},
+          active: [],
+          projectOrder: [],
+          remoteProjects: [],
+        }),
+      ])
+
+      const persisted = JSON.parse(await readFile(join(codexHome, '.codex-global-state.json'), 'utf8')) as {
+        'thread-queue-state'?: Record<string, Array<{ id: string }>>
+        'electron-saved-workspace-roots'?: string[]
+      }
+      expect(persisted['thread-queue-state']?.['thread-1']).toEqual([
+        expect.objectContaining({ id: message.id }),
+      ])
+      expect(persisted['electron-saved-workspace-roots']).toEqual([])
+    } finally {
+      if (originalCodexHome === undefined) delete process.env.CODEX_HOME
+      else process.env.CODEX_HOME = originalCodexHome
+      await rm(codexHome, { recursive: true, force: true })
+    }
+  })
+
   it('atomically appends queued messages without resurrecting a popped snapshot', async () => {
     const originalCodexHome = process.env.CODEX_HOME
     const codexHome = await mkdtemp(join(tmpdir(), 'codex-mobile-atomic-queue-'))
@@ -669,11 +722,22 @@ describe('backend queue scheduling', () => {
     try {
       await writeFile(statePath, JSON.stringify({ 'thread-queue-state': {} }))
       await appendThreadQueuedMessage('thread-1', message)
-      const popped = await (processor as unknown as {
-        popNextQueuedTurn: (threadId: string) => Promise<{ message: { id: string } } | null>
-      }).popNextQueuedTurn('thread-1')
+      const queueProcessor = processor as unknown as {
+        claimNextQueuedTurn: (threadId: string) => Promise<{
+          threadId: string
+          message: { id: string }
+          attempted: boolean
+        } | null>
+        finalizeQueuedTurn: (turn: {
+          threadId: string
+          message: { id: string }
+          attempted: boolean
+        }) => Promise<void>
+      }
+      const popped = await queueProcessor.claimNextQueuedTurn('thread-1')
 
       expect(popped?.message.id).toBe(message.id)
+      await queueProcessor.finalizeQueuedTurn(popped!)
       await appendThreadQueuedMessage('thread-1', message)
 
       const persisted = JSON.parse(await readFile(statePath, 'utf8')) as {
@@ -685,6 +749,131 @@ describe('backend queue scheduling', () => {
         threadId: 'thread-1',
         messageId: message.id,
       })
+    } finally {
+      processor.dispose()
+      if (originalCodexHome === undefined) delete process.env.CODEX_HOME
+      else process.env.CODEX_HOME = originalCodexHome
+      await rm(codexHome, { recursive: true, force: true })
+    }
+  })
+
+  it('keeps a durable dispatch claim until turn/start is accepted', async () => {
+    const originalCodexHome = process.env.CODEX_HOME
+    const codexHome = await mkdtemp(join(tmpdir(), 'codex-mobile-durable-dispatch-'))
+    process.env.CODEX_HOME = codexHome
+    const started = deferred<Record<string, unknown>>()
+    const rpc = vi.fn(async (method: string) => {
+      if (method === 'thread/read') return { thread: { id: 'thread-1', turns: [] } }
+      if (method === 'thread/resume') return { thread: { id: 'thread-1' } }
+      if (method === 'turn/start') return started.promise
+      if (method === 'config/read') return { config: { model: 'gpt-test' } }
+      return {}
+    })
+    const processor = new BackendQueueProcessor({
+      rpc,
+      getPid: () => 31337,
+      onNotification: () => () => undefined,
+    } as never)
+    const message = {
+      id: 'queued-dispatch',
+      text: 'survive dispatch crash window',
+      imageUrls: [],
+      skills: [],
+      fileAttachments: [],
+      collaborationMode: 'default' as const,
+      model: 'gpt-test',
+      effort: '' as const,
+    }
+
+    try {
+      await appendThreadQueuedMessage('thread-1', message)
+      const processing = processor.processThreadQueue('thread-1')
+      await vi.waitFor(() => expect(rpc).toHaveBeenCalledWith('turn/start', expect.anything()))
+
+      const duringDispatch = JSON.parse(await readFile(join(codexHome, '.codex-global-state.json'), 'utf8')) as {
+        'thread-queue-state'?: Record<string, Array<{ id: string }>>
+        'thread-queue-processing'?: Record<string, { messageId: string }>
+      }
+      expect(duringDispatch['thread-queue-state']?.['thread-1']).toEqual([
+        expect.objectContaining({ id: message.id }),
+      ])
+      expect(duringDispatch['thread-queue-processing']?.['thread-1']).toMatchObject({
+        messageId: message.id,
+      })
+
+      started.resolve({ turn: { id: 'turn-queued' } })
+      await processing
+      const afterDispatch = JSON.parse(await readFile(join(codexHome, '.codex-global-state.json'), 'utf8')) as {
+        'thread-queue-state'?: Record<string, Array<{ id: string }>>
+        'thread-queue-processing'?: Record<string, { messageId: string }>
+      }
+      expect(afterDispatch['thread-queue-state']?.['thread-1'] ?? []).toEqual([])
+      expect(afterDispatch['thread-queue-processing']?.['thread-1']).toBeUndefined()
+    } finally {
+      processor.dispose()
+      if (originalCodexHome === undefined) delete process.env.CODEX_HOME
+      else process.env.CODEX_HOME = originalCodexHome
+      await rm(codexHome, { recursive: true, force: true })
+    }
+  })
+
+  it('finalizes an ambiguously accepted turn by client user message id', async () => {
+    const originalCodexHome = process.env.CODEX_HOME
+    const codexHome = await mkdtemp(join(tmpdir(), 'codex-mobile-ambiguous-dispatch-'))
+    process.env.CODEX_HOME = codexHome
+    let readCount = 0
+    let turnStartParams: Record<string, unknown> | undefined
+    const rpc = vi.fn(async (method: string, params?: unknown) => {
+      if (method === 'thread/read') {
+        readCount += 1
+        return readCount === 1
+          ? { thread: { id: 'thread-1', turns: [] } }
+          : {
+              thread: {
+                id: 'thread-1',
+                turns: [{
+                  id: 'turn-accepted',
+                  status: 'inProgress',
+                  items: [{ type: 'userMessage', id: 'user-1', clientId: 'queued-ambiguous', content: [] }],
+                }],
+              },
+            }
+      }
+      if (method === 'thread/resume') return { thread: { id: 'thread-1' } }
+      if (method === 'turn/start') {
+        turnStartParams = params as Record<string, unknown>
+        throw new Error('response lost after acceptance')
+      }
+      if (method === 'config/read') return { config: { model: 'gpt-test' } }
+      return {}
+    })
+    const processor = new BackendQueueProcessor({
+      rpc,
+      getPid: () => 31337,
+      onNotification: () => () => undefined,
+    } as never)
+    const message = {
+      id: 'queued-ambiguous',
+      text: 'run once despite response loss',
+      imageUrls: [],
+      skills: [],
+      fileAttachments: [],
+      collaborationMode: 'default' as const,
+      model: 'gpt-test',
+      effort: '' as const,
+    }
+
+    try {
+      await appendThreadQueuedMessage('thread-1', message)
+      await processor.processThreadQueue('thread-1')
+
+      expect(turnStartParams).toMatchObject({ clientUserMessageId: message.id })
+      const persisted = JSON.parse(await readFile(join(codexHome, '.codex-global-state.json'), 'utf8')) as {
+        'thread-queue-state'?: Record<string, Array<{ id: string }>>
+        'thread-queue-processing'?: Record<string, { messageId: string }>
+      }
+      expect(persisted['thread-queue-state']?.['thread-1'] ?? []).toEqual([])
+      expect(persisted['thread-queue-processing']?.['thread-1']).toBeUndefined()
     } finally {
       processor.dispose()
       if (originalCodexHome === undefined) delete process.env.CODEX_HOME
@@ -764,13 +953,12 @@ describe('backend queue scheduling', () => {
     try {
       await processor.scheduleAllQueuedThreads(0)
       await vi.advanceTimersByTimeAsync(0)
-      await Promise.resolve()
-      await Promise.resolve()
-
-      expect(runtimeProbe.registerThread).toHaveBeenCalledWith(
-        'thread-1',
-        join(codexHome, 'sessions', 'rollout-thread-1.jsonl'),
-      )
+      await vi.waitFor(() => {
+        expect(runtimeProbe.registerThread).toHaveBeenCalledWith(
+          'thread-1',
+          join(codexHome, 'sessions', 'rollout-thread-1.jsonl'),
+        )
+      })
       expect(runtimeProbe.inspect).toHaveBeenCalledWith('thread-1', 31337)
       expect(rpc).not.toHaveBeenCalledWith('thread/resume', expect.anything())
       expect(rpc).not.toHaveBeenCalledWith('turn/start', expect.anything())
@@ -801,11 +989,19 @@ describe('backend queue scheduling', () => {
     } as never, runtimeProbe)
 
     try {
-      const canStart = await (processor as unknown as {
-        canStartQueuedTurn: (threadId: string) => Promise<boolean>
-      }).canStartQueuedTurn('thread-1')
+      const status = await (processor as unknown as {
+        inspectQueuedTurn: (turn: {
+          threadId: string
+          message: { id: string }
+          attempted: boolean
+        }) => Promise<{ accepted: boolean; canStart: boolean }>
+      }).inspectQueuedTurn({
+        threadId: 'thread-1',
+        message: { id: 'queued-1' },
+        attempted: false,
+      })
 
-      expect(canStart).toBe(process.platform !== 'linux')
+      expect(status).toEqual({ accepted: false, canStart: process.platform !== 'linux' })
       if (process.platform === 'linux') {
         expect(runtimeProbe.registerThread).toHaveBeenCalledOnce()
         expect(runtimeProbe.inspect).toHaveBeenCalledWith('thread-1', 31337)
@@ -830,8 +1026,16 @@ describe('backend queue scheduling', () => {
 
     try {
       await expect((processor as unknown as {
-        canStartQueuedTurn: (threadId: string) => Promise<boolean>
-      }).canStartQueuedTurn('thread-1')).resolves.toBe(true)
+        inspectQueuedTurn: (turn: {
+          threadId: string
+          message: { id: string }
+          attempted: boolean
+        }) => Promise<{ accepted: boolean; canStart: boolean }>
+      }).inspectQueuedTurn({
+        threadId: 'thread-1',
+        message: { id: 'queued-1' },
+        attempted: false,
+      })).resolves.toEqual({ accepted: false, canStart: true })
       expect(runtimeProbe.registerThread).not.toHaveBeenCalled()
       expect(runtimeProbe.inspect).not.toHaveBeenCalled()
     } finally {
@@ -983,7 +1187,7 @@ describe('backend queue scheduling', () => {
         }],
       })
       const turn = await (processor as unknown as {
-        popNextQueuedTurn: (threadId: string) => Promise<{
+        claimNextQueuedTurn: (threadId: string) => Promise<{
           threadId: string
           message: {
             id: string
@@ -995,8 +1199,9 @@ describe('backend queue scheduling', () => {
             model: string
             effort: 'high'
           }
+          attempted: boolean
         } | null>
-      }).popNextQueuedTurn('thread-queued')
+      }).claimNextQueuedTurn('thread-queued')
 
       expect(turn?.message.imageUrls).toEqual([managedImageUrl])
       const params = await (processor as unknown as {

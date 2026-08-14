@@ -306,6 +306,11 @@ export type StoredQueuedMessage = {
 
 export type ThreadQueueState = Record<string, StoredQueuedMessage[]>
 
+export type ThreadQueueSnapshot = {
+  state: ThreadQueueState
+  revision: number
+}
+
 export type ComposerFileSuggestion = {
   path: string
 }
@@ -3299,7 +3304,7 @@ function invalidateWorkspaceRootsStateCache(): void {
   cachedWorkspaceRootsState = null
 }
 
-export async function getThreadQueueState(): Promise<ThreadQueueState> {
+export async function getThreadQueueSnapshot(): Promise<ThreadQueueSnapshot> {
   const response = await fetch('/codex-api/thread-queue-state')
   const payload = (await response.json()) as unknown
   if (!response.ok) {
@@ -3309,7 +3314,17 @@ export async function getThreadQueueState(): Promise<ThreadQueueState> {
     payload && typeof payload === 'object' && !Array.isArray(payload)
       ? (payload as Record<string, unknown>)
       : {}
-  return normalizeThreadQueueState(envelope.data)
+  const rawRevision = envelope.revision
+  return {
+    state: normalizeThreadQueueState(envelope.data),
+    revision: typeof rawRevision === 'number' && Number.isSafeInteger(rawRevision) && rawRevision >= 0
+      ? rawRevision
+      : 0,
+  }
+}
+
+export async function getThreadQueueState(): Promise<ThreadQueueState> {
+  return (await getThreadQueueSnapshot()).state
 }
 
 export async function getThreadQueueAppendReceipt(threadId: string, messageId: string): Promise<boolean> {
@@ -3360,7 +3375,9 @@ export async function appendThreadQueuedMessage(
     }),
   })
   if (!response.ok) {
-    throw new Error('Failed to append thread queue message')
+    const error = new Error('Failed to append thread queue message')
+    if (response.status >= 500) error.name = 'ThreadQueueAppendAmbiguousError'
+    throw error
   }
 }
 

@@ -33,6 +33,7 @@ const gatewayMocks = vi.hoisted(() => ({
   getThreadRuntimeState: vi.fn(),
   getThreadRuntimeStates: vi.fn(),
   getThreadQueueAppendReceipt: vi.fn(),
+  getThreadQueueSnapshot: vi.fn(),
   getThreadQueueState: vi.fn(),
   getThreadTitleCache: vi.fn(),
   getWorkspaceRootsState: vi.fn(),
@@ -359,6 +360,10 @@ beforeEach(() => {
     (threadId: string, signal?: AbortSignal) => gatewayMocks.getThreadDetail(threadId, signal),
   )
   gatewayMocks.getThreadQueueState.mockReset().mockResolvedValue({})
+  gatewayMocks.getThreadQueueSnapshot.mockReset().mockImplementation(async () => ({
+    state: await gatewayMocks.getThreadQueueState(),
+    revision: 0,
+  }))
   gatewayMocks.getThreadQueueAppendReceipt.mockReset().mockResolvedValue(false)
   gatewayMocks.getThreadGoal.mockResolvedValue(null)
   gatewayMocks.getThreadRuntimeStates.mockResolvedValue({})
@@ -3018,6 +3023,10 @@ describe('turn completion lifecycle', () => {
   it('queues managed attachments without starting another turn immediately', async () => {
     const { state, emit } = await setupTurnLifecycleNotificationState('thread-1')
     gatewayMocks.startThreadTurn.mockResolvedValue('turn-steer')
+    gatewayMocks.getThreadQueueState.mockImplementation(async () => {
+      const message = gatewayMocks.appendThreadQueuedMessage.mock.calls.at(-1)?.[1]
+      return message ? { 'thread-1': [message] } : {}
+    })
     emit({ method: 'turn/started', params: { threadId: 'thread-1', turn: { id: 'turn-active' } } })
     const persistenceCalls = gatewayMocks.appendThreadQueuedMessage.mock.calls.length
     const managedImageUrl = '/codex-local-image?path=%2Ftmp%2Fcodex-web-uploads%2Fupload%2Fphoto.png&uploadHandle=queue-handle'
@@ -6956,6 +6965,52 @@ describe('external runtime ownership', () => {
     expect(state.error.value).toBe('')
   })
 
+  it('reconciles proxy 502 append responses through the durable receipt', async () => {
+    const { state } = await setupExternalRuntimeState()
+    gatewayMocks.getThreadDetail.mockResolvedValue(externalDetail())
+    await state.loadMessages('thread-1')
+    const proxyError = new Error('bad gateway')
+    proxyError.name = 'ThreadQueueAppendAmbiguousError'
+    gatewayMocks.appendThreadQueuedMessage
+      .mockRejectedValueOnce(proxyError)
+      .mockRejectedValueOnce(proxyError)
+    gatewayMocks.getThreadQueueAppendReceipt.mockResolvedValue(true)
+
+    await state.sendMessageToSelectedThread('accepted behind proxy', [], [], 'steer')
+
+    expect(gatewayMocks.appendThreadQueuedMessage).toHaveBeenCalledTimes(2)
+    expect(gatewayMocks.getThreadQueueAppendReceipt).toHaveBeenCalledOnce()
+    expect(state.selectedThreadQueuedMessages.value).toEqual([
+      expect.objectContaining({ text: 'accepted behind proxy' }),
+    ])
+    expect(state.error.value).toBe('')
+  })
+
+  it('keeps retrying an ambiguous append when the receipt query also fails', async () => {
+    const { state } = await setupExternalRuntimeState()
+    gatewayMocks.getThreadDetail.mockResolvedValue(externalDetail())
+    await state.loadMessages('thread-1')
+    gatewayMocks.appendThreadQueuedMessage
+      .mockRejectedValueOnce(new TypeError('connection reset'))
+      .mockRejectedValueOnce(new TypeError('connection reset again'))
+      .mockResolvedValueOnce(undefined)
+    gatewayMocks.getThreadQueueAppendReceipt.mockRejectedValueOnce(new TypeError('receipt unavailable'))
+
+    const send = state.sendMessageToSelectedThread('retry until durable', [], [], 'steer')
+    await flushMicrotasks()
+    expect(state.selectedThreadQueuedMessages.value).toEqual([
+      expect.objectContaining({ text: 'retry until durable' }),
+    ])
+    await vi.advanceTimersByTimeAsync(250)
+    await send
+
+    expect(gatewayMocks.appendThreadQueuedMessage).toHaveBeenCalledTimes(3)
+    expect(state.selectedThreadQueuedMessages.value).toEqual([
+      expect.objectContaining({ text: 'retry until durable' }),
+    ])
+    expect(state.error.value).toBe('')
+  })
+
   it('keeps an optimistic queue row while its append is still in flight', async () => {
     const { state, emit } = await setupExternalRuntimeState()
     gatewayMocks.getThreadDetail.mockResolvedValue(externalDetail())
@@ -7093,6 +7148,53 @@ describe('external runtime ownership', () => {
     await vi.waitFor(() => {
       expect(gatewayMocks.getThreadQueueState).toHaveBeenCalledTimes(2)
     })
+    expect(state.selectedThreadQueuedMessages.value).toEqual([])
+  })
+
+  it('never applies an older queue response after a newer refresh is requested', async () => {
+    const { state, emit } = await setupExternalRuntimeState()
+    const staleQueueRefresh = deferred<Record<string, Array<{
+      id: string
+      text: string
+      imageUrls: string[]
+      skills: never[]
+      fileAttachments: never[]
+      collaborationMode: 'default'
+      model: string
+      effort: ''
+    }>>>()
+    gatewayMocks.getThreadQueueState.mockClear()
+    gatewayMocks.getThreadQueueState
+      .mockReturnValueOnce(staleQueueRefresh.promise)
+      .mockResolvedValueOnce({})
+    const observedQueueIds: string[][] = []
+    const stop = watch(
+      () => state.selectedThreadQueuedMessages.value,
+      (messages) => observedQueueIds.push(messages.map((message) => message.id)),
+      { flush: 'sync' },
+    )
+
+    emit({ method: 'turn/started', params: { threadId: 'thread-1', turn: { id: 'turn-local' } } })
+    await flushMicrotasks()
+    emit({ method: 'turn/completed', params: { threadId: 'thread-1', turn: { id: 'turn-local', status: 'completed' } } })
+    await flushMicrotasks()
+    staleQueueRefresh.resolve({
+      'thread-1': [{
+        id: 'already-popped',
+        text: 'must not resurrect',
+        imageUrls: [],
+        skills: [],
+        fileAttachments: [],
+        collaborationMode: 'default',
+        model: 'gpt-test',
+        effort: '',
+      }],
+    })
+    await flushMicrotasks()
+    await vi.waitFor(() => expect(gatewayMocks.getThreadQueueState).toHaveBeenCalledTimes(2))
+    stop()
+
+    expect(observedQueueIds).not.toContainEqual(['already-popped'])
     expect(state.selectedThreadQueuedMessages.value).toEqual([])
   })
 

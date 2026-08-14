@@ -11,6 +11,7 @@ import {
   getOlderThreadMessages,
   getThreadGoal,
   getThreadQueueAppendReceipt,
+  getThreadQueueSnapshot,
   getThreadRuntimeState,
   getThreadRuntimeStates,
   getThreadTextPage,
@@ -397,6 +398,25 @@ describe('managed uploads', () => {
     })
   })
 
+  it('marks a server-side append failure as ambiguous when a proxy may have lost the response', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({ error: 'bad gateway' }), {
+      status: 502,
+      headers: { 'Content-Type': 'application/json' },
+    })))
+
+    const append = appendThreadQueuedMessage('thread-1', {
+      id: 'queued-ambiguous-http',
+      text: 'may already be accepted',
+      imageUrls: [],
+      skills: [],
+      fileAttachments: [],
+      collaborationMode: 'default',
+      model: 'gpt-test',
+      effort: '',
+    })
+    await expect(append).rejects.toMatchObject({ name: 'ThreadQueueAppendAmbiguousError' })
+  })
+
   it('queries a durable queue append receipt by thread and message id', async () => {
     const requests: Array<RequestInfo | URL> = []
     vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
@@ -411,6 +431,34 @@ describe('managed uploads', () => {
     expect(String(requests[0])).toBe(
       '/codex-api/thread-queue-receipt?threadId=thread+%2F+1&messageId=queued%3F1',
     )
+  })
+
+  it('returns the server queue revision with a queue snapshot', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({
+      data: {
+        'thread-1': [{
+          id: 'queued-revision',
+          text: 'revision aware',
+          imageUrls: [],
+          skills: [],
+          fileAttachments: [],
+          collaborationMode: 'default',
+          model: 'gpt-test',
+          effort: '',
+        }],
+      },
+      revision: 17,
+    }), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' },
+    })))
+
+    await expect(getThreadQueueSnapshot()).resolves.toMatchObject({
+      revision: 17,
+      state: {
+        'thread-1': [expect.objectContaining({ id: 'queued-revision' })],
+      },
+    })
   })
 })
 
