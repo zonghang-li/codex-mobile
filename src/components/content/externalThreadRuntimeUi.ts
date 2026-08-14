@@ -13,11 +13,11 @@ export function canApplyThreadUiMutation(_ownership: RuntimeOwnership): boolean 
 }
 
 export function canApplyAttachmentMutation(
-  ownership: RuntimeOwnership,
+  _ownership: RuntimeOwnership,
   expectedSessionToken: number,
   currentSessionToken: number,
 ): boolean {
-  return ownership !== 'external' && expectedSessionToken === currentSessionToken
+  return expectedSessionToken === currentSessionToken
 }
 
 export function applyExternalRuntimeTakeover(
@@ -27,6 +27,5 @@ export function applyExternalRuntimeTakeover(
 ): boolean {
   if (previousOwnership === 'external' || ownership !== 'external') return false
   effects.cancelDictation()
-  effects.invalidateAttachments()
   return true
 }

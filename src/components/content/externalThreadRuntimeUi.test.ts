@@ -15,14 +15,15 @@ describe('external thread runtime UI guards', () => {
     expect(canApplyThreadUiMutation(ownership)).toBe(expected)
   })
 
-  it('requires both a current attachment session and non-external ownership', () => {
+  it('preserves an attachment started before external takeover in the current draft session', () => {
     expect(canApplyAttachmentMutation('local', 4, 4)).toBe(true)
     expect(canApplyAttachmentMutation('idle', 4, 4)).toBe(true)
     expect(canApplyAttachmentMutation('local', 3, 4)).toBe(false)
-    expect(canApplyAttachmentMutation('external', 4, 4)).toBe(false)
+    expect(canApplyAttachmentMutation('external', 4, 4)).toBe(true)
+    expect(canApplyAttachmentMutation('external', 3, 4)).toBe(false)
   })
 
-  it('cancels dictation and invalidates attachments only on external takeover', () => {
+  it('cancels dictation without invalidating attachments on external takeover', () => {
     const cancelDictation = vi.fn()
     const invalidateAttachments = vi.fn()
     const effects = { cancelDictation, invalidateAttachments }
@@ -34,6 +35,6 @@ describe('external thread runtime UI guards', () => {
 
     expect(applyExternalRuntimeTakeover('local', 'external', effects)).toBe(true)
     expect(cancelDictation).toHaveBeenCalledTimes(1)
-    expect(invalidateAttachments).toHaveBeenCalledTimes(1)
+    expect(invalidateAttachments).not.toHaveBeenCalled()
   })
 })

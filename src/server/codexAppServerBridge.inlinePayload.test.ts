@@ -1180,14 +1180,71 @@ describe('backend queue scheduling', () => {
     }
   })
 
+  it('rechecks direct CLI ownership after preparing queued turn parameters', async () => {
+    const originalCodexHome = process.env.CODEX_HOME
+    const codexHome = await mkdtemp(join(tmpdir(), 'codex-mobile-queue-param-race-'))
+    process.env.CODEX_HOME = codexHome
+    let writerStarted = false
+    const rolloutPath = join(codexHome, 'sessions', 'rollout-thread-param-race.jsonl')
+    const rpc = vi.fn(async (method: string) => {
+      if (method === 'thread/read') {
+        return { thread: { id: 'thread-param-race', path: rolloutPath, turns: [] } }
+      }
+      if (method === 'config/read') {
+        writerStarted = true
+        return { config: { model: 'gpt-test' } }
+      }
+      return {}
+    })
+    const runtimeProbe = {
+      registerThread: vi.fn(),
+      inspect: vi.fn(async () => writerStarted
+        ? {
+            state: 'running' as const,
+            turnId: 'turn-cli-raced',
+            interruptible: false as const,
+            source: 'external-session-writer' as const,
+          }
+        : { state: 'idle' as const }),
+    }
+    const processor = new BackendQueueProcessor({
+      rpc,
+      getPid: () => process.pid,
+      onNotification: () => () => undefined,
+    } as never, runtimeProbe)
+
+    try {
+      await appendThreadQueuedMessage('thread-param-race', {
+        id: 'queued-param-race', text: 'wait for CLI', imageUrls: [], skills: [], fileAttachments: [],
+        collaborationMode: 'default', model: 'gpt-test', effort: '',
+      })
+      await processor.processThreadQueue('thread-param-race')
+
+      expect(rpc).not.toHaveBeenCalledWith('thread/resume', expect.anything())
+      expect(rpc).not.toHaveBeenCalledWith('turn/start', expect.anything())
+      const persisted = JSON.parse(await readFile(join(codexHome, '.codex-global-state.json'), 'utf8')) as {
+        'thread-queue-state'?: Record<string, Array<{ id: string }>>
+      }
+      expect(persisted['thread-queue-state']?.['thread-param-race']).toEqual([
+        expect.objectContaining({ id: 'queued-param-race' }),
+      ])
+    } finally {
+      processor.dispose()
+      if (originalCodexHome === undefined) delete process.env.CODEX_HOME
+      else process.env.CODEX_HOME = originalCodexHome
+      await rm(codexHome, { recursive: true, force: true })
+    }
+  })
+
   it('durably protects accepted-turn uploads until terminal completion', async () => {
     const originalCodexHome = process.env.CODEX_HOME
     const codexHome = await mkdtemp(join(tmpdir(), 'codex-mobile-queue-active-upload-'))
     const uploadRoot = join(codexHome, 'uploads')
     process.env.CODEX_HOME = codexHome
     const upload = await createManagedUpload('photo.png', Buffer.from('image'), uploadRoot)
+    const rolloutPath = join(codexHome, 'sessions', 'rollout-thread-upload.jsonl')
     const rpc = vi.fn(async (method: string) => {
-      if (method === 'thread/read') return { thread: { id: 'thread-upload', turns: [] } }
+      if (method === 'thread/read') return { thread: { id: 'thread-upload', path: rolloutPath, turns: [] } }
       if (method === 'config/read') return { config: { model: 'gpt-test' } }
       return {}
     })
@@ -1199,7 +1256,10 @@ describe('backend queue scheduling', () => {
         notify = listener
         return () => undefined
       },
-    } as never)
+    } as never, {
+      registerThread: vi.fn(),
+      inspect: vi.fn(async () => ({ state: 'idle' as const })),
+    })
     try {
       await appendThreadQueuedMessage('thread-upload', {
         id: 'queued-upload', text: 'inspect image', imageUrls: [], skills: [],
@@ -1275,6 +1335,53 @@ describe('backend queue scheduling', () => {
     } finally {
       processor.dispose()
       vi.restoreAllMocks()
+      if (originalCodexHome === undefined) delete process.env.CODEX_HOME
+      else process.env.CODEX_HOME = originalCodexHome
+      await rm(codexHome, { recursive: true, force: true })
+    }
+  })
+
+  it('releases stale active-upload protection when restart observes the accepted turn completed', async () => {
+    const originalCodexHome = process.env.CODEX_HOME
+    const codexHome = await mkdtemp(join(tmpdir(), 'codex-mobile-queue-completed-upload-'))
+    const uploadRoot = join(codexHome, 'uploads')
+    process.env.CODEX_HOME = codexHome
+    const upload = await createManagedUpload('completed.png', Buffer.from('completed-image'), uploadRoot)
+    const activeMessage = {
+      id: 'queued-completed-before-restart', text: 'completed before restart', imageUrls: [], skills: [],
+      fileAttachments: [{ label: 'completed.png', path: upload.path, fsPath: upload.path, uploadHandle: upload.uploadHandle }],
+      collaborationMode: 'default' as const, model: 'gpt-test', effort: '' as const,
+    }
+    const statePath = join(codexHome, '.codex-global-state.json')
+    await writeFile(statePath, JSON.stringify({
+      'thread-active-managed-messages': { 'thread-completed-upload': activeMessage },
+    }))
+    const processor = new BackendQueueProcessor({
+      rpc: vi.fn(async (method: string) => method === 'thread/read'
+        ? {
+            thread: {
+              id: 'thread-completed-upload',
+              turns: [{
+                id: 'turn-accepted', status: 'completed',
+                items: [{ id: 'user', clientId: activeMessage.id }],
+              }],
+            },
+          }
+        : {}),
+      getPid: () => process.pid,
+      onNotification: () => () => undefined,
+    } as never)
+
+    try {
+      await vi.waitFor(async () => {
+        const persisted = JSON.parse(await readFile(statePath, 'utf8')) as Record<string, unknown>
+        expect(persisted['thread-active-managed-messages']).toBeUndefined()
+      })
+      await expect(reapExpiredManagedUploads({ uploadRoot, nowMs: Date.now() + 60_000, ttlMs: 0 }))
+        .resolves.toBe(1)
+      expect(existsSync(upload.path)).toBe(false)
+    } finally {
+      processor.dispose()
       if (originalCodexHome === undefined) delete process.env.CODEX_HOME
       else process.env.CODEX_HOME = originalCodexHome
       await rm(codexHome, { recursive: true, force: true })
@@ -1499,6 +1606,53 @@ describe('backend queue scheduling', () => {
     }
   })
 
+  it('bounds durable receipts and per-thread change revisions in long-lived queue state', async () => {
+    const originalCodexHome = process.env.CODEX_HOME
+    const codexHome = await mkdtemp(join(tmpdir(), 'codex-mobile-queue-bounded-metadata-'))
+    process.env.CODEX_HOME = codexHome
+    const statePath = join(codexHome, '.codex-global-state.json')
+    const queued = Array.from({ length: 2_100 }, (_, index) => ({
+      id: `queued-${index}`,
+      text: `queued-${index}`,
+      imageUrls: [],
+      skills: [],
+      fileAttachments: [],
+      collaborationMode: 'default',
+      model: 'gpt-test',
+      effort: '',
+    }))
+    await writeFile(statePath, JSON.stringify({
+      'thread-queue-state': { 'thread-large': queued },
+      'thread-queue-receipts': queued.map((message, index) => ({
+        threadId: 'thread-large', messageId: message.id, acceptedAtMs: index,
+      })),
+      'thread-queue-revision': 2_100,
+      'thread-queue-changed-revisions': Object.fromEntries(
+        Array.from({ length: 2_100 }, (_, index) => [
+          `thread-${index}`,
+          { revision: index + 1, writerId: `writer-${index}` },
+        ]),
+      ),
+    }))
+
+    try {
+      await appendThreadQueuedMessage('thread-new', {
+        id: 'queued-new', text: 'new', imageUrls: [], skills: [], fileAttachments: [],
+        collaborationMode: 'default', model: 'gpt-test', effort: '',
+      })
+      const persisted = JSON.parse(await readFile(statePath, 'utf8')) as {
+        'thread-queue-receipts'?: unknown[]
+        'thread-queue-changed-revisions'?: Record<string, unknown>
+      }
+      expect(persisted['thread-queue-receipts']?.length).toBeLessThanOrEqual(2_048)
+      expect(Object.keys(persisted['thread-queue-changed-revisions'] ?? {})).toHaveLength(2_048)
+    } finally {
+      if (originalCodexHome === undefined) delete process.env.CODEX_HOME
+      else process.env.CODEX_HOME = originalCodexHome
+      await rm(codexHome, { recursive: true, force: true })
+    }
+  })
+
   it('returns durable managed capabilities when removing a recovered row', async () => {
     const originalCodexHome = process.env.CODEX_HOME
     const codexHome = await mkdtemp(join(tmpdir(), 'codex-mobile-queue-remove-managed-'))
@@ -1691,8 +1845,9 @@ describe('backend queue scheduling', () => {
     const codexHome = await mkdtemp(join(tmpdir(), 'codex-mobile-durable-dispatch-'))
     process.env.CODEX_HOME = codexHome
     const started = deferred<Record<string, unknown>>()
+    const rolloutPath = join(codexHome, 'sessions', 'rollout-thread-1.jsonl')
     const rpc = vi.fn(async (method: string) => {
-      if (method === 'thread/read') return { thread: { id: 'thread-1', turns: [] } }
+      if (method === 'thread/read') return { thread: { id: 'thread-1', path: rolloutPath, turns: [] } }
       if (method === 'thread/resume') return { thread: { id: 'thread-1' } }
       if (method === 'turn/start') return started.promise
       if (method === 'config/read') return { config: { model: 'gpt-test' } }
@@ -1702,7 +1857,10 @@ describe('backend queue scheduling', () => {
       rpc,
       getPid: () => 31337,
       onNotification: () => () => undefined,
-    } as never)
+    } as never, {
+      registerThread: vi.fn(),
+      inspect: vi.fn(async () => ({ state: 'idle' as const })),
+    })
     const message = {
       id: 'queued-dispatch',
       text: 'survive dispatch crash window',
@@ -1750,16 +1908,17 @@ describe('backend queue scheduling', () => {
     const originalCodexHome = process.env.CODEX_HOME
     const codexHome = await mkdtemp(join(tmpdir(), 'codex-mobile-ambiguous-dispatch-'))
     process.env.CODEX_HOME = codexHome
-    let readCount = 0
+    let startAttempted = false
+    const rolloutPath = join(codexHome, 'sessions', 'rollout-thread-1.jsonl')
     let turnStartParams: Record<string, unknown> | undefined
     const rpc = vi.fn(async (method: string, params?: unknown) => {
       if (method === 'thread/read') {
-        readCount += 1
-        return readCount <= 2
-          ? { thread: { id: 'thread-1', turns: [] } }
+        return !startAttempted
+          ? { thread: { id: 'thread-1', path: rolloutPath, turns: [] } }
           : {
               thread: {
                 id: 'thread-1',
+                path: rolloutPath,
                 turns: [{
                   id: 'turn-accepted',
                   status: 'inProgress',
@@ -1770,6 +1929,7 @@ describe('backend queue scheduling', () => {
       }
       if (method === 'thread/resume') return { thread: { id: 'thread-1' } }
       if (method === 'turn/start') {
+        startAttempted = true
         turnStartParams = params as Record<string, unknown>
         throw new Error('response lost after acceptance')
       }
@@ -1780,7 +1940,10 @@ describe('backend queue scheduling', () => {
       rpc,
       getPid: () => 31337,
       onNotification: () => () => undefined,
-    } as never)
+    } as never, {
+      registerThread: vi.fn(),
+      inspect: vi.fn(async () => ({ state: 'idle' as const })),
+    })
     const message = {
       id: 'queued-ambiguous',
       text: 'run once despite response loss',
@@ -1933,7 +2096,7 @@ describe('backend queue scheduling', () => {
       expect(status).toEqual({
         accepted: false,
         acceptedInProgress: false,
-        canStart: process.platform !== 'linux',
+        canStart: false,
       })
       if (process.platform === 'linux') {
         expect(runtimeProbe.registerThread).toHaveBeenCalledOnce()
@@ -1944,7 +2107,7 @@ describe('backend queue scheduling', () => {
     }
   })
 
-  it('preserves idle queue draining when thread/read has no trusted rollout path', async () => {
+  it('fails closed when thread/read has no trusted rollout path', async () => {
     const runtimeProbe = {
       registerThread: vi.fn(),
       inspect: vi.fn(async () => ({ state: 'unknown' as const })),
@@ -1968,7 +2131,7 @@ describe('backend queue scheduling', () => {
         threadId: 'thread-1',
         message: { id: 'queued-1' },
         attempted: false,
-      })).resolves.toEqual({ accepted: false, acceptedInProgress: false, canStart: true })
+      })).resolves.toEqual({ accepted: false, acceptedInProgress: false, canStart: false })
       expect(runtimeProbe.registerThread).not.toHaveBeenCalled()
       expect(runtimeProbe.inspect).not.toHaveBeenCalled()
     } finally {
@@ -1976,7 +2139,11 @@ describe('backend queue scheduling', () => {
     }
   })
 
-  it('pins backend queued turns to the unrestricted no-approval runtime policy', async () => {
+  it('inherits safe-mode approval and sandbox policy for backend queued turns', async () => {
+    const originalApprovalPolicy = process.env.CODEXUI_APPROVAL_POLICY
+    const originalSandboxMode = process.env.CODEXUI_SANDBOX_MODE
+    process.env.CODEXUI_APPROVAL_POLICY = 'on-request'
+    process.env.CODEXUI_SANDBOX_MODE = 'workspace-write'
     const processor = new BackendQueueProcessor({
       rpc: vi.fn(async (method: string) => {
         if (method === 'config/read') return { config: { model: 'gpt-test', model_reasoning_effort: 'high' } }
@@ -2013,11 +2180,15 @@ describe('backend queue scheduling', () => {
 
       expect(params).toMatchObject({
         threadId: 'thread-queued',
-        approvalPolicy: 'never',
-        sandboxPolicy: { type: 'dangerFullAccess' },
+        approvalPolicy: 'on-request',
+        sandboxPolicy: { type: 'workspaceWrite' },
       })
     } finally {
       processor.dispose()
+      if (originalApprovalPolicy === undefined) delete process.env.CODEXUI_APPROVAL_POLICY
+      else process.env.CODEXUI_APPROVAL_POLICY = originalApprovalPolicy
+      if (originalSandboxMode === undefined) delete process.env.CODEXUI_SANDBOX_MODE
+      else process.env.CODEXUI_SANDBOX_MODE = originalSandboxMode
     }
   })
 

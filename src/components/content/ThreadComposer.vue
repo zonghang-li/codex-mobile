@@ -706,7 +706,6 @@ const canSubmit = computed(() => {
   if (!props.activeThreadId) return false
   if (isPlanModeWaitingForModel.value) return false
   if (pendingAttachmentCount.value > 0) return false
-  if (isExternallyOwned.value) return draft.value.trim().length > 0
   return draft.value.trim().length > 0 || selectedImages.value.length > 0 || fileAttachments.value.length > 0
 })
 const hasUnsavedDraft = computed(() =>
@@ -1023,9 +1022,9 @@ function buildContextUsageView(
 function onSubmit(mode: 'steer' | 'queue' = 'steer'): void {
   const text = draft.value.trim()
   if (!canSubmit.value) return
-  const imageUrls = isExternallyOwned.value ? [] : selectedImages.value.map(toSelectedImageUrl)
-  const submitFileAttachments = isExternallyOwned.value ? [] : [...fileAttachments.value]
-  const submitSkills = isExternallyOwned.value ? [] : selectedSkills.value.map((s) => ({ name: s.name, path: s.path }))
+  const imageUrls = selectedImages.value.map(toSelectedImageUrl)
+  const submitFileAttachments = [...fileAttachments.value]
+  const submitSkills = selectedSkills.value.map((s) => ({ name: s.name, path: s.path }))
   emit('submit', {
     text,
     imageUrls,
@@ -2068,7 +2067,6 @@ watch(
       onInputChange()
     }
     lastActiveThreadId = normalizedThreadId
-    if (isExternallyOwned.value) invalidatePendingAttachments()
   },
   { immediate: true },
 )

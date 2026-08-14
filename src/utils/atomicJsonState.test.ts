@@ -136,16 +136,23 @@ describe('mutateJsonStateFile', () => {
     })).resolves.toBe(true)
   })
 
-  it('does not replace malformed existing state with an empty snapshot', async () => {
+  it('recovers malformed state from the last durable backup before mutating', async () => {
     const root = await mkdtemp(join(tmpdir(), 'codex-mobile-json-state-invalid-'))
     const statePath = join(root, 'state.json')
-    await writeFile(statePath, '{broken', 'utf8')
 
     try {
+      await mutateJsonStateFile(statePath, (payload) => {
+        payload.stable = true
+      })
+      await writeFile(statePath, '{broken', 'utf8')
+
       await expect(mutateJsonStateFile(statePath, (payload) => {
         payload.next = true
-      })).rejects.toBeInstanceOf(SyntaxError)
-      await expect(readFile(statePath, 'utf8')).resolves.toBe('{broken')
+      })).resolves.toBeUndefined()
+      await expect(readFile(statePath, 'utf8').then(JSON.parse)).resolves.toEqual({
+        stable: true,
+        next: true,
+      })
     } finally {
       await rm(root, { recursive: true, force: true })
     }

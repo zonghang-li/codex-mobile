@@ -1,4 +1,5 @@
 import { createServer } from 'node:http'
+import { spawnSync } from 'node:child_process'
 import type { AddressInfo } from 'node:net'
 import { appendFile, mkdir, mkdtemp, rm, truncate, utimes, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
@@ -2212,6 +2213,92 @@ describe('POST /codex-api/rpc guarded resume', () => {
 })
 
 describe('POST /codex-api/rpc guarded user turns', () => {
+  it('blocks only the exact state-db archived thread without affecting an active neighbor', async () => {
+    const codexHome = await mkdtemp(join(tmpdir(), 'codex-mobile-rpc-archived-exact-'))
+    process.env.CODEX_HOME = codexHome
+    disposers.push(() => rm(codexHome, { recursive: true, force: true }))
+    const stateDbPath = join(codexHome, 'state_5.sqlite')
+    const sqlite = spawnSync('sqlite3', [stateDbPath, [
+      'CREATE TABLE threads (id TEXT PRIMARY KEY, archived INTEGER);',
+      "INSERT INTO threads (id, archived) VALUES ('thread-archived', 1);",
+      "INSERT INTO threads (id, archived) VALUES ('thread-active', 0);",
+    ].join(' ')], { encoding: 'utf8' })
+    expect(sqlite.status).toBe(0)
+    const middleware = createCodexBridgeMiddleware()
+    const shared = sharedBridgeForTest()
+    const rpc = vi.spyOn(shared.appServer as unknown as {
+      rpc(method: string, params: unknown): Promise<unknown>
+    }, 'rpc').mockImplementation(async (_method, params) => ({
+      thread: { id: (params as { threadId?: string }).threadId, turns: [] },
+    }))
+    const port = await listenWithMiddleware(middleware)
+    const read = (threadId: string) => fetch(`http://127.0.0.1:${port}/codex-api/rpc`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ method: 'thread/read', params: { threadId } }),
+    })
+
+    const archivedResponse = await read('thread-archived')
+    const activeResponse = await read('thread-active')
+
+    expect(archivedResponse.status).toBe(409)
+    expect(activeResponse.status).toBe(200)
+    expect(rpc).not.toHaveBeenCalledWith('thread/read', { threadId: 'thread-archived' })
+    expect(rpc).toHaveBeenCalledWith('thread/read', { threadId: 'thread-active' })
+  })
+
+  it.each([
+    'thread/archive',
+    'thread/unarchive',
+    'thread/fork',
+    'thread/rollback',
+    'thread/name/set',
+    'thread/goal/set',
+    'thread/goal/clear',
+    'thread/start-turn',
+    'turn/interrupt',
+  ])('returns 409 without dispatching %s while a direct CLI owns the thread', async (method) => {
+    const middleware = createCodexBridgeMiddleware()
+    const shared = sharedBridgeForTest()
+    vi.spyOn(shared.appServer, 'getPid').mockReturnValue(4242)
+    const rpc = vi.spyOn(shared.appServer as unknown as {
+      rpc(method: string, params: unknown): Promise<unknown>
+    }, 'rpc').mockImplementation(async (calledMethod) => {
+      if (calledMethod === 'thread/read') {
+        return {
+          thread: {
+            id: 'thread-cli-owned',
+            path: '/home/user/.codex/sessions/rollout-thread-cli-owned.jsonl',
+            status: { type: 'idle' },
+            turns: [],
+          },
+        }
+      }
+      return { ok: true }
+    })
+    vi.spyOn(shared.runtimeProbe, 'inspect').mockResolvedValue({
+      state: 'running',
+      turnId: 'turn-cli',
+      interruptible: false,
+      source: 'external-session-writer',
+    })
+    const port = await listenWithMiddleware(middleware)
+
+    const response = await fetch(`http://127.0.0.1:${port}/codex-api/rpc`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ method, params: { threadId: 'thread-cli-owned' } }),
+    })
+
+    expect(response.status).toBe(409)
+    expect(rpc).toHaveBeenCalledTimes(1)
+    expect(rpc).toHaveBeenCalledWith('thread/read', {
+      threadId: 'thread-cli-owned',
+      includeTurns: true,
+    })
+    expect(rpc).not.toHaveBeenCalledWith(method, expect.anything())
+  })
+
   it('returns 409 when a cross-process turn-start claim already exists', async () => {
     const codexHome = await mkdtemp(join(tmpdir(), 'codex-mobile-rpc-start-conflict-'))
     process.env.CODEX_HOME = codexHome
@@ -2321,7 +2408,7 @@ describe('POST /codex-api/rpc guarded user turns', () => {
       }),
     })
 
-    expect(response.status).toBe(502)
+    expect(response.status).toBe(409)
     expect(await response.json()).toMatchObject({
       error: expect.stringContaining('writer ownership is not idle'),
     })
@@ -2375,7 +2462,7 @@ describe('POST /codex-api/rpc guarded user turns', () => {
       }),
     })
 
-    expect(response.status).toBe(502)
+    expect(response.status).toBe(409)
     await expect(response.json()).resolves.toMatchObject({
       error: expect.stringContaining('writer ownership is not idle'),
     })
@@ -2423,7 +2510,7 @@ describe('POST /codex-api/rpc guarded user turns', () => {
       }),
     })
 
-    expect(response.status).toBe(502)
+    expect(response.status).toBe(409)
     await expect(response.json()).resolves.toMatchObject({
       error: expect.stringContaining('writer ownership is not idle'),
     })
@@ -2613,7 +2700,7 @@ describe('POST /codex-api/rpc guarded user turns', () => {
       }),
     })
 
-    expect(turnResponse.status).toBe(502)
+    expect(turnResponse.status).toBe(409)
     expect(await turnResponse.json()).toMatchObject({
       error: expect.stringContaining('writer ownership is not idle'),
     })
@@ -2674,7 +2761,7 @@ describe('POST /codex-api/rpc guarded user turns', () => {
       }),
     })
 
-    expect(turnResponse.status).toBe(502)
+    expect(turnResponse.status).toBe(409)
     expect(await turnResponse.json()).toMatchObject({
       error: expect.stringContaining('writer ownership is not idle'),
     })
@@ -2734,7 +2821,7 @@ describe('POST /codex-api/rpc guarded user turns', () => {
       }),
     })
 
-    expect(turnResponse.status).toBe(502)
+    expect(turnResponse.status).toBe(409)
     expect(inspect).toHaveBeenCalledTimes(2)
     expect(rpc).not.toHaveBeenCalledWith('turn/start', expect.anything())
   })

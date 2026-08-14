@@ -7089,6 +7089,9 @@ describe('external runtime ownership', () => {
     expect(state.selectedThreadQueuedMessages.value).toEqual([
       expect.objectContaining({ text: 'queue while desktop owns writer' }),
     ])
+    expect(state.selectedThreadQueuedMessages.value[0]?.id).toMatch(
+      /^q-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u,
+    )
     expect(state.selectedThreadRuntimeOwnership.value).toBe('external')
     expect(state.error.value).toBe('')
   })
@@ -7660,6 +7663,47 @@ describe('external runtime ownership', () => {
     expect(state.error.value).toBe('')
   })
 
+  it('preserves submitted model settings when a start race falls back to the queue', async () => {
+    const { state } = await setupExternalRuntimeState()
+    gatewayMocks.resumeThread.mockResolvedValue(idleDetail())
+    const start = deferred<string>()
+    gatewayMocks.startThreadTurn.mockReturnValue(start.promise)
+    state.setSelectedModelIdForThread('thread-1', 'submitted-model')
+    state.setSelectedReasoningEffort('high')
+
+    const send = state.sendMessageToSelectedThread(
+      'preserve submitted settings',
+      [],
+      [],
+      'steer',
+      [],
+      undefined,
+      'plan',
+    )
+    await vi.waitFor(() => expect(gatewayMocks.startThreadTurn).toHaveBeenCalledOnce())
+
+    state.setSelectedModelIdForThread('thread-1', 'later-model')
+    state.setSelectedReasoningEffort('low')
+    start.reject(new CodexApiError(
+      'RPC turn/start failed with HTTP 409: Cannot start a turn because task writer ownership is not idle.',
+      { code: 'http_error', method: 'turn/start', status: 409 },
+    ))
+    await send
+    await flushMicrotasks()
+
+    expect(gatewayMocks.appendThreadQueuedMessage).toHaveBeenLastCalledWith(
+      'thread-1',
+      expect.objectContaining({
+        text: 'preserve submitted settings',
+        model: 'submitted-model',
+        effort: 'high',
+        collaborationMode: 'plan',
+      }),
+      undefined,
+      expect.any(AbortSignal),
+    )
+  })
+
   it('durably queues a turn rejected by the cross-process start claim', async () => {
     const { state } = await setupExternalRuntimeState()
     gatewayMocks.resumeThread.mockResolvedValue(idleDetail())
@@ -8124,6 +8168,9 @@ describe('external runtime ownership', () => {
     state.removeQueuedMessage('queued-1')
     state.reorderQueuedMessage('queued-1', 'queued-2')
     await state.rollbackSelectedThread('turn-external')
+    await state.archiveThreadById('thread-1')
+    await state.renameThreadById('thread-1', 'must stay unchanged')
+    await state.forkThreadById('thread-1')
     const replied = await state.respondToPendingServerRequest({ id: 99, result: {} })
     await flushMicrotasks()
 
@@ -8131,6 +8178,10 @@ describe('external runtime ownership', () => {
     expect(gatewayMocks.startThreadTurn).not.toHaveBeenCalled()
     expect(gatewayMocks.revertThreadFileChanges).not.toHaveBeenCalled()
     expect(gatewayMocks.rollbackThread).not.toHaveBeenCalled()
+    expect(gatewayMocks.archiveThread).not.toHaveBeenCalled()
+    expect(gatewayMocks.renameThread).not.toHaveBeenCalled()
+    expect(gatewayMocks.forkThread).not.toHaveBeenCalled()
+    expect(state.selectedThreadId.value).toBe('thread-1')
     expect(gatewayMocks.replyToServerRequest).not.toHaveBeenCalled()
     expect(replied).toBe(false)
     expect(state.selectedThreadQueuedMessages.value.map((message) => message.text)).toEqual([

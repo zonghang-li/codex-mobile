@@ -234,9 +234,12 @@ describe('callRpcWithArchiveRecovery', () => {
     ])
   })
 
-  it('falls back to external runtime interrupt when local turn/interrupt cannot materialize the thread', async () => {
+  it('does not let raw turn/interrupt mutate a thread owned by an external runtime', async () => {
     const appServer = {
       async rpc(method: string): Promise<unknown> {
+        if (method === 'thread/read') {
+          return { thread: { id: 'thread-external', path: '/tmp/rollout-thread-external.jsonl' } }
+        }
         if (method === 'turn/interrupt') {
           throw new Error('thread not found: thread-external')
         }
@@ -245,7 +248,12 @@ describe('callRpcWithArchiveRecovery', () => {
     }
     const runtimeProbe = {
       registerThread: vi.fn(),
-      inspect: vi.fn(),
+      inspect: vi.fn().mockResolvedValue({
+        state: 'running',
+        turnId: 'turn-external',
+        interruptible: false,
+        source: 'external-session-writer',
+      }),
       interrupt: vi.fn().mockResolvedValue({ interrupted: true }),
     }
 
@@ -255,8 +263,8 @@ describe('callRpcWithArchiveRecovery', () => {
       { threadId: 'thread-external', turnId: 'turn-external' },
       runtimeProbe,
       4242,
-    )).resolves.toEqual({ ok: true })
-    expect(runtimeProbe.interrupt).toHaveBeenCalledWith('thread-external', 'turn-external', 4242)
+    )).rejects.toThrow('writer ownership is not idle')
+    expect(runtimeProbe.interrupt).not.toHaveBeenCalled()
   })
 })
 

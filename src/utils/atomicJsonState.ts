@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto'
-import { mkdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises'
+import { mkdir, open, readFile, rename, rm, stat, writeFile } from 'node:fs/promises'
 import { basename, dirname, join } from 'node:path'
 
 export function isLockDestinationConflict(error: unknown): boolean {
@@ -31,17 +31,23 @@ export async function mutateJsonStateFile<T>(
         payload = parsed as Record<string, unknown>
       }
     } catch (error) {
-      if (!(error instanceof Error && 'code' in error && error.code === 'ENOENT')) throw error
+      if (error instanceof Error && 'code' in error && error.code === 'ENOENT') {
+        // A missing state file starts from an empty object.
+      } else {
+        try {
+          const backup = JSON.parse(await readFile(`${statePath}.bak`, 'utf8')) as unknown
+          if (!backup || typeof backup !== 'object' || Array.isArray(backup)) throw error
+          payload = backup as Record<string, unknown>
+        } catch {
+          throw error
+        }
+      }
     }
 
     const result = await update(payload)
-    const tempPath = join(dirname(statePath), `.${basename(statePath)}.${process.pid}.${randomUUID()}.tmp`)
-    try {
-      await writeFile(tempPath, JSON.stringify(payload), { encoding: 'utf8', mode: 0o600 })
-      await rename(tempPath, statePath)
-    } finally {
-      await rm(tempPath, { force: true }).catch(() => {})
-    }
+    const serialized = JSON.stringify(payload)
+    await replaceFileDurably(`${statePath}.bak`, serialized)
+    await replaceFileDurably(statePath, serialized)
     return result
   } finally {
     try {
@@ -52,6 +58,29 @@ export async function mutateJsonStateFile<T>(
     } catch {
       // Never remove a lock whose ownership cannot be proven.
     }
+  }
+}
+
+async function replaceFileDurably(path: string, contents: string): Promise<void> {
+  const directory = dirname(path)
+  const tempPath = join(directory, `.${basename(path)}.${process.pid}.${randomUUID()}.tmp`)
+  try {
+    const file = await open(tempPath, 'w', 0o600)
+    try {
+      await file.writeFile(contents, { encoding: 'utf8' })
+      await file.sync()
+    } finally {
+      await file.close()
+    }
+    await rename(tempPath, path)
+    const directoryHandle = await open(directory, 'r')
+    try {
+      await directoryHandle.sync()
+    } finally {
+      await directoryHandle.close()
+    }
+  } finally {
+    await rm(tempPath, { force: true }).catch(() => {})
   }
 }
 

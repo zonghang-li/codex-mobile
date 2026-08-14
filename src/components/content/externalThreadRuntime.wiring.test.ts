@@ -4,14 +4,20 @@ import { describe, expect, it } from 'vitest'
 describe('external thread runtime read-only wiring', () => {
   it('passes runtime ownership from App to the selected-thread composer and queue', async () => {
     const appSource = await readFile(new URL('../../App.vue', import.meta.url), 'utf8')
+    const sidebarSource = await readFile(new URL('../sidebar/SidebarThreadTree.vue', import.meta.url), 'utf8')
 
     expect(appSource).toContain(':runtime-ownership="selectedThreadRuntimeOwnership"')
+    expect(appSource).toContain(':externally-owned-thread-ids="externallyOwnedThreadIds"')
     expect(appSource).toContain(':disabled="selectedThreadRuntimeOwnership === \'external\'"')
     expect(appSource).toContain(':steer-disabled-message-ids="selectedThreadQueuedSteerDisabledMessageIds"')
     expect(appSource).toContain('const selectedThreadQueuedSteerDisabledMessageIds = computed(() => {')
     expect(appSource).toContain('return selectedThreadQueuedMessages.value.map((message) => message.id)')
     expect(appSource).toContain(':read-only="selectedThreadRuntimeOwnership === \'external\'"')
     expect(appSource).toMatch(/function onEditQueuedMessage\(messageId: string\): void \{\n  if \(selectedThreadRuntimeOwnership\.value === 'external'\) return/u)
+    expect(sidebarSource).toContain('externallyOwnedThreadIds: string[]')
+    expect(sidebarSource).toMatch(/function onForkThread\(threadId: string\): void \{\n  if \(isThreadExternallyOwned\(threadId\)\) return/u)
+    expect(sidebarSource).toMatch(/function openRenameThreadDialog\(threadId: string, currentTitle: string\): void \{\n  if \(isThreadExternallyOwned\(threadId\)\) return/u)
+    expect(sidebarSource).toMatch(/function openDeleteThreadDialog\(threadId: string, currentTitle: string\): void \{\n  if \(isThreadExternallyOwned\(threadId\)\) return/u)
   })
 
   it('hides conversation mutations and disables pending responses while externally owned', async () => {
@@ -39,7 +45,7 @@ describe('external thread runtime read-only wiring', () => {
     expect(pendingRequestSource).toContain('Approve for me')
   })
 
-  it('keeps externally owned transcript mutations read-only while composer input can queue or stop', async () => {
+  it('keeps externally owned transcript mutations read-only while preserving the complete queued payload', async () => {
     const composerSource = await readFile(new URL('./ThreadComposer.vue', import.meta.url), 'utf8')
 
     expect(composerSource).toContain('runtimeOwnership?: ThreadRuntimeOwnership')
@@ -52,10 +58,10 @@ describe('external thread runtime read-only wiring', () => {
     expect(composerSource).toMatch(/class="thread-composer-file-chip-remove"[\s\S]*?:disabled="isAttachmentControlDisabled"/u)
     expect(composerSource).toMatch(/class="thread-composer-skill-chip-name"[\s\S]*?:disabled="isAttachmentControlDisabled"/u)
     expect(composerSource).toMatch(/class="thread-composer-skill-chip-remove"[\s\S]*?:disabled="isAttachmentControlDisabled"/u)
-    expect(composerSource).toMatch(/const canSubmit = computed\(\(\) => \{[\s\S]*?if \(isExternallyOwned\.value\) return draft\.value\.trim\(\)\.length > 0/u)
-    expect(composerSource).toContain('const imageUrls = isExternallyOwned.value ? [] : selectedImages.value.map(toSelectedImageUrl)')
-    expect(composerSource).toContain('const submitFileAttachments = isExternallyOwned.value ? [] : [...fileAttachments.value]')
-    expect(composerSource).toContain('const submitSkills = isExternallyOwned.value ? [] : selectedSkills.value.map((s) => ({ name: s.name, path: s.path }))')
+    expect(composerSource).not.toMatch(/if \(isExternallyOwned\.value\) return draft\.value\.trim\(\)\.length > 0/u)
+    expect(composerSource).toContain('const imageUrls = selectedImages.value.map(toSelectedImageUrl)')
+    expect(composerSource).toContain('const submitFileAttachments = [...fileAttachments.value]')
+    expect(composerSource).toContain('const submitSkills = selectedSkills.value.map((s) => ({ name: s.name, path: s.path }))')
     expect(composerSource).toMatch(/function triggerPhotoLibrary\(\): void \{\n  if \(isAttachmentControlDisabled\.value\) return/u)
     expect(composerSource).toMatch(/function removeImage\(id: string\): void \{\n  if \(isAttachmentControlDisabled\.value\) return/u)
     expect(composerSource).toMatch(/function removeFileAttachment\(fsPath: string\): void \{\n  if \(isAttachmentControlDisabled\.value\) return/u)
@@ -68,7 +74,7 @@ describe('external thread runtime read-only wiring', () => {
     expect(composerSource).toMatch(/fileMentionDebounceTimer = setTimeout\(async \(\) => \{\n    if \(isAttachmentControlDisabled\.value\) \{/u)
     expect(composerSource).toContain('fileAttachments.value = []')
     expect(composerSource).toContain('selectedSkills.value = []')
-    expect(composerSource).toMatch(/if \(isExternallyOwned\.value\) invalidatePendingAttachments\(\)/u)
+    expect(composerSource).not.toMatch(/if \(isExternallyOwned\.value\) invalidatePendingAttachments\(\)/u)
     expect(composerSource).not.toContain("primaryAction === 'externalRunning'")
     expect(composerSource).not.toMatch(/function onSubmit\(mode: 'steer' \| 'queue' = 'steer'\): void \{\n  if \(isExternallyOwned\.value\) return/u)
     expect(composerSource).not.toMatch(/function onInterrupt\(\): void \{\n  if \(isExternallyOwned\.value\) return/u)

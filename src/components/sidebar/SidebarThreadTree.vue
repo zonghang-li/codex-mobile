@@ -35,6 +35,7 @@
               <span class="thread-left-stack">
                 <span v-if="shouldShowThreadIndicator(thread)" class="thread-status-indicator" :data-state="getThreadState(thread)" />
                 <button
+                  v-if="!isThreadExternallyOwned(thread.id)"
                   class="thread-delete-button"
                   type="button"
                   :data-confirming="isInlineDeleteConfirming(thread.id)"
@@ -202,6 +203,7 @@
                 :data-state="getThreadState(thread)"
               />
               <button
+                v-if="!isThreadExternallyOwned(thread.id)"
                 class="thread-delete-button"
                 type="button"
                 :data-confirming="isInlineDeleteConfirming(thread.id)"
@@ -406,6 +408,7 @@
                       :data-state="getThreadState(thread)"
                     />
                     <button
+                      v-if="!isThreadExternallyOwned(thread.id)"
                       class="thread-delete-button"
                       type="button"
                       :data-confirming="isInlineDeleteConfirming(thread.id)"
@@ -534,6 +537,7 @@
                   :data-state="getThreadState(thread)"
                 />
                 <button
+                  v-if="!isThreadExternallyOwned(thread.id)"
                   class="thread-delete-button"
                   type="button"
                   :data-confirming="isInlineDeleteConfirming(thread.id)"
@@ -629,16 +633,16 @@
         >
           Copy chat
         </button>
-        <button class="thread-menu-item" type="button" @click="onForkThread(openThreadMenuThread.id)">
+        <button v-if="!isThreadExternallyOwned(openThreadMenuThread.id)" class="thread-menu-item" type="button" @click="onForkThread(openThreadMenuThread.id)">
           Create chat fork
         </button>
         <button class="thread-menu-item" type="button" @click="onTogglePinFromMenu(openThreadMenuThread.id)">
           {{ isPinned(openThreadMenuThread.id) ? 'Unpin thread' : 'Pin thread' }}
         </button>
-        <button class="thread-menu-item" type="button" @click="openRenameThreadDialog(openThreadMenuThread.id, openThreadMenuThread.title)">
+        <button v-if="!isThreadExternallyOwned(openThreadMenuThread.id)" class="thread-menu-item" type="button" @click="openRenameThreadDialog(openThreadMenuThread.id, openThreadMenuThread.title)">
           {{ t('Rename thread') }}
         </button>
-        <button class="thread-menu-item thread-menu-item-danger" type="button" @click="openDeleteThreadDialog(openThreadMenuThread.id, openThreadMenuThread.title)">
+        <button v-if="!isThreadExternallyOwned(openThreadMenuThread.id)" class="thread-menu-item thread-menu-item-danger" type="button" @click="openDeleteThreadDialog(openThreadMenuThread.id, openThreadMenuThread.title)">
           {{ t('Delete thread') }}
         </button>
       </div>
@@ -913,10 +917,15 @@ const props = defineProps<{
   isThreadListFullyLoaded: boolean
   searchQuery: string
   searchMatchedThreadIds: string[] | null
+  externallyOwnedThreadIds: string[]
 }>()
 
 const { t } = useUiLanguage()
 const { recordVisibleFailure } = useFeedbackDiagnostics()
+
+function isThreadExternallyOwned(threadId: string): boolean {
+  return props.externallyOwnedThreadIds.includes(threadId)
+}
 
 const emit = defineEmits<{
   select: [threadId: string]
@@ -1716,6 +1725,7 @@ function onCopyThreadChat(threadId: string): void {
 }
 
 function onForkThread(threadId: string): void {
+  if (isThreadExternallyOwned(threadId)) return
   emit('fork-thread', threadId)
   closeThreadMenu()
 }
@@ -1803,6 +1813,7 @@ function onThreadRowContextMenu(event: MouseEvent, threadId: string): void {
 }
 
 function openRenameThreadDialog(threadId: string, currentTitle: string): void {
+  if (isThreadExternallyOwned(threadId)) return
   renameThreadDialogThreadId.value = threadId
   renameThreadDraft.value = currentTitle
   renameThreadDialogVisible.value = true
@@ -1828,6 +1839,7 @@ function submitRenameThread(): void {
 }
 
 function openDeleteThreadDialog(threadId: string, currentTitle: string): void {
+  if (isThreadExternallyOwned(threadId)) return
   inlineDeleteConfirmThreadId.value = ''
   deleteThreadDialogThreadId.value = threadId
   deleteThreadTitle.value = currentTitle
@@ -1853,6 +1865,7 @@ function isInlineDeleteConfirming(threadId: string): boolean {
 }
 
 function onInlineDeleteClick(threadId: string): void {
+  if (isThreadExternallyOwned(threadId)) return
   if (inlineDeleteConfirmThreadId.value !== threadId) {
     inlineDeleteConfirmThreadId.value = threadId
     closeThreadMenu()
@@ -1864,6 +1877,7 @@ function onInlineDeleteClick(threadId: string): void {
 }
 
 function deleteThreadById(threadId: string): void {
+  if (isThreadExternallyOwned(threadId)) return
   if (!optimisticallyArchivedThreadIdSet.value.has(threadId)) {
     optimisticallyArchivedThreadIds.value = [threadId, ...optimisticallyArchivedThreadIds.value]
   }

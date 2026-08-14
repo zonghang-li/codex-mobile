@@ -309,9 +309,24 @@ const THREAD_LIST_PERSISTED_CACHE_MAX_AGE_MS = 6 * 60 * 60 * 1000
 const THREAD_LIST_PREWARM_DELAY_MS = 50
 const THREAD_METHODS_WITH_TURNS = new Set(['thread/read', 'thread/resume', 'thread/fork', 'thread/rollback'])
 const THREAD_METHODS_WITH_THREAD_SNAPSHOT = new Set([...THREAD_METHODS_WITH_TURNS, 'thread/start'])
+const THREAD_WRITER_METHODS_REQUIRING_IDLE = new Set([
+  'thread/archive',
+  'thread/unarchive',
+  'thread/fork',
+  'thread/rollback',
+  'thread/name/set',
+  'thread/goal/set',
+  'thread/goal/clear',
+  'thread/start-turn',
+  'turn/interrupt',
+  'turn/start',
+])
+const ARCHIVED_THREAD_BLOCKED_METHODS = new Set([
+  ...THREAD_WRITER_METHODS_REQUIRING_IDLE,
+  'thread/read',
+  'thread/resume',
+])
 const THREAD_SEARCH_FULL_TEXT_THREAD_LIMIT = 100
-const MOBILE_APPROVAL_POLICY = 'never'
-const MOBILE_TURN_SANDBOX_POLICY = { type: 'dangerFullAccess' } as const
 const PROJECTLESS_THREAD_DIRECTORY_MAX_ATTEMPTS = 100
 const PROJECTLESS_THREAD_READABLE_DIRECTORY_ATTEMPTS = 20
 const PROJECTLESS_THREAD_SLUG_MAX_LENGTH = 80
@@ -2999,6 +3014,18 @@ function sqlString(value: string): string {
   return `'${value.replace(/'/g, "''")}'`
 }
 
+function isStateDbThreadArchived(threadId: string): boolean {
+  const normalizedThreadId = threadId.trim()
+  if (!normalizedThreadId) return false
+  const stateDbPath = join(getCodexHomeDir(), 'state_5.sqlite')
+  if (!existsSync(stateDbPath)) return false
+  const result = spawnSync('sqlite3', [
+    stateDbPath,
+    `SELECT archived FROM threads WHERE id = ${sqlString(normalizedThreadId)} LIMIT 1;`,
+  ], { encoding: 'utf8' })
+  return result.status === 0 && result.stdout.trim() === '1'
+}
+
 function ensureImportedThreadsStateDbTable(stateDbPath: string): boolean {
   const sql = `
 CREATE TABLE IF NOT EXISTS threads (
@@ -3949,6 +3976,17 @@ export async function callRpcWithArchiveRecovery(
 ): Promise<unknown> {
   const paramsRecord = asRecord(params)
   const threadId = readNonEmptyString(paramsRecord?.threadId)
+  if (threadId && runtimeProbe && THREAD_WRITER_METHODS_REQUIRING_IDLE.has(method)) {
+    const inspection = await inspectThreadWriter(appServer, runtimeProbe, excludedPid, threadId)
+    const allowsUnmaterializedFirstTurn = method === 'turn/start'
+      && options.locallyCreatedFirstTurn === true
+      && inspection.state === 'unmaterialized'
+    if (inspection.state !== 'idle' && !allowsUnmaterializedFirstTurn) {
+      const error = new Error('Cannot mutate a task because writer ownership is not idle.')
+      error.name = 'ThreadWriterOwnershipConflictError'
+      throw error
+    }
+  }
   if (method === 'thread/resume' && threadId && runtimeProbe) {
     const guard = await guardThreadResumeAgainstExternalWriter(
       appServer,
@@ -7760,6 +7798,7 @@ const THREAD_QUEUE_CHANGED_REVISIONS_KEY = 'thread-queue-changed-revisions'
 const THREAD_ACTIVE_MANAGED_MESSAGES_KEY = 'thread-active-managed-messages'
 const THREAD_START_CLAIMS_KEY = 'thread-start-claims'
 const THREAD_QUEUE_RECEIPT_LIMIT = 2048
+const THREAD_QUEUE_CHANGED_REVISION_LIMIT = 2048
 const THREAD_QUEUE_DEPENDENCY_WAIT_MS = 30_000
 const threadQueueRevisionListeners = new Set<(event: { threadIds: string[]; revision: number }) => void>()
 const threadQueueWriterId = randomUUID()
@@ -7831,6 +7870,19 @@ type ThreadStartClaimState = Record<string, {
 type ResolvedCollaborationModeSettings = {
   model: string
   reasoningEffort: ReasoningEffort | null
+}
+
+function readQueuedTurnApprovalPolicy(): 'never' | 'on-request' | 'on-failure' | 'untrusted' {
+  const value = process.env.CODEXUI_APPROVAL_POLICY?.trim()
+  if (value === 'on-request' || value === 'on-failure' || value === 'untrusted') return value
+  return 'never'
+}
+
+function readQueuedTurnSandboxPolicy(): Record<string, unknown> {
+  const value = process.env.CODEXUI_SANDBOX_MODE?.trim()
+  if (value === 'workspace-write') return { type: 'workspaceWrite' }
+  if (value === 'read-only') return { type: 'readOnly' }
+  return { type: 'dangerFullAccess' }
 }
 
 function normalizeStoredQueuedMessage(value: unknown): StoredQueuedMessage | null {
@@ -8034,7 +8086,7 @@ function pruneThreadQueueReceipts(
   const protectedKeys = new Set<string>()
   for (const [threadId, messages] of Object.entries(state)) {
     for (const message of messages) {
-      for (const messageId of [message.id, message.queueAfterId, message.queueBeforeId]) {
+      for (const messageId of [message.queueAfterId, message.queueBeforeId]) {
         if (messageId) protectedKeys.add(`${threadId}\u0000${messageId}`)
       }
     }
@@ -8042,7 +8094,7 @@ function pruneThreadQueueReceipts(
   const normalized = normalizeThreadQueueReceipts(receipts)
   const protectedReceipts = normalized.filter((receipt) => (
     protectedKeys.has(`${receipt.threadId}\u0000${receipt.messageId}`)
-  ))
+  )).slice(-THREAD_QUEUE_RECEIPT_LIMIT)
   const remaining = Math.max(0, THREAD_QUEUE_RECEIPT_LIMIT - protectedReceipts.length)
   const recentReceipts = remaining === 0
     ? []
@@ -8051,6 +8103,16 @@ function pruneThreadQueueReceipts(
         .sort((left, right) => (left.acceptedAtMs ?? 0) - (right.acceptedAtMs ?? 0))
         .slice(-remaining)
   return [...recentReceipts, ...protectedReceipts]
+}
+
+function pruneThreadQueueChangedRevisions(
+  changedRevisions: ThreadQueueChangedRevisionState,
+): ThreadQueueChangedRevisionState {
+  return Object.fromEntries(
+    Object.entries(changedRevisions)
+      .sort((left, right) => right[1].revision - left[1].revision)
+      .slice(0, THREAD_QUEUE_CHANGED_REVISION_LIMIT),
+  )
 }
 
 function isManagedQueuedImageUrl(value: string): boolean {
@@ -8188,7 +8250,7 @@ async function withThreadQueueStateUpdate<T>(
       for (const threadId of changedThreadIds) {
         changedRevisions[threadId] = { revision: nextRevision, writerId: threadQueueWriterId }
       }
-      payload[THREAD_QUEUE_CHANGED_REVISIONS_KEY] = changedRevisions
+      payload[THREAD_QUEUE_CHANGED_REVISIONS_KEY] = pruneThreadQueueChangedRevisions(changedRevisions)
       payload[THREAD_QUEUE_CHANGED_THREAD_IDS_KEY] = changedThreadIds
       payload[THREAD_QUEUE_WRITER_ID_KEY] = threadQueueWriterId
     }
@@ -10454,6 +10516,7 @@ export class BackendQueueProcessor {
       void this.processThreadQueue(threadId)
     })
     void this.scheduleAllQueuedThreads(1000)
+    void this.reconcilePersistedActiveManagedMessages()
   }
 
   dispose(): void {
@@ -10635,7 +10698,7 @@ export class BackendQueueProcessor {
 
     const rolloutPath = readNonEmptyString(thread.path)
     if (!this.runtimeProbe || process.platform !== 'linux' || !rolloutPath) {
-      return { accepted: false, acceptedInProgress: false, canStart: true }
+      return { accepted: false, acceptedInProgress: false, canStart: false }
     }
 
     this.runtimeProbe.registerThread(threadId, rolloutPath)
@@ -10812,6 +10875,41 @@ export class BackendQueueProcessor {
     this.releaseManagedMessage(message)
   }
 
+  private async reconcilePersistedActiveManagedMessages(): Promise<void> {
+    let activeMessages: Record<string, StoredQueuedMessage>
+    try {
+      activeMessages = (await readThreadQueueStore()).activeManagedMessages
+    } catch {
+      return
+    }
+    for (const [threadId, message] of Object.entries(activeMessages)) {
+      if (this.disposed) return
+      try {
+        const response = asRecord(await this.appServer.rpc('thread/read', { threadId, includeTurns: true }))
+        const thread = asRecord(response?.thread)
+        const turns = Array.isArray(thread?.turns) ? thread.turns : []
+        const acceptedTurn = turns.find((rawTurn) => {
+          const turn = asRecord(rawTurn)
+          const items = Array.isArray(turn?.items) ? turn.items : []
+          return items.some((rawItem) => {
+            const item = asRecord(rawItem)
+            return readNonEmptyString(item?.clientId) === message.id
+              || readNonEmptyString(item?.client_id) === message.id
+          })
+        })
+        if (!acceptedTurn) continue
+        if (readThreadResultInProgress({ turns: [acceptedTurn] })) {
+          this.activeManagedMessagesByThreadId.set(threadId, message)
+          continue
+        }
+        const released = await this.deactivateManagedMessage(threadId, message)
+        if (released) this.releaseManagedMessage(released)
+      } catch {
+        // Ambiguous recovery remains protected until a later completion or restart.
+      }
+    }
+  }
+
   private async reconcileAcceptedManagedMessage(
     threadId: string,
     message: StoredQueuedMessage,
@@ -10903,8 +11001,8 @@ export class BackendQueueProcessor {
       threadId: turn.threadId,
       clientUserMessageId: turn.message.id,
       input,
-      approvalPolicy: MOBILE_APPROVAL_POLICY,
-      sandboxPolicy: MOBILE_TURN_SANDBOX_POLICY,
+      approvalPolicy: readQueuedTurnApprovalPolicy(),
+      sandboxPolicy: readQueuedTurnSandboxPolicy(),
     }
     const queuedModel = (turn.message.model ?? '').trim()
     const queuedEffort = turn.message.effort ?? ''
@@ -10942,6 +11040,7 @@ export class BackendQueueProcessor {
       if (!currentState.canStart) {
         throw new Error('Cannot start a queued turn while another turn is active.')
       }
+      const params = await this.buildQueuedTurnParams(turn)
       if (this.runtimeProbe) {
         const guard = await guardThreadResumeAgainstExternalWriter(
           this.appServer,
@@ -10953,7 +11052,6 @@ export class BackendQueueProcessor {
           throw new Error('Cannot resume a task owned by another app-server process.')
         }
       }
-      const params = await this.buildQueuedTurnParams(turn)
       await this.appServer.rpc('thread/resume', { threadId: turn.threadId })
       if (!(await this.markQueuedTurnAttempted(turn))) {
         throw new Error('Queued turn claim was lost before turn/start.')
@@ -10961,6 +11059,11 @@ export class BackendQueueProcessor {
       if (managedMessage) {
         await this.persistActiveManagedMessage(turn.threadId, managedMessage)
         this.activeManagedMessagesByThreadId.set(turn.threadId, managedMessage)
+      }
+      const finalState = await this.inspectQueuedTurn(turn)
+      if (finalState.accepted) return
+      if (!finalState.canStart) {
+        throw new Error('Cannot start a queued turn after writer ownership changed.')
       }
       await this.appServer.rpc('turn/start', params)
     })
@@ -11940,6 +12043,15 @@ export function createCodexBridgeMiddleware(options: {
         let rpcResult: unknown
         try {
           const requestThreadId = readNonEmptyString(asRecord(preparedRpcRequest.params)?.threadId)
+          if (
+            requestThreadId
+            && ARCHIVED_THREAD_BLOCKED_METHODS.has(body.method)
+            && isStateDbThreadArchived(requestThreadId)
+          ) {
+            const archivedError = new Error('Cannot operate on an archived task.')
+            archivedError.name = 'ArchivedThreadConflictError'
+            throw archivedError
+          }
           const threadListCacheKey = body.method === 'thread/list'
             ? buildThreadListRpcCacheKey(preparedRpcRequest.params)
             : null
@@ -11993,20 +12105,6 @@ export function createCodexBridgeMiddleware(options: {
             }
           } else {
             const callPreparedRpc = async () => {
-              if (body.method === 'turn/start' && requestThreadId) {
-                const inspection = await inspectThreadWriter(
-                  appServer,
-                  runtimeProbe,
-                  appServer.getPid(),
-                  requestThreadId,
-                )
-                if (
-                  inspection.state !== 'idle'
-                  && !(inspection.state === 'unmaterialized' && isPendingFirstTurn)
-                ) {
-                  throw new Error('Cannot start a turn because task writer ownership is not idle.')
-                }
-              }
               return callRpcWithArchiveRecovery(
                 appServer,
                 body.method,
@@ -14452,7 +14550,11 @@ export function createCodexBridgeMiddleware(options: {
       next()
     } catch (error) {
       const message = getErrorMessage(error, 'Unknown bridge error')
-      setJson(res, error instanceof Error && error.name === 'ThreadStartClaimConflictError' ? 409 : 502, { error: message })
+      setJson(res, error instanceof Error && (
+        error.name === 'ThreadStartClaimConflictError'
+        || error.name === 'ThreadWriterOwnershipConflictError'
+        || error.name === 'ArchivedThreadConflictError'
+      ) ? 409 : 502, { error: message })
     }
   }
 

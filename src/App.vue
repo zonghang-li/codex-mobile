@@ -84,6 +84,7 @@
           <SidebarThreadTree ref="sidebarThreadTreeRef" :groups="projectGroups" :project-display-name-by-id="projectDisplayNameById"
             :project-git-repo-by-name="projectGitRepoByName"
             :project-cwd-by-name="projectCwdByName"
+            :externally-owned-thread-ids="externallyOwnedThreadIds"
             v-if="!isSidebarCollapsed"
             :selected-thread-id="selectedThreadId" :is-loading="isLoadingThreads"
             :is-thread-list-fully-loaded="isThreadListFullyLoaded"
@@ -1450,6 +1451,7 @@ const {
   isPendingNewThreadStop,
   isSelectedThreadInterruptPending,
   selectedThreadRuntimeOwnership,
+  externallyOwnedThreadIds,
   selectedThreadCanInterrupt,
   selectedThreadRuntimeCwd,
   isUpdatingSpeedMode,

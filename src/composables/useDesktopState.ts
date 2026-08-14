@@ -2267,6 +2267,7 @@ export function useDesktopState() {
     imageUrls: string[]
     skills: Array<{ name: string; path: string }>
     fileAttachments: FileAttachment[]
+    model: string
     effort: ReasoningEffort | ''
     collaborationMode: CollaborationModeKind
     fallbackRetried: boolean
@@ -2522,6 +2523,9 @@ export function useDesktopState() {
     const threadId = selectedThreadId.value
     return threadId ? runtimeOwnershipByThreadId.value[threadId] ?? 'idle' : 'idle'
   })
+  const externallyOwnedThreadIds = computed(() => Object.entries(runtimeOwnershipByThreadId.value)
+    .filter(([, ownership]) => ownership === 'external')
+    .map(([threadId]) => threadId))
   const selectedThreadTerminalOpen = computed(() => {
     const threadId = selectedThreadId.value
     return Boolean(threadId && terminalOpenByThreadId.value[threadId] === true)
@@ -7541,9 +7545,10 @@ export function useDesktopState() {
     fileAttachments: FileAttachment[],
     collaborationModeOverride?: CollaborationModeKind,
     queueInsertIndex?: number,
+    settingsOverride?: Pick<QueuedMessage, 'collaborationMode' | 'model' | 'effort'>,
   ): QueuedMessage {
     const queue = queuedMessagesByThreadId.value[threadId] ?? []
-    const id = `q-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
+    const id = `q-${globalThis.crypto.randomUUID()}`
     const nextQueue = [...queue]
     const insertIndex = typeof queueInsertIndex === 'number'
       ? Math.max(0, Math.min(queueInsertIndex, nextQueue.length))
@@ -7556,9 +7561,10 @@ export function useDesktopState() {
       imageUrls,
       skills,
       fileAttachments,
-      collaborationMode: normalizeQueuedCollaborationMode(collaborationModeOverride),
-      model: readModelIdForThread(threadId),
-      effort: readReasoningEffortForThread(threadId),
+      collaborationMode: settingsOverride?.collaborationMode
+        ?? normalizeQueuedCollaborationMode(collaborationModeOverride),
+      model: settingsOverride?.model ?? readModelIdForThread(threadId),
+      effort: settingsOverride?.effort ?? readReasoningEffortForThread(threadId),
     }
     nextQueue.splice(insertIndex, 0, queuedMessage)
     queuedMessagesByThreadId.value = {
@@ -7706,6 +7712,7 @@ export function useDesktopState() {
     fileAttachments: FileAttachment[],
     collaborationModeOverride?: CollaborationModeKind,
     queueInsertIndex?: number,
+    settingsOverride?: Pick<QueuedMessage, 'collaborationMode' | 'model' | 'effort'>,
   ): Promise<QueuedMessage | null> {
     const queuedMessage = enqueueThreadMessage(
       threadId,
@@ -7715,6 +7722,7 @@ export function useDesktopState() {
       fileAttachments,
       collaborationModeOverride,
       queueInsertIndex,
+      settingsOverride,
     )
     setQueueAppendPending(threadId, queuedMessage.id, true)
     try {
@@ -7765,6 +7773,7 @@ export function useDesktopState() {
     fileAttachments: FileAttachment[],
     collaborationModeOverride?: CollaborationModeKind,
     queueInsertIndex?: number,
+    settingsOverride?: Pick<QueuedMessage, 'collaborationMode' | 'model' | 'effort'>,
   ): Promise<QueuedMessage | null> {
     if (!nextText.trim() && imageUrls.length === 0 && fileAttachments.length === 0) return null
     return enqueueThreadMessageDurably(
@@ -7775,6 +7784,7 @@ export function useDesktopState() {
       fileAttachments,
       collaborationModeOverride,
       queueInsertIndex,
+      settingsOverride,
     )
   }
 
@@ -8992,6 +9002,7 @@ export function useDesktopState() {
   }
 
   async function archiveThreadById(threadId: string) {
+    if (isExternallyOwned(threadId)) return
     const wasSelectedThread = selectedThreadId.value === threadId
     const nextSelectedThreadId = wasSelectedThread
       ? findAdjacentThreadId(flattenThreads(projectGroups.value), threadId)
@@ -9019,7 +9030,7 @@ export function useDesktopState() {
 
   async function renameThreadById(threadId: string, threadName: string) {
     const normalizedName = threadName.trim()
-    if (!threadId || !normalizedName) return
+    if (!threadId || !normalizedName || isExternallyOwned(threadId)) return
 
     try {
       await renameThread(threadId, normalizedName)
@@ -9033,7 +9044,7 @@ export function useDesktopState() {
 
   async function forkThreadById(threadId: string): Promise<string> {
     const sourceThreadId = threadId.trim()
-    if (!sourceThreadId) return ''
+    if (!sourceThreadId || isExternallyOwned(sourceThreadId)) return ''
 
     const sourceThread = flattenThreads(sourceGroups.value).find((row) => row.id === sourceThreadId)
     const sourceCwd = sourceThread?.cwd?.trim() ?? ''
@@ -9064,7 +9075,12 @@ export function useDesktopState() {
 
   async function forkThreadFromTurn(threadId: string, turnIndex: number): Promise<string> {
     const normalizedThreadId = threadId.trim()
-    if (!normalizedThreadId || !Number.isInteger(turnIndex) || turnIndex < 0) return ''
+    if (
+      !normalizedThreadId
+      || !Number.isInteger(turnIndex)
+      || turnIndex < 0
+      || isExternallyOwned(normalizedThreadId)
+    ) return ''
 
     if (inProgressById.value[normalizedThreadId] === true) {
       error.value = 'Finish the current turn before forking from a response.'
@@ -9284,8 +9300,9 @@ export function useDesktopState() {
             pendingTurnRequest?.imageUrls ?? imageUrls,
             pendingTurnRequest?.skills ?? skills,
             pendingTurnRequest?.fileAttachments ?? fileAttachments,
-            collaborationModeOverride,
+            pendingTurnRequest?.collaborationMode ?? collaborationModeOverride,
             queueInsertIndex,
+            pendingTurnRequest,
           )
           if (queuedMessage) {
             transferPendingTurnRequest(threadId, pendingTurnRequest)
@@ -9369,8 +9386,9 @@ export function useDesktopState() {
           pendingTurnRequest?.imageUrls ?? imageUrls,
           pendingTurnRequest?.skills ?? skills,
           pendingTurnRequest?.fileAttachments ?? fileAttachments,
-          collaborationModeOverride,
+          pendingTurnRequest?.collaborationMode ?? collaborationModeOverride,
           queueInsertIndex,
+          pendingTurnRequest,
         )
         if (queuedMessage) {
           transferPendingTurnRequest(threadId, pendingTurnRequest)
@@ -9629,6 +9647,7 @@ export function useDesktopState() {
       imageUrls: [...normalizedImageUrls],
       skills: normalizedSkills,
       fileAttachments: normalizedFileAttachments,
+      model: requestedModelId,
       effort: reasoningEffort,
       collaborationMode,
       fallbackRetried: false,
@@ -9678,6 +9697,7 @@ export function useDesktopState() {
             imageUrls: [...normalizedImageUrls],
             skills: normalizedSkills,
             fileAttachments: normalizedFileAttachments,
+            model: MODEL_FALLBACK_ID,
             effort: reasoningEffort,
             collaborationMode,
             fallbackRetried: true,
@@ -9731,7 +9751,12 @@ export function useDesktopState() {
   ): Promise<void> {
     const refreshRequestVersion = (queueRefreshRequestVersionByThreadId.get(threadId) ?? 0) + 1
     queueRefreshRequestVersionByThreadId.set(threadId, refreshRequestVersion)
-    if (queueMutationVersion !== scheduledMutationVersion) return
+    if (queueMutationVersion !== scheduledMutationVersion) {
+      if (queueRefreshRequestVersionByThreadId.get(threadId) === refreshRequestVersion) {
+        queueRefreshRequestVersionByThreadId.delete(threadId)
+      }
+      return
+    }
     if ((pendingQueueAppendMessageIdsByThreadId.get(threadId)?.size ?? 0) > 0) {
       queueRefreshDuringPendingAppendThreadIds.add(threadId)
     }
@@ -9763,6 +9788,8 @@ export function useDesktopState() {
       queueProcessingByThreadId.value = omitKey(queueProcessingByThreadId.value, threadId)
       if (pendingQueueRefreshThreadIds.delete(threadId)) {
         void processQueuedMessages(threadId)
+      } else if (queueRefreshRequestVersionByThreadId.get(threadId) === refreshRequestVersion) {
+        queueRefreshRequestVersionByThreadId.delete(threadId)
       }
     }
   }
@@ -10882,6 +10909,7 @@ export function useDesktopState() {
     projectDisplayNameById,
     selectedThread,
     selectedThreadRuntimeOwnership,
+    externallyOwnedThreadIds,
     selectedThreadCanInterrupt,
     selectedThreadRuntimeCwd,
     selectedThreadTokenUsage,
