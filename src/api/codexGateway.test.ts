@@ -17,6 +17,8 @@ import {
   getThreadTextPage,
   getThreadQueueState,
   interruptThreadTurn,
+  removeThreadQueuedMessage,
+  reorderThreadQueuedMessages,
   setThreadQueueState,
   listDirectoryComposioConnectors,
   readThreadDetailRuntime,
@@ -337,7 +339,7 @@ describe('managed uploads', () => {
     })
   })
 
-  it('sends managed queue capabilities to the volatile server handoff', async () => {
+  it('sends managed queue capabilities with a replacement base revision', async () => {
     let body = ''
     vi.stubGlobal('fetch', vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
       body = String(init?.body ?? '')
@@ -359,13 +361,51 @@ describe('managed uploads', () => {
         model: 'gpt-5.5',
         effort: 'high',
       }],
-    })
+    }, { baseRevision: 7 })
 
     expect(JSON.parse(body)).toMatchObject({
+      baseRevision: 7,
       queueState: {
         'thread-1': [expect.objectContaining({ imageUrls: [managedImageUrl] })],
       },
     })
+  })
+
+  it('uses exact PATCH operations for queue removal and reorder', async () => {
+    const requests: RequestInit[] = []
+    vi.stubGlobal('fetch', vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+      requests.push(init ?? {})
+      return new Response(JSON.stringify({ ok: true, revision: requests.length }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      })
+    }))
+
+    await removeThreadQueuedMessage('thread-1', 'queued-1', { transferManagedUploads: true })
+    await reorderThreadQueuedMessages('thread-1', ['queued-2', 'queued-1'])
+
+    expect(requests.map((request) => ({
+      method: request.method,
+      body: JSON.parse(String(request.body)),
+    }))).toEqual([
+      {
+        method: 'PATCH',
+        body: {
+          threadId: 'thread-1',
+          operation: 'remove',
+          messageId: 'queued-1',
+          transferManagedUploads: true,
+        },
+      },
+      {
+        method: 'PATCH',
+        body: {
+          threadId: 'thread-1',
+          operation: 'reorder',
+          orderedMessageIds: ['queued-2', 'queued-1'],
+        },
+      },
+    ])
   })
 
   it('appends one queued message atomically instead of replacing queue state', async () => {
@@ -438,6 +478,8 @@ describe('managed uploads', () => {
       data: {
         'thread-1': [{
           id: 'queued-revision',
+          queueAfterId: 'queued-before',
+          queueBeforeId: 'queued-after',
           text: 'revision aware',
           imageUrls: [],
           skills: [],
@@ -456,7 +498,11 @@ describe('managed uploads', () => {
     await expect(getThreadQueueSnapshot()).resolves.toMatchObject({
       revision: 17,
       state: {
-        'thread-1': [expect.objectContaining({ id: 'queued-revision' })],
+        'thread-1': [expect.objectContaining({
+          id: 'queued-revision',
+          queueAfterId: 'queued-before',
+          queueBeforeId: 'queued-after',
+        })],
       },
     })
   })

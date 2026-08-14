@@ -1,7 +1,7 @@
 import { spawn, spawnSync, type ChildProcessWithoutNullStreams } from 'node:child_process'
 import { createHash, createHmac, randomBytes, randomUUID, timingSafeEqual } from 'node:crypto'
 import { link, mkdtemp, open, readFile, readdir, rename, rm, mkdir, stat, cp, lstat, readlink, symlink, realpath, utimes, type FileHandle } from 'node:fs/promises'
-import { createReadStream, existsSync, readFileSync, statSync } from 'node:fs'
+import { createReadStream, existsSync, readFileSync, statSync, watch, type FSWatcher } from 'node:fs'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { request as httpRequest } from 'node:http'
 import { request as httpsRequest } from 'node:https'
@@ -58,6 +58,7 @@ import {
 } from './threadTextPage.js'
 import { ThreadTerminalManager } from './terminalManager.js'
 import { getSpawnInvocation } from '../utils/commandInvocation.js'
+import { mutateJsonStateFile } from '../utils/atomicJsonState.js'
 import {
   resolveCodexCommand,
   resolveRipgrepCommand,
@@ -7021,26 +7022,11 @@ async function readCodexGlobalStateSnapshot(): Promise<Record<string, unknown>> 
   return readCodexGlobalStateFile()
 }
 
-async function writeCodexGlobalStateFile(payload: Record<string, unknown>): Promise<void> {
-  const statePath = getCodexGlobalStatePath()
-  await mkdir(dirname(statePath), { recursive: true })
-  const tempPath = join(dirname(statePath), `.${basename(statePath)}.${process.pid}.${randomUUID()}.tmp`)
-  try {
-    await writeFile(tempPath, JSON.stringify(payload), { encoding: 'utf8', mode: 0o600 })
-    await rename(tempPath, statePath)
-  } finally {
-    await rm(tempPath, { force: true }).catch(() => {})
-  }
-}
-
 function updateCodexGlobalState<T>(
   update: (payload: Record<string, unknown>) => T | Promise<T>,
 ): Promise<T> {
   const run = codexGlobalStateMutationChain.catch(() => undefined).then(async () => {
-    const payload = await readCodexGlobalStateFile()
-    const result = await update(payload)
-    await writeCodexGlobalStateFile(payload)
-    return result
+    return mutateJsonStateFile(getCodexGlobalStatePath(), update)
   })
   codexGlobalStateMutationChain = run.catch(() => {})
   return run
@@ -7749,9 +7735,20 @@ const THREAD_QUEUE_STATE_KEY = 'thread-queue-state'
 const THREAD_QUEUE_RECEIPTS_KEY = 'thread-queue-receipts'
 const THREAD_QUEUE_PROCESSING_KEY = 'thread-queue-processing'
 const THREAD_QUEUE_REVISION_KEY = 'thread-queue-revision'
+const THREAD_QUEUE_CHANGED_THREAD_IDS_KEY = 'thread-queue-changed-thread-ids'
+const threadQueueRevisionListeners = new Set<(event: { threadIds: string[]; revision: number }) => void>()
+
+function subscribeThreadQueueRevisions(
+  listener: (event: { threadIds: string[]; revision: number }) => void,
+): () => void {
+  threadQueueRevisionListeners.add(listener)
+  return () => threadQueueRevisionListeners.delete(listener)
+}
 
 type StoredQueuedMessage = {
   id: string
+  queueAfterId?: string
+  queueBeforeId?: string
   text: string
   imageUrls: string[]
   skills: Array<{ name: string; path: string }>
@@ -7771,12 +7768,15 @@ type ThreadQueueReceipt = {
 type ThreadQueueProcessingState = Record<string, {
   messageId: string
   attempted: boolean
+  ownerId?: string
+  leaseExpiresAt?: number
 }>
 
 type BackendQueuedTurn = {
   threadId: string
   message: StoredQueuedMessage
   attempted: boolean
+  ownerId: string
 }
 
 type ThreadQueueStateUpdate<T> = {
@@ -7826,6 +7826,8 @@ function normalizeStoredQueuedMessage(value: unknown): StoredQueuedMessage | nul
 
   return {
     id,
+    ...(readNonEmptyString(record.queueAfterId) ? { queueAfterId: readNonEmptyString(record.queueAfterId) } : {}),
+    ...(readNonEmptyString(record.queueBeforeId) ? { queueBeforeId: readNonEmptyString(record.queueBeforeId) } : {}),
     text: typeof record.text === 'string' ? record.text : '',
     imageUrls: normalizeStringArray(record.imageUrls),
     skills: normalizeNamedPathItems(record.skills),
@@ -7834,6 +7836,42 @@ function normalizeStoredQueuedMessage(value: unknown): StoredQueuedMessage | nul
     model: readNonEmptyString(record.model),
     effort: normalizeReasoningEffort(record.effort),
   }
+}
+
+function orderQueuedMessagesByClientPosition(messages: StoredQueuedMessage[]): StoredQueuedMessage[] {
+  const byId = new Map(messages.map((message) => [message.id, message]))
+  const originalIndex = new Map(messages.map((message, index) => [message.id, index]))
+  const outgoing = new Map<string, Set<string>>()
+  const indegree = new Map(messages.map((message) => [message.id, 0]))
+  const addEdge = (from: string | undefined, to: string | undefined): void => {
+    if (!from || !to || from === to || !byId.has(from) || !byId.has(to)) return
+    const targets = outgoing.get(from) ?? new Set<string>()
+    if (targets.has(to)) return
+    targets.add(to)
+    outgoing.set(from, targets)
+    indegree.set(to, (indegree.get(to) ?? 0) + 1)
+  }
+  for (const message of messages) {
+    addEdge(message.queueAfterId, message.id)
+    addEdge(message.id, message.queueBeforeId)
+  }
+  const ready = messages
+    .filter((message) => indegree.get(message.id) === 0)
+    .sort((left, right) => (originalIndex.get(left.id) ?? 0) - (originalIndex.get(right.id) ?? 0))
+  const ordered: StoredQueuedMessage[] = []
+  while (ready.length > 0) {
+    const message = ready.shift()!
+    ordered.push(message)
+    for (const targetId of outgoing.get(message.id) ?? []) {
+      const nextIndegree = (indegree.get(targetId) ?? 0) - 1
+      indegree.set(targetId, nextIndegree)
+      if (nextIndegree === 0) {
+        ready.push(byId.get(targetId)!)
+        ready.sort((left, right) => (originalIndex.get(left.id) ?? 0) - (originalIndex.get(right.id) ?? 0))
+      }
+    }
+  }
+  return ordered.length === messages.length ? ordered : messages
 }
 
 function normalizeThreadQueueState(value: unknown): ThreadQueueState {
@@ -7881,6 +7919,10 @@ function normalizeThreadQueueProcessingState(value: unknown): ThreadQueueProcess
     processing[normalizedThreadId] = {
       messageId,
       attempted: entry?.attempted === true,
+      ...(readNonEmptyString(entry?.ownerId) ? { ownerId: readNonEmptyString(entry?.ownerId) } : {}),
+      ...(typeof entry?.leaseExpiresAt === 'number' && Number.isFinite(entry.leaseExpiresAt)
+        ? { leaseExpiresAt: entry.leaseExpiresAt }
+        : {}),
     }
   }
   return processing
@@ -7917,21 +7959,7 @@ function hasManagedQueuedCapabilities(message: StoredQueuedMessage): boolean {
 }
 
 function sanitizeThreadQueueStateForPersistence(state: ThreadQueueState): ThreadQueueState {
-  const sanitized: ThreadQueueState = {}
-  for (const [threadId, messages] of Object.entries(state)) {
-    sanitized[threadId] = messages.map((message) => ({
-      ...message,
-      imageUrls: message.imageUrls.filter((imageUrl) => !isManagedQueuedImageUrl(imageUrl)),
-      fileAttachments: message.fileAttachments
-        .filter((attachment) => !(
-          attachment.uploadHandle?.trim()
-          || attachment.path.replace(/\\/gu, '/').includes('/codex-web-uploads/')
-          || attachment.fsPath.replace(/\\/gu, '/').includes('/codex-web-uploads/')
-        ))
-        .map(({ label, path, fsPath }) => ({ label, path, fsPath })),
-    }))
-  }
-  return sanitized
+  return normalizeThreadQueueState(state)
 }
 
 function managedQueuedUploadHandles(message: StoredQueuedMessage): string[] {
@@ -7957,6 +7985,7 @@ async function readThreadQueueStore(): Promise<{
   receipts: ThreadQueueReceipt[]
   processing: ThreadQueueProcessingState
   revision: number
+  changedThreadIds: string[]
 }> {
   const payload = await readCodexGlobalStateSnapshot()
   const rawRevision = payload[THREAD_QUEUE_REVISION_KEY]
@@ -7967,6 +7996,7 @@ async function readThreadQueueStore(): Promise<{
     revision: typeof rawRevision === 'number' && Number.isSafeInteger(rawRevision) && rawRevision >= 0
       ? rawRevision
       : 0,
+    changedThreadIds: normalizeStringArray(payload[THREAD_QUEUE_CHANGED_THREAD_IDS_KEY]),
   }
 }
 
@@ -8010,7 +8040,8 @@ async function withThreadQueueStateUpdate<T>(
     revision: number,
   ) => ThreadQueueStateUpdate<T> | Promise<ThreadQueueStateUpdate<T>>,
 ): Promise<T> {
-  return updateCodexGlobalState(async (payload) => {
+  let committedEvent: { threadIds: string[]; revision: number } | null = null
+  const result = await updateCodexGlobalState(async (payload) => {
     const rawRevision = payload[THREAD_QUEUE_REVISION_KEY]
     const revision = typeof rawRevision === 'number' && Number.isSafeInteger(rawRevision) && rawRevision >= 0
       ? rawRevision
@@ -8024,16 +8055,84 @@ async function withThreadQueueStateUpdate<T>(
       nextProcessing = processing,
       result,
     } = await update(currentState, receipts, processing, revision)
-    writeThreadQueueStoreToPayload(payload, nextState, nextReceipts, nextProcessing, revision + 1)
+    const nextRevision = revision + 1
+    writeThreadQueueStoreToPayload(payload, nextState, nextReceipts, nextProcessing, nextRevision)
+    const changedThreadIds = [...new Set([...Object.keys(currentState), ...Object.keys(nextState)])]
+    payload[THREAD_QUEUE_CHANGED_THREAD_IDS_KEY] = changedThreadIds
+    committedEvent = {
+      threadIds: changedThreadIds,
+      revision: nextRevision,
+    }
     return result
+  })
+  if (committedEvent) {
+    for (const listener of threadQueueRevisionListeners) listener(committedEvent)
+  }
+  return result
+}
+
+export async function replaceThreadQueueState(
+  nextState: ThreadQueueState,
+  expectedRevision: number,
+): Promise<number> {
+  return withThreadQueueStateUpdate((_state, _receipts, _processing, revision) => {
+    if (revision !== expectedRevision) {
+      const error = new Error(`Thread queue revision changed from ${expectedRevision} to ${revision}`)
+      error.name = 'ThreadQueueRevisionConflictError'
+      throw error
+    }
+    return {
+      nextState: normalizeThreadQueueState(nextState),
+      result: revision + 1,
+    }
   })
 }
 
-async function writeThreadQueueState(nextState: ThreadQueueState): Promise<void> {
-  await withThreadQueueStateUpdate(() => ({
-    nextState: normalizeThreadQueueState(nextState),
-    result: undefined,
-  }))
+export async function removeThreadQueuedMessage(threadId: string, messageId: string): Promise<StoredQueuedMessage | null> {
+  const normalizedThreadId = threadId.trim()
+  const normalizedMessageId = messageId.trim()
+  if (!normalizedThreadId || !normalizedMessageId) return null
+  return withThreadQueueStateUpdate((state, _receipts, processing) => {
+    const queue = state[normalizedThreadId] ?? []
+    const removedMessage = queue.find((message) => message.id === normalizedMessageId) ?? null
+    const nextQueue = queue.filter((message) => message.id !== normalizedMessageId)
+    const nextState = { ...state }
+    if (nextQueue.length > 0) nextState[normalizedThreadId] = nextQueue
+    else delete nextState[normalizedThreadId]
+    const nextProcessing = { ...processing }
+    if (nextProcessing[normalizedThreadId]?.messageId === normalizedMessageId) {
+      delete nextProcessing[normalizedThreadId]
+    }
+    return { nextState, nextProcessing, result: removedMessage }
+  })
+}
+
+export async function reorderThreadQueuedMessages(threadId: string, orderedMessageIds: string[]): Promise<void> {
+  const normalizedThreadId = threadId.trim()
+  if (!normalizedThreadId) return
+  const order = new Map(normalizeStringArray(orderedMessageIds).map((messageId, index) => [messageId, index]))
+  await withThreadQueueStateUpdate((state) => {
+    const queue = state[normalizedThreadId] ?? []
+    const known = queue
+      .filter((message) => order.has(message.id))
+      .sort((left, right) => order.get(left.id)! - order.get(right.id)!)
+    const unknown = queue.filter((message) => !order.has(message.id))
+    const reordered = [...known, ...unknown].map((message, index, messages) => {
+      const { queueAfterId: _queueAfterId, queueBeforeId: _queueBeforeId, ...rest } = message
+      return {
+        ...rest,
+        ...(messages[index - 1]?.id ? { queueAfterId: messages[index - 1].id } : {}),
+        ...(messages[index + 1]?.id ? { queueBeforeId: messages[index + 1].id } : {}),
+      }
+    })
+    return {
+      nextState: {
+        ...state,
+        ...(reordered.length > 0 ? { [normalizedThreadId]: reordered } : {}),
+      },
+      result: undefined,
+    }
+  })
 }
 
 export async function appendThreadQueuedMessage(
@@ -8063,7 +8162,7 @@ export async function appendThreadQueuedMessage(
     return {
       nextState: {
         ...state,
-        [normalizedThreadId]: nextQueue,
+        [normalizedThreadId]: orderQueuedMessagesByClientPosition(nextQueue),
       },
       nextReceipts,
       result: undefined,
@@ -9946,11 +10045,13 @@ class AppServerProcess {
 }
 
 export class BackendQueueProcessor {
+  private static readonly CLAIM_LEASE_MS = 10_000
   private readonly processingThreadIds = new Set<string>()
   private readonly queueDrainTimersByThreadId = new Map<string, ReturnType<typeof setTimeout>>()
   private readonly queueDrainDueAtByThreadId = new Map<string, number>()
   private readonly runtimeQueuedMessages = new Map<string, StoredQueuedMessage>()
   private readonly activeManagedMessagesByThreadId = new Map<string, StoredQueuedMessage>()
+  private readonly claimOwnerId = randomUUID()
   private readonly unsubscribe: () => void
 
   constructor(
@@ -10012,6 +10113,19 @@ export class BackendQueueProcessor {
     this.runtimeQueuedMessages.set(this.runtimeQueueKey(threadId, message.id), message)
   }
 
+  forgetRuntimeQueuedMessage(
+    threadId: string,
+    messageId: string,
+    transferManagedUploads = false,
+    fallbackMessage?: StoredQueuedMessage | null,
+  ): void {
+    const key = this.runtimeQueueKey(threadId, messageId)
+    const message = this.runtimeQueuedMessages.get(key) ?? fallbackMessage
+    if (!message) return
+    this.runtimeQueuedMessages.delete(key)
+    if (!transferManagedUploads) this.releaseManagedMessage(message)
+  }
+
   async scheduleAllQueuedThreads(delayMs = 0): Promise<void> {
     try {
       const state = await readThreadQueueState()
@@ -10050,9 +10164,13 @@ export class BackendQueueProcessor {
     this.processingThreadIds.add(threadId)
     try {
       const next = await this.claimNextQueuedTurn(threadId)
-      if (!next) return
+      if (!next) {
+        if (await this.hasQueuedTurns(threadId)) this.scheduleThreadQueueDrain(threadId)
+        return
+      }
       const runtimeKey = this.runtimeQueueKey(threadId, next.message.id)
       const managedMessage = this.runtimeQueuedMessages.get(runtimeKey)
+        ?? (hasManagedQueuedCapabilities(next.message) ? next.message : undefined)
       if (managedMessage) {
         this.activeManagedMessagesByThreadId.set(threadId, managedMessage)
       }
@@ -10067,7 +10185,10 @@ export class BackendQueueProcessor {
         this.scheduleThreadQueueDrain(threadId)
         return
       }
-      await this.markQueuedTurnAttempted(next)
+      if (!(await this.markQueuedTurnAttempted(next))) {
+        this.scheduleThreadQueueDrain(threadId)
+        return
+      }
       try {
         await this.startQueuedTurn(next)
         await this.finalizeQueuedTurn(next)
@@ -10129,7 +10250,7 @@ export class BackendQueueProcessor {
   }
 
   private async claimNextQueuedTurn(threadId: string): Promise<BackendQueuedTurn | null> {
-    return withThreadQueueStateUpdate((state, _receipts, processing) => {
+    return withThreadQueueStateUpdate((state, receipts, processing) => {
       const queue = state[threadId]
       if (!queue || queue.length === 0) {
         const nextProcessing = { ...processing }
@@ -10137,6 +10258,13 @@ export class BackendQueueProcessor {
         return { nextState: state, nextProcessing, result: null }
       }
       const existing = processing[threadId]
+      if (
+        existing?.ownerId
+        && existing.ownerId !== this.claimOwnerId
+        && (existing.leaseExpiresAt ?? 0) > Date.now()
+      ) {
+        return { nextState: state, result: null }
+      }
       const message = existing
         ? queue.find((queuedMessage) => queuedMessage.id === existing.messageId)
         : queue[0]
@@ -10145,13 +10273,23 @@ export class BackendQueueProcessor {
         delete nextProcessing[threadId]
         return { nextState: state, nextProcessing, result: null }
       }
+      if (
+        !existing
+        && message.queueAfterId
+        && !hasThreadQueueReceipt(receipts, threadId, message.queueAfterId)
+      ) {
+        return { nextState: state, result: null }
+      }
       const runtimeMessage = this.runtimeQueuedMessages.get(this.runtimeQueueKey(threadId, message.id))
-      const nextProcessing = existing
-        ? processing
-        : {
-            ...processing,
-            [threadId]: { messageId: message.id, attempted: false },
-          }
+      const nextProcessing = {
+        ...processing,
+        [threadId]: {
+          messageId: message.id,
+          attempted: existing?.attempted === true,
+          ownerId: this.claimOwnerId,
+          leaseExpiresAt: Date.now() + BackendQueueProcessor.CLAIM_LEASE_MS,
+        },
+      }
       return {
         nextState: state,
         nextProcessing,
@@ -10159,24 +10297,49 @@ export class BackendQueueProcessor {
           threadId,
           message: runtimeMessage ?? message,
           attempted: existing?.attempted === true,
+          ownerId: this.claimOwnerId,
         },
       }
     })
   }
 
-  private async markQueuedTurnAttempted(turn: BackendQueuedTurn): Promise<void> {
-    await withThreadQueueStateUpdate((state, _receipts, processing) => {
+  private async markQueuedTurnAttempted(turn: BackendQueuedTurn): Promise<boolean> {
+    return withThreadQueueStateUpdate((state, _receipts, processing) => {
       const current = processing[turn.threadId]
-      if (current?.messageId !== turn.message.id || current.attempted) {
-        return { nextState: state, result: undefined }
+      if (current?.messageId !== turn.message.id || current.ownerId !== turn.ownerId) {
+        return { nextState: state, result: false }
       }
       return {
         nextState: state,
         nextProcessing: {
           ...processing,
-          [turn.threadId]: { ...current, attempted: true },
+          [turn.threadId]: {
+            ...current,
+            attempted: true,
+            leaseExpiresAt: Date.now() + BackendQueueProcessor.CLAIM_LEASE_MS,
+          },
         },
-        result: undefined,
+        result: true,
+      }
+    })
+  }
+
+  private async renewQueuedTurnClaim(turn: BackendQueuedTurn): Promise<boolean> {
+    return withThreadQueueStateUpdate((state, _receipts, processing) => {
+      const current = processing[turn.threadId]
+      if (current?.messageId !== turn.message.id || current.ownerId !== turn.ownerId) {
+        return { nextState: state, result: false }
+      }
+      return {
+        nextState: state,
+        nextProcessing: {
+          ...processing,
+          [turn.threadId]: {
+            ...current,
+            leaseExpiresAt: Date.now() + BackendQueueProcessor.CLAIM_LEASE_MS,
+          },
+        },
+        result: true,
       }
     })
   }
@@ -10189,7 +10352,10 @@ export class BackendQueueProcessor {
       if (nextQueue.length > 0) nextState[turn.threadId] = nextQueue
       else delete nextState[turn.threadId]
       const nextProcessing = { ...processing }
-      if (nextProcessing[turn.threadId]?.messageId === turn.message.id) {
+      if (
+        nextProcessing[turn.threadId]?.messageId === turn.message.id
+        && nextProcessing[turn.threadId]?.ownerId === turn.ownerId
+      ) {
         delete nextProcessing[turn.threadId]
       }
       return { nextState, nextProcessing, result: undefined }
@@ -10332,6 +10498,9 @@ export class BackendQueueProcessor {
       }
     }
     await this.appServer.rpc('thread/resume', { threadId: turn.threadId })
+    if (!(await this.renewQueuedTurnClaim(turn))) {
+      throw new Error('Queued turn claim was lost before turn/start.')
+    }
     await this.appServer.rpc('turn/start', await this.buildQueuedTurnParams(turn))
   }
 }
@@ -10466,10 +10635,26 @@ type SharedBridgeState = {
   backendQueueProcessor: BackendQueueProcessor
   runtimeProbe: ExternalThreadRuntimeProbe
   localRuntimeLedger: LocalThreadRuntimeLedger
+  queueStateWatcher: FSWatcher | null
 }
 
 const SHARED_BRIDGE_KEY = '__codexRemoteSharedBridge__'
-const SHARED_BRIDGE_VERSION = 'experimental-api-v4-unified-runtime'
+const SHARED_BRIDGE_VERSION = 'experimental-api-v5-durable-queue'
+
+function watchThreadQueueStateFile(): FSWatcher | null {
+  const statePath = getCodexGlobalStatePath()
+  try {
+    return watch(dirname(statePath), { persistent: false }, (_eventType, fileName) => {
+      if (fileName !== null && String(fileName) !== basename(statePath)) return
+      void readThreadQueueStore().then(({ changedThreadIds, revision }) => {
+        const event = { threadIds: changedThreadIds, revision }
+        for (const listener of threadQueueRevisionListeners) listener(event)
+      }).catch(() => {})
+    })
+  } catch {
+    return null
+  }
+}
 
 function getSharedBridgeState(): SharedBridgeState {
   const globalScope = globalThis as typeof globalThis & {
@@ -10485,6 +10670,7 @@ function getSharedBridgeState(): SharedBridgeState {
     existing.backendQueueProcessor?.dispose()
     existing.terminalManager?.dispose()
     existing.runtimeProbe?.clear()
+    existing.queueStateWatcher?.close()
   }
 
   const localRuntimeLedger = new LocalThreadRuntimeLedger()
@@ -10502,6 +10688,7 @@ function getSharedBridgeState(): SharedBridgeState {
     backendQueueProcessor,
     runtimeProbe,
     localRuntimeLedger,
+    queueStateWatcher: watchThreadQueueStateFile(),
     telegramBridge: new TelegramThreadBridge(appServer, {
       onChatSeen: (chatId) => {
         void rememberTelegramChatId(chatId).catch(() => {})
@@ -13146,11 +13333,59 @@ export function createCodexBridgeMiddleware(options: {
         }
         const queueStateRecord = asRecord(record.queueState) ?? record
         const runtimeState = normalizeThreadQueueState(queueStateRecord)
+        const baseRevision = typeof record.baseRevision === 'number' && Number.isSafeInteger(record.baseRevision)
+          ? record.baseRevision
+          : null
+        if (baseRevision === null || baseRevision < 0) {
+          setJson(res, 400, { error: 'Missing valid baseRevision' })
+          return
+        }
         const transferManagedMessageIds = new Set(normalizeStringArray(record.transferManagedMessageIds))
+        let revision: number
+        try {
+          revision = await replaceThreadQueueState(runtimeState, baseRevision)
+        } catch (error) {
+          if (error instanceof Error && error.name === 'ThreadQueueRevisionConflictError') {
+            setJson(res, 409, { error: error.message })
+            return
+          }
+          throw error
+        }
         backendQueueProcessor.replaceRuntimeQueueState(runtimeState, transferManagedMessageIds)
-        await writeThreadQueueState(runtimeState)
         void backendQueueProcessor.scheduleAllQueuedThreads()
-        setJson(res, 200, { ok: true })
+        setJson(res, 200, { ok: true, revision })
+        return
+      }
+
+      if (req.method === 'PATCH' && url.pathname === '/codex-api/thread-queue-state') {
+        const record = asRecord(await readJsonBody(req))
+        const threadId = readNonEmptyString(record?.threadId)
+        const operation = readNonEmptyString(record?.operation)
+        if (!threadId || !operation) {
+          setJson(res, 400, { error: 'Missing threadId or operation' })
+          return
+        }
+        if (operation === 'remove') {
+          const messageId = readNonEmptyString(record?.messageId)
+          if (!messageId) {
+            setJson(res, 400, { error: 'Missing messageId' })
+            return
+          }
+          const removedMessage = await removeThreadQueuedMessage(threadId, messageId)
+          backendQueueProcessor.forgetRuntimeQueuedMessage(
+            threadId,
+            messageId,
+            record?.transferManagedUploads === true,
+            removedMessage,
+          )
+        } else if (operation === 'reorder') {
+          await reorderThreadQueuedMessages(threadId, normalizeStringArray(record?.orderedMessageIds))
+        } else {
+          setJson(res, 400, { error: 'Unsupported queue operation' })
+          return
+        }
+        const { revision } = await readThreadQueueStore()
+        setJson(res, 200, { ok: true, revision })
         return
       }
 
@@ -13719,6 +13954,7 @@ export function createCodexBridgeMiddleware(options: {
     terminalManager.dispose()
     backendQueueProcessor.dispose()
     runtimeProbe.clear()
+    sharedBridgeState.queueStateWatcher?.close()
     appServer.dispose()
   }
   middleware.subscribeNotifications = (
@@ -13736,9 +13972,17 @@ export function createCodexBridgeMiddleware(options: {
         atIso: new Date().toISOString(),
       })
     })
+    const unsubscribeQueue = subscribeThreadQueueRevisions((event) => {
+      listener({
+        method: 'thread/queue/updated',
+        params: event,
+        atIso: new Date().toISOString(),
+      })
+    })
     return () => {
       unsubscribeAppServer()
       unsubscribeTerminal()
+      unsubscribeQueue()
     }
   }
   middleware.readThreadForNotifier = async (threadId: string) => {

@@ -21,6 +21,8 @@ import {
   interruptThreadTurn,
   pickCodexRateLimitSnapshot,
   replyToServerRequest,
+  removeThreadQueuedMessage as removeThreadQueuedMessageFromServer,
+  reorderThreadQueuedMessages as reorderThreadQueuedMessagesOnServer,
   revertThreadFileChanges,
   rollbackThread,
   getThreadGroupsPage,
@@ -29,7 +31,6 @@ import {
   getWorkspaceRootsState,
   setCodexSpeedMode,
   setThreadGoal,
-  setThreadQueueState,
   setWorkspaceRootsState,
   getThreadTitleCache,
   persistThreadTitle,
@@ -2239,6 +2240,8 @@ export function useDesktopState() {
   type FileAttachment = { label: string; path: string; fsPath: string; uploadHandle?: string }
   type QueuedMessage = {
     id: string
+    queueAfterId?: string
+    queueBeforeId?: string
     text: string
     imageUrls: string[]
     skills: Array<{ name: string; path: string }>
@@ -2279,6 +2282,7 @@ export function useDesktopState() {
   const pendingQueueRefreshThreadIds = new Set<string>()
   const pendingQueueAppendMessageIdsByThreadId = new Map<string, Set<string>>()
   const queueRefreshDuringPendingAppendThreadIds = new Set<string>()
+  const queuePositionRepairThreadIds = new Set<string>()
   let hasLoadedPersistedQueueState = false
   let queueMutationVersion = 0
   let queueRefreshRequestVersion = 0
@@ -3769,7 +3773,7 @@ export function useDesktopState() {
     const nextQueuedMessages = pruneThreadStateMap(queuedMessagesByThreadId.value, activeThreadIds)
     if (nextQueuedMessages !== queuedMessagesByThreadId.value) {
       queuedMessagesByThreadId.value = nextQueuedMessages
-      persistQueueState()
+      queueMutationVersion += 1
     }
     threadTokenUsageByThreadId.value = pruneThreadStateMap(threadTokenUsageByThreadId.value, activeThreadIds)
     eventUnreadByThreadId.value = pruneThreadStateMap(eventUnreadByThreadId.value, activeThreadIds)
@@ -7490,16 +7494,6 @@ export function useDesktopState() {
     applyThreadFlags()
   }
 
-  function persistQueueState(transferManagedMessageIds: string[] = []): void {
-    queueMutationVersion += 1
-    const request = transferManagedMessageIds.length > 0
-      ? setThreadQueueState(queuedMessagesByThreadId.value, { transferManagedMessageIds })
-      : setThreadQueueState(queuedMessagesByThreadId.value)
-    void request.catch(() => {
-      // Queue persistence is best-effort; keep the current in-memory queue usable.
-    })
-  }
-
   function normalizeQueuedCollaborationMode(
     collaborationModeOverride?: CollaborationModeKind,
   ): CollaborationModeKind {
@@ -7527,6 +7521,8 @@ export function useDesktopState() {
       : nextQueue.length
     const queuedMessage: QueuedMessage = {
       id,
+      ...(nextQueue[insertIndex - 1]?.id ? { queueAfterId: nextQueue[insertIndex - 1].id } : {}),
+      ...(nextQueue[insertIndex]?.id ? { queueBeforeId: nextQueue[insertIndex].id } : {}),
       text: nextText,
       imageUrls,
       skills,
@@ -7639,12 +7635,28 @@ export function useDesktopState() {
       return queuedMessage
     } catch (queueError) {
       removeLocallyQueuedMessage(threadId, queuedMessage.id)
+      queuePositionRepairThreadIds.add(threadId)
       const message = queueError instanceof Error ? queueError.message : 'Failed to append thread queue message'
       setTurnErrorForThread(threadId, message)
       error.value = message
       return null
     } finally {
       setQueueAppendPending(threadId, queuedMessage.id, false)
+      if (
+        queuePositionRepairThreadIds.has(threadId)
+        && (pendingQueueAppendMessageIdsByThreadId.get(threadId)?.size ?? 0) === 0
+      ) {
+        queuePositionRepairThreadIds.delete(threadId)
+        try {
+          const revision = await reorderThreadQueuedMessagesOnServer(
+            threadId,
+            (queuedMessagesByThreadId.value[threadId] ?? []).map((message) => message.id),
+          )
+          latestQueueRevision = Math.max(latestQueueRevision, revision)
+        } catch {
+          void processQueuedMessages(threadId)
+        }
+      }
       queueMutationVersion += 1
       const needsSettledRefresh = queueRefreshDuringPendingAppendThreadIds.delete(threadId)
       if (queueProcessingByThreadId.value[threadId] === true) {
@@ -10394,6 +10406,20 @@ export function useDesktopState() {
         void recoverBridgeState()
         return
       }
+      if (notification.method === 'thread/queue/updated') {
+        const params = asRecord(notification.params)
+        const revision = readNumber(params?.revision)
+        if (revision !== null && Number.isSafeInteger(revision) && revision >= 0) {
+          latestQueueRevision = Math.max(latestQueueRevision, revision)
+        }
+        const threadIds = Array.isArray(params?.threadIds)
+          ? params.threadIds.filter((value): value is string => typeof value === 'string' && value.trim().length > 0)
+          : []
+        for (const threadId of threadIds) {
+          void processQueuedMessages(threadId)
+        }
+        return
+      }
       queueEventDrivenSync(notification)
       applyRealtimeUpdates(notification)
     })
@@ -10535,9 +10561,9 @@ export function useDesktopState() {
     pendingQueueRefreshThreadIds.clear()
     pendingQueueAppendMessageIdsByThreadId.clear()
     queueRefreshDuringPendingAppendThreadIds.clear()
+    queuePositionRepairThreadIds.clear()
     queueRefreshRequestVersion = 0
     latestQueueRevision = 0
-    persistQueueState()
     codexRateLimit.value = null
     threadTokenUsageByThreadId.value = {}
     threadGoalByThreadId.value = {}
@@ -10551,11 +10577,11 @@ export function useDesktopState() {
     return queuedMessagesByThreadId.value[threadId] ?? []
   })
 
-  function removeQueuedMessage(
+  async function removeQueuedMessage(
     messageId: string,
     transferManagedUploads = false,
     allowExternallyOwned = false,
-  ): void {
+  ): Promise<void> {
     const threadId = selectedThreadId.value
     if (!threadId || (isExternallyOwned(threadId) && !allowExternallyOwned)) return
     const queue = queuedMessagesByThreadId.value[threadId]
@@ -10564,10 +10590,16 @@ export function useDesktopState() {
     queuedMessagesByThreadId.value = next.length > 0
       ? { ...queuedMessagesByThreadId.value, [threadId]: next }
       : omitKey(queuedMessagesByThreadId.value, threadId)
-    persistQueueState(transferManagedUploads ? [messageId] : [])
+    queueMutationVersion += 1
+    try {
+      const revision = await removeThreadQueuedMessageFromServer(threadId, messageId, { transferManagedUploads })
+      latestQueueRevision = Math.max(latestQueueRevision, revision)
+    } catch {
+      void processQueuedMessages(threadId)
+    }
   }
 
-  function reorderQueuedMessage(draggedId: string, targetId: string): void {
+  async function reorderQueuedMessage(draggedId: string, targetId: string): Promise<void> {
     const threadId = selectedThreadId.value
     if (!threadId || isExternallyOwned(threadId)) return
     const queue = queuedMessagesByThreadId.value[threadId]
@@ -10584,7 +10616,13 @@ export function useDesktopState() {
       ...queuedMessagesByThreadId.value,
       [threadId]: next,
     }
-    persistQueueState()
+    queueMutationVersion += 1
+    try {
+      const revision = await reorderThreadQueuedMessagesOnServer(threadId, next.map((message) => message.id))
+      latestQueueRevision = Math.max(latestQueueRevision, revision)
+    } catch {
+      void processQueuedMessages(threadId)
+    }
   }
 
   async function steerQueuedMessage(messageId: string): Promise<void> {
@@ -10595,7 +10633,7 @@ export function useDesktopState() {
     const msg = queue.find((m) => m.id === messageId)
     if (!msg) return
     if (isExternallyOwned(threadId)) return
-    removeQueuedMessage(messageId, true)
+    await removeQueuedMessage(messageId, true)
     setSelectedCollaborationMode(msg.collaborationMode)
     void sendMessageToSelectedThread(msg.text, msg.imageUrls, msg.skills, 'steer', msg.fileAttachments)
   }

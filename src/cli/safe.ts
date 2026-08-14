@@ -29,6 +29,7 @@ import {
   writeManagedState,
 } from '../safe/state.js'
 import { spawnSyncCommand } from '../utils/commandInvocation.js'
+import { mutateJsonStateFile } from '../utils/atomicJsonState.js'
 import { listenWithFallback, openBrowser } from './shared/launcher.js'
 import { createSharedShutdown, runBestEffortShutdown } from './shared/shutdown.js'
 
@@ -65,21 +66,15 @@ async function persistLaunchProject(projectPath: string): Promise<string> {
   if (!info.isDirectory()) throw new Error(`Not a directory: ${normalized}`)
 
   const statePath = join(getCodexHome(), '.codex-global-state.json')
-  let state: Record<string, unknown> = {}
-  try {
-    const parsed = JSON.parse(await readFile(statePath, 'utf8')) as unknown
-    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) state = parsed as Record<string, unknown>
-  } catch {}
-
-  const normalizeRoots = (value: unknown): string[] => Array.isArray(value)
-    ? value.filter((item): item is string => typeof item === 'string' && item.trim().length > 0)
-    : []
-  const roots = normalizeRoots(state['electron-saved-workspace-roots'])
-  const activeRoots = normalizeRoots(state['active-workspace-roots'])
-  state['electron-saved-workspace-roots'] = [normalized, ...roots.filter((root) => root !== normalized)]
-  state['active-workspace-roots'] = [normalized, ...activeRoots.filter((root) => root !== normalized)]
-  await mkdir(dirname(statePath), { recursive: true, mode: 0o700 })
-  await writeFile(statePath, JSON.stringify(state), { mode: 0o600 })
+  await mutateJsonStateFile(statePath, (state) => {
+    const normalizeRoots = (value: unknown): string[] => Array.isArray(value)
+      ? value.filter((item): item is string => typeof item === 'string' && item.trim().length > 0)
+      : []
+    const roots = normalizeRoots(state['electron-saved-workspace-roots'])
+    const activeRoots = normalizeRoots(state['active-workspace-roots'])
+    state['electron-saved-workspace-roots'] = [normalized, ...roots.filter((root) => root !== normalized)]
+    state['active-workspace-roots'] = [normalized, ...activeRoots.filter((root) => root !== normalized)]
+  })
   return normalized
 }
 

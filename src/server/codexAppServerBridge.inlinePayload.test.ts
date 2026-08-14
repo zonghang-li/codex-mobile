@@ -9,6 +9,9 @@ import {
   mergeSessionSkillInputsIntoTurns,
   parseAutomationToml,
   prepareThreadRpcResultForClient,
+  removeThreadQueuedMessage,
+  reorderThreadQueuedMessages,
+  replaceThreadQueueState,
   sanitizeThreadTurnsInlinePayloads,
   toAutomationApiRecord,
   writeWorkspaceRootsState,
@@ -621,6 +624,203 @@ describe('thread session skill recovery', () => {
 })
 
 describe('backend queue scheduling', () => {
+  it('orders inverse-arrival appends by their client submission key', async () => {
+    const originalCodexHome = process.env.CODEX_HOME
+    const codexHome = await mkdtemp(join(tmpdir(), 'codex-mobile-queue-order-'))
+    process.env.CODEX_HOME = codexHome
+    const message = (id: string, queueAfterId?: string) => ({
+      id,
+      ...(queueAfterId ? { queueAfterId } : {}),
+      text: id,
+      imageUrls: [],
+      skills: [],
+      fileAttachments: [],
+      collaborationMode: 'default' as const,
+      model: 'gpt-test',
+      effort: '' as const,
+    })
+
+    try {
+      await appendThreadQueuedMessage('thread-ordered', message('queued-second', 'queued-first'))
+      await appendThreadQueuedMessage('thread-ordered', message('queued-first'))
+
+      const persisted = JSON.parse(await readFile(join(codexHome, '.codex-global-state.json'), 'utf8')) as {
+        'thread-queue-state'?: Record<string, Array<{ id: string }>>
+      }
+      expect(persisted['thread-queue-state']?.['thread-ordered']?.map((item) => item.id))
+        .toEqual(['queued-first', 'queued-second'])
+    } finally {
+      if (originalCodexHome === undefined) delete process.env.CODEX_HOME
+      else process.env.CODEX_HOME = originalCodexHome
+      await rm(codexHome, { recursive: true, force: true })
+    }
+  })
+
+  it('does not claim an inverse-arrival row before its predecessor is accepted', async () => {
+    const originalCodexHome = process.env.CODEX_HOME
+    const codexHome = await mkdtemp(join(tmpdir(), 'codex-mobile-queue-predecessor-'))
+    process.env.CODEX_HOME = codexHome
+    const processor = new BackendQueueProcessor({ onNotification: () => () => undefined } as never)
+    const claim = () => (processor as unknown as {
+      claimNextQueuedTurn: (threadId: string) => Promise<unknown>
+    }).claimNextQueuedTurn('thread-predecessor')
+    const message = (id: string, queueAfterId?: string) => ({
+      id,
+      ...(queueAfterId ? { queueAfterId } : {}),
+      text: id,
+      imageUrls: [],
+      skills: [],
+      fileAttachments: [],
+      collaborationMode: 'default' as const,
+      model: 'gpt-test',
+      effort: '' as const,
+    })
+
+    try {
+      await appendThreadQueuedMessage('thread-predecessor', message('queued-second', 'queued-first'))
+      await expect(claim()).resolves.toBeNull()
+
+      await appendThreadQueuedMessage('thread-predecessor', message('queued-first'))
+      await expect(claim()).resolves.toMatchObject({ message: { id: 'queued-first' } })
+    } finally {
+      processor.dispose()
+      if (originalCodexHome === undefined) delete process.env.CODEX_HOME
+      else process.env.CODEX_HOME = originalCodexHome
+      await rm(codexHome, { recursive: true, force: true })
+    }
+  })
+
+  it('allows only one live processor to claim a queued turn', async () => {
+    const originalCodexHome = process.env.CODEX_HOME
+    const codexHome = await mkdtemp(join(tmpdir(), 'codex-mobile-queue-claim-'))
+    process.env.CODEX_HOME = codexHome
+    const first = new BackendQueueProcessor({ onNotification: () => () => undefined } as never)
+    const second = new BackendQueueProcessor({ onNotification: () => () => undefined } as never)
+    const claim = (processor: BackendQueueProcessor) => (processor as unknown as {
+      claimNextQueuedTurn: (threadId: string) => Promise<unknown>
+    }).claimNextQueuedTurn('thread-claimed')
+
+    try {
+      await appendThreadQueuedMessage('thread-claimed', {
+        id: 'queued-once',
+        text: 'only one processor may own me',
+        imageUrls: [],
+        skills: [],
+        fileAttachments: [],
+        collaborationMode: 'default',
+        model: 'gpt-test',
+        effort: '',
+      })
+
+      await expect(claim(first)).resolves.not.toBeNull()
+      await expect(claim(second)).resolves.toBeNull()
+    } finally {
+      first.dispose()
+      second.dispose()
+      if (originalCodexHome === undefined) delete process.env.CODEX_HOME
+      else process.env.CODEX_HOME = originalCodexHome
+      await rm(codexHome, { recursive: true, force: true })
+    }
+  })
+
+  it('rejects stale full replacement and preserves concurrent rows in exact mutations', async () => {
+    const originalCodexHome = process.env.CODEX_HOME
+    const codexHome = await mkdtemp(join(tmpdir(), 'codex-mobile-queue-cas-'))
+    process.env.CODEX_HOME = codexHome
+    const message = (id: string) => ({
+      id,
+      text: id,
+      imageUrls: [],
+      skills: [],
+      fileAttachments: [],
+      collaborationMode: 'default' as const,
+      model: 'gpt-test',
+      effort: '' as const,
+    })
+
+    try {
+      await appendThreadQueuedMessage('thread-cas', message('queued-1'))
+      await expect(replaceThreadQueueState({}, 0)).rejects.toMatchObject({
+        name: 'ThreadQueueRevisionConflictError',
+      })
+      await appendThreadQueuedMessage('thread-cas', message('queued-2'))
+      await reorderThreadQueuedMessages('thread-cas', ['queued-1'])
+      await removeThreadQueuedMessage('thread-cas', 'queued-1')
+
+      const persisted = JSON.parse(await readFile(join(codexHome, '.codex-global-state.json'), 'utf8')) as {
+        'thread-queue-state'?: Record<string, Array<{ id: string }>>
+      }
+      expect(persisted['thread-queue-state']?.['thread-cas']?.map((item) => item.id))
+        .toEqual(['queued-2'])
+    } finally {
+      if (originalCodexHome === undefined) delete process.env.CODEX_HOME
+      else process.env.CODEX_HOME = originalCodexHome
+      await rm(codexHome, { recursive: true, force: true })
+    }
+  })
+
+  it('persists reordered position constraints for later appends', async () => {
+    const originalCodexHome = process.env.CODEX_HOME
+    const codexHome = await mkdtemp(join(tmpdir(), 'codex-mobile-queue-reorder-'))
+    process.env.CODEX_HOME = codexHome
+    const message = (id: string, queueAfterId?: string) => ({
+      id,
+      ...(queueAfterId ? { queueAfterId } : {}),
+      text: id,
+      imageUrls: [],
+      skills: [],
+      fileAttachments: [],
+      collaborationMode: 'default' as const,
+      model: 'gpt-test',
+      effort: '' as const,
+    })
+
+    try {
+      await appendThreadQueuedMessage('thread-reorder', message('queued-1'))
+      await appendThreadQueuedMessage('thread-reorder', message('queued-2', 'queued-1'))
+      await reorderThreadQueuedMessages('thread-reorder', ['queued-2', 'queued-1'])
+      await appendThreadQueuedMessage('thread-reorder', message('queued-3', 'queued-1'))
+
+      const persisted = JSON.parse(await readFile(join(codexHome, '.codex-global-state.json'), 'utf8')) as {
+        'thread-queue-state'?: Record<string, Array<{ id: string }>>
+      }
+      expect(persisted['thread-queue-state']?.['thread-reorder']?.map((item) => item.id))
+        .toEqual(['queued-2', 'queued-1', 'queued-3'])
+    } finally {
+      if (originalCodexHome === undefined) delete process.env.CODEX_HOME
+      else process.env.CODEX_HOME = originalCodexHome
+      await rm(codexHome, { recursive: true, force: true })
+    }
+  })
+
+  it('returns durable managed capabilities when removing a recovered row', async () => {
+    const originalCodexHome = process.env.CODEX_HOME
+    const codexHome = await mkdtemp(join(tmpdir(), 'codex-mobile-queue-remove-managed-'))
+    process.env.CODEX_HOME = codexHome
+    const managedImageUrl = '/codex-local-image?path=%2Ftmp%2Fcodex-web-uploads%2Fupload%2Fphoto.png&uploadHandle=remove-managed'
+
+    try {
+      await appendThreadQueuedMessage('thread-remove', {
+        id: 'queued-managed-remove',
+        text: 'remove me',
+        imageUrls: [managedImageUrl],
+        skills: [],
+        fileAttachments: [],
+        collaborationMode: 'default',
+        model: 'gpt-test',
+        effort: '',
+      })
+      await expect(removeThreadQueuedMessage('thread-remove', 'queued-managed-remove')).resolves.toMatchObject({
+        id: 'queued-managed-remove',
+        imageUrls: [managedImageUrl],
+      })
+    } finally {
+      if (originalCodexHome === undefined) delete process.env.CODEX_HOME
+      else process.env.CODEX_HOME = originalCodexHome
+      await rm(codexHome, { recursive: true, force: true })
+    }
+  })
+
   it('preserves queue data when workspace roots are written concurrently', async () => {
     const originalCodexHome = process.env.CODEX_HOME
     const codexHome = await mkdtemp(join(tmpdir(), 'codex-mobile-global-state-race-'))
@@ -1145,25 +1345,22 @@ describe('backend queue scheduling', () => {
     }
   })
 
-  it('hydrates a persisted queue row from volatile managed upload capabilities', async () => {
+  it('recovers managed upload capabilities from durable queue state after restart', async () => {
     const originalCodexHome = process.env.CODEX_HOME
     const codexHome = await mkdtemp(join(tmpdir(), 'codex-mobile-managed-queue-'))
     process.env.CODEX_HOME = codexHome
     const managedImageUrl = '/codex-local-image?path=%2Ftmp%2Fcodex-web-uploads%2Fupload%2Fphoto.png&uploadHandle=managed-queue'
-    await writeFile(join(codexHome, '.codex-global-state.json'), JSON.stringify({
-      'thread-queue-state': {
-        'thread-queued': [{
-          id: 'queued-managed',
-          text: 'inspect later',
-          imageUrls: [],
-          skills: [],
-          fileAttachments: [],
-          collaborationMode: 'default',
-          model: 'gpt-5.5',
-          effort: 'high',
-        }],
-      },
-    }))
+    const queuedMessage = {
+      id: 'queued-managed',
+      text: 'inspect later',
+      imageUrls: [managedImageUrl],
+      skills: [],
+      fileAttachments: [],
+      collaborationMode: 'default' as const,
+      model: 'gpt-5.5',
+      effort: 'high' as const,
+    }
+    await appendThreadQueuedMessage('thread-queued', queuedMessage)
     const processor = new BackendQueueProcessor({
       rpc: vi.fn(async (method: string) => {
         if (method === 'config/read') return { config: { model: 'gpt-5.5' } }
@@ -1174,18 +1371,6 @@ describe('backend queue scheduling', () => {
     } as never)
 
     try {
-      processor.replaceRuntimeQueueState({
-        'thread-queued': [{
-          id: 'queued-managed',
-          text: 'inspect later',
-          imageUrls: [managedImageUrl],
-          skills: [],
-          fileAttachments: [],
-          collaborationMode: 'default',
-          model: 'gpt-5.5',
-          effort: 'high',
-        }],
-      })
       const turn = await (processor as unknown as {
         claimNextQueuedTurn: (threadId: string) => Promise<{
           threadId: string

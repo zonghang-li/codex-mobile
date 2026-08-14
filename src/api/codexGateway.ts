@@ -295,6 +295,8 @@ let cachedWorkspaceRootsState: WorkspaceRootsState | null = null
 
 export type StoredQueuedMessage = {
   id: string
+  queueAfterId?: string
+  queueBeforeId?: string
   text: string
   imageUrls: string[]
   skills: Array<{ name: string; path: string }>
@@ -3233,6 +3235,12 @@ function normalizeStoredQueuedMessage(value: unknown): StoredQueuedMessage | nul
 
   return {
     id,
+    ...(typeof record.queueAfterId === 'string' && record.queueAfterId.trim()
+      ? { queueAfterId: record.queueAfterId.trim() }
+      : {}),
+    ...(typeof record.queueBeforeId === 'string' && record.queueBeforeId.trim()
+      ? { queueBeforeId: record.queueBeforeId.trim() }
+      : {}),
     text: typeof record.text === 'string' ? record.text : '',
     imageUrls,
     skills,
@@ -3345,19 +3353,58 @@ export async function getThreadQueueAppendReceipt(threadId: string, messageId: s
 
 export async function setThreadQueueState(
   nextState: ThreadQueueState,
-  options: { transferManagedMessageIds?: string[] } = {},
-): Promise<void> {
+  options: { baseRevision: number; transferManagedMessageIds?: string[] },
+): Promise<number> {
   const response = await fetch('/codex-api/thread-queue-state', {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
       queueState: nextState,
+      baseRevision: options.baseRevision,
       transferManagedMessageIds: options.transferManagedMessageIds ?? [],
     }),
   })
   if (!response.ok) {
     throw new Error('Failed to save thread queue state')
   }
+  const payload = await response.json() as { revision?: unknown }
+  return typeof payload.revision === 'number' && Number.isSafeInteger(payload.revision)
+    ? payload.revision
+    : options.baseRevision + 1
+}
+
+export async function removeThreadQueuedMessage(
+  threadId: string,
+  messageId: string,
+  options: { transferManagedUploads?: boolean } = {},
+): Promise<number> {
+  const response = await fetch('/codex-api/thread-queue-state', {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      threadId,
+      operation: 'remove',
+      messageId,
+      transferManagedUploads: options.transferManagedUploads === true,
+    }),
+  })
+  const payload = await response.json() as { revision?: unknown }
+  if (!response.ok) throw new Error('Failed to remove queued message')
+  return typeof payload.revision === 'number' && Number.isSafeInteger(payload.revision) ? payload.revision : 0
+}
+
+export async function reorderThreadQueuedMessages(
+  threadId: string,
+  orderedMessageIds: string[],
+): Promise<number> {
+  const response = await fetch('/codex-api/thread-queue-state', {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ threadId, operation: 'reorder', orderedMessageIds }),
+  })
+  const payload = await response.json() as { revision?: unknown }
+  if (!response.ok) throw new Error('Failed to reorder queued messages')
+  return typeof payload.revision === 'number' && Number.isSafeInteger(payload.revision) ? payload.revision : 0
 }
 
 export async function appendThreadQueuedMessage(

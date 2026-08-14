@@ -41,6 +41,8 @@ const gatewayMocks = vi.hoisted(() => ({
   interruptThreadTurn: vi.fn(),
   persistThreadTitle: vi.fn(),
   renameThread: vi.fn(),
+  removeThreadQueuedMessage: vi.fn(),
+  reorderThreadQueuedMessages: vi.fn(),
   replyToServerRequest: vi.fn(),
   resumeThread: vi.fn(),
   revertThreadFileChanges: vi.fn(),
@@ -368,6 +370,8 @@ beforeEach(() => {
   gatewayMocks.getThreadGoal.mockResolvedValue(null)
   gatewayMocks.getThreadRuntimeStates.mockResolvedValue({})
   gatewayMocks.setThreadQueueState.mockReset().mockResolvedValue(undefined)
+  gatewayMocks.removeThreadQueuedMessage.mockReset().mockResolvedValue(1)
+  gatewayMocks.reorderThreadQueuedMessages.mockReset().mockResolvedValue(1)
   gatewayMocks.cleanupManagedUploads.mockReset().mockResolvedValue(true)
   gatewayMocks.startThreadTurn.mockReset()
   gatewayMocks.appendThreadQueuedMessage.mockReset().mockResolvedValue(undefined)
@@ -3050,9 +3054,10 @@ describe('turn completion lifecycle', () => {
     const queuedId = state.selectedThreadQueuedMessages.value[0]!.id
     state.steerQueuedMessage(queuedId)
     await flushMicrotasks()
-    expect(gatewayMocks.setThreadQueueState).toHaveBeenLastCalledWith(
-      {},
-      { transferManagedMessageIds: [queuedId] },
+    expect(gatewayMocks.removeThreadQueuedMessage).toHaveBeenLastCalledWith(
+      'thread-1',
+      queuedId,
+      { transferManagedUploads: true },
     )
   })
 
@@ -6940,6 +6945,25 @@ describe('external runtime ownership', () => {
     expect(state.error.value).toContain('queue storage unavailable')
   })
 
+  it('clears a failed predecessor constraint from a later accepted append', async () => {
+    const { state } = await setupExternalRuntimeState()
+    gatewayMocks.getThreadDetail.mockResolvedValue(externalDetail())
+    gatewayMocks.appendThreadQueuedMessage
+      .mockRejectedValueOnce(new Error('first append rejected'))
+      .mockResolvedValueOnce(undefined)
+    await state.loadMessages('thread-1')
+
+    const first = state.sendMessageToSelectedThread('first rejected', [], [], 'steer')
+    const second = state.sendMessageToSelectedThread('second accepted', [], [], 'steer')
+    await Promise.all([first, second])
+
+    const acceptedId = gatewayMocks.appendThreadQueuedMessage.mock.calls[1]?.[1].id
+    expect(gatewayMocks.reorderThreadQueuedMessages).toHaveBeenCalledWith('thread-1', [acceptedId])
+    expect(state.selectedThreadQueuedMessages.value).toEqual([
+      expect.objectContaining({ id: acceptedId, text: 'second accepted' }),
+    ])
+  })
+
   it('retries an ambiguous append with the same id instead of trusting current queue membership', async () => {
     const { state } = await setupExternalRuntimeState()
     gatewayMocks.getThreadDetail.mockResolvedValue(externalDetail())
@@ -7195,6 +7219,56 @@ describe('external runtime ownership', () => {
     stop()
 
     expect(observedQueueIds).not.toContainEqual(['already-popped'])
+    expect(state.selectedThreadQueuedMessages.value).toEqual([])
+  })
+
+  it('rejects a queue snapshot superseded by a server revision notification', async () => {
+    const { state, emit } = await setupExternalRuntimeState()
+    const staleQueueRefresh = deferred<{
+      state: Record<string, Array<{
+        id: string
+        text: string
+        imageUrls: string[]
+        skills: never[]
+        fileAttachments: never[]
+        collaborationMode: 'default'
+        model: string
+        effort: ''
+      }>>
+      revision: number
+    }>()
+    gatewayMocks.getThreadQueueSnapshot.mockReset()
+      .mockReturnValueOnce(staleQueueRefresh.promise)
+      .mockResolvedValueOnce({ state: {}, revision: 2 })
+    const observedQueueIds: string[][] = []
+    const stop = watch(
+      () => state.selectedThreadQueuedMessages.value,
+      (messages) => observedQueueIds.push(messages.map((message) => message.id)),
+      { flush: 'sync' },
+    )
+
+    emit({ method: 'turn/started', params: { threadId: 'thread-1', turn: { id: 'turn-local' } } })
+    await flushMicrotasks()
+    emit({ method: 'thread/queue/updated', params: { threadIds: ['thread-1'], revision: 2 } })
+    staleQueueRefresh.resolve({
+      state: {
+        'thread-1': [{
+          id: 'already-popped-after-read',
+          text: 'must not resurrect',
+          imageUrls: [],
+          skills: [],
+          fileAttachments: [],
+          collaborationMode: 'default',
+          model: 'gpt-test',
+          effort: '',
+        }],
+      },
+      revision: 1,
+    })
+
+    await vi.waitFor(() => expect(gatewayMocks.getThreadQueueSnapshot).toHaveBeenCalledTimes(2))
+    stop()
+    expect(observedQueueIds).not.toContainEqual(['already-popped-after-read'])
     expect(state.selectedThreadQueuedMessages.value).toEqual([])
   })
 
@@ -8230,7 +8304,8 @@ describe('external runtime ownership', () => {
     await state.interruptSelectedThreadTurn()
     await flushMicrotasks()
 
-    expect(gatewayMocks.setThreadQueueState).toHaveBeenCalled()
+    expect(gatewayMocks.reorderThreadQueuedMessages).toHaveBeenCalled()
+    expect(gatewayMocks.removeThreadQueuedMessage).toHaveBeenCalled()
     expect(gatewayMocks.startThreadTurn).toHaveBeenCalled()
     expect(gatewayMocks.interruptThreadTurn).toHaveBeenCalledWith('thread-1', expect.any(String), 'local')
   })
