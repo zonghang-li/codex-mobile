@@ -32,6 +32,7 @@ const gatewayMocks = vi.hoisted(() => ({
   getThreadGoal: vi.fn(),
   getThreadRuntimeState: vi.fn(),
   getThreadRuntimeStates: vi.fn(),
+  getThreadQueueAppendReceipt: vi.fn(),
   getThreadQueueState: vi.fn(),
   getThreadTitleCache: vi.fn(),
   getWorkspaceRootsState: vi.fn(),
@@ -358,6 +359,7 @@ beforeEach(() => {
     (threadId: string, signal?: AbortSignal) => gatewayMocks.getThreadDetail(threadId, signal),
   )
   gatewayMocks.getThreadQueueState.mockReset().mockResolvedValue({})
+  gatewayMocks.getThreadQueueAppendReceipt.mockReset().mockResolvedValue(false)
   gatewayMocks.getThreadGoal.mockResolvedValue(null)
   gatewayMocks.getThreadRuntimeStates.mockResolvedValue({})
   gatewayMocks.setThreadQueueState.mockReset().mockResolvedValue(undefined)
@@ -6929,24 +6931,68 @@ describe('external runtime ownership', () => {
     expect(state.error.value).toContain('queue storage unavailable')
   })
 
-  it('keeps an external queue row when the append response is lost after persistence', async () => {
+  it('retries an ambiguous append with the same id instead of trusting current queue membership', async () => {
     const { state } = await setupExternalRuntimeState()
     gatewayMocks.getThreadDetail.mockResolvedValue(externalDetail())
-    gatewayMocks.appendThreadQueuedMessage.mockRejectedValue(new TypeError('connection reset'))
+    gatewayMocks.appendThreadQueuedMessage
+      .mockRejectedValueOnce(new TypeError('connection reset'))
+      .mockRejectedValueOnce(new TypeError('response reset again'))
+    gatewayMocks.getThreadQueueAppendReceipt.mockResolvedValue(true)
     await state.loadMessages('thread-1')
-    gatewayMocks.getThreadQueueState.mockImplementation(async () => {
-      const persistedMessage = gatewayMocks.appendThreadQueuedMessage.mock.calls.at(-1)?.[1]
-      return persistedMessage ? { 'thread-1': [persistedMessage] } : {}
-    })
 
     await state.sendMessageToSelectedThread('persisted despite response loss', [], [], 'steer')
 
-    expect(gatewayMocks.appendThreadQueuedMessage).toHaveBeenCalledOnce()
-    expect(gatewayMocks.getThreadQueueState).toHaveBeenCalled()
+    expect(gatewayMocks.appendThreadQueuedMessage).toHaveBeenCalledTimes(2)
+    expect(gatewayMocks.appendThreadQueuedMessage.mock.calls[1]?.[1]).toEqual(
+      gatewayMocks.appendThreadQueuedMessage.mock.calls[0]?.[1],
+    )
+    expect(gatewayMocks.getThreadQueueAppendReceipt).toHaveBeenCalledWith(
+      'thread-1',
+      gatewayMocks.appendThreadQueuedMessage.mock.calls[0]?.[1].id,
+    )
     expect(state.selectedThreadQueuedMessages.value).toEqual([
       expect.objectContaining({ text: 'persisted despite response loss' }),
     ])
     expect(state.error.value).toBe('')
+  })
+
+  it('keeps an optimistic queue row while its append is still in flight', async () => {
+    const { state, emit } = await setupExternalRuntimeState()
+    gatewayMocks.getThreadDetail.mockResolvedValue(externalDetail())
+    await state.loadMessages('thread-1')
+    const append = deferred<void>()
+    let persisted = false
+    gatewayMocks.appendThreadQueuedMessage.mockImplementation(async () => {
+      await append.promise
+      persisted = true
+    })
+    gatewayMocks.getThreadQueueState.mockImplementation(async () => {
+      const message = gatewayMocks.appendThreadQueuedMessage.mock.calls.at(-1)?.[1]
+      return persisted && message ? { 'thread-1': [message] } : {}
+    })
+
+    const send = state.sendMessageToSelectedThread('append still pending', [], [], 'steer')
+    await vi.waitFor(() => {
+      expect(gatewayMocks.appendThreadQueuedMessage).toHaveBeenCalledOnce()
+    })
+    expect(state.selectedThreadQueuedMessages.value).toEqual([
+      expect.objectContaining({ text: 'append still pending' }),
+    ])
+    emit({ method: 'turn/started', params: { threadId: 'thread-1', turn: { id: 'turn-external' } } })
+    await flushMicrotasks()
+
+    expect(state.selectedThreadQueuedMessages.value).toEqual([
+      expect.objectContaining({ text: 'append still pending' }),
+    ])
+
+    append.resolve()
+    await send
+    await vi.waitFor(() => {
+      expect(gatewayMocks.getThreadQueueState.mock.calls.length).toBeGreaterThanOrEqual(2)
+    })
+    expect(state.selectedThreadQueuedMessages.value).toEqual([
+      expect.objectContaining({ text: 'append still pending' }),
+    ])
   })
 
   it('moves a local steer to the queue when writer ownership changes', async () => {

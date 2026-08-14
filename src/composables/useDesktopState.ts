@@ -24,6 +24,7 @@ import {
   revertThreadFileChanges,
   rollbackThread,
   getThreadGroupsPage,
+  getThreadQueueAppendReceipt,
   getThreadQueueState,
   getWorkspaceRootsState,
   setCodexSpeedMode,
@@ -2276,6 +2277,8 @@ export function useDesktopState() {
   const queuedMessagesByThreadId = ref<Record<string, QueuedMessage[]>>({})
   const queueProcessingByThreadId = ref<Record<string, boolean>>({})
   const pendingQueueRefreshThreadIds = new Set<string>()
+  const pendingQueueAppendMessageIdsByThreadId = new Map<string, Set<string>>()
+  const queueRefreshDuringPendingAppendThreadIds = new Set<string>()
   let hasLoadedPersistedQueueState = false
   let queueMutationVersion = 0
   const eventUnreadByThreadId = ref<Record<string, boolean>>({})
@@ -7549,6 +7552,35 @@ export function useDesktopState() {
     queueMutationVersion += 1
   }
 
+  function setQueueAppendPending(threadId: string, messageId: string, pending: boolean): void {
+    const ids = pendingQueueAppendMessageIdsByThreadId.get(threadId) ?? new Set<string>()
+    if (pending) {
+      ids.add(messageId)
+      pendingQueueAppendMessageIdsByThreadId.set(threadId, ids)
+      return
+    }
+    ids.delete(messageId)
+    if (ids.size > 0) pendingQueueAppendMessageIdsByThreadId.set(threadId, ids)
+    else pendingQueueAppendMessageIdsByThreadId.delete(threadId)
+  }
+
+  function mergePendingQueueAppends(refreshedState: Record<string, QueuedMessage[]>): Record<string, QueuedMessage[]> {
+    let mergedState = refreshedState
+    for (const [threadId, pendingIds] of pendingQueueAppendMessageIdsByThreadId) {
+      const localQueue = queuedMessagesByThreadId.value[threadId] ?? []
+      const pendingMessages = localQueue.filter((message) => pendingIds.has(message.id))
+      if (pendingMessages.length === 0) continue
+      const nextQueue = [...(mergedState[threadId] ?? [])]
+      for (const message of pendingMessages) {
+        if (nextQueue.some((queuedMessage) => queuedMessage.id === message.id)) continue
+        const localIndex = localQueue.findIndex((queuedMessage) => queuedMessage.id === message.id)
+        nextQueue.splice(Math.max(0, Math.min(localIndex, nextQueue.length)), 0, message)
+      }
+      mergedState = { ...mergedState, [threadId]: nextQueue }
+    }
+    return mergedState
+  }
+
   async function enqueueThreadMessageDurably(
     threadId: string,
     nextText: string,
@@ -7567,23 +7599,35 @@ export function useDesktopState() {
       collaborationModeOverride,
       queueInsertIndex,
     )
+    setQueueAppendPending(threadId, queuedMessage.id, true)
     try {
-      await appendThreadQueuedMessage(threadId, queuedMessage, queueInsertIndex)
+      try {
+        await appendThreadQueuedMessage(threadId, queuedMessage, queueInsertIndex)
+      } catch (queueError) {
+        if (!(queueError instanceof TypeError)) throw queueError
+        try {
+          await appendThreadQueuedMessage(threadId, queuedMessage, queueInsertIndex)
+        } catch (retryError) {
+          if (!(retryError instanceof TypeError)) throw retryError
+          if (!await getThreadQueueAppendReceipt(threadId, queuedMessage.id)) throw queueError
+        }
+      }
       return queuedMessage
     } catch (queueError) {
-      try {
-        const persistedState = await getThreadQueueState()
-        if (persistedState[threadId]?.some((message) => message.id === queuedMessage.id)) {
-          return queuedMessage
-        }
-      } catch {
-        // Surface the original append failure when persistence cannot be confirmed.
-      }
       removeLocallyQueuedMessage(threadId, queuedMessage.id)
       const message = queueError instanceof Error ? queueError.message : 'Failed to append thread queue message'
       setTurnErrorForThread(threadId, message)
       error.value = message
       return null
+    } finally {
+      setQueueAppendPending(threadId, queuedMessage.id, false)
+      queueMutationVersion += 1
+      const needsSettledRefresh = queueRefreshDuringPendingAppendThreadIds.delete(threadId)
+      if (queueProcessingByThreadId.value[threadId] === true) {
+        pendingQueueRefreshThreadIds.add(threadId)
+      } else if (needsSettledRefresh) {
+        void processQueuedMessages(threadId)
+      }
     }
   }
 
@@ -9518,6 +9562,9 @@ export function useDesktopState() {
     scheduledMutationVersion = queueMutationVersion,
   ): Promise<void> {
     if (queueMutationVersion !== scheduledMutationVersion) return
+    if ((pendingQueueAppendMessageIdsByThreadId.get(threadId)?.size ?? 0) > 0) {
+      queueRefreshDuringPendingAppendThreadIds.add(threadId)
+    }
     if (queueProcessingByThreadId.value[threadId] === true) {
       pendingQueueRefreshThreadIds.add(threadId)
       return
@@ -9530,7 +9577,7 @@ export function useDesktopState() {
     try {
       const refreshedQueueState = await getThreadQueueState()
       if (queueMutationVersion === mutationVersionAtStart) {
-        queuedMessagesByThreadId.value = refreshedQueueState
+        queuedMessagesByThreadId.value = mergePendingQueueAppends(refreshedQueueState)
       } else {
         pendingQueueRefreshThreadIds.add(threadId)
       }
@@ -10453,6 +10500,8 @@ export function useDesktopState() {
     queuedMessagesByThreadId.value = {}
     queueProcessingByThreadId.value = {}
     pendingQueueRefreshThreadIds.clear()
+    pendingQueueAppendMessageIdsByThreadId.clear()
+    queueRefreshDuringPendingAppendThreadIds.clear()
     persistQueueState()
     codexRateLimit.value = null
     threadTokenUsageByThreadId.value = {}

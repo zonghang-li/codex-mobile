@@ -3312,6 +3312,22 @@ export async function getThreadQueueState(): Promise<ThreadQueueState> {
   return normalizeThreadQueueState(envelope.data)
 }
 
+export async function getThreadQueueAppendReceipt(threadId: string, messageId: string): Promise<boolean> {
+  const params = new URLSearchParams({ threadId, messageId })
+  const response = await fetch(`/codex-api/thread-queue-receipt?${params.toString()}`)
+  const payload = (await response.json()) as unknown
+  if (!response.ok) {
+    throw new Error('Failed to load thread queue append receipt')
+  }
+  const envelope = payload && typeof payload === 'object' && !Array.isArray(payload)
+    ? payload as Record<string, unknown>
+    : {}
+  const data = envelope.data && typeof envelope.data === 'object' && !Array.isArray(envelope.data)
+    ? envelope.data as Record<string, unknown>
+    : {}
+  return data.accepted === true
+}
+
 export async function setThreadQueueState(
   nextState: ThreadQueueState,
   options: { transferManagedMessageIds?: string[] } = {},

@@ -647,6 +647,52 @@ describe('backend queue scheduling', () => {
     }
   })
 
+  it('does not append an accepted message again after the queue consumer pops it', async () => {
+    const originalCodexHome = process.env.CODEX_HOME
+    const codexHome = await mkdtemp(join(tmpdir(), 'codex-mobile-consumed-queue-'))
+    process.env.CODEX_HOME = codexHome
+    const statePath = join(codexHome, '.codex-global-state.json')
+    const message = {
+      id: 'queued-consumed',
+      text: 'run exactly once',
+      imageUrls: [],
+      skills: [],
+      fileAttachments: [],
+      collaborationMode: 'default' as const,
+      model: 'gpt-test',
+      effort: '' as const,
+    }
+    const processor = new BackendQueueProcessor({
+      onNotification: () => () => undefined,
+    } as never)
+
+    try {
+      await writeFile(statePath, JSON.stringify({ 'thread-queue-state': {} }))
+      await appendThreadQueuedMessage('thread-1', message)
+      const popped = await (processor as unknown as {
+        popNextQueuedTurn: (threadId: string) => Promise<{ message: { id: string } } | null>
+      }).popNextQueuedTurn('thread-1')
+
+      expect(popped?.message.id).toBe(message.id)
+      await appendThreadQueuedMessage('thread-1', message)
+
+      const persisted = JSON.parse(await readFile(statePath, 'utf8')) as {
+        'thread-queue-state'?: Record<string, Array<{ id: string }>>
+        'thread-queue-receipts'?: Array<{ threadId: string; messageId: string }>
+      }
+      expect(persisted['thread-queue-state']?.['thread-1'] ?? []).toEqual([])
+      expect(persisted['thread-queue-receipts']).toContainEqual({
+        threadId: 'thread-1',
+        messageId: message.id,
+      })
+    } finally {
+      processor.dispose()
+      if (originalCodexHome === undefined) delete process.env.CODEX_HOME
+      else process.env.CODEX_HOME = originalCodexHome
+      await rm(codexHome, { recursive: true, force: true })
+    }
+  })
+
   it('reschedules a pending drain when a run-now request needs an earlier drain', async () => {
     vi.useFakeTimers()
     const processor = new BackendQueueProcessor({

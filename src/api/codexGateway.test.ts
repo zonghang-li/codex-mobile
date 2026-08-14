@@ -10,6 +10,7 @@ import {
   getThreadGroupsPage,
   getOlderThreadMessages,
   getThreadGoal,
+  getThreadQueueAppendReceipt,
   getThreadRuntimeState,
   getThreadRuntimeStates,
   getThreadTextPage,
@@ -394,6 +395,22 @@ describe('managed uploads', () => {
       message: expect.objectContaining({ id: 'queued-atomic', text: 'wait for CLI' }),
       queueInsertIndex: 1,
     })
+  })
+
+  it('queries a durable queue append receipt by thread and message id', async () => {
+    const requests: Array<RequestInfo | URL> = []
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
+      requests.push(input)
+      return new Response(JSON.stringify({ data: { accepted: true } }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      })
+    }))
+
+    await expect(getThreadQueueAppendReceipt('thread / 1', 'queued?1')).resolves.toBe(true)
+    expect(String(requests[0])).toBe(
+      '/codex-api/thread-queue-receipt?threadId=thread+%2F+1&messageId=queued%3F1',
+    )
   })
 })
 

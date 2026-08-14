@@ -7719,6 +7719,8 @@ async function writePinnedThreadIds(threadIds: string[]): Promise<void> {
 
 const FIRST_LAUNCH_PLUGINS_CARD_DISMISSED_KEY = 'first-launch-plugins-card-dismissed'
 const THREAD_QUEUE_STATE_KEY = 'thread-queue-state'
+const THREAD_QUEUE_RECEIPTS_KEY = 'thread-queue-receipts'
+const MAX_THREAD_QUEUE_RECEIPTS = 4096
 
 type StoredQueuedMessage = {
   id: string
@@ -7733,6 +7735,11 @@ type StoredQueuedMessage = {
 
 type ThreadQueueState = Record<string, StoredQueuedMessage[]>
 
+type ThreadQueueReceipt = {
+  threadId: string
+  messageId: string
+}
+
 type BackendQueuedTurn = {
   threadId: string
   message: StoredQueuedMessage
@@ -7740,6 +7747,7 @@ type BackendQueuedTurn = {
 
 type ThreadQueueStateUpdate<T> = {
   nextState: ThreadQueueState
+  nextReceipts?: ThreadQueueReceipt[]
   result: T
 }
 
@@ -7812,6 +7820,28 @@ function normalizeThreadQueueState(value: unknown): ThreadQueueState {
   return state
 }
 
+function normalizeThreadQueueReceipts(value: unknown): ThreadQueueReceipt[] {
+  if (!Array.isArray(value)) return []
+  const seen = new Set<string>()
+  return value.flatMap((item) => {
+    const record = asRecord(item)
+    const threadId = readNonEmptyString(record?.threadId)
+    const messageId = readNonEmptyString(record?.messageId)
+    const key = `${threadId}\u0000${messageId}`
+    if (!threadId || !messageId || seen.has(key)) return []
+    seen.add(key)
+    return [{ threadId, messageId }]
+  }).slice(-MAX_THREAD_QUEUE_RECEIPTS)
+}
+
+function hasThreadQueueReceipt(
+  receipts: ThreadQueueReceipt[],
+  threadId: string,
+  messageId: string,
+): boolean {
+  return receipts.some((receipt) => receipt.threadId === threadId && receipt.messageId === messageId)
+}
+
 function isManagedQueuedImageUrl(value: string): boolean {
   try {
     const parsed = new URL(value, 'http://localhost')
@@ -7872,18 +7902,31 @@ function managedQueuedUploadHandles(message: StoredQueuedMessage): string[] {
 
 let threadQueueMutationChain: Promise<unknown> = Promise.resolve()
 
-async function readThreadQueueState(): Promise<ThreadQueueState> {
+async function readThreadQueueStore(): Promise<{
+  state: ThreadQueueState
+  receipts: ThreadQueueReceipt[]
+}> {
   const statePath = getCodexGlobalStatePath()
   try {
     const raw = await readFile(statePath, 'utf8')
     const payload = asRecord(JSON.parse(raw)) ?? {}
-    return normalizeThreadQueueState(payload[THREAD_QUEUE_STATE_KEY])
+    return {
+      state: normalizeThreadQueueState(payload[THREAD_QUEUE_STATE_KEY]),
+      receipts: normalizeThreadQueueReceipts(payload[THREAD_QUEUE_RECEIPTS_KEY]),
+    }
   } catch {
-    return {}
+    return { state: {}, receipts: [] }
   }
 }
 
-async function writeThreadQueueStateUnlocked(nextState: ThreadQueueState): Promise<void> {
+async function readThreadQueueState(): Promise<ThreadQueueState> {
+  return (await readThreadQueueStore()).state
+}
+
+async function writeThreadQueueStateUnlocked(
+  nextState: ThreadQueueState,
+  nextReceipts: ThreadQueueReceipt[],
+): Promise<void> {
   const statePath = getCodexGlobalStatePath()
   let payload: Record<string, unknown> = {}
   try {
@@ -7898,16 +7941,25 @@ async function writeThreadQueueStateUnlocked(nextState: ThreadQueueState): Promi
   } else {
     delete payload[THREAD_QUEUE_STATE_KEY]
   }
+  const normalizedReceipts = normalizeThreadQueueReceipts(nextReceipts)
+  if (normalizedReceipts.length > 0) {
+    payload[THREAD_QUEUE_RECEIPTS_KEY] = normalizedReceipts
+  } else {
+    delete payload[THREAD_QUEUE_RECEIPTS_KEY]
+  }
   await writeFile(statePath, JSON.stringify(payload), 'utf8')
 }
 
 async function withThreadQueueStateUpdate<T>(
-  update: (state: ThreadQueueState) => ThreadQueueStateUpdate<T> | Promise<ThreadQueueStateUpdate<T>>,
+  update: (
+    state: ThreadQueueState,
+    receipts: ThreadQueueReceipt[],
+  ) => ThreadQueueStateUpdate<T> | Promise<ThreadQueueStateUpdate<T>>,
 ): Promise<T> {
   const run = threadQueueMutationChain.then(async () => {
-    const currentState = await readThreadQueueState()
-    const { nextState, result } = await update(currentState)
-    await writeThreadQueueStateUnlocked(nextState)
+    const { state: currentState, receipts } = await readThreadQueueStore()
+    const { nextState, nextReceipts = receipts, result } = await update(currentState, receipts)
+    await writeThreadQueueStateUnlocked(nextState, nextReceipts)
     return result
   })
   threadQueueMutationChain = run.catch(() => {})
@@ -7928,10 +7980,17 @@ export async function appendThreadQueuedMessage(
 ): Promise<void> {
   const normalizedThreadId = threadId.trim()
   if (!normalizedThreadId) throw new Error('threadId is required')
-  await withThreadQueueStateUpdate((state) => {
+  await withThreadQueueStateUpdate((state, receipts) => {
     const queue = state[normalizedThreadId] ?? []
-    if (queue.some((queuedMessage) => queuedMessage.id === message.id)) {
+    if (hasThreadQueueReceipt(receipts, normalizedThreadId, message.id)) {
       return { nextState: state, result: undefined }
+    }
+    const nextReceipts = [...receipts, {
+      threadId: normalizedThreadId,
+      messageId: message.id,
+    }].slice(-MAX_THREAD_QUEUE_RECEIPTS)
+    if (queue.some((queuedMessage) => queuedMessage.id === message.id)) {
+      return { nextState: state, nextReceipts, result: undefined }
     }
     const nextQueue = [...queue]
     const insertIndex = typeof queueInsertIndex === 'number'
@@ -7943,9 +8002,19 @@ export async function appendThreadQueuedMessage(
         ...state,
         [normalizedThreadId]: nextQueue,
       },
+      nextReceipts,
       result: undefined,
     }
   })
+}
+
+export async function hasThreadQueueAppendReceipt(threadId: string, messageId: string): Promise<boolean> {
+  const normalizedThreadId = threadId.trim()
+  const normalizedMessageId = messageId.trim()
+  if (!normalizedThreadId || !normalizedMessageId) return false
+  await threadQueueMutationChain.catch(() => {})
+  const { receipts } = await readThreadQueueStore()
+  return hasThreadQueueReceipt(receipts, normalizedThreadId, normalizedMessageId)
 }
 
 function normalizeReasoningEffort(value: unknown): ReasoningEffort | '' {
@@ -12355,6 +12424,18 @@ export function createCodexBridgeMiddleware(options: {
       if (req.method === 'GET' && url.pathname === '/codex-api/thread-queue-state') {
         const state = await readThreadQueueState()
         setJson(res, 200, { data: state })
+        return
+      }
+
+      if (req.method === 'GET' && url.pathname === '/codex-api/thread-queue-receipt') {
+        const threadId = (url.searchParams.get('threadId') ?? '').trim()
+        const messageId = (url.searchParams.get('messageId') ?? '').trim()
+        if (!threadId || !messageId) {
+          setJson(res, 400, { error: 'Missing threadId or messageId' })
+          return
+        }
+        const accepted = await hasThreadQueueAppendReceipt(threadId, messageId)
+        setJson(res, 200, { data: { accepted } })
         return
       }
 
