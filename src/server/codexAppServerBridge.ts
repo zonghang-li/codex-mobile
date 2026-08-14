@@ -3915,11 +3915,27 @@ function readThreadArchiveFallbackName(threadReadResult: unknown): string {
   )
 }
 
-function isArchivedThreadReadResult(threadReadResult: unknown): boolean {
+async function readVerifiedThreadArchiveState(
+  threadReadResult: unknown,
+  expectedThreadId: string,
+): Promise<'active' | 'archived' | 'unknown'> {
   const record = asRecord(threadReadResult)
   const thread = asRecord(record?.thread)
+  if (readNonEmptyString(thread?.id) !== expectedThreadId) return 'unknown'
   const sessionPath = readNonEmptyString(thread?.path)
-  return sessionPath.split(/[\\/]+/u).includes('archived_sessions')
+  if (!sessionPath || !isAbsolute(sessionPath)) return 'unknown'
+  try {
+    const canonicalPath = await realpath(sessionPath)
+    const [activeRoot, archivedRoot] = await Promise.all([
+      realpath(join(getCodexHomeDir(), 'sessions')).catch(() => null),
+      realpath(join(getCodexHomeDir(), 'archived_sessions')).catch(() => null),
+    ])
+    if (archivedRoot && isSameOrDescendantPath(canonicalPath, archivedRoot)) return 'archived'
+    if (activeRoot && isSameOrDescendantPath(canonicalPath, activeRoot)) return 'active'
+  } catch {
+    return 'unknown'
+  }
+  return 'unknown'
 }
 
 export async function callRpcWithArchiveRecovery(
@@ -3999,9 +4015,11 @@ export async function callRpcWithArchiveRecovery(
       threadId,
       includeTurns: false,
     })
-    if (isArchivedThreadReadResult(threadReadResult)) {
+    const archiveState = await readVerifiedThreadArchiveState(threadReadResult, threadId)
+    if (archiveState === 'archived') {
       return null
     }
+    if (archiveState !== 'active') throw new Error('Cannot verify thread archive state.')
 
     await appServer.rpc('thread/name/set', {
       threadId,
@@ -9296,6 +9314,7 @@ export async function reapExpiredManagedUploads(options: {
   nowMs?: number
   ttlMs?: number
   maxEntries?: number
+  beforeDeleteCandidate?: (directory: string) => Promise<void>
 } = {}): Promise<number> {
   const root = resolve(options.uploadRoot ?? MANAGED_UPLOAD_ROOT)
   const nowMs = options.nowMs ?? Date.now()
@@ -9337,21 +9356,27 @@ export async function reapExpiredManagedUploads(options: {
   let removed = 0
   for (const [handle, upload] of managedUploads) {
     if (protectedDirectoryNames.has(basename(upload.directory))) continue
-    if (
+    const deletionDue = (
       resolve(upload.root) === root
       && upload.deleteAfter !== undefined
       && upload.deleteAfter <= nowMs
-      && await deleteManagedUpload(handle, {
-        uploadRoot: root,
-        nowMs,
-        ttlMs,
-        minimumRetentionMs: 0,
-      })
-    ) {
-      managedUploads.delete(handle)
-      removed += 1
-      if (removed >= maxEntries) return removed
-      continue
+    )
+    if (deletionDue) {
+      await options.beforeDeleteCandidate?.(upload.directory)
+      const deleted = await deleteManagedUploadIfUnreferenced(root, upload.directory, () => (
+        deleteManagedUpload(handle, {
+          uploadRoot: root,
+          nowMs,
+          ttlMs,
+          minimumRetentionMs: 0,
+        })
+      ))
+      if (deleted) {
+        managedUploads.delete(handle)
+        removed += 1
+        if (removed >= maxEntries) return removed
+        continue
+      }
     }
     if (upload.expiresAt <= nowMs) managedUploads.delete(handle)
   }
@@ -9397,7 +9422,12 @@ export async function reapExpiredManagedUploads(options: {
         ) continue
         const canonicalDirectory = await realpath(directory)
         if (!isPathInsideRoot(canonicalRoot, canonicalDirectory)) continue
-        await rm(canonicalDirectory, { recursive: true, force: false })
+        await options.beforeDeleteCandidate?.(canonicalDirectory)
+        const deleted = await deleteManagedUploadIfUnreferenced(root, canonicalDirectory, async () => {
+          await rm(canonicalDirectory, { recursive: true, force: false })
+          return true
+        })
+        if (!deleted) continue
         for (const [handle, upload] of managedUploads) {
           if (resolve(upload.directory) === resolve(directory)) managedUploads.delete(handle)
         }
@@ -9410,6 +9440,44 @@ export async function reapExpiredManagedUploads(options: {
   } catch {
     return 0
   }
+}
+
+async function deleteManagedUploadIfUnreferenced(
+  root: string,
+  directory: string,
+  deletion: () => Promise<boolean>,
+): Promise<boolean> {
+  return updateCodexGlobalState(async (payload) => {
+    const directoryName = basename(directory)
+    const queueState = normalizeThreadQueueState(payload[THREAD_QUEUE_STATE_KEY])
+    const activeMessages = normalizeActiveManagedMessages(payload[THREAD_ACTIVE_MANAGED_MESSAGES_KEY])
+    for (const message of [
+      ...Object.values(queueState).flat(),
+      ...Object.values(activeMessages),
+    ]) {
+      for (const handle of managedQueuedUploadHandles(message)) {
+        const match = handle.match(/^v1\.[0-9a-z]+\.([0-9a-f-]{36})\./iu)
+        if (match?.[1] && directoryName === `upload-${match[1]}`) return false
+      }
+      for (const candidatePath of [
+        ...message.imageUrls.flatMap((imageUrl) => {
+          try {
+            const parsed = new URL(imageUrl, 'http://localhost')
+            return parsed.searchParams.get('path') ? [parsed.searchParams.get('path')!] : []
+          } catch {
+            return []
+          }
+        }),
+        ...message.fileAttachments.flatMap((attachment) => [attachment.path, attachment.fsPath]),
+      ]) {
+        const candidateDirectory = resolve(dirname(candidatePath))
+        if (resolve(dirname(candidateDirectory)) === resolve(root) && basename(candidateDirectory) === directoryName) {
+          return false
+        }
+      }
+    }
+    return deletion()
+  })
 }
 
 function handleFileUpload(req: IncomingMessage, res: ServerResponse): void {
@@ -10371,6 +10439,7 @@ export class BackendQueueProcessor {
   private readonly activeManagedMessagesByThreadId = new Map<string, StoredQueuedMessage>()
   private readonly claimOwnerId = randomUUID()
   private readonly unsubscribe: () => void
+  private disposed = false
 
   constructor(
     private readonly appServer: AppServerProcess,
@@ -10388,6 +10457,7 @@ export class BackendQueueProcessor {
   }
 
   dispose(): void {
+    this.disposed = true
     liveBackendQueueClaimOwnerIds.delete(this.claimOwnerId)
     this.unsubscribe()
     for (const timer of this.queueDrainTimersByThreadId.values()) {
@@ -10443,6 +10513,7 @@ export class BackendQueueProcessor {
   async scheduleAllQueuedThreads(delayMs = 0): Promise<void> {
     try {
       const state = await readThreadQueueState()
+      if (this.disposed) return
       for (const threadId of Object.keys(state)) {
         this.scheduleThreadQueueDrain(threadId, delayMs)
       }
@@ -10452,7 +10523,7 @@ export class BackendQueueProcessor {
   }
 
   scheduleThreadQueueDrain(threadId: string, delayMs = 5000): void {
-    if (!threadId) return
+    if (this.disposed || !threadId) return
     const normalizedDelayMs = Math.max(0, delayMs)
     const nextDueAt = Date.now() + normalizedDelayMs
     const existingDueAt = this.queueDrainDueAtByThreadId.get(threadId)
@@ -10474,7 +10545,7 @@ export class BackendQueueProcessor {
   }
 
   async processThreadQueue(threadId: string): Promise<void> {
-    if (this.processingThreadIds.has(threadId)) return
+    if (this.disposed || this.processingThreadIds.has(threadId)) return
     this.processingThreadIds.add(threadId)
     try {
       const next = await this.claimNextQueuedTurn(threadId)
@@ -10490,7 +10561,7 @@ export class BackendQueueProcessor {
         const finalized = await this.finalizeQueuedTurn(next)
         if (managedMessage && finalized) {
           this.runtimeQueuedMessages.delete(runtimeKey)
-          this.releaseManagedMessage(managedMessage)
+          await this.reconcileAcceptedManagedMessage(threadId, managedMessage, beforeStart.acceptedInProgress)
         }
         if (await this.hasQueuedTurns(threadId)) this.scheduleThreadQueueDrain(threadId)
         return
@@ -10511,7 +10582,10 @@ export class BackendQueueProcessor {
         const afterFailure = await this.inspectQueuedTurn(next)
         if (afterFailure.accepted) {
           const finalized = await this.finalizeQueuedTurn(next)
-          if (managedMessage && finalized) this.runtimeQueuedMessages.delete(runtimeKey)
+          if (managedMessage && finalized) {
+            this.runtimeQueuedMessages.delete(runtimeKey)
+            await this.reconcileAcceptedManagedMessage(threadId, managedMessage, afterFailure.acceptedInProgress)
+          }
         } else if (managedMessage && this.activeManagedMessagesByThreadId.get(threadId) === managedMessage) {
           await this.deactivateManagedMessage(threadId, managedMessage)
         }
@@ -10533,14 +10607,15 @@ export class BackendQueueProcessor {
 
   private async inspectQueuedTurn(turn: BackendQueuedTurn): Promise<{
     accepted: boolean
+    acceptedInProgress: boolean
     canStart: boolean
   }> {
     const threadId = turn.threadId
     const response = asRecord(await this.appServer.rpc('thread/read', { threadId, includeTurns: true }))
     const thread = asRecord(response?.thread)
-    if (!thread) return { accepted: false, canStart: false }
+    if (!thread) return { accepted: false, acceptedInProgress: false, canStart: false }
     const turns = Array.isArray(thread.turns) ? thread.turns : []
-    const accepted = turns.some((rawTurn) => {
+    const acceptedTurn = turns.find((rawTurn) => {
       const turnRecord = asRecord(rawTurn)
       const items = Array.isArray(turnRecord?.items) ? turnRecord.items : []
       return items.some((rawItem) => {
@@ -10549,17 +10624,23 @@ export class BackendQueueProcessor {
           || readNonEmptyString(item?.client_id) === turn.message.id
       })
     })
-    if (accepted) return { accepted: true, canStart: false }
-    if (readThreadResultInProgress(thread)) return { accepted: false, canStart: false }
+    if (acceptedTurn) {
+      return {
+        accepted: true,
+        acceptedInProgress: readThreadResultInProgress({ turns: [acceptedTurn] }),
+        canStart: false,
+      }
+    }
+    if (readThreadResultInProgress(thread)) return { accepted: false, acceptedInProgress: false, canStart: false }
 
     const rolloutPath = readNonEmptyString(thread.path)
     if (!this.runtimeProbe || process.platform !== 'linux' || !rolloutPath) {
-      return { accepted: false, canStart: true }
+      return { accepted: false, acceptedInProgress: false, canStart: true }
     }
 
     this.runtimeProbe.registerThread(threadId, rolloutPath)
     const externalRuntime = await this.runtimeProbe.inspect(threadId, this.appServer.getPid())
-    return { accepted: false, canStart: externalRuntime.state === 'idle' }
+    return { accepted: false, acceptedInProgress: false, canStart: externalRuntime.state === 'idle' }
   }
 
   private async claimNextQueuedTurn(threadId: string): Promise<BackendQueuedTurn | null> {
@@ -10728,6 +10809,20 @@ export class BackendQueueProcessor {
     const persistedMessage = await this.deactivateManagedMessage(threadId, inMemoryMessage)
     const message = inMemoryMessage ?? persistedMessage
     if (!message) return
+    this.releaseManagedMessage(message)
+  }
+
+  private async reconcileAcceptedManagedMessage(
+    threadId: string,
+    message: StoredQueuedMessage,
+    acceptedInProgress: boolean,
+  ): Promise<void> {
+    if (acceptedInProgress) {
+      await this.persistActiveManagedMessage(threadId, message)
+      this.activeManagedMessagesByThreadId.set(threadId, message)
+      return
+    }
+    await this.deactivateManagedMessage(threadId, message)
     this.releaseManagedMessage(message)
   }
 
@@ -11943,7 +12038,14 @@ export function createCodexBridgeMiddleware(options: {
 		            const threadId = typeof params?.threadId === 'string' ? params.threadId.trim() : ''
 		            const snapshot = threadId ? appServer.getLastThreadReadSnapshot(threadId) : null
 		            if (snapshot) {
-		              setJson(res, 200, { result: snapshot })
+		              const augmentedSnapshot = await augmentThreadResultWithExternalRuntime(
+		                body.method,
+		                snapshot,
+		                runtimeProbe,
+		                appServer.getPid(),
+		                localRuntimeLedger,
+		              )
+		              setJson(res, 200, { result: augmentedSnapshot })
 		              return
 		            }
 		          }
@@ -14350,7 +14452,7 @@ export function createCodexBridgeMiddleware(options: {
       next()
     } catch (error) {
       const message = getErrorMessage(error, 'Unknown bridge error')
-      setJson(res, 502, { error: message })
+      setJson(res, error instanceof Error && error.name === 'ThreadStartClaimConflictError' ? 409 : 502, { error: message })
     }
   }
 

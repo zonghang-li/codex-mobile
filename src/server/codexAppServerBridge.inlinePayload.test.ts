@@ -629,6 +629,33 @@ describe('thread session skill recovery', () => {
 })
 
 describe('backend queue scheduling', () => {
+  it('does not schedule recovered queue work after disposal', async () => {
+    const originalCodexHome = process.env.CODEX_HOME
+    const codexHome = await mkdtemp(join(tmpdir(), 'codex-mobile-queue-disposed-recovery-'))
+    process.env.CODEX_HOME = codexHome
+    await appendThreadQueuedMessage('thread-disposed-recovery', {
+      id: 'queued-disposed', text: 'do not restart', imageUrls: [], skills: [], fileAttachments: [],
+      collaborationMode: 'default', model: 'gpt-test', effort: '',
+    })
+    const processor = new BackendQueueProcessor({
+      rpc: vi.fn(),
+      onNotification: () => () => undefined,
+    } as never)
+
+    try {
+      processor.dispose()
+      await processor.scheduleAllQueuedThreads(0)
+      expect((processor as unknown as {
+        queueDrainTimersByThreadId: Map<string, unknown>
+      }).queueDrainTimersByThreadId.size).toBe(0)
+    } finally {
+      processor.dispose()
+      if (originalCodexHome === undefined) delete process.env.CODEX_HOME
+      else process.env.CODEX_HOME = originalCodexHome
+      await rm(codexHome, { recursive: true, force: true })
+    }
+  })
+
   it('serializes competing turn starts for the same thread', async () => {
     const originalCodexHome = process.env.CODEX_HOME
     const codexHome = await mkdtemp(join(tmpdir(), 'codex-mobile-thread-start-claim-'))
@@ -1199,6 +1226,55 @@ describe('backend queue scheduling', () => {
       })
     } finally {
       processor.dispose()
+      if (originalCodexHome === undefined) delete process.env.CODEX_HOME
+      else process.env.CODEX_HOME = originalCodexHome
+      await rm(codexHome, { recursive: true, force: true })
+    }
+  })
+
+  it('preserves active-turn uploads when a replacement processor finalizes the durable queue row', async () => {
+    const originalCodexHome = process.env.CODEX_HOME
+    const codexHome = await mkdtemp(join(tmpdir(), 'codex-mobile-queue-crash-upload-'))
+    const uploadRoot = join(codexHome, 'uploads')
+    process.env.CODEX_HOME = codexHome
+    const issuedAt = Date.now()
+    const upload = await createManagedUpload('crash.png', Buffer.from('active-image'), uploadRoot)
+    const queuedMessage = {
+      id: 'queued-before-crash', text: 'accepted before crash', imageUrls: [], skills: [],
+      fileAttachments: [{ label: 'crash.png', path: upload.path, fsPath: upload.path, uploadHandle: upload.uploadHandle }],
+      collaborationMode: 'default' as const, model: 'gpt-test', effort: '' as const,
+    }
+    await appendThreadQueuedMessage('thread-crash-upload', queuedMessage)
+    const statePath = join(codexHome, '.codex-global-state.json')
+    const payload = JSON.parse(await readFile(statePath, 'utf8')) as Record<string, unknown>
+    payload['thread-active-managed-messages'] = { 'thread-crash-upload': queuedMessage }
+    await writeFile(statePath, JSON.stringify(payload))
+    vi.spyOn(Date, 'now').mockReturnValue(issuedAt + (10 * 60 * 1000))
+    const processor = new BackendQueueProcessor({
+      rpc: vi.fn(async (method: string) => method === 'thread/read'
+        ? {
+            thread: {
+              id: 'thread-crash-upload',
+              turns: [{
+                id: 'turn-accepted', status: 'inProgress',
+                items: [{ id: 'user', clientId: queuedMessage.id }],
+              }],
+            },
+          }
+        : {}),
+      getPid: () => process.pid,
+      onNotification: () => () => undefined,
+    } as never)
+    try {
+      await processor.processThreadQueue('thread-crash-upload')
+      const persisted = JSON.parse(await readFile(statePath, 'utf8')) as Record<string, unknown>
+      expect(persisted['thread-active-managed-messages']).toMatchObject({
+        'thread-crash-upload': expect.objectContaining({ id: queuedMessage.id }),
+      })
+      expect(existsSync(upload.path)).toBe(true)
+    } finally {
+      processor.dispose()
+      vi.restoreAllMocks()
       if (originalCodexHome === undefined) delete process.env.CODEX_HOME
       else process.env.CODEX_HOME = originalCodexHome
       await rm(codexHome, { recursive: true, force: true })
@@ -1854,7 +1930,11 @@ describe('backend queue scheduling', () => {
         attempted: false,
       })
 
-      expect(status).toEqual({ accepted: false, canStart: process.platform !== 'linux' })
+      expect(status).toEqual({
+        accepted: false,
+        acceptedInProgress: false,
+        canStart: process.platform !== 'linux',
+      })
       if (process.platform === 'linux') {
         expect(runtimeProbe.registerThread).toHaveBeenCalledOnce()
         expect(runtimeProbe.inspect).toHaveBeenCalledWith('thread-1', 31337)
@@ -1888,7 +1968,7 @@ describe('backend queue scheduling', () => {
         threadId: 'thread-1',
         message: { id: 'queued-1' },
         attempted: false,
-      })).resolves.toEqual({ accepted: false, canStart: true })
+      })).resolves.toEqual({ accepted: false, acceptedInProgress: false, canStart: true })
       expect(runtimeProbe.registerThread).not.toHaveBeenCalled()
       expect(runtimeProbe.inspect).not.toHaveBeenCalled()
     } finally {

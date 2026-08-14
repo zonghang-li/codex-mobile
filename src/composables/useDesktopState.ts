@@ -843,6 +843,17 @@ function isWriterOwnershipNotIdleError(error: unknown): boolean {
   return error.message.toLowerCase().includes('task writer ownership is not idle')
 }
 
+function isThreadStartClaimConflictError(error: unknown): boolean {
+  return error instanceof CodexApiError
+    && error.code === 'http_error'
+    && error.status === 409
+    && error.message.toLowerCase().includes('another start is already in progress')
+}
+
+function isTurnStartQueueFallbackError(error: unknown): boolean {
+  return isWriterOwnershipNotIdleError(error) || isThreadStartClaimConflictError(error)
+}
+
 function isThreadNotFoundInterruptError(error: unknown): boolean {
   if (!(error instanceof Error)) return false
   const message = error.message.toLowerCase()
@@ -2287,6 +2298,7 @@ export function useDesktopState() {
   let hasLoadedPersistedQueueState = false
   let queueMutationVersion = 0
   let queueRefreshRequestVersion = 0
+  const queueRefreshRequestVersionByThreadId = new Map<string, number>()
   let queueLifecycleGeneration = 0
   let latestQueueRevision = 0
   const pendingQueueAppendRetryWaits = new Set<{
@@ -3135,6 +3147,16 @@ export function useDesktopState() {
     ) return
     releasedPendingTurnRequests.add(request)
     void cleanupManagedUploads(request.imageUrls, request.fileAttachments)
+  }
+
+  function transferPendingTurnRequest(
+    threadId: string,
+    request: PendingTurnRequest | undefined = pendingTurnRequestByThreadId.value[threadId],
+  ): void {
+    if (pendingTurnRequestByThreadId.value[threadId] === request) {
+      clearPendingTurnRequest(threadId)
+    }
+    if (request) releasedPendingTurnRequests.add(request)
   }
 
   async function retryPendingTurnWithFallback(threadId: string): Promise<void> {
@@ -7735,20 +7757,22 @@ export function useDesktopState() {
     }
   }
 
-  async function enqueueExternalTextOnlyThreadMessage(
+  async function enqueueExternalThreadMessage(
     threadId: string,
     nextText: string,
+    imageUrls: string[],
+    skills: Array<{ name: string; path: string }>,
+    fileAttachments: FileAttachment[],
     collaborationModeOverride?: CollaborationModeKind,
     queueInsertIndex?: number,
   ): Promise<QueuedMessage | null> {
-    const textOnly = nextText.trim()
-    if (!textOnly) return null
+    if (!nextText.trim() && imageUrls.length === 0 && fileAttachments.length === 0) return null
     return enqueueThreadMessageDurably(
       threadId,
-      textOnly,
-      [],
-      [],
-      [],
+      nextText,
+      imageUrls,
+      skills,
+      fileAttachments,
       collaborationModeOverride,
       queueInsertIndex,
     )
@@ -9170,12 +9194,16 @@ export function useDesktopState() {
       return
     }
     if (isExternallyOwned(threadId)) {
-      await enqueueExternalTextOnlyThreadMessage(
+      const queuedMessage = await enqueueExternalThreadMessage(
         threadId,
         nextText,
+        imageUrls,
+        skills,
+        fileAttachments,
         collaborationModeOverride,
         queueInsertIndex,
       )
+      if (queuedMessage) uploadLease.transfer()
       await uploadLease.release()
       return
     }
@@ -9188,12 +9216,16 @@ export function useDesktopState() {
         return
       }
       if (isExternallyOwned(threadId)) {
-        await enqueueExternalTextOnlyThreadMessage(
+        const queuedMessage = await enqueueExternalThreadMessage(
           threadId,
           nextText,
+          imageUrls,
+          skills,
+          fileAttachments,
           collaborationModeOverride,
           queueInsertIndex,
         )
+        if (queuedMessage) uploadLease.transfer()
         await uploadLease.release()
         return
       }
@@ -9241,18 +9273,26 @@ export function useDesktopState() {
         uploadLease.transfer,
         submission,
       ).catch(async (unknownError) => {
-        if (isWriterOwnershipNotIdleError(unknownError)) {
+        if (isTurnStartQueueFallbackError(unknownError)) {
           const pendingTurnRequest = submission.pendingTurnRequest
           clearPendingStopRequest(threadId, submission.generation)
           clearLocalSubmission(threadId, submission.generation)
-          releasePendingTurnRequest(threadId, pendingTurnRequest)
           removeOptimisticUserMessage(threadId, optimisticMessageId)
-          const queuedMessage = await enqueueExternalTextOnlyThreadMessage(
+          const queuedMessage = await enqueueExternalThreadMessage(
             threadId,
-            nextText,
+            pendingTurnRequest?.text ?? nextText,
+            pendingTurnRequest?.imageUrls ?? imageUrls,
+            pendingTurnRequest?.skills ?? skills,
+            pendingTurnRequest?.fileAttachments ?? fileAttachments,
             collaborationModeOverride,
             queueInsertIndex,
           )
+          if (queuedMessage) {
+            transferPendingTurnRequest(threadId, pendingTurnRequest)
+            uploadLease.transfer()
+          } else {
+            releasePendingTurnRequest(threadId, pendingTurnRequest)
+          }
           setThreadRuntimeOwnership(threadId, 'external', { externalPollDelayMs: 0 })
           setThreadInProgress(threadId, true)
           if (queuedMessage) {
@@ -9317,19 +9357,27 @@ export function useDesktopState() {
       )
       await uploadLease.release()
     } catch (unknownError) {
-      if (isWriterOwnershipNotIdleError(unknownError)) {
+      if (isTurnStartQueueFallbackError(unknownError)) {
         const pendingTurnRequest = submission.pendingTurnRequest
-        releasePendingTurnRequest(threadId, pendingTurnRequest)
         await uploadLease.release()
         clearPendingStopRequest(threadId, submission.generation)
         clearLocalSubmission(threadId, submission.generation)
         removeOptimisticUserMessage(threadId, optimisticMessageId)
-        const queuedMessage = await enqueueExternalTextOnlyThreadMessage(
+        const queuedMessage = await enqueueExternalThreadMessage(
           threadId,
-          nextText,
+          pendingTurnRequest?.text ?? nextText,
+          pendingTurnRequest?.imageUrls ?? imageUrls,
+          pendingTurnRequest?.skills ?? skills,
+          pendingTurnRequest?.fileAttachments ?? fileAttachments,
           collaborationModeOverride,
           queueInsertIndex,
         )
+        if (queuedMessage) {
+          transferPendingTurnRequest(threadId, pendingTurnRequest)
+          uploadLease.transfer()
+        } else {
+          releasePendingTurnRequest(threadId, pendingTurnRequest)
+        }
         setThreadRuntimeOwnership(threadId, 'external', { externalPollDelayMs: 0 })
         setThreadInProgress(threadId, true)
         setTurnActivityForThread(threadId, null)
@@ -9666,7 +9714,7 @@ export function useDesktopState() {
       await syncFromNotifications()
       scheduleDelayedTurnSync(threadId)
     } catch (unknownError) {
-      if (!isAmbiguousTurnStartError(unknownError) && !isWriterOwnershipNotIdleError(unknownError)) {
+      if (!isAmbiguousTurnStartError(unknownError) && !isTurnStartQueueFallbackError(unknownError)) {
         if (submission) {
           releasePendingTurnRequest(threadId, submission.pendingTurnRequest)
         } else {
@@ -9681,7 +9729,8 @@ export function useDesktopState() {
     threadId: string,
     scheduledMutationVersion = queueMutationVersion,
   ): Promise<void> {
-    const refreshRequestVersion = ++queueRefreshRequestVersion
+    const refreshRequestVersion = (queueRefreshRequestVersionByThreadId.get(threadId) ?? 0) + 1
+    queueRefreshRequestVersionByThreadId.set(threadId, refreshRequestVersion)
     if (queueMutationVersion !== scheduledMutationVersion) return
     if ((pendingQueueAppendMessageIdsByThreadId.get(threadId)?.size ?? 0) > 0) {
       queueRefreshDuringPendingAppendThreadIds.add(threadId)
@@ -9697,7 +9746,7 @@ export function useDesktopState() {
     const mutationVersionAtStart = queueMutationVersion
     try {
       const snapshot = await getThreadQueueSnapshot()
-      if (queueRefreshRequestVersion !== refreshRequestVersion) {
+      if (queueRefreshRequestVersionByThreadId.get(threadId) !== refreshRequestVersion) {
         pendingQueueRefreshThreadIds.add(threadId)
       } else if (
         queueMutationVersion === mutationVersionAtStart
@@ -10554,6 +10603,7 @@ export function useDesktopState() {
   function stopPolling(): void {
     queueLifecycleGeneration += 1
     queueRefreshRequestVersion += 1
+    queueRefreshRequestVersionByThreadId.clear()
     for (const wait of pendingQueueAppendRetryWaits) {
       globalThis.clearTimeout(wait.timer)
       wait.resolve(false)

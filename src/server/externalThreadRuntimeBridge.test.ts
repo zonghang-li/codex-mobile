@@ -10,6 +10,7 @@ import {
   createCodexBridgeMiddleware,
   pruneExpiredCachedHttpResponses,
   trimCachedHttpResponses,
+  withThreadStartClaim,
 } from './codexAppServerBridge'
 import { PERMISSIVE_SECURITY_POLICY } from './securityPolicy'
 
@@ -276,11 +277,11 @@ describe('external thread runtime bridge augmentation', () => {
   })
 })
 
-const disposers: Array<() => void> = []
+const disposers: Array<() => void | Promise<void>> = []
 const originalCodexHome = process.env.CODEX_HOME
 
-afterEach(() => {
-  for (const dispose of disposers.splice(0)) dispose()
+afterEach(async () => {
+  for (const dispose of disposers.splice(0)) await dispose()
   if (originalCodexHome === undefined) delete process.env.CODEX_HOME
   else process.env.CODEX_HOME = originalCodexHome
   vi.restoreAllMocks()
@@ -2211,6 +2212,75 @@ describe('POST /codex-api/rpc guarded resume', () => {
 })
 
 describe('POST /codex-api/rpc guarded user turns', () => {
+  it('returns 409 when a cross-process turn-start claim already exists', async () => {
+    const codexHome = await mkdtemp(join(tmpdir(), 'codex-mobile-rpc-start-conflict-'))
+    process.env.CODEX_HOME = codexHome
+    let release!: () => void
+    const held = withThreadStartClaim('thread-start-conflict-http', async () => (
+      new Promise<void>((resolve) => { release = resolve })
+    ))
+    await vi.waitFor(() => expect(release).toBeTypeOf('function'))
+    const middleware = createCodexBridgeMiddleware()
+    const port = await listenWithMiddleware(middleware)
+    disposers.push(() => rm(codexHome, { recursive: true, force: true }))
+    try {
+      const response = await fetch(`http://127.0.0.1:${port}/codex-api/rpc`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          method: 'turn/start',
+          params: { threadId: 'thread-start-conflict-http', input: [{ type: 'text', text: 'loser' }] },
+        }),
+      })
+      expect(response.status).toBe(409)
+    } finally {
+      release()
+      await held
+    }
+  })
+
+  it('augments an empty thread/read fallback with current external ownership', async () => {
+    const middleware = createCodexBridgeMiddleware()
+    const shared = sharedBridgeForTest() as ReturnType<typeof sharedBridgeForTest> & {
+      appServer: ReturnType<typeof sharedBridgeForTest>['appServer'] & {
+        rpc: (method: string, params: unknown) => Promise<unknown>
+        storeThreadReadSnapshot: (threadId: string, snapshot: unknown) => void
+      }
+    }
+    shared.appServer.storeThreadReadSnapshot('thread-empty-fallback', {
+      thread: {
+        id: 'thread-empty-fallback',
+        path: '/tmp/thread-empty-fallback.jsonl',
+        status: { type: 'idle' },
+        turns: [{ id: 'turn-cli', status: 'interrupted', items: [] }],
+      },
+    })
+    vi.spyOn(shared.appServer, 'rpc').mockRejectedValue(new Error(
+      'failed to read thread: failed to read rollout /tmp/thread-empty-fallback.jsonl: rollout at /tmp/thread-empty-fallback.jsonl is empty',
+    ))
+    vi.spyOn(shared.runtimeProbe, 'inspect').mockResolvedValue({
+      state: 'running', turnId: 'turn-cli', interruptible: false, source: 'external-session-writer',
+    })
+    const port = await listenWithMiddleware(middleware)
+
+    const response = await fetch(`http://127.0.0.1:${port}/codex-api/rpc`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ method: 'thread/read', params: { threadId: 'thread-empty-fallback' } }),
+    })
+    expect(response.status).toBe(200)
+    await expect(response.json()).resolves.toMatchObject({
+      result: {
+        thread: {
+          id: 'thread-empty-fallback',
+          status: { type: 'idle' },
+          externalRuntime: {
+            state: 'running', turnId: 'turn-cli', interruptible: false, source: 'external-session-writer',
+          },
+        },
+      },
+    })
+  })
   it.each([
     ['running', {
       state: 'running' as const,

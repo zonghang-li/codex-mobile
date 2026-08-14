@@ -515,12 +515,29 @@ function readCodexCommandArgs(cmdline: string): string[] | null {
 }
 
 function isCodexAppServerCommand(cmdline: string): boolean {
-  return readCodexCommandArgs(cmdline)?.includes('app-server') === true
+  return readCodexSubcommand(readCodexCommandArgs(cmdline)) === 'app-server'
 }
 
 function isDirectCodexCliCommand(cmdline: string): boolean {
   const args = readCodexCommandArgs(cmdline)
-  return args !== null && !args.includes('app-server')
+  return args !== null && readCodexSubcommand(args) !== 'app-server'
+}
+
+const CODEX_GLOBAL_OPTIONS_WITH_VALUE = new Set([
+  '-c', '--config', '-m', '--model', '-p', '--profile', '-s', '--sandbox',
+  '-C', '--cd', '--add-dir', '--color', '--output-schema', '-i', '--image',
+])
+
+function readCodexSubcommand(args: string[] | null): string | null {
+  if (!args) return null
+  for (let index = 0; index < args.length; index += 1) {
+    const argument = args[index] ?? ''
+    if (argument === '--') return null
+    if (!argument.startsWith('-')) return argument
+    const optionName = argument.includes('=') ? argument.slice(0, argument.indexOf('=')) : argument
+    if (CODEX_GLOBAL_OPTIONS_WITH_VALUE.has(optionName) && !argument.includes('=')) index += 1
+  }
+  return null
 }
 
 function isCodexRolloutWriterCommand(cmdline: string): boolean {

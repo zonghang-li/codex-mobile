@@ -7381,7 +7381,7 @@ describe('external runtime ownership', () => {
         'text steer',
       ])
     })
-    expect(gatewayMocks.cleanupManagedUploads).toHaveBeenCalledWith([managedImageUrl], [])
+    expect(gatewayMocks.cleanupManagedUploads).not.toHaveBeenCalledWith([managedImageUrl], [])
   })
 
   it('refreshes again after a local queue mutation and accepts a backend pop', async () => {
@@ -7507,6 +7507,24 @@ describe('external runtime ownership', () => {
     expect(state.selectedThreadQueuedMessages.value).toEqual([])
   })
 
+  it('settles concurrent queue refreshes for a multi-thread notification without retry ping-pong', async () => {
+    const { emit } = await setupExternalRuntimeState()
+    const first = deferred<{ state: Record<string, never[]>; revision: number }>()
+    const second = deferred<{ state: Record<string, never[]>; revision: number }>()
+    gatewayMocks.getThreadQueueSnapshot.mockReset()
+      .mockReturnValueOnce(first.promise)
+      .mockReturnValueOnce(second.promise)
+
+    emit({ method: 'thread/queue/updated', params: { threadIds: ['thread-1', 'thread-2'], revision: 2 } })
+    await vi.waitFor(() => expect(gatewayMocks.getThreadQueueSnapshot).toHaveBeenCalledTimes(2))
+    first.resolve({ state: {}, revision: 2 })
+    second.resolve({ state: {}, revision: 2 })
+    await flushMicrotasks()
+    await flushMicrotasks()
+
+    expect(gatewayMocks.getThreadQueueSnapshot).toHaveBeenCalledTimes(2)
+  })
+
   it('queues an idle text-only submit when writer ownership changes after turn/start is issued', async () => {
     const { state } = await setupExternalRuntimeState()
     gatewayMocks.resumeThread.mockResolvedValue(idleDetail())
@@ -7580,7 +7598,7 @@ describe('external runtime ownership', () => {
       expect(state.selectedThreadQueuedMessages.value).toEqual([
         expect.objectContaining({
           text: 'copy the screenshot',
-          imageUrls: [],
+          imageUrls: [managedImageUrl],
           skills: [],
           fileAttachments: [],
         }),
@@ -7588,7 +7606,7 @@ describe('external runtime ownership', () => {
     })
   })
 
-  it('queues a steer when turn/start reports a non-idle writer owner', async () => {
+  it('queues the complete steer payload when turn/start reports a non-idle writer owner', async () => {
     const { state } = await setupExternalRuntimeState()
     gatewayMocks.resumeThread.mockResolvedValue(idleDetail())
     gatewayMocks.startThreadTurn.mockRejectedValue(new CodexApiError(
@@ -7622,9 +7640,9 @@ describe('external runtime ownership', () => {
       'thread-1',
       expect.objectContaining({
         text: 'append while desktop is writing',
-        imageUrls: [],
-        skills: [],
-        fileAttachments: [],
+        imageUrls: [managedImageUrl],
+        skills: [skill],
+        fileAttachments: [managedFile],
       }),
       undefined,
       expect.any(AbortSignal),
@@ -7632,17 +7650,40 @@ describe('external runtime ownership', () => {
     expect(state.selectedThreadQueuedMessages.value).toEqual([
       expect.objectContaining({
         text: 'append while desktop is writing',
-        imageUrls: [],
-        skills: [],
-        fileAttachments: [],
+        imageUrls: [managedImageUrl],
+        skills: [skill],
+        fileAttachments: [managedFile],
       }),
     ])
-    expect(gatewayMocks.cleanupManagedUploads).toHaveBeenCalledWith([managedImageUrl], [managedFile])
+    expect(gatewayMocks.cleanupManagedUploads).not.toHaveBeenCalledWith([managedImageUrl], [managedFile])
     expect(state.selectedThreadRuntimeOwnership.value).toBe('external')
     expect(state.error.value).toBe('')
   })
 
-  it('sanitizes a running steer fallback to text-only when writer ownership flips external', async () => {
+  it('durably queues a turn rejected by the cross-process start claim', async () => {
+    const { state } = await setupExternalRuntimeState()
+    gatewayMocks.resumeThread.mockResolvedValue(idleDetail())
+    gatewayMocks.startThreadTurn.mockRejectedValue(new CodexApiError(
+      'RPC turn/start failed with HTTP 409: Cannot start a turn because another start is already in progress.',
+      { code: 'http_error', method: 'turn/start', status: 409 },
+    ))
+
+    await state.sendMessageToSelectedThread('keep the losing submission', [], [], 'steer')
+    await flushMicrotasks()
+
+    expect(gatewayMocks.appendThreadQueuedMessage).toHaveBeenCalledWith(
+      'thread-1',
+      expect.objectContaining({ text: 'keep the losing submission' }),
+      undefined,
+      expect.any(AbortSignal),
+    )
+    expect(state.selectedThreadQueuedMessages.value).toEqual([
+      expect.objectContaining({ text: 'keep the losing submission' }),
+    ])
+    expect(state.error.value).toBe('')
+  })
+
+  it('preserves a running steer payload when writer ownership flips external', async () => {
     const { state, emit } = await setupExternalRuntimeState()
     gatewayMocks.getThreadDetail.mockResolvedValue(localDetail('turn-local'))
     gatewayMocks.resumeThread.mockResolvedValue(idleDetail())
@@ -7678,9 +7719,9 @@ describe('external runtime ownership', () => {
       'thread-1',
       expect.objectContaining({
         text: 'steer with external race',
-        imageUrls: [],
-        skills: [],
-        fileAttachments: [],
+        imageUrls: [managedImageUrl],
+        skills: [skill],
+        fileAttachments: [managedFile],
       }),
       undefined,
       expect.any(AbortSignal),
@@ -7688,12 +7729,12 @@ describe('external runtime ownership', () => {
     expect(state.selectedThreadQueuedMessages.value).toEqual([
       expect.objectContaining({
         text: 'steer with external race',
-        imageUrls: [],
-        skills: [],
-        fileAttachments: [],
+        imageUrls: [managedImageUrl],
+        skills: [skill],
+        fileAttachments: [managedFile],
       }),
     ])
-    expect(gatewayMocks.cleanupManagedUploads).toHaveBeenCalledWith([managedImageUrl], [managedFile])
+    expect(gatewayMocks.cleanupManagedUploads).not.toHaveBeenCalledWith([managedImageUrl], [managedFile])
     expect(state.selectedThreadRuntimeOwnership.value).toBe('external')
   })
 
@@ -8101,18 +8142,18 @@ describe('external runtime ownership', () => {
     expect(state.selectedThreadQueuedMessages.value.slice(2)).toEqual([
       expect.objectContaining({
         text: 'steer externally',
-        imageUrls: [],
-        skills: [],
-        fileAttachments: [],
+        imageUrls: [managedImageUrl],
+        skills: [skill],
+        fileAttachments: [managedFile],
       }),
       expect.objectContaining({
         text: 'queue externally',
-        imageUrls: [],
-        skills: [],
-        fileAttachments: [],
+        imageUrls: [managedImageUrl],
+        skills: [skill],
+        fileAttachments: [managedFile],
       }),
     ])
-    expect(gatewayMocks.cleanupManagedUploads).toHaveBeenCalledWith([managedImageUrl], [managedFile])
+    expect(gatewayMocks.cleanupManagedUploads).not.toHaveBeenCalledWith([managedImageUrl], [managedFile])
     expect(state.selectedThreadQueuedMessages.value.slice(0, 2).map((message) => message.id)).toEqual(queueBeforeMutations)
     expect(gatewayMocks.appendThreadQueuedMessage.mock.calls.length).toBeGreaterThanOrEqual(
       persistenceCallsBeforeMutations + 2,
@@ -8322,12 +8363,11 @@ describe('external runtime ownership', () => {
 
     expect(state.selectedThreadRuntimeOwnership.value).toBe('external')
     expect(gatewayMocks.startThreadTurn).not.toHaveBeenCalled()
-    expect(gatewayMocks.cleanupManagedUploads).toHaveBeenCalledTimes(1)
-    expect(gatewayMocks.cleanupManagedUploads).toHaveBeenCalledWith([managedImageUrl], [])
+    expect(gatewayMocks.cleanupManagedUploads).not.toHaveBeenCalledWith([managedImageUrl], [])
     expect(state.selectedThreadQueuedMessages.value).toEqual([
       expect.objectContaining({
         text: 'edited prompt',
-        imageUrls: [],
+        imageUrls: [managedImageUrl],
         skills: [],
         fileAttachments: [],
       }),

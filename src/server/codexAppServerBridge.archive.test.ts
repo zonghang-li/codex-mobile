@@ -29,6 +29,12 @@ afterEach(() => {
 
 describe('callRpcWithArchiveRecovery', () => {
   it('sets a fallback name and retries archive when Codex has not materialized a rollout', async () => {
+    const codexHome = await mkdtemp(join(tmpdir(), 'codex-archive-active-'))
+    process.env.CODEX_HOME = codexHome
+    const sessionPath = join(codexHome, 'sessions', 'rollout-test-thread.jsonl')
+    await mkdir(join(codexHome, 'sessions'), { recursive: true })
+    await mkdir(join(codexHome, 'archived_sessions'), { recursive: true })
+    await writeFile(sessionPath, '{}\n')
     const calls: Array<{ method: string; params: unknown }> = []
     let archiveCalls = 0
     const appServer = {
@@ -46,7 +52,7 @@ describe('callRpcWithArchiveRecovery', () => {
             thread: {
               id: 'test-thread',
               preview: 'Preview title',
-              path: '/home/user/.codex/sessions/rollout-test-thread.jsonl',
+              path: sessionPath,
             },
           }
         }
@@ -54,16 +60,59 @@ describe('callRpcWithArchiveRecovery', () => {
       },
     }
 
-    await expect(callRpcWithArchiveRecovery(appServer, 'thread/archive', { threadId: 'test-thread' })).resolves.toEqual({ ok: true })
-    expect(calls).toEqual([
-      { method: 'thread/archive', params: { threadId: 'test-thread' } },
-      { method: 'thread/read', params: { threadId: 'test-thread', includeTurns: false } },
-      { method: 'thread/name/set', params: { threadId: 'test-thread', name: 'Preview title' } },
-      { method: 'thread/archive', params: { threadId: 'test-thread' } },
-    ])
+    try {
+      await expect(callRpcWithArchiveRecovery(appServer, 'thread/archive', { threadId: 'test-thread' })).resolves.toEqual({ ok: true })
+      expect(calls).toEqual([
+        { method: 'thread/archive', params: { threadId: 'test-thread' } },
+        { method: 'thread/read', params: { threadId: 'test-thread', includeTurns: false } },
+        { method: 'thread/name/set', params: { threadId: 'test-thread', name: 'Preview title' } },
+        { method: 'thread/archive', params: { threadId: 'test-thread' } },
+      ])
+    } finally {
+      await rm(codexHome, { recursive: true, force: true })
+    }
+  })
+
+  it('recovers an active thread when the archived sessions root does not exist yet', async () => {
+    const codexHome = await mkdtemp(join(tmpdir(), 'codex-archive-no-archived-root-'))
+    process.env.CODEX_HOME = codexHome
+    const sessionPath = join(codexHome, 'sessions', 'rollout-active-thread.jsonl')
+    await mkdir(join(codexHome, 'sessions'), { recursive: true })
+    await writeFile(sessionPath, '{}\n')
+    let archiveCalls = 0
+    const appServer = {
+      async rpc(method: string): Promise<unknown> {
+        if (method === 'thread/archive') {
+          archiveCalls += 1
+          if (archiveCalls === 1) throw new Error('no rollout found for thread active-thread')
+          return { ok: true }
+        }
+        if (method === 'thread/read') {
+          return { thread: { id: 'active-thread', preview: 'Active title', path: sessionPath } }
+        }
+        if (method === 'thread/name/set') return { ok: true }
+        throw new Error(`unexpected method ${method}`)
+      },
+    }
+
+    try {
+      await expect(callRpcWithArchiveRecovery(
+        appServer,
+        'thread/archive',
+        { threadId: 'active-thread' },
+      )).resolves.toEqual({ ok: true })
+    } finally {
+      await rm(codexHome, { recursive: true, force: true })
+    }
   })
 
   it('treats no-rollout archive of an already archived thread as successful', async () => {
+    const codexHome = await mkdtemp(join(tmpdir(), 'codex-archive-archived-'))
+    process.env.CODEX_HOME = codexHome
+    const sessionPath = join(codexHome, 'archived_sessions', 'rollout-archived-thread.jsonl')
+    await mkdir(join(codexHome, 'sessions'), { recursive: true })
+    await mkdir(join(codexHome, 'archived_sessions'), { recursive: true })
+    await writeFile(sessionPath, '{}\n')
     const calls: Array<{ method: string; params: unknown }> = []
     const appServer = {
       async rpc(method: string, params: unknown): Promise<unknown> {
@@ -75,7 +124,7 @@ describe('callRpcWithArchiveRecovery', () => {
           return {
             thread: {
               id: 'archived-thread',
-              path: '/home/user/.codex/archived_sessions/rollout-archived-thread.jsonl',
+              path: sessionPath,
             },
           }
         }
@@ -83,11 +132,15 @@ describe('callRpcWithArchiveRecovery', () => {
       },
     }
 
-    await expect(callRpcWithArchiveRecovery(appServer, 'thread/archive', { threadId: 'archived-thread' })).resolves.toBeNull()
-    expect(calls).toEqual([
-      { method: 'thread/archive', params: { threadId: 'archived-thread' } },
-      { method: 'thread/read', params: { threadId: 'archived-thread', includeTurns: false } },
-    ])
+    try {
+      await expect(callRpcWithArchiveRecovery(appServer, 'thread/archive', { threadId: 'archived-thread' })).resolves.toBeNull()
+      expect(calls).toEqual([
+        { method: 'thread/archive', params: { threadId: 'archived-thread' } },
+        { method: 'thread/read', params: { threadId: 'archived-thread', includeTurns: false } },
+      ])
+    } finally {
+      await rm(codexHome, { recursive: true, force: true })
+    }
   })
 
   it('does not write a fallback title when archive metadata cannot be verified', async () => {
@@ -106,6 +159,30 @@ describe('callRpcWithArchiveRecovery', () => {
       'thread/archive',
       { threadId: 'uncertain-thread' },
     )).rejects.toThrow('metadata temporarily unavailable')
+    expect(calls).toEqual(['thread/archive', 'thread/read'])
+  })
+
+  it.each([
+    ['missing thread', {}],
+    ['mismatched id', { thread: { id: 'other-thread', path: '/tmp/sessions/rollout.jsonl' } }],
+    ['relative path', { thread: { id: 'uncertain-thread', path: 'sessions/rollout.jsonl' } }],
+    ['untrusted archived component', { thread: { id: 'uncertain-thread', path: '/tmp/archived_sessions/rollout.jsonl' } }],
+  ])('does not write after malformed successful archive metadata: %s', async (_label, readResult) => {
+    const calls: string[] = []
+    const appServer = {
+      async rpc(method: string): Promise<unknown> {
+        calls.push(method)
+        if (method === 'thread/archive') throw new Error('no rollout found for thread uncertain-thread')
+        if (method === 'thread/read') return readResult
+        throw new Error(`unexpected writer ${method}`)
+      },
+    }
+
+    await expect(callRpcWithArchiveRecovery(
+      appServer,
+      'thread/archive',
+      { threadId: 'uncertain-thread' },
+    )).rejects.toThrow('Cannot verify thread archive state')
     expect(calls).toEqual(['thread/archive', 'thread/read'])
   })
 

@@ -2,6 +2,11 @@ import { randomUUID } from 'node:crypto'
 import { mkdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises'
 import { basename, dirname, join } from 'node:path'
 
+export function isLockDestinationConflict(error: unknown): boolean {
+  const code = (error as NodeJS.ErrnoException | null)?.code
+  return code === 'EEXIST' || code === 'ENOTEMPTY'
+}
+
 export async function mutateJsonStateFile<T>(
   statePath: string,
   update: (payload: Record<string, unknown>) => T | Promise<T>,
@@ -63,6 +68,7 @@ async function tryCreateOwnedLock(lockPath: string, token: string): Promise<bool
       await rename(candidatePath, lockPath)
       return true
     } catch (error) {
+      if (isLockDestinationConflict(error)) return false
       try {
         await stat(lockPath)
         return false

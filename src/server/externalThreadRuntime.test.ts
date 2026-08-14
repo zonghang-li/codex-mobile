@@ -865,6 +865,20 @@ describe('ExternalThreadRuntimeProbe', () => {
     })
   })
 
+  it('keeps a direct CLI command non-interruptible when app-server is only an argument', async () => {
+    const system = fakeRuntimeSystem({
+      log: lifecycle('task_started', 'turn-cli-argument'),
+      fds: [writerFd({ cmdline: '/usr/local/bin/codex\0exec\0app-server\0' })],
+    })
+
+    await expect(registeredProbe(system).inspect('thread-1', 99)).resolves.toEqual({
+      state: 'running',
+      turnId: 'turn-cli-argument',
+      interruptible: false,
+      source: 'external-session-writer',
+    })
+  })
+
   it('recognizes a flag-only interactive Codex CLI writer as non-interruptible', async () => {
     const system = fakeRuntimeSystem({
       log: lifecycle('task_started', 'turn-cli'),

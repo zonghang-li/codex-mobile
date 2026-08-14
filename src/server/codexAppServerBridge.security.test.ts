@@ -101,6 +101,39 @@ describe('Codex bridge security-policy wiring', () => {
     }
   })
 
+  it('rechecks durable queue references immediately before deleting an upload', async () => {
+    const originalCodexHome = process.env.CODEX_HOME
+    const codexHome = await mkdtemp(join(tmpdir(), 'codex-managed-upload-race-home-'))
+    const root = await mkdtemp(join(tmpdir(), 'codex-managed-upload-race-'))
+    cleanupRoots.push(codexHome, root)
+    process.env.CODEX_HOME = codexHome
+    try {
+      const upload = await createManagedUpload('raced.png', Buffer.from('queued-during-reap'), root)
+      const old = new Date(Date.now() - (2 * 60 * 60 * 1000))
+      await utimes(dirname(upload.path), old, old)
+      let appended = false
+
+      await expect(reapExpiredManagedUploads({
+        uploadRoot: root,
+        nowMs: Date.now(),
+        ttlMs: 60 * 60 * 1000,
+        beforeDeleteCandidate: async () => {
+          if (appended) return
+          appended = true
+          await appendThreadQueuedMessage('thread-raced-upload', {
+            id: 'queued-during-reap', text: 'keep file', imageUrls: [], skills: [],
+            fileAttachments: [{ label: 'raced.png', path: upload.path, fsPath: upload.path, uploadHandle: upload.uploadHandle }],
+            collaborationMode: 'default', model: 'gpt-test', effort: '',
+          })
+        },
+      })).resolves.toBe(0)
+      await expect(readFile(upload.path, 'utf8')).resolves.toBe('queued-during-reap')
+    } finally {
+      if (originalCodexHome === undefined) delete process.env.CODEX_HOME
+      else process.env.CODEX_HOME = originalCodexHome
+    }
+  })
+
   it('does not release durable queued uploads when a processor is disposed', async () => {
     const originalCodexHome = process.env.CODEX_HOME
     const codexHome = await mkdtemp(join(tmpdir(), 'codex-managed-upload-dispose-home-'))

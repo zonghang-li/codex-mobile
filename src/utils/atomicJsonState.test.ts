@@ -3,6 +3,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { describe, expect, it } from 'vitest'
 import {
+  isLockDestinationConflict,
   isProcessIdentityAlive,
   isProcessOwnerAlive,
   mutateJsonStateFile,
@@ -19,6 +20,12 @@ function deferred() {
 }
 
 describe('mutateJsonStateFile', () => {
+  it('treats Linux directory rename conflicts as ordinary lock contention', () => {
+    expect(isLockDestinationConflict(Object.assign(new Error('exists'), { code: 'EEXIST' }))).toBe(true)
+    expect(isLockDestinationConflict(Object.assign(new Error('not empty'), { code: 'ENOTEMPTY' }))).toBe(true)
+    expect(isLockDestinationConflict(Object.assign(new Error('denied'), { code: 'EACCES' }))).toBe(false)
+  })
+
   it('treats an unreadable identity for a demonstrably live pid as still owned', () => {
     expect(isProcessIdentityAlive(true, '123:456', null, 'linux')).toBe(true)
   })
