@@ -1019,6 +1019,7 @@ export class ExternalThreadRuntimeProbe {
     expectedWriter?: RuntimeFdSnapshot,
   ): Promise<{ fd: RuntimeFdSnapshot } | { reason: string }> {
     const writerFds: RuntimeFdSnapshot[] = []
+    let hasNonInterruptibleWriter = false
     let complete = true
     const iterator = this.system.listFdSnapshots()[Symbol.asyncIterator]()
     try {
@@ -1029,10 +1030,11 @@ export class ExternalThreadRuntimeProbe {
           break
         }
         const fd = next.value
-        if (
-          !matchesWriter(fd, runtime.identity, this.system.uid!, excludedPid)
-          || !isCodexAppServerCommand(fd.cmdline)
-        ) continue
+        if (!matchesWriter(fd, runtime.identity, this.system.uid!, excludedPid)) continue
+        if (!isCodexAppServerCommand(fd.cmdline)) {
+          hasNonInterruptibleWriter = true
+          continue
+        }
         if (expectedWriter) {
           if (fd.pid !== expectedWriter.pid) continue
           if (expectedWriter.startTime && fd.startTime !== expectedWriter.startTime) continue
@@ -1043,6 +1045,7 @@ export class ExternalThreadRuntimeProbe {
       return { reason: 'writer-not-found' }
     }
     if (!complete) return { reason: 'writer-not-found' }
+    if (hasNonInterruptibleWriter) return { reason: 'non-interruptible-writer' }
 
     const writerPids = new Set(writerFds.map((fd) => fd.pid))
     if (writerPids.size === 0) return { reason: 'writer-not-found' }

@@ -2275,6 +2275,7 @@ export function useDesktopState() {
   }
   const queuedMessagesByThreadId = ref<Record<string, QueuedMessage[]>>({})
   const queueProcessingByThreadId = ref<Record<string, boolean>>({})
+  const pendingQueueRefreshThreadIds = new Set<string>()
   let hasLoadedPersistedQueueState = false
   let queueMutationVersion = 0
   const eventUnreadByThreadId = ref<Record<string, boolean>>({})
@@ -7570,6 +7571,14 @@ export function useDesktopState() {
       await appendThreadQueuedMessage(threadId, queuedMessage, queueInsertIndex)
       return queuedMessage
     } catch (queueError) {
+      try {
+        const persistedState = await getThreadQueueState()
+        if (persistedState[threadId]?.some((message) => message.id === queuedMessage.id)) {
+          return queuedMessage
+        }
+      } catch {
+        // Surface the original append failure when persistence cannot be confirmed.
+      }
       removeLocallyQueuedMessage(threadId, queuedMessage.id)
       const message = queueError instanceof Error ? queueError.message : 'Failed to append thread queue message'
       setTurnErrorForThread(threadId, message)
@@ -9509,7 +9518,10 @@ export function useDesktopState() {
     scheduledMutationVersion = queueMutationVersion,
   ): Promise<void> {
     if (queueMutationVersion !== scheduledMutationVersion) return
-    if (queueProcessingByThreadId.value[threadId] === true) return
+    if (queueProcessingByThreadId.value[threadId] === true) {
+      pendingQueueRefreshThreadIds.add(threadId)
+      return
+    }
     queueProcessingByThreadId.value = {
       ...queueProcessingByThreadId.value,
       [threadId]: true,
@@ -9519,11 +9531,16 @@ export function useDesktopState() {
       const refreshedQueueState = await getThreadQueueState()
       if (queueMutationVersion === mutationVersionAtStart) {
         queuedMessagesByThreadId.value = refreshedQueueState
+      } else {
+        pendingQueueRefreshThreadIds.add(threadId)
       }
     } catch {
       // Backend queue state is optional during transient bridge failures.
     } finally {
       queueProcessingByThreadId.value = omitKey(queueProcessingByThreadId.value, threadId)
+      if (pendingQueueRefreshThreadIds.delete(threadId)) {
+        void processQueuedMessages(threadId)
+      }
     }
   }
 
@@ -9532,7 +9549,7 @@ export function useDesktopState() {
     void processQueuedMessages(threadId, scheduledMutationVersion)
     if (typeof window === 'undefined') return
     window.setTimeout(() => {
-      void processQueuedMessages(threadId, scheduledMutationVersion)
+      void processQueuedMessages(threadId)
     }, 650)
   }
 
@@ -10435,6 +10452,7 @@ export function useDesktopState() {
     persistedUserMessageByThreadId.value = {}
     queuedMessagesByThreadId.value = {}
     queueProcessingByThreadId.value = {}
+    pendingQueueRefreshThreadIds.clear()
     persistQueueState()
     codexRateLimit.value = null
     threadTokenUsageByThreadId.value = {}

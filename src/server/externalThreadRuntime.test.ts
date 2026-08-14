@@ -1260,6 +1260,22 @@ describe('ExternalThreadRuntimeProbe', () => {
     expect(system.signalCalls).toEqual([{ pid: 200, signal: 'SIGTERM', expectedStartTime: '918273' }])
   })
 
+  it('does not interrupt an app-server writer when a direct CLI shares the rollout', async () => {
+    const system = fakeRuntimeSystem({
+      log: lifecycle('task_started', 'turn-a'),
+      fds: [
+        writerFd({ pid: 200, startTime: '20000', cmdline: '/usr/local/bin/codex\0app-server\0' }),
+        writerFd({ pid: 201, startTime: '20100', cmdline: '/usr/local/bin/codex\0resume\0' }),
+      ],
+    })
+
+    await expect(registeredProbe(system).interrupt('thread-1', 'turn-a', 99)).resolves.toEqual({
+      interrupted: false,
+      reason: 'non-interruptible-writer',
+    })
+    expect(system.signalCalls).toEqual([])
+  })
+
   it('does not interrupt when writer fd evidence disappears before the signal revalidation', async () => {
     const system = fakeRuntimeSystem({
       log: lifecycle('task_started', 'turn-a'),

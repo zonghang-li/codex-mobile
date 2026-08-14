@@ -6929,6 +6929,26 @@ describe('external runtime ownership', () => {
     expect(state.error.value).toContain('queue storage unavailable')
   })
 
+  it('keeps an external queue row when the append response is lost after persistence', async () => {
+    const { state } = await setupExternalRuntimeState()
+    gatewayMocks.getThreadDetail.mockResolvedValue(externalDetail())
+    gatewayMocks.appendThreadQueuedMessage.mockRejectedValue(new TypeError('connection reset'))
+    await state.loadMessages('thread-1')
+    gatewayMocks.getThreadQueueState.mockImplementation(async () => {
+      const persistedMessage = gatewayMocks.appendThreadQueuedMessage.mock.calls.at(-1)?.[1]
+      return persistedMessage ? { 'thread-1': [persistedMessage] } : {}
+    })
+
+    await state.sendMessageToSelectedThread('persisted despite response loss', [], [], 'steer')
+
+    expect(gatewayMocks.appendThreadQueuedMessage).toHaveBeenCalledOnce()
+    expect(gatewayMocks.getThreadQueueState).toHaveBeenCalled()
+    expect(state.selectedThreadQueuedMessages.value).toEqual([
+      expect.objectContaining({ text: 'persisted despite response loss' }),
+    ])
+    expect(state.error.value).toBe('')
+  })
+
   it('moves a local steer to the queue when writer ownership changes', async () => {
     const { state, emit } = await setupExternalRuntimeState()
     gatewayMocks.getThreadDetail.mockResolvedValue(localDetail('turn-local'))
@@ -7004,11 +7024,13 @@ describe('external runtime ownership', () => {
     expect(gatewayMocks.cleanupManagedUploads).toHaveBeenCalledWith([managedImageUrl], [])
   })
 
-  it('keeps a local queue append when an older queue refresh settles', async () => {
+  it('refreshes again after a local queue mutation and accepts a backend pop', async () => {
     const { state, emit } = await setupExternalRuntimeState()
     const staleQueueRefresh = deferred<Record<string, never[]>>()
     gatewayMocks.getThreadQueueState.mockClear()
-    gatewayMocks.getThreadQueueState.mockReturnValueOnce(staleQueueRefresh.promise)
+    gatewayMocks.getThreadQueueState
+      .mockReturnValueOnce(staleQueueRefresh.promise)
+      .mockResolvedValueOnce({})
 
     emit({ method: 'turn/started', params: { threadId: 'thread-1', turn: { id: 'turn-local' } } })
     await flushMicrotasks()
@@ -7022,16 +7044,10 @@ describe('external runtime ownership', () => {
     staleQueueRefresh.resolve({})
     await flushMicrotasks()
 
-    expect(state.selectedThreadQueuedMessages.value).toEqual([
-      expect.objectContaining({ text: 'queued after refresh started' }),
-    ])
-
-    await vi.advanceTimersByTimeAsync(650)
-    await flushMicrotasks()
-    expect(gatewayMocks.getThreadQueueState).toHaveBeenCalledOnce()
-    expect(state.selectedThreadQueuedMessages.value).toEqual([
-      expect.objectContaining({ text: 'queued after refresh started' }),
-    ])
+    await vi.waitFor(() => {
+      expect(gatewayMocks.getThreadQueueState).toHaveBeenCalledTimes(2)
+    })
+    expect(state.selectedThreadQueuedMessages.value).toEqual([])
   })
 
   it('queues an idle text-only submit when writer ownership changes after turn/start is issued', async () => {
