@@ -14,7 +14,7 @@ describe('external thread runtime read-only wiring', () => {
     expect(appSource).toContain('return selectedThreadQueuedMessages.value.map((message) => message.id)')
     expect(appSource).toContain(':read-only="selectedThreadRuntimeOwnership === \'external\'"')
     expect(appSource).toMatch(/function onEditQueuedMessage\(messageId: string\): void \{\n  if \(selectedThreadRuntimeOwnership\.value === 'external'\) return/u)
-    expect(sidebarSource).toContain('externallyOwnedThreadIds: string[]')
+    expect(sidebarSource).toContain('externallyOwnedThreadIds: Record<string, boolean>')
     expect(sidebarSource).toMatch(/function onForkThread\(threadId: string\): void \{\n  if \(isThreadExternallyOwned\(threadId\)\) return/u)
     expect(sidebarSource).toMatch(/function openRenameThreadDialog\(threadId: string, currentTitle: string\): void \{\n  if \(isThreadExternallyOwned\(threadId\)\) return/u)
     expect(sidebarSource).toMatch(/function openDeleteThreadDialog\(threadId: string, currentTitle: string\): void \{\n  if \(isThreadExternallyOwned\(threadId\)\) return/u)

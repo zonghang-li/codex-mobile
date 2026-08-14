@@ -1,4 +1,5 @@
 import { existsSync } from 'node:fs'
+import { spawnSync } from 'node:child_process'
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -629,6 +630,230 @@ describe('thread session skill recovery', () => {
 })
 
 describe('backend queue scheduling', () => {
+  it('drops durable queued work for an archived thread without calling app-server', async () => {
+    const originalCodexHome = process.env.CODEX_HOME
+    const codexHome = await mkdtemp(join(tmpdir(), 'codex-mobile-archived-queue-'))
+    process.env.CODEX_HOME = codexHome
+    const sqlite = spawnSync('sqlite3', [join(codexHome, 'state_5.sqlite'), [
+      'CREATE TABLE threads (id TEXT PRIMARY KEY, archived INTEGER);',
+      "INSERT INTO threads (id, archived) VALUES ('thread-archived-queue', 1);",
+    ].join(' ')], { encoding: 'utf8' })
+    expect(sqlite.status).toBe(0)
+    await appendThreadQueuedMessage('thread-archived-queue', {
+      id: 'queued-archived', text: 'must not run', imageUrls: [], skills: [], fileAttachments: [],
+      collaborationMode: 'default', model: '', effort: '',
+    })
+    const rpc = vi.fn(async () => ({}))
+    const processor = new BackendQueueProcessor({
+      rpc,
+      getPid: () => 31337,
+      onNotification: () => () => undefined,
+    } as never, {
+      registerThread: vi.fn(),
+      inspect: vi.fn(async () => ({ state: 'idle' as const })),
+      inspectWriterEvidence: vi.fn(async () => false),
+    } as never)
+
+    try {
+      await processor.processThreadQueue('thread-archived-queue')
+      expect(rpc).not.toHaveBeenCalled()
+      const state = JSON.parse(await readFile(join(codexHome, '.codex-global-state.json'), 'utf8'))
+      expect(state['thread-queue-state']?.['thread-archived-queue']).toBeUndefined()
+    } finally {
+      processor.dispose()
+      if (originalCodexHome === undefined) delete process.env.CODEX_HOME
+      else process.env.CODEX_HOME = originalCodexHome
+      await rm(codexHome, { recursive: true, force: true })
+    }
+  })
+
+  it('does not resume a thread archived after the queue start claim is acquired', async () => {
+    const originalCodexHome = process.env.CODEX_HOME
+    const codexHome = await mkdtemp(join(tmpdir(), 'codex-mobile-queue-archive-after-claim-'))
+    process.env.CODEX_HOME = codexHome
+    const stateDbPath = join(codexHome, 'state_5.sqlite')
+    const sqlite = spawnSync('sqlite3', [stateDbPath, [
+      'CREATE TABLE threads (id TEXT PRIMARY KEY, archived INTEGER);',
+      "INSERT INTO threads (id, archived) VALUES ('thread-archive-after-claim', 0);",
+    ].join(' ')], { encoding: 'utf8' })
+    expect(sqlite.status).toBe(0)
+    await appendThreadQueuedMessage('thread-archive-after-claim', {
+      id: 'queued-before-archive', text: 'must not resume', imageUrls: [], skills: [], fileAttachments: [],
+      collaborationMode: 'default', model: 'gpt-test', effort: '',
+    })
+    const rpc = vi.fn(async (method: string) => {
+      if (method === 'thread/read') {
+        return {
+          thread: {
+            id: 'thread-archive-after-claim',
+            path: join(codexHome, 'sessions', 'thread-archive-after-claim.jsonl'),
+            turns: [],
+          },
+        }
+      }
+      if (method === 'config/read') {
+        expect(spawnSync('sqlite3', [stateDbPath, [
+          "UPDATE threads SET archived = 1 WHERE id = 'thread-archive-after-claim';",
+        ].join(' ')], { encoding: 'utf8' }).status).toBe(0)
+        return { config: { model: 'gpt-test' } }
+      }
+      return {}
+    })
+    const processor = new BackendQueueProcessor({
+      rpc,
+      getPid: () => process.pid,
+      onNotification: () => () => undefined,
+    } as never, {
+      registerThread: vi.fn(),
+      inspect: vi.fn(async () => ({ state: 'idle' as const })),
+      inspectWriterEvidence: vi.fn(async () => false),
+    } as never)
+
+    try {
+      await processor.processThreadQueue('thread-archive-after-claim')
+      expect(rpc).not.toHaveBeenCalledWith('thread/resume', expect.anything())
+      expect(rpc).not.toHaveBeenCalledWith('turn/start', expect.anything())
+      const state = JSON.parse(await readFile(join(codexHome, '.codex-global-state.json'), 'utf8'))
+      expect(state['thread-queue-state']?.['thread-archive-after-claim']).toBeUndefined()
+    } finally {
+      processor.dispose()
+      if (originalCodexHome === undefined) delete process.env.CODEX_HOME
+      else process.env.CODEX_HOME = originalCodexHome
+      await rm(codexHome, { recursive: true, force: true })
+    }
+  })
+
+  it('does not start a turn when archive lands immediately after queued resume', async () => {
+    const originalCodexHome = process.env.CODEX_HOME
+    const codexHome = await mkdtemp(join(tmpdir(), 'codex-mobile-queue-archive-after-resume-'))
+    process.env.CODEX_HOME = codexHome
+    const stateDbPath = join(codexHome, 'state_5.sqlite')
+    expect(spawnSync('sqlite3', [stateDbPath, [
+      'CREATE TABLE threads (id TEXT PRIMARY KEY, archived INTEGER);',
+      "INSERT INTO threads VALUES ('thread-archive-after-resume', 0);",
+    ].join(' ')], { encoding: 'utf8' }).status).toBe(0)
+    await appendThreadQueuedMessage('thread-archive-after-resume', {
+      id: 'queued-after-resume', text: 'must not start', imageUrls: [], skills: [], fileAttachments: [],
+      collaborationMode: 'default', model: 'gpt-test', effort: '',
+    })
+    const rpc = vi.fn(async (method: string) => {
+      if (method === 'thread/read') return {
+        thread: { id: 'thread-archive-after-resume', path: '/tmp/archive-after-resume.jsonl', turns: [] },
+      }
+      if (method === 'config/read') return { config: { model: 'gpt-test' } }
+      if (method === 'thread/resume') {
+        expect(spawnSync('sqlite3', [stateDbPath,
+          "UPDATE threads SET archived = 1 WHERE id = 'thread-archive-after-resume';",
+        ], { encoding: 'utf8' }).status).toBe(0)
+      }
+      return {}
+    })
+    const processor = new BackendQueueProcessor({
+      rpc, getPid: () => process.pid, onNotification: () => () => undefined,
+    } as never, {
+      registerThread: vi.fn(), inspect: vi.fn(async () => ({ state: 'idle' as const })),
+      inspectWriterEvidence: vi.fn(async () => false),
+    } as never)
+
+    try {
+      await processor.processThreadQueue('thread-archive-after-resume')
+      expect(rpc).not.toHaveBeenCalledWith('turn/start', expect.anything())
+      const state = JSON.parse(await readFile(join(codexHome, '.codex-global-state.json'), 'utf8'))
+      expect(state['thread-queue-state']?.['thread-archive-after-resume']).toBeUndefined()
+    } finally {
+      processor.dispose()
+      if (originalCodexHome === undefined) delete process.env.CODEX_HOME
+      else process.env.CODEX_HOME = originalCodexHome
+      await rm(codexHome, { recursive: true, force: true })
+    }
+  })
+
+  it('drops persisted active managed uploads for an archived thread', async () => {
+    const originalCodexHome = process.env.CODEX_HOME
+    const codexHome = await mkdtemp(join(tmpdir(), 'codex-mobile-archived-active-upload-'))
+    const uploadRoot = join(codexHome, 'uploads')
+    process.env.CODEX_HOME = codexHome
+    const sqlite = spawnSync('sqlite3', [join(codexHome, 'state_5.sqlite'), [
+      'CREATE TABLE threads (id TEXT PRIMARY KEY, archived INTEGER);',
+      "INSERT INTO threads (id, archived) VALUES ('thread-archived-active', 1);",
+    ].join(' ')], { encoding: 'utf8' })
+    expect(sqlite.status).toBe(0)
+    const upload = await createManagedUpload('archived.png', Buffer.from('archived-image'), uploadRoot)
+    const activeMessage = {
+      id: 'queued-archived-active', text: 'already accepted', imageUrls: [], skills: [],
+      fileAttachments: [{ label: 'archived.png', path: upload.path, fsPath: upload.path, uploadHandle: upload.uploadHandle }],
+      collaborationMode: 'default' as const, model: 'gpt-test', effort: '' as const,
+    }
+    const statePath = join(codexHome, '.codex-global-state.json')
+    await writeFile(statePath, JSON.stringify({
+      'thread-active-managed-messages': { 'thread-archived-active': activeMessage },
+    }))
+    const processor = new BackendQueueProcessor({
+      rpc: vi.fn(),
+      getPid: () => process.pid,
+      onNotification: () => () => undefined,
+    } as never)
+
+    try {
+      await processor.processThreadQueue('thread-archived-active')
+      const persisted = JSON.parse(await readFile(statePath, 'utf8')) as Record<string, unknown>
+      expect(persisted['thread-active-managed-messages']).toBeUndefined()
+      await expect(reapExpiredManagedUploads({
+        uploadRoot,
+        nowMs: Date.now() + (10 * 60 * 1000),
+        ttlMs: 0,
+      })).resolves.toBe(1)
+      expect(existsSync(upload.path)).toBe(false)
+    } finally {
+      processor.dispose()
+      if (originalCodexHome === undefined) delete process.env.CODEX_HOME
+      else process.env.CODEX_HOME = originalCodexHome
+      await rm(codexHome, { recursive: true, force: true })
+    }
+  })
+
+  it('removes a definitively rejected queue head so later work is not poisoned', async () => {
+    const originalCodexHome = process.env.CODEX_HOME
+    const codexHome = await mkdtemp(join(tmpdir(), 'codex-mobile-definitive-queue-error-'))
+    process.env.CODEX_HOME = codexHome
+    await appendThreadQueuedMessage('thread-invalid-queue', {
+      id: 'queued-invalid', text: 'invalid request', imageUrls: [], skills: [], fileAttachments: [],
+      collaborationMode: 'default', model: 'invalid-model', effort: '',
+    })
+    const rpc = vi.fn(async (method: string) => {
+      if (method === 'thread/read') return {
+        thread: {
+          id: 'thread-invalid-queue',
+          path: join(codexHome, 'sessions', 'thread-invalid-queue.jsonl'),
+          turns: [],
+        },
+      }
+      if (method === 'config/read') return { config: { model: 'invalid-model' } }
+      if (method === 'turn/start') throw new Error('model is not supported')
+      return {}
+    })
+    const processor = new BackendQueueProcessor({
+      rpc,
+      getPid: () => 31337,
+      onNotification: () => () => undefined,
+    } as never, {
+      registerThread: vi.fn(),
+      inspect: vi.fn(async () => ({ state: 'idle' as const })),
+      inspectWriterEvidence: vi.fn(async () => false),
+    } as never)
+
+    try {
+      await processor.processThreadQueue('thread-invalid-queue')
+      const state = JSON.parse(await readFile(join(codexHome, '.codex-global-state.json'), 'utf8'))
+      expect(state['thread-queue-state']?.['thread-invalid-queue']).toBeUndefined()
+      expect(state['thread-queue-processing']?.['thread-invalid-queue']).toBeUndefined()
+    } finally {
+      processor.dispose()
+      if (originalCodexHome === undefined) delete process.env.CODEX_HOME
+      else process.env.CODEX_HOME = originalCodexHome
+      await rm(codexHome, { recursive: true, force: true })
+    }
+  })
   it('does not schedule recovered queue work after disposal', async () => {
     const originalCodexHome = process.env.CODEX_HOME
     const codexHome = await mkdtemp(join(tmpdir(), 'codex-mobile-queue-disposed-recovery-'))
@@ -1238,6 +1463,145 @@ describe('backend queue scheduling', () => {
     }
   })
 
+  it('does not start queued work when writable writer evidence appears after resume', async () => {
+    const originalCodexHome = process.env.CODEX_HOME
+    const codexHome = await mkdtemp(join(tmpdir(), 'codex-mobile-queue-writer-evidence-race-'))
+    process.env.CODEX_HOME = codexHome
+    let resumed = false
+    const rolloutPath = join(codexHome, 'sessions', 'rollout-thread-writer-evidence.jsonl')
+    const rpc = vi.fn(async (method: string) => {
+      if (method === 'thread/read') {
+        return { thread: { id: 'thread-writer-evidence', path: rolloutPath, turns: [] } }
+      }
+      if (method === 'config/read') return { config: { model: 'gpt-test' } }
+      if (method === 'thread/resume') {
+        resumed = true
+        return {}
+      }
+      if (method === 'turn/start') return { turn: { id: 'turn-must-not-start' } }
+      return {}
+    })
+    const runtimeProbe = {
+      registerThread: vi.fn(),
+      inspect: vi.fn(async () => ({ state: 'idle' as const })),
+      inspectWriterEvidence: vi.fn(async () => resumed),
+    }
+    const processor = new BackendQueueProcessor({
+      rpc,
+      getPid: () => process.pid,
+      onNotification: () => () => undefined,
+    } as never, runtimeProbe)
+
+    try {
+      await appendThreadQueuedMessage('thread-writer-evidence', {
+        id: 'queued-writer-evidence', text: 'wait for writer', imageUrls: [], skills: [], fileAttachments: [],
+        collaborationMode: 'default', model: 'gpt-test', effort: '',
+      })
+      await processor.processThreadQueue('thread-writer-evidence')
+
+      expect(rpc).toHaveBeenCalledWith('thread/resume', { threadId: 'thread-writer-evidence' })
+      expect(runtimeProbe.inspectWriterEvidence).toHaveBeenCalled()
+      expect(rpc).not.toHaveBeenCalledWith('turn/start', expect.anything())
+    } finally {
+      processor.dispose()
+      if (originalCodexHome === undefined) delete process.env.CODEX_HOME
+      else process.env.CODEX_HOME = originalCodexHome
+      await rm(codexHome, { recursive: true, force: true })
+    }
+  })
+
+  it('keeps queued work retryable after post-start ownership rollback', async () => {
+    const originalCodexHome = process.env.CODEX_HOME
+    const codexHome = await mkdtemp(join(tmpdir(), 'codex-mobile-queue-post-start-rollback-'))
+    process.env.CODEX_HOME = codexHome
+    let started = false
+    const earlierRollbackTurnIds = Array.from({ length: 9 }, (_, index) => `turn-earlier-rollback-${index}`)
+    const rolloutPath = join(codexHome, 'sessions', 'rollout-thread-post-start-rollback.jsonl')
+    const rpc = vi.fn(async (method: string) => {
+      if (method === 'thread/read') {
+        return {
+          thread: {
+            id: 'thread-post-start-rollback',
+            path: rolloutPath,
+            turns: [
+              ...earlierRollbackTurnIds.map((turnId) => ({
+                id: turnId,
+                status: 'interrupted',
+                items: [{ clientId: 'queued-post-start-rollback' }],
+              })),
+              ...(started ? [{
+                id: 'turn-mobile-rolled-back',
+                status: 'interrupted',
+                items: [{ clientId: 'queued-post-start-rollback' }],
+              }] : []),
+            ],
+          },
+        }
+      }
+      if (method === 'config/read') return { config: { model: 'gpt-test' } }
+      if (method === 'turn/start') {
+        started = true
+        return { turn: { id: 'turn-mobile-rolled-back' } }
+      }
+      return {}
+    })
+    const runtimeProbe = {
+      registerThread: vi.fn(),
+      inspect: vi.fn(async () => started
+        ? {
+            state: 'running' as const,
+            turnId: 'turn-mobile-rolled-back',
+            interruptible: false as const,
+            source: 'external-session-writer' as const,
+          }
+        : { state: 'idle' as const }),
+      inspectWriterEvidence: vi.fn(async () => started),
+    }
+    const processor = new BackendQueueProcessor({
+      rpc,
+      getPid: () => process.pid,
+      onNotification: () => () => undefined,
+    } as never, runtimeProbe)
+
+    try {
+      const queuedMessage = {
+        id: 'queued-post-start-rollback',
+        text: 'retry after conflict',
+        imageUrls: ['/codex-local-image?path=%2Ftmp%2Fcodex-web-uploads%2Frollback.png&uploadHandle=rollback-managed'],
+        skills: [],
+        fileAttachments: [],
+        collaborationMode: 'default' as const, model: 'gpt-test', effort: '' as const,
+        ownershipRollbackTurnIds: earlierRollbackTurnIds,
+      }
+      await appendThreadQueuedMessage('thread-post-start-rollback', queuedMessage)
+      const { ownershipRollbackTurnIds: _rollbackIds, ...runtimeQueuedMessage } = queuedMessage
+      processor.rememberRuntimeQueuedMessage('thread-post-start-rollback', runtimeQueuedMessage)
+      await processor.processThreadQueue('thread-post-start-rollback')
+
+      expect(rpc).toHaveBeenCalledWith('turn/interrupt', {
+        threadId: 'thread-post-start-rollback',
+        turnId: 'turn-mobile-rolled-back',
+      })
+      await processor.processThreadQueue('thread-post-start-rollback')
+      const persisted = JSON.parse(await readFile(join(codexHome, '.codex-global-state.json'), 'utf8')) as {
+        'thread-queue-state'?: Record<string, Array<{ id: string }>>
+        'thread-queue-processing'?: Record<string, unknown>
+      }
+      expect(persisted['thread-queue-state']?.['thread-post-start-rollback']).toEqual([
+        expect.objectContaining({
+          id: 'queued-post-start-rollback',
+          ownershipRollbackTurnIds: [...earlierRollbackTurnIds, 'turn-mobile-rolled-back'],
+        }),
+      ])
+      expect(persisted['thread-queue-processing']?.['thread-post-start-rollback']).toBeUndefined()
+    } finally {
+      processor.dispose()
+      if (originalCodexHome === undefined) delete process.env.CODEX_HOME
+      else process.env.CODEX_HOME = originalCodexHome
+      await rm(codexHome, { recursive: true, force: true })
+    }
+  })
+
   it('durably protects accepted-turn uploads until terminal completion', async () => {
     const originalCodexHome = process.env.CODEX_HOME
     const codexHome = await mkdtemp(join(tmpdir(), 'codex-mobile-queue-active-upload-'))
@@ -1411,7 +1775,7 @@ describe('backend queue scheduling', () => {
         name: 'ThreadQueueRevisionConflictError',
       })
       await appendThreadQueuedMessage('thread-cas', message('queued-2'))
-      await reorderThreadQueuedMessages('thread-cas', ['queued-1'])
+      await expect(reorderThreadQueuedMessages('thread-cas', ['queued-1'], 2)).resolves.toBe(3)
       await removeThreadQueuedMessage('thread-cas', 'queued-1')
 
       const persisted = JSON.parse(await readFile(join(codexHome, '.codex-global-state.json'), 'utf8')) as {

@@ -64,7 +64,7 @@ type RegisteredThread = {
 }
 
 type PreparedRuntimeInspection =
-  | { state: 'idle'; cwd?: string }
+  | { state: 'idle'; cwd?: string; identity: RuntimeFileIdentity }
   | { state: 'unknown' }
   | {
       state: 'unmatched'
@@ -761,7 +761,6 @@ function matchesWriter(
     && fd.dev === identity.dev
     && fd.ino === identity.ino
     && isWritableDescriptor(fd.flags)
-    && fd.position > 0
 }
 
 function isWritableDescriptor(flags: number): boolean {
@@ -974,6 +973,26 @@ export class ExternalThreadRuntimeProbe {
     return states[threadId] ?? { state: 'unknown' }
   }
 
+  async inspectWriterEvidence(threadId: string, excludedPid: number | null): Promise<boolean | null> {
+    const runtime = await this.prepareInspection(threadId)
+    if (runtime.state === 'unknown') return null
+    try {
+      let complete = true
+      const iterator = this.system.listFdSnapshots()[Symbol.asyncIterator]()
+      while (true) {
+        const next = await iterator.next()
+        if (next.done) {
+          complete = next.value !== false
+          break
+        }
+        if (matchesWriter(next.value, runtime.identity, this.system.uid!, excludedPid)) return true
+      }
+      return complete ? false : null
+    } catch {
+      return null
+    }
+  }
+
   async interrupt(
     threadId: string,
     turnId: string,
@@ -1155,6 +1174,7 @@ export class ExternalThreadRuntimeProbe {
       if (!nextCache.unmatchedTurnId) {
         return {
           state: 'idle',
+          identity: revalidatedIdentity,
           ...(nextCache.durableRuntimeCwd ? { cwd: nextCache.durableRuntimeCwd } : {}),
         }
       }

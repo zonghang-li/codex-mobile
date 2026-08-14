@@ -311,6 +311,12 @@ function saveThreadGroupsSnapshot(groups: UiProjectGroup[]): void {
   }
 }
 
+function removeThreadFromPersistedThreadGroupsSnapshot(threadId: string): void {
+  const snapshot = readThreadGroupsSnapshot()
+  if (snapshot.length === 0) return
+  saveThreadGroupsSnapshot(removeThreadFromGroups(snapshot, threadId))
+}
+
 function loadUnreadCutoffIso(): string {
   if (typeof window === 'undefined') return ''
 
@@ -852,7 +858,7 @@ function isAmbiguousTurnStartError(error: unknown): boolean {
 
 function isWriterOwnershipNotIdleError(error: unknown): boolean {
   if (!(error instanceof Error)) return false
-  return error.message.toLowerCase().includes('task writer ownership is not idle')
+  return error.message.toLowerCase().includes('writer ownership is not idle')
 }
 
 function isThreadStartClaimConflictError(error: unknown): boolean {
@@ -2497,6 +2503,7 @@ export function useDesktopState() {
   let threadListNextCursor: string | null = null
   let threadListBackgroundTimer: number | null = null
   let isLoadingRemainingThreadPages = false
+  let threadListGeneration = 0
   let hasLoadedAllThreadPages = false
   let loadedThreadListGroups: UiProjectGroup[] = []
   let freshThreadListGroupsDuringSnapshotRefresh: UiProjectGroup[] | null = null
@@ -7683,17 +7690,16 @@ export function useDesktopState() {
     threadId: string,
     queuedMessage: QueuedMessage,
     queueInsertIndex?: number,
-  ): Promise<void> {
+  ): Promise<number> {
     const lifecycleGeneration = queueLifecycleGeneration
     let ambiguousAttempts = 0
     let lastAmbiguousError: unknown = new Error('Failed to append thread queue message')
     while (ambiguousAttempts < 6) {
       if (lifecycleGeneration !== queueLifecycleGeneration) throw queueAppendCancelledError()
       try {
-        await runQueueRequest(lifecycleGeneration, (signal) => (
+        return await runQueueRequest(lifecycleGeneration, (signal) => (
           appendThreadQueuedMessage(threadId, queuedMessage, queueInsertIndex, signal)
         ))
-        return
       } catch (queueError) {
         if (!isAmbiguousQueueAppendError(queueError)) throw queueError
         lastAmbiguousError = queueError
@@ -7702,7 +7708,12 @@ export function useDesktopState() {
           try {
             if (await runQueueRequest(lifecycleGeneration, (signal) => (
               getThreadQueueAppendReceipt(threadId, queuedMessage.id, signal)
-            ))) return
+            ))) {
+              const snapshot = await runQueueRequest(lifecycleGeneration, (signal) => (
+                getThreadQueueSnapshot(signal)
+              ))
+              return snapshot.revision
+            }
           } catch {
             // Keep the optimistic row pending and retry the idempotent append.
           }
@@ -7740,7 +7751,8 @@ export function useDesktopState() {
     )
     setQueueAppendPending(threadId, queuedMessage.id, true)
     try {
-      await persistQueuedMessageUntilConfirmed(threadId, queuedMessage, queueInsertIndex)
+      const revision = await persistQueuedMessageUntilConfirmed(threadId, queuedMessage, queueInsertIndex)
+      latestQueueRevision = Math.max(latestQueueRevision, revision)
       return queuedMessage
     } catch (queueError) {
       removeLocallyQueuedMessage(threadId, queuedMessage.id)
@@ -7763,6 +7775,7 @@ export function useDesktopState() {
           const revision = await reorderThreadQueuedMessagesOnServer(
             threadId,
             (queuedMessagesByThreadId.value[threadId] ?? []).map((message) => message.id),
+            { baseRevision: latestQueueRevision },
           )
           latestQueueRevision = Math.max(latestQueueRevision, revision)
         } catch {
@@ -7831,6 +7844,7 @@ export function useDesktopState() {
   function removeArchivedThreadFromLoadedLists(threadId: string): void {
     loadedThreadListGroups = removeThreadFromGroups(loadedThreadListGroups, threadId)
     sourceGroups.value = removeThreadFromGroups(sourceGroups.value, threadId)
+    removeThreadFromPersistedThreadGroupsSnapshot(threadId)
     inProgressById.value = omitKey(inProgressById.value, threadId)
     applyThreadFlags()
   }
@@ -7871,7 +7885,10 @@ export function useDesktopState() {
     return Object.values(inProgressById.value).some((value) => value === true)
   }
 
-  function scheduleRemainingThreadPages(rootsState: WorkspaceRootsState | null = loadedThreadListRootsState): void {
+  function scheduleRemainingThreadPages(
+    rootsState: WorkspaceRootsState | null = loadedThreadListRootsState,
+    generation = threadListGeneration,
+  ): void {
     if (!ENABLE_AUTOMATIC_BACKGROUND_THREAD_PAGINATION) {
       loadedThreadListRootsState = rootsState
       return
@@ -7892,18 +7909,23 @@ export function useDesktopState() {
 
     threadListBackgroundTimer = window.setTimeout(() => {
       threadListBackgroundTimer = null
-      if (!threadListNextCursor) return
+      if (!threadListNextCursor || generation !== threadListGeneration) return
       if (typeof document !== 'undefined' && document.visibilityState !== 'visible') return
-      void loadRemainingThreadPages(loadedThreadListRootsState)
+      void loadRemainingThreadPages(loadedThreadListRootsState, generation)
     }, BACKGROUND_THREAD_PAGINATION_DELAY_MS)
   }
 
-  async function loadRemainingThreadPages(rootsState: WorkspaceRootsState | null): Promise<void> {
-    if (isLoadingRemainingThreadPages || !threadListNextCursor) return
+  async function loadRemainingThreadPages(
+    rootsState: WorkspaceRootsState | null,
+    generation = threadListGeneration,
+  ): Promise<void> {
+    if (generation !== threadListGeneration || isLoadingRemainingThreadPages || !threadListNextCursor) return
     isLoadingRemainingThreadPages = true
+    const requestCursor = threadListNextCursor
 
     try {
-      const page = await getThreadGroupsPage(threadListNextCursor, getBackgroundThreadListLimit())
+      const page = await getThreadGroupsPage(requestCursor, getBackgroundThreadListLimit())
+      if (generation !== threadListGeneration) return
       threadListNextCursor = page.nextCursor
       hasLoadedAllThreadPages = page.nextCursor === null
       isThreadListFullyLoaded.value = hasLoadedAllThreadPages
@@ -7928,7 +7950,7 @@ export function useDesktopState() {
     } finally {
       isLoadingRemainingThreadPages = false
       if (threadListNextCursor) {
-        scheduleRemainingThreadPages(rootsState)
+        scheduleRemainingThreadPages(loadedThreadListRootsState, threadListGeneration)
       }
     }
   }
@@ -7948,6 +7970,12 @@ export function useDesktopState() {
     }
 
     loadThreadsPromise = (async () => {
+    const generation = threadListGeneration + 1
+    threadListGeneration = generation
+    if (threadListBackgroundTimer !== null && typeof window !== 'undefined') {
+      window.clearTimeout(threadListBackgroundTimer)
+      threadListBackgroundTimer = null
+    }
     if (!hasLoadedThreads.value) {
       isLoadingThreads.value = true
     }
@@ -7963,6 +7991,7 @@ export function useDesktopState() {
           { forceFresh: true },
         )
         : await getThreadGroupsPage()
+      if (generation !== threadListGeneration) return
       const rootsState = loadedThreadListRootsState
       const groups = page.groups
       if (replacingStartupSnapshot && page.nextCursor !== null) {
@@ -7970,7 +7999,7 @@ export function useDesktopState() {
         loadedThreadListGroups = mergeThreadGroupPages(loadedThreadListGroups, groups)
       } else {
         freshThreadListGroupsDuringSnapshotRefresh = null
-        loadedThreadListGroups = hasLoadedThreads.value && !replacingStartupSnapshot
+        loadedThreadListGroups = hasLoadedThreads.value && !replacingStartupSnapshot && options.force !== true
           ? mergeThreadGroupPages(loadedThreadListGroups, groups)
           : groups
         if (replacingStartupSnapshot) {
@@ -7978,9 +8007,7 @@ export function useDesktopState() {
         }
       }
       hasLoadedThreadListSnapshotOnly = false
-      threadListNextCursor = hasLoadedThreads.value && !hasLoadedAllThreadPages && !replacingStartupSnapshot
-        ? threadListNextCursor
-        : page.nextCursor
+      threadListNextCursor = page.nextCursor
       hasLoadedAllThreadPages = page.nextCursor === null
       isThreadListFullyLoaded.value = hasLoadedAllThreadPages
 
@@ -7991,7 +8018,7 @@ export function useDesktopState() {
       hasLoadedThreads.value = true
       lastThreadListLoadAt = Date.now()
       if (!hasLoadedAllThreadPages) {
-        scheduleRemainingThreadPages(rootsState)
+        scheduleRemainingThreadPages(rootsState, generation)
       }
 
       const metadataRefresh = refreshThreadListMetadataAfterFirstPage({ force: options.force === true })
@@ -9031,8 +9058,11 @@ export function useDesktopState() {
 
     try {
       await archiveThread(threadId)
+      const hadInFlightThreadList = loadThreadsPromise !== null
+      threadListGeneration += 1
       removeArchivedThreadFromLoadedLists(threadId)
-      await loadThreads()
+      if (hadInFlightThreadList) await loadThreads()
+      await loadThreads({ force: true })
 
       if (wasSelectedThread && nextSelectedThreadId && selectedThreadId.value === nextSelectedThreadId) {
         await ensureThreadMessagesLoaded(nextSelectedThreadId, { silent: true })
@@ -9285,14 +9315,17 @@ export function useDesktopState() {
 
     if (isInProgress) {
       shouldAutoScrollOnNextAgentEvent = true
-      const optimisticMessageId = appendOptimisticUserMessage(
-        threadId,
-        nextText,
-        imageUrls,
-        skills,
-        fileAttachments,
-      )
-      const submission = beginLocalSubmission(threadId, optimisticMessageId)
+      const submission = beginLocalSubmission(threadId, '')
+      const revealAcceptedMessage = () => {
+        if (submission.optimisticMessageId) return
+        submission.optimisticMessageId = appendOptimisticUserMessage(
+          threadId,
+          nextText,
+          imageUrls,
+          skills,
+          fileAttachments,
+        )
+      }
       void startTurnForThread(
         threadId,
         nextText,
@@ -9302,12 +9335,13 @@ export function useDesktopState() {
         collaborationModeOverride,
         uploadLease.transfer,
         submission,
+        revealAcceptedMessage,
       ).catch(async (unknownError) => {
         if (isTurnStartQueueFallbackError(unknownError)) {
           const pendingTurnRequest = submission.pendingTurnRequest
           clearPendingStopRequest(threadId, submission.generation)
           clearLocalSubmission(threadId, submission.generation)
-          removeOptimisticUserMessage(threadId, optimisticMessageId)
+          removeOptimisticUserMessage(threadId, submission.optimisticMessageId)
           const queuedMessage = await enqueueExternalThreadMessage(
             threadId,
             pendingTurnRequest?.text ?? nextText,
@@ -9333,7 +9367,7 @@ export function useDesktopState() {
           return
         }
         if (!isAmbiguousTurnStartError(unknownError)) {
-          removeOptimisticUserMessage(threadId, optimisticMessageId)
+          removeOptimisticUserMessage(threadId, submission.optimisticMessageId)
           clearPendingStopRequest(threadId, submission.generation)
           clearLocalSubmission(threadId, submission.generation)
         }
@@ -9366,14 +9400,17 @@ export function useDesktopState() {
     setTurnErrorForThread(threadId, null)
     setThreadRuntimeOwnership(threadId, 'local')
     setThreadInProgress(threadId, true)
-    const optimisticMessageId = appendOptimisticUserMessage(
-      threadId,
-      nextText,
-      imageUrls,
-      skills,
-      fileAttachments,
-    )
-    const submission = beginLocalSubmission(threadId, optimisticMessageId)
+    const submission = beginLocalSubmission(threadId, '')
+    const revealAcceptedMessage = () => {
+      if (submission.optimisticMessageId) return
+      submission.optimisticMessageId = appendOptimisticUserMessage(
+        threadId,
+        nextText,
+        imageUrls,
+        skills,
+        fileAttachments,
+      )
+    }
 
     try {
       await startTurnForThread(
@@ -9385,6 +9422,7 @@ export function useDesktopState() {
         collaborationModeOverride,
         uploadLease.transfer,
         submission,
+        revealAcceptedMessage,
       )
       await uploadLease.release()
     } catch (unknownError) {
@@ -9393,7 +9431,7 @@ export function useDesktopState() {
         await uploadLease.release()
         clearPendingStopRequest(threadId, submission.generation)
         clearLocalSubmission(threadId, submission.generation)
-        removeOptimisticUserMessage(threadId, optimisticMessageId)
+        removeOptimisticUserMessage(threadId, submission.optimisticMessageId)
         const queuedMessage = await enqueueExternalThreadMessage(
           threadId,
           pendingTurnRequest?.text ?? nextText,
@@ -9427,7 +9465,7 @@ export function useDesktopState() {
         setTurnActivityForThread(threadId, null)
       }
       if (!ambiguousStart) {
-        removeOptimisticUserMessage(threadId, optimisticMessageId)
+        removeOptimisticUserMessage(threadId, submission.optimisticMessageId)
         clearPendingStopRequest(threadId, submission.generation)
         clearLocalSubmission(threadId, submission.generation)
       }
@@ -9636,6 +9674,7 @@ export function useDesktopState() {
     collaborationModeOverride?: CollaborationModeKind,
     onPendingTurnEstablished?: () => void,
     submission?: LocalSubmissionState,
+    onTurnStartAccepted?: () => void,
   ): Promise<void> {
     const requestedModelId = readModelIdForThread(threadId)
     const reasoningEffort = readReasoningEffortForThread(threadId)
@@ -9735,6 +9774,7 @@ export function useDesktopState() {
       const canAdoptStartedTurn = !submission
         || currentSubmission?.generation === submission.generation
       if (startedTurnId && canAdoptStartedTurn) {
+        onTurnStartAccepted?.()
         activeTurnIdByThreadId.value = {
           ...activeTurnIdByThreadId.value,
           [threadId]: startedTurnId,
@@ -10784,7 +10824,10 @@ export function useDesktopState() {
       : omitKey(queuedMessagesByThreadId.value, threadId)
     queueMutationVersion += 1
     try {
-      const revision = await removeThreadQueuedMessageFromServer(threadId, messageId, { transferManagedUploads })
+      const revision = await removeThreadQueuedMessageFromServer(threadId, messageId, {
+        baseRevision: latestQueueRevision,
+        transferManagedUploads,
+      })
       latestQueueRevision = Math.max(latestQueueRevision, revision)
     } catch (removeError) {
       void processQueuedMessages(threadId)
@@ -10811,7 +10854,11 @@ export function useDesktopState() {
     }
     queueMutationVersion += 1
     try {
-      const revision = await reorderThreadQueuedMessagesOnServer(threadId, next.map((message) => message.id))
+      const revision = await reorderThreadQueuedMessagesOnServer(
+        threadId,
+        next.map((message) => message.id),
+        { baseRevision: latestQueueRevision },
+      )
       latestQueueRevision = Math.max(latestQueueRevision, revision)
     } catch {
       void processQueuedMessages(threadId)
@@ -10836,6 +10883,7 @@ export function useDesktopState() {
       const revision = await reorderThreadQueuedMessagesOnServer(
         threadId,
         prioritized.map((message) => message.id),
+        { baseRevision: latestQueueRevision },
       )
       latestQueueRevision = Math.max(latestQueueRevision, revision)
     } catch (reorderError) {

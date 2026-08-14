@@ -125,6 +125,14 @@ describe('mutateJsonStateFile', () => {
 
   it('distinguishes a reused live pid from the original process owner', async () => {
     const processStartIdentity = await readProcessStartIdentity(process.pid)
+    if (process.platform !== 'linux') {
+      expect(processStartIdentity).toBeNull()
+      await expect(isProcessOwnerAlive({
+        pid: process.pid,
+        processStartIdentity: 'linux-only-identity',
+      })).resolves.toBe(true)
+      return
+    }
     expect(processStartIdentity).toBeTruthy()
     await expect(isProcessOwnerAlive({
       pid: process.pid,

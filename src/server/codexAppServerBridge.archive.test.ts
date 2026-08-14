@@ -187,17 +187,25 @@ describe('callRpcWithArchiveRecovery', () => {
   })
 
   it('does not recover unrelated RPC failures', async () => {
+    const codexHome = await mkdtemp(join(tmpdir(), 'codex-archive-unrelated-rpc-'))
+    process.env.CODEX_HOME = codexHome
     const appServer = {
       async rpc(): Promise<unknown> {
         throw new Error('network failed')
       },
     }
 
-    await expect(callRpcWithArchiveRecovery(appServer, 'thread/archive', { threadId: 'test-thread' })).rejects.toThrow('network failed')
-    await expect(callRpcWithArchiveRecovery(appServer, 'thread/read', { threadId: 'test-thread' })).rejects.toThrow('network failed')
+    try {
+      await expect(callRpcWithArchiveRecovery(appServer, 'thread/archive', { threadId: 'test-thread' })).rejects.toThrow('network failed')
+      await expect(callRpcWithArchiveRecovery(appServer, 'thread/read', { threadId: 'test-thread' })).rejects.toThrow('network failed')
+    } finally {
+      await rm(codexHome, { recursive: true, force: true })
+    }
   })
 
   it('resumes and retries turn/start when a restarted app-server has not materialized the thread', async () => {
+    const codexHome = await mkdtemp(join(tmpdir(), 'codex-archive-turn-start-'))
+    process.env.CODEX_HOME = codexHome
     const calls: Array<{ method: string; params: unknown }> = []
     let startCalls = 0
     const appServer = {
@@ -217,24 +225,30 @@ describe('callRpcWithArchiveRecovery', () => {
       },
     }
 
-    await expect(callRpcWithArchiveRecovery(appServer, 'turn/start', {
-      threadId: 'test-thread',
-      input: [{ type: 'text', text: 'hi' }],
-    })).resolves.toEqual({ turn: { id: 'turn-2' } })
-    expect(calls).toEqual([
-      {
-        method: 'turn/start',
-        params: { threadId: 'test-thread', input: [{ type: 'text', text: 'hi' }] },
-      },
-      { method: 'thread/resume', params: { threadId: 'test-thread' } },
-      {
-        method: 'turn/start',
-        params: { threadId: 'test-thread', input: [{ type: 'text', text: 'hi' }] },
-      },
-    ])
+    try {
+      await expect(callRpcWithArchiveRecovery(appServer, 'turn/start', {
+        threadId: 'test-thread',
+        input: [{ type: 'text', text: 'hi' }],
+      })).resolves.toEqual({ turn: { id: 'turn-2' } })
+      expect(calls).toEqual([
+        {
+          method: 'turn/start',
+          params: { threadId: 'test-thread', input: [{ type: 'text', text: 'hi' }] },
+        },
+        { method: 'thread/resume', params: { threadId: 'test-thread' } },
+        {
+          method: 'turn/start',
+          params: { threadId: 'test-thread', input: [{ type: 'text', text: 'hi' }] },
+        },
+      ])
+    } finally {
+      await rm(codexHome, { recursive: true, force: true })
+    }
   })
 
   it('does not let raw turn/interrupt mutate a thread owned by an external runtime', async () => {
+    const codexHome = await mkdtemp(join(tmpdir(), 'codex-archive-external-runtime-'))
+    process.env.CODEX_HOME = codexHome
     const appServer = {
       async rpc(method: string): Promise<unknown> {
         if (method === 'thread/read') {
@@ -257,14 +271,18 @@ describe('callRpcWithArchiveRecovery', () => {
       interrupt: vi.fn().mockResolvedValue({ interrupted: true }),
     }
 
-    await expect(callRpcWithArchiveRecovery(
-      appServer,
-      'turn/interrupt',
-      { threadId: 'thread-external', turnId: 'turn-external' },
-      runtimeProbe,
-      4242,
-    )).rejects.toThrow('writer ownership is not idle')
-    expect(runtimeProbe.interrupt).not.toHaveBeenCalled()
+    try {
+      await expect(callRpcWithArchiveRecovery(
+        appServer,
+        'turn/interrupt',
+        { threadId: 'thread-external', turnId: 'turn-external' },
+        runtimeProbe,
+        4242,
+      )).rejects.toThrow('writer ownership is not idle')
+      expect(runtimeProbe.interrupt).not.toHaveBeenCalled()
+    } finally {
+      await rm(codexHome, { recursive: true, force: true })
+    }
   })
 })
 

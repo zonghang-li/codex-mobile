@@ -1,7 +1,7 @@
 import { lstat, mkdir, mkdtemp, readFile, rm, symlink, utimes, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
-import { afterEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import {
   BackendQueueProcessor,
   appendThreadQueuedMessage,
@@ -12,10 +12,19 @@ import {
 } from './codexAppServerBridge'
 
 const cleanupRoots: string[] = []
+const originalCodexHome = process.env.CODEX_HOME
+
+beforeEach(async () => {
+  const codexHome = await mkdtemp(join(tmpdir(), 'codex-mobile-security-test-home-'))
+  cleanupRoots.push(codexHome)
+  process.env.CODEX_HOME = codexHome
+})
 
 afterEach(async () => {
   vi.useRealTimers()
   await Promise.all(cleanupRoots.splice(0).map((root) => rm(root, { recursive: true, force: true })))
+  if (originalCodexHome === undefined) delete process.env.CODEX_HOME
+  else process.env.CODEX_HOME = originalCodexHome
 })
 
 describe('Codex bridge security-policy wiring', () => {

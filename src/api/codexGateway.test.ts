@@ -320,6 +320,7 @@ describe('managed uploads', () => {
           collaborationMode: 'default',
         }],
       },
+      revision: 1,
     }), {
       status: 200,
       headers: { 'Content-Type': 'application/json' },
@@ -343,7 +344,7 @@ describe('managed uploads', () => {
     let body = ''
     vi.stubGlobal('fetch', vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
       body = String(init?.body ?? '')
-      return new Response(JSON.stringify({ ok: true }), {
+      return new Response(JSON.stringify({ ok: true, revision: 8 }), {
         status: 200,
         headers: { 'Content-Type': 'application/json' },
       })
@@ -381,8 +382,8 @@ describe('managed uploads', () => {
       })
     }))
 
-    await removeThreadQueuedMessage('thread-1', 'queued-1', { transferManagedUploads: true })
-    await reorderThreadQueuedMessages('thread-1', ['queued-2', 'queued-1'])
+    await removeThreadQueuedMessage('thread-1', 'queued-1', { baseRevision: 7, transferManagedUploads: true })
+    await reorderThreadQueuedMessages('thread-1', ['queued-2', 'queued-1'], { baseRevision: 8 })
 
     expect(requests.map((request) => ({
       method: request.method,
@@ -394,6 +395,7 @@ describe('managed uploads', () => {
           threadId: 'thread-1',
           operation: 'remove',
           messageId: 'queued-1',
+          baseRevision: 7,
           transferManagedUploads: true,
         },
       },
@@ -403,8 +405,36 @@ describe('managed uploads', () => {
           threadId: 'thread-1',
           operation: 'reorder',
           orderedMessageIds: ['queued-2', 'queued-1'],
+          baseRevision: 8,
         },
       },
+    ])
+  })
+
+  it('fails closed instead of replacing queue state when a legacy GET has no revision', async () => {
+    const requests: RequestInit[] = []
+    vi.stubGlobal('fetch', vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+      requests.push(init ?? {})
+      if (init?.method === 'PATCH') return new Response('', { status: 405 })
+      if (!init?.method) {
+        return new Response(JSON.stringify({ data: {
+          'thread-1': [
+            { id: 'queued-1', text: 'one', imageUrls: [], skills: [], fileAttachments: [], collaborationMode: 'default', model: '', effort: '' },
+            { id: 'queued-2', text: 'two', imageUrls: [], skills: [], fileAttachments: [], collaborationMode: 'default', model: '', effort: '' },
+          ],
+        } }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      return new Response(JSON.stringify({ ok: true }), {
+        status: 200, headers: { 'Content-Type': 'application/json' },
+      })
+    }))
+
+    await expect(removeThreadQueuedMessage('thread-1', 'queued-1', { baseRevision: 1 }))
+      .rejects.toThrow('Invalid thread queue revision')
+    await expect(reorderThreadQueuedMessages('thread-1', ['queued-2', 'queued-1'], { baseRevision: 1 }))
+      .rejects.toThrow('Invalid thread queue revision')
+    expect(requests.map((request) => request.method ?? 'GET')).toEqual([
+      'PATCH', 'GET', 'PATCH', 'GET',
     ])
   })
 
@@ -412,13 +442,13 @@ describe('managed uploads', () => {
     const requests: Array<{ input: RequestInfo | URL; init?: RequestInit }> = []
     vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       requests.push({ input, init })
-      return new Response(JSON.stringify({ ok: true }), {
+      return new Response(JSON.stringify({ ok: true, revision: 7 }), {
         status: 200,
         headers: { 'Content-Type': 'application/json' },
       })
     }))
 
-    await appendThreadQueuedMessage('thread-1', {
+    await expect(appendThreadQueuedMessage('thread-1', {
       id: 'queued-atomic',
       text: 'wait for CLI',
       imageUrls: [],
@@ -427,7 +457,7 @@ describe('managed uploads', () => {
       collaborationMode: 'default',
       model: 'gpt-5.6-sol',
       effort: 'high',
-    }, 1)
+    }, 1)).resolves.toBe(7)
 
     expect(String(requests[0]?.input)).toBe('/codex-api/thread-queue-state')
     expect(requests[0]?.init?.method).toBe('POST')
@@ -438,11 +468,66 @@ describe('managed uploads', () => {
     })
   })
 
+  it('does not replace queue state when atomic append and revision support are unavailable', async () => {
+    const requests: RequestInit[] = []
+    vi.stubGlobal('fetch', vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+      requests.push(init ?? {})
+      if (init?.method === 'POST') return new Response('', { status: 405 })
+      if (!init?.method) {
+        return new Response(JSON.stringify({ data: { 'thread-1': [] } }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        })
+      }
+      return new Response(JSON.stringify({ ok: true }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      })
+    }))
+
+    await expect(appendThreadQueuedMessage('thread-1', {
+      id: 'queued-legacy', text: 'survive mixed deployment', imageUrls: [], skills: [], fileAttachments: [],
+      collaborationMode: 'default', model: '', effort: '',
+    })).rejects.toThrow('Invalid thread queue revision')
+
+    expect(requests.map((request) => request.method ?? 'GET')).toEqual(['POST', 'GET'])
+  })
+
+  it('forwards cancellation through the legacy queue append fallback', async () => {
+    const requests: RequestInit[] = []
+    vi.stubGlobal('fetch', vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+      requests.push(init ?? {})
+      if (init?.method === 'POST') return new Response('', { status: 405 })
+      if (!init?.method) {
+        return new Response(JSON.stringify({ data: { 'thread-1': [] }, revision: 4 }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        })
+      }
+      return new Response(JSON.stringify({ ok: true, revision: 5 }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      })
+    }))
+    const controller = new AbortController()
+
+    await appendThreadQueuedMessage('thread-1', {
+      id: 'queued-legacy-signal', text: 'cancel mixed deployment', imageUrls: [], skills: [], fileAttachments: [],
+      collaborationMode: 'default', model: '', effort: '',
+    }, undefined, controller.signal)
+
+    expect(requests.map((request) => request.signal)).toEqual([
+      controller.signal,
+      controller.signal,
+      controller.signal,
+    ])
+  })
+
   it('forwards cancellation signals to queue append and receipt requests', async () => {
     const requests: RequestInit[] = []
     vi.stubGlobal('fetch', vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
       requests.push(init ?? {})
-      return new Response(JSON.stringify({ ok: true, data: { accepted: true } }), {
+      return new Response(JSON.stringify({ ok: true, revision: 5, data: { accepted: true } }), {
         status: 200,
         headers: { 'Content-Type': 'application/json' },
       })
@@ -474,6 +559,24 @@ describe('managed uploads', () => {
       effort: '',
     })
     await expect(append).rejects.toMatchObject({ name: 'ThreadQueueAppendAmbiguousError' })
+  })
+
+  it('marks a queue append claim timeout as retryable without retrying archived conflicts', async () => {
+    const message = {
+      id: 'queued-claim-timeout', text: 'keep retrying', imageUrls: [], skills: [], fileAttachments: [],
+      collaborationMode: 'default' as const, model: '', effort: '' as const,
+    }
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({
+      error: 'Cannot start a turn because another start is already in progress.',
+    }), { status: 409, headers: { 'Content-Type': 'application/json' } })))
+    await expect(appendThreadQueuedMessage('thread-1', message))
+      .rejects.toMatchObject({ name: 'ThreadQueueAppendAmbiguousError' })
+
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({
+      error: 'Cannot queue work for an archived task.',
+    }), { status: 409, headers: { 'Content-Type': 'application/json' } })))
+    await expect(appendThreadQueuedMessage('thread-1', message))
+      .rejects.not.toMatchObject({ name: 'ThreadQueueAppendAmbiguousError' })
   })
 
   it('queries a durable queue append receipt by thread and message id', async () => {
@@ -576,14 +679,20 @@ describe('thread goal RPCs', () => {
       tokensUsed: 1_200,
       tokenBudget: 10_000,
     }
-    vi.stubGlobal('fetch', vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       const body = typeof init?.body === 'string'
         ? JSON.parse(init.body) as { method: string, params: Record<string, unknown> }
         : { method: '', params: {} }
-      requests.push(body)
-      return new Response(JSON.stringify({
-        result: body.method === 'thread/goal/clear' ? {} : { goal },
-      }), {
+      const path = String(input)
+      if (path.endsWith('/thread-goal-set')) requests.push({ method: 'thread/goal/set', params: body as never })
+      else if (path.endsWith('/thread-goal-clear')) requests.push({ method: 'thread/goal/clear', params: body as never })
+      else requests.push(body)
+      const payload = path.endsWith('/thread-goal-clear')
+        ? { ok: true }
+        : path.endsWith('/thread-goal-set')
+          ? { goal }
+          : { result: { goal } }
+      return new Response(JSON.stringify(payload), {
         status: 200,
         headers: { 'Content-Type': 'application/json' },
       })
@@ -622,7 +731,7 @@ describe('thread goal RPCs', () => {
     ]
     let responseGoal: Record<string, unknown> | null = null
     vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({
-      result: { goal: responseGoal },
+      goal: responseGoal,
     }), {
       status: 200,
       headers: { 'Content-Type': 'application/json' },

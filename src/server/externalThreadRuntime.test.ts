@@ -1127,6 +1127,17 @@ describe('ExternalThreadRuntimeProbe', () => {
     expect(system.scanCount).toBe(0)
   })
 
+  it('detects a foreign writable descriptor even when the rollout lifecycle is idle', async () => {
+    const system = fakeRuntimeSystem({
+      log: lifecycle('task_started', 'turn-a') + lifecycle('task_complete', 'turn-a'),
+      fds: [writerFd({ cmdline: '/usr/local/bin/codex\0resume\0' })],
+    })
+    const probe = registeredProbe(system)
+
+    await expect(probe.inspect('thread-1', 99)).resolves.toEqual({ state: 'idle' })
+    await expect(probe.inspectWriterEvidence('thread-1', 99)).resolves.toBe(true)
+  })
+
   it('does not let an older terminal event clear a newer start', async () => {
     const system = fakeRuntimeSystem({
       log: lifecycle('task_started', 'turn-a'),
@@ -1385,7 +1396,6 @@ describe('ExternalThreadRuntimeProbe', () => {
     ['non-Codex command', { cmdline: '/usr/bin/node\0server.js\0' }],
     ['different device', { dev: '9' }],
     ['different inode', { ino: '22' }],
-    ['zero descriptor position', { position: 0 }],
   ] satisfies Array<[string, Partial<RuntimeFdSnapshot>]>) (
     'rejects writer evidence from a %s',
     async (_label, overrides) => {
@@ -1399,6 +1409,15 @@ describe('ExternalThreadRuntimeProbe', () => {
       })
     },
   )
+
+  it('treats a just-opened writable descriptor at offset zero as writer evidence', async () => {
+    const system = fakeRuntimeSystem({
+      log: lifecycle('task_started', 'turn-a'),
+      fds: [writerFd({ position: 0 })],
+    })
+
+    await expect(registeredProbe(system).inspectWriterEvidence('thread-1', 99)).resolves.toBe(true)
+  })
 
   it.each([
     [
@@ -1899,7 +1918,7 @@ describe('ExternalThreadRuntimeProbe', () => {
     await expect(probe.inspect('thread-1', 99)).resolves.toEqual({ state: 'unknown' })
   })
 
-  it('uses a stable writable FD latest zero position as non-writer evidence', async () => {
+  it('uses a stable writable FD at zero position as writer evidence', async () => {
     const probe = defaultRuntimeProbe({
       fdIdentities: [
         { dev: 8n, ino: 21n },
@@ -1912,7 +1931,10 @@ describe('ExternalThreadRuntimeProbe', () => {
       ],
     })
 
-    await expect(probe.inspect('thread-1', 99)).resolves.toEqual({ state: 'unknown' })
+    await expect(probe.inspect('thread-1', 99)).resolves.toMatchObject({
+      state: 'running',
+      turnId: 'turn-a',
+    })
   })
 
   it('accepts a stable writable FD whose position advances during inspection', async () => {

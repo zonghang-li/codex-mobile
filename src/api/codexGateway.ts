@@ -823,6 +823,32 @@ async function callRpc<T>(method: string, params?: unknown, signal?: AbortSignal
   }
 }
 
+async function postCodexApiJson(
+  path: string,
+  body: Record<string, unknown>,
+  fallback: string,
+  method: string,
+): Promise<unknown> {
+  let response: Response
+  try {
+    response = await fetch(path, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    })
+  } catch (error) {
+    throw normalizeCodexApiError(error, fallback, method)
+  }
+  const payload = await response.json().catch(() => null)
+  if (!response.ok) {
+    throw new CodexApiError(
+      extractErrorMessage(payload, `${fallback} with HTTP ${response.status}`),
+      { code: 'http_error', method, status: response.status },
+    )
+  }
+  return payload
+}
+
 function buildTurnIndexByTurnId(payload: ThreadReadResponse, baseTurnIndex = 0): ThreadTurnIndexById {
   const turns = Array.isArray(payload.thread.turns) ? payload.thread.turns : []
   const lookup: ThreadTurnIndexById = {}
@@ -2128,7 +2154,12 @@ export async function resumeThread(threadId: string): Promise<ResumedThread> {
 }
 
 export async function archiveThread(threadId: string): Promise<void> {
-  await callRpc('thread/archive', { threadId })
+  await postCodexApiJson(
+    '/codex-api/thread-stop-and-archive',
+    { threadId },
+    `Failed to stop and archive thread ${threadId}`,
+    'thread-stop-and-archive',
+  )
 }
 
 export async function renameThread(threadId: string, threadName: string): Promise<void> {
@@ -2154,14 +2185,24 @@ export async function setThreadGoal(input: {
     status: input.status,
   }
   if (input.objective !== undefined) params.objective = input.objective
-  const payload = await callRpc<unknown>('thread/goal/set', params)
+  const payload = await postCodexApiJson(
+    '/codex-api/thread-goal-set',
+    params,
+    `Failed to set goal for thread ${input.threadId}`,
+    'thread-goal-set',
+  )
   const goal = normalizeThreadGoal(asRecord(payload)?.goal)
   if (!goal) throw new Error('Invalid thread goal response')
   return goal
 }
 
 export async function clearThreadGoal(threadId: string): Promise<void> {
-  await callRpc('thread/goal/clear', { threadId })
+  await postCodexApiJson(
+    '/codex-api/thread-goal-clear',
+    { threadId },
+    `Failed to clear goal for thread ${threadId}`,
+    'thread-goal-clear',
+  )
 }
 
 export async function rollbackThread(threadId: string, numTurns: number): Promise<UiMessage[]> {
@@ -3312,8 +3353,10 @@ function invalidateWorkspaceRootsStateCache(): void {
   cachedWorkspaceRootsState = null
 }
 
-export async function getThreadQueueSnapshot(): Promise<ThreadQueueSnapshot> {
-  const response = await fetch('/codex-api/thread-queue-state')
+export async function getThreadQueueSnapshot(
+  signal?: AbortSignal,
+): Promise<ThreadQueueSnapshot> {
+  const response = await fetch('/codex-api/thread-queue-state', { signal })
   const payload = (await response.json()) as unknown
   if (!response.ok) {
     throw new Error('Failed to load thread queue state')
@@ -3323,11 +3366,13 @@ export async function getThreadQueueSnapshot(): Promise<ThreadQueueSnapshot> {
       ? (payload as Record<string, unknown>)
       : {}
   const rawRevision = envelope.revision
+  const revision = rawRevision
+  if (typeof revision !== 'number' || !Number.isSafeInteger(revision) || revision < 0) {
+    throw new Error('Invalid thread queue revision')
+  }
   return {
     state: normalizeThreadQueueState(envelope.data),
-    revision: typeof rawRevision === 'number' && Number.isSafeInteger(rawRevision) && rawRevision >= 0
-      ? rawRevision
-      : 0,
+    revision,
   }
 }
 
@@ -3357,7 +3402,11 @@ export async function getThreadQueueAppendReceipt(
 
 export async function setThreadQueueState(
   nextState: ThreadQueueState,
-  options: { baseRevision: number; transferManagedMessageIds?: string[] },
+  options: {
+    baseRevision: number
+    transferManagedMessageIds?: string[]
+    signal?: AbortSignal
+  },
 ): Promise<number> {
   const response = await fetch('/codex-api/thread-queue-state', {
     method: 'PUT',
@@ -3367,20 +3416,22 @@ export async function setThreadQueueState(
       baseRevision: options.baseRevision,
       transferManagedMessageIds: options.transferManagedMessageIds ?? [],
     }),
+    signal: options.signal,
   })
   if (!response.ok) {
     throw new Error('Failed to save thread queue state')
   }
   const payload = await response.json() as { revision?: unknown }
-  return typeof payload.revision === 'number' && Number.isSafeInteger(payload.revision)
-    ? payload.revision
-    : options.baseRevision + 1
+  if (typeof payload.revision !== 'number' || !Number.isSafeInteger(payload.revision) || payload.revision < 0) {
+    throw new Error('Invalid thread queue revision')
+  }
+  return payload.revision
 }
 
 export async function removeThreadQueuedMessage(
   threadId: string,
   messageId: string,
-  options: { transferManagedUploads?: boolean } = {},
+  options: { baseRevision: number; transferManagedUploads?: boolean },
 ): Promise<number> {
   const response = await fetch('/codex-api/thread-queue-state', {
     method: 'PATCH',
@@ -3389,26 +3440,65 @@ export async function removeThreadQueuedMessage(
       threadId,
       operation: 'remove',
       messageId,
+      baseRevision: options.baseRevision,
       transferManagedUploads: options.transferManagedUploads === true,
     }),
   })
+  if (response.status === 404 || response.status === 405) {
+    const snapshot = await getThreadQueueSnapshot()
+    if (snapshot.revision !== options.baseRevision) {
+      throw new Error(`Thread queue revision changed from ${options.baseRevision} to ${snapshot.revision}`)
+    }
+    const nextState = { ...snapshot.state }
+    const nextQueue = (nextState[threadId] ?? []).filter((message) => message.id !== messageId)
+    if (nextQueue.length > 0) nextState[threadId] = nextQueue
+    else delete nextState[threadId]
+    return setThreadQueueState(nextState, {
+      baseRevision: snapshot.revision,
+      transferManagedMessageIds: options.transferManagedUploads === true ? [messageId] : [],
+    })
+  }
   const payload = await response.json() as { revision?: unknown }
   if (!response.ok) throw new Error('Failed to remove queued message')
-  return typeof payload.revision === 'number' && Number.isSafeInteger(payload.revision) ? payload.revision : 0
+  if (typeof payload.revision !== 'number' || !Number.isSafeInteger(payload.revision) || payload.revision < 0) {
+    throw new Error('Invalid thread queue revision')
+  }
+  return payload.revision
 }
 
 export async function reorderThreadQueuedMessages(
   threadId: string,
   orderedMessageIds: string[],
+  options: { baseRevision: number },
 ): Promise<number> {
   const response = await fetch('/codex-api/thread-queue-state', {
     method: 'PATCH',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ threadId, operation: 'reorder', orderedMessageIds }),
+    body: JSON.stringify({
+      threadId,
+      operation: 'reorder',
+      orderedMessageIds,
+      baseRevision: options.baseRevision,
+    }),
   })
+  if (response.status === 404 || response.status === 405) {
+    const snapshot = await getThreadQueueSnapshot()
+    if (snapshot.revision !== options.baseRevision) {
+      throw new Error(`Thread queue revision changed from ${options.baseRevision} to ${snapshot.revision}`)
+    }
+    const order = new Map(orderedMessageIds.map((messageId, index) => [messageId, index]))
+    const current = snapshot.state[threadId] ?? []
+    const known = current.filter((message) => order.has(message.id))
+      .sort((left, right) => order.get(left.id)! - order.get(right.id)!)
+    const nextState = { ...snapshot.state, [threadId]: [...known, ...current.filter((message) => !order.has(message.id))] }
+    return setThreadQueueState(nextState, { baseRevision: snapshot.revision })
+  }
   const payload = await response.json() as { revision?: unknown }
   if (!response.ok) throw new Error('Failed to reorder queued messages')
-  return typeof payload.revision === 'number' && Number.isSafeInteger(payload.revision) ? payload.revision : 0
+  if (typeof payload.revision !== 'number' || !Number.isSafeInteger(payload.revision) || payload.revision < 0) {
+    throw new Error('Invalid thread queue revision')
+  }
+  return payload.revision
 }
 
 export async function appendThreadQueuedMessage(
@@ -3416,7 +3506,7 @@ export async function appendThreadQueuedMessage(
   message: StoredQueuedMessage,
   queueInsertIndex?: number,
   signal?: AbortSignal,
-): Promise<void> {
+): Promise<number> {
   const response = await fetch('/codex-api/thread-queue-state', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -3427,11 +3517,47 @@ export async function appendThreadQueuedMessage(
     }),
     signal,
   })
+  if (response.status === 404 || response.status === 405) {
+    const snapshot = await getThreadQueueSnapshot(signal)
+    const current = snapshot.state[threadId] ?? []
+    if (!current.some((queuedMessage) => queuedMessage.id === message.id)) {
+      const insertIndex = typeof queueInsertIndex === 'number'
+        ? Math.max(0, Math.min(current.length, Math.floor(queueInsertIndex)))
+        : current.length
+      const nextQueue = [...current]
+      nextQueue.splice(insertIndex, 0, message)
+      return setThreadQueueState({ ...snapshot.state, [threadId]: nextQueue }, {
+        baseRevision: snapshot.revision,
+        signal,
+      })
+    }
+    return snapshot.revision
+  }
   if (!response.ok) {
+    let responseError = ''
+    try {
+      const payload = await response.json() as { error?: unknown }
+      responseError = typeof payload.error === 'string' ? payload.error : ''
+    } catch {
+      responseError = ''
+    }
     const error = new Error('Failed to append thread queue message')
-    if (response.status >= 500) error.name = 'ThreadQueueAppendAmbiguousError'
+    if (
+      response.status >= 500
+      || (
+        response.status === 409
+        && responseError.toLowerCase().includes('another start is already in progress')
+      )
+    ) {
+      error.name = 'ThreadQueueAppendAmbiguousError'
+    }
     throw error
   }
+  const payload = await response.json() as { revision?: unknown }
+  if (typeof payload.revision !== 'number' || !Number.isSafeInteger(payload.revision) || payload.revision < 0) {
+    throw new Error('Invalid thread queue revision')
+  }
+  return payload.revision
 }
 
 export async function createWorktree(sourceCwd: string, baseBranch?: string): Promise<WorktreeCreateResult> {

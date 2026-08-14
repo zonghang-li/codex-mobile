@@ -396,7 +396,7 @@ beforeEach(() => {
   gatewayMocks.reorderThreadQueuedMessages.mockReset().mockResolvedValue(1)
   gatewayMocks.cleanupManagedUploads.mockReset().mockResolvedValue(true)
   gatewayMocks.startThreadTurn.mockReset()
-  gatewayMocks.appendThreadQueuedMessage.mockReset().mockResolvedValue(undefined)
+  gatewayMocks.appendThreadQueuedMessage.mockReset().mockResolvedValue(0)
   gatewayMocks.getThreadTitleCache.mockResolvedValue({ titles: {} })
   gatewayMocks.getWorkspaceRootsState.mockRejectedValue(new Error('no workspace roots state'))
 })
@@ -2128,6 +2128,46 @@ describe('startup request deduplication', () => {
     expect(gatewayMocks.getThreadDetail).not.toHaveBeenCalled()
   })
 
+  it('ignores an older background page after a forced first-page refresh', async () => {
+    vi.useFakeTimers()
+    installFakeTimerWindow()
+    vi.stubGlobal('document', {
+      visibilityState: 'visible',
+      addEventListener: vi.fn(),
+      removeEventListener: vi.fn(),
+    })
+    const stalePage = deferred<{ groups: UiProjectGroup[]; nextCursor: string | null }>()
+    gatewayMocks.getThreadGroupsPage
+      .mockResolvedValueOnce({
+        groups: [{ projectName: 'Project', threads: [thread('old-first', '/tmp/project')] }],
+        nextCursor: 'old-page-2',
+      })
+      .mockReturnValueOnce(stalePage.promise)
+      .mockResolvedValueOnce({
+        groups: [{ projectName: 'Project', threads: [thread('fresh-first', '/tmp/project')] }],
+        nextCursor: null,
+      })
+
+    const state = useDesktopState()
+    await state.refreshAll({ includeSelectedThreadMessages: false })
+    await vi.advanceTimersByTimeAsync(250)
+    await flushMicrotasks()
+    const forced = state.refreshAll({
+      includeSelectedThreadMessages: false,
+      forceThreadRefresh: true,
+    })
+    await flushMicrotasks()
+    await forced
+    stalePage.resolve({
+      groups: [{ projectName: 'Project', threads: [thread('stale-second', '/tmp/project')] }],
+      nextCursor: null,
+    })
+    await flushMicrotasks()
+
+    expect(state.projectGroups.value[0]?.threads.map((row) => row.id)).toEqual(['fresh-first'])
+    expect(state.isThreadListFullyLoaded.value).toBe(true)
+  })
+
   it('preserves read state for threads that arrive on a later directory page', async () => {
     vi.useFakeTimers()
     installFakeTimerWindow({
@@ -3239,6 +3279,7 @@ describe('turn completion lifecycle', () => {
   it('queues managed attachments without starting another turn immediately', async () => {
     const { state, emit } = await setupTurnLifecycleNotificationState('thread-1')
     gatewayMocks.startThreadTurn.mockResolvedValue('turn-steer')
+    gatewayMocks.appendThreadQueuedMessage.mockResolvedValue(7)
     gatewayMocks.getThreadQueueState.mockImplementation(async () => {
       const message = gatewayMocks.appendThreadQueuedMessage.mock.calls.at(-1)?.[1]
       return message ? { 'thread-1': [message] } : {}
@@ -3270,6 +3311,7 @@ describe('turn completion lifecycle', () => {
     expect(gatewayMocks.reorderThreadQueuedMessages).toHaveBeenLastCalledWith(
       'thread-1',
       [queuedId],
+      { baseRevision: 7 },
     )
     expect(gatewayMocks.removeThreadQueuedMessage).not.toHaveBeenCalled()
     expect(gatewayMocks.startThreadTurn).not.toHaveBeenCalled()
@@ -6092,6 +6134,78 @@ describe('external runtime ownership', () => {
     ])
   })
 
+  it('does not let an older in-flight thread list resurrect an archived row', async () => {
+    const state = await setupBackgroundRuntimeState()
+    expect(gatewayMocks.getThreadGroupsPage).toHaveBeenCalledOnce()
+    expect(state.projectGroups.value.flatMap((group) => group.threads).map((row) => row.id))
+      .toEqual(['thread-running', 'thread-selected'])
+    gatewayMocks.archiveThread.mockResolvedValue(undefined)
+    gatewayMocks.getThreadGroupsPage.mockReset()
+    const staleList = deferred<{ groups: UiProjectGroup[]; nextCursor: null }>()
+    gatewayMocks.getThreadGroupsPage.mockReturnValueOnce(staleList.promise)
+    gatewayMocks.getThreadGroupsPage.mockResolvedValueOnce({
+      groups: [{ projectName: 'Project', threads: [thread('thread-selected', '/tmp/project')] }],
+      nextCursor: null,
+    })
+
+    const staleRefresh = state.refreshAll({
+      includeSelectedThreadMessages: false,
+      forceThreadRefresh: true,
+    })
+    await vi.advanceTimersByTimeAsync(0)
+    await flushMicrotasks()
+    expect(gatewayMocks.getThreadGroupsPage).toHaveBeenCalledOnce()
+    const archive = state.archiveThreadById('thread-running')
+    await flushMicrotasks()
+    staleList.resolve({
+      groups: [{ projectName: 'Project', threads: [
+        thread('thread-running', '/tmp/project'),
+        thread('thread-selected', '/tmp/project'),
+      ] }],
+      nextCursor: null,
+    })
+    await Promise.all([staleRefresh, archive])
+
+    expect(gatewayMocks.getThreadGroupsPage).toHaveBeenCalledTimes(2)
+    expect(state.projectGroups.value.flatMap((group) => group.threads).map((row) => row.id))
+      .toEqual(['thread-selected'])
+    state.stopPolling()
+  })
+
+  it('removes an archived row from the persisted startup snapshot immediately', async () => {
+    vi.useFakeTimers()
+    installFakeTimerWindow({
+      'codex-web-local.thread-groups-snapshot.v1': JSON.stringify({
+        groups: [{ projectName: 'Project', threads: [
+          thread('thread-archive', '/tmp/project'),
+          thread('thread-cached-old', '/tmp/project'),
+        ] }],
+      }),
+    })
+    vi.stubGlobal('document', {
+      visibilityState: 'hidden',
+      addEventListener: vi.fn(),
+      removeEventListener: vi.fn(),
+    })
+    gatewayMocks.getPendingServerRequests.mockResolvedValue([])
+    gatewayMocks.archiveThread.mockResolvedValue(undefined)
+    gatewayMocks.getThreadGroupsPage.mockResolvedValue({
+      groups: [{ projectName: 'Project', threads: [thread('thread-fresh', '/tmp/project')] }],
+      nextCursor: 'older-page',
+    })
+    const state = useDesktopState()
+    await state.refreshAll({ includeSelectedThreadMessages: false })
+
+    await state.archiveThreadById('thread-archive')
+
+    const persisted = JSON.parse(
+      window.localStorage.getItem('codex-web-local.thread-groups-snapshot.v1') ?? '{}',
+    ) as { groups?: UiProjectGroup[] }
+    const persistedIds = (persisted.groups ?? []).flatMap((group) => group.threads.map((row) => row.id))
+    expect(persistedIds).not.toContain('thread-archive')
+    expect(persistedIds).toContain('thread-cached-old')
+  })
+
   it('polls selected, recently running, and first-screen rows within the small runtime limit', async () => {
     vi.useFakeTimers()
     installFakeTimerWindow()
@@ -7170,7 +7284,7 @@ describe('external runtime ownership', () => {
     gatewayMocks.getThreadDetail.mockResolvedValue(externalDetail())
     gatewayMocks.appendThreadQueuedMessage
       .mockRejectedValueOnce(new Error('first append rejected'))
-      .mockResolvedValueOnce(undefined)
+      .mockResolvedValueOnce(0)
     await state.loadMessages('thread-1')
 
     const first = state.sendMessageToSelectedThread('first rejected', [], [], 'steer')
@@ -7178,7 +7292,11 @@ describe('external runtime ownership', () => {
     await Promise.all([first, second])
 
     const acceptedId = gatewayMocks.appendThreadQueuedMessage.mock.calls[1]?.[1].id
-    expect(gatewayMocks.reorderThreadQueuedMessages).toHaveBeenCalledWith('thread-1', [acceptedId])
+    expect(gatewayMocks.reorderThreadQueuedMessages).toHaveBeenCalledWith(
+      'thread-1',
+      [acceptedId],
+      { baseRevision: 0 },
+    )
     expect(state.selectedThreadQueuedMessages.value).toEqual([
       expect.objectContaining({ id: acceptedId, text: 'second accepted' }),
     ])
@@ -7238,7 +7356,7 @@ describe('external runtime ownership', () => {
     gatewayMocks.appendThreadQueuedMessage
       .mockRejectedValueOnce(new TypeError('connection reset'))
       .mockRejectedValueOnce(new TypeError('connection reset again'))
-      .mockResolvedValueOnce(undefined)
+      .mockResolvedValueOnce(0)
     gatewayMocks.getThreadQueueAppendReceipt.mockRejectedValueOnce(new TypeError('receipt unavailable'))
 
     const send = state.sendMessageToSelectedThread('retry until durable', [], [], 'steer')
@@ -7278,7 +7396,7 @@ describe('external runtime ownership', () => {
     const { state } = await setupExternalRuntimeState()
     gatewayMocks.getThreadDetail.mockResolvedValue(externalDetail())
     await state.loadMessages('thread-1')
-    const append = deferred<void>()
+    const append = deferred<number>()
     let observedSignal: AbortSignal | undefined
     gatewayMocks.appendThreadQueuedMessage.mockImplementation((...args) => {
       observedSignal = args[3] as AbortSignal | undefined
@@ -7299,11 +7417,12 @@ describe('external runtime ownership', () => {
     const { state, emit } = await setupExternalRuntimeState()
     gatewayMocks.getThreadDetail.mockResolvedValue(externalDetail())
     await state.loadMessages('thread-1')
-    const append = deferred<void>()
+    const append = deferred<number>()
     let persisted = false
     gatewayMocks.appendThreadQueuedMessage.mockImplementation(async () => {
-      await append.promise
+      const revision = await append.promise
       persisted = true
+      return revision
     })
     gatewayMocks.getThreadQueueState.mockImplementation(async () => {
       const message = gatewayMocks.appendThreadQueuedMessage.mock.calls.at(-1)?.[1]
@@ -7324,7 +7443,7 @@ describe('external runtime ownership', () => {
       expect.objectContaining({ text: 'append still pending' }),
     ])
 
-    append.resolve()
+    append.resolve(0)
     await send
     await vi.waitFor(() => {
       expect(gatewayMocks.getThreadQueueState.mock.calls.length).toBeGreaterThanOrEqual(2)
@@ -7349,7 +7468,7 @@ describe('external runtime ownership', () => {
 
     await state.sendMessageToSelectedThread('steer across ownership race', [], [], 'steer')
     await flushMicrotasks()
-    expect(state.messages.value.filter((message) => message.text === 'steer across ownership race')).toHaveLength(1)
+    expect(state.messages.value.filter((message) => message.text === 'steer across ownership race')).toHaveLength(0)
 
     firstStart.reject(new CodexApiError(
       'RPC turn/start failed with HTTP 502: Cannot start a turn because task writer ownership is not idle.',
@@ -7554,8 +7673,17 @@ describe('external runtime ownership', () => {
   it('queues an idle text-only submit when writer ownership changes after turn/start is issued', async () => {
     const { state } = await setupExternalRuntimeState()
     gatewayMocks.resumeThread.mockResolvedValue(idleDetail())
+    const firstStart = deferred<string>()
     gatewayMocks.startThreadTurn
-      .mockRejectedValueOnce(new CodexApiError(
+      .mockReturnValueOnce(firstStart.promise)
+      .mockResolvedValueOnce('turn-external-steer')
+    gatewayMocks.setThreadQueueState.mockClear()
+
+    const send = state.sendMessageToSelectedThread('idle steer ownership race', [], [], 'steer')
+    await flushMicrotasks()
+    expect(state.messages.value.filter((message) => message.text === 'idle steer ownership race')).toHaveLength(0)
+
+    firstStart.reject(new CodexApiError(
         'RPC turn/start failed with HTTP 502: Cannot start a turn because task writer ownership is not idle.',
         {
           code: 'http_error',
@@ -7563,10 +7691,7 @@ describe('external runtime ownership', () => {
           status: 502,
         },
       ))
-      .mockResolvedValueOnce('turn-external-steer')
-    gatewayMocks.setThreadQueueState.mockClear()
-
-    await state.sendMessageToSelectedThread('idle steer ownership race', [], [], 'steer')
+    await send
     await flushMicrotasks()
 
     expect(gatewayMocks.startThreadTurn).toHaveBeenCalledTimes(1)
@@ -7579,6 +7704,25 @@ describe('external runtime ownership', () => {
     expect(state.selectedThreadQueuedMessages.value).toEqual([
       expect.objectContaining({ text: 'idle steer ownership race' }),
     ])
+  })
+
+  it('queues an idle submit for the preflight writer ownership conflict wording', async () => {
+    const { state } = await setupExternalRuntimeState()
+    gatewayMocks.resumeThread.mockResolvedValue(idleDetail())
+    gatewayMocks.startThreadTurn.mockRejectedValue(new CodexApiError(
+      'RPC turn/start failed with HTTP 409: Cannot mutate a task because writer ownership is not idle.',
+      { code: 'http_error', method: 'turn/start', status: 409 },
+    ))
+
+    await state.sendMessageToSelectedThread('preserve preflight race', [], [], 'steer')
+    await flushMicrotasks()
+
+    expect(gatewayMocks.appendThreadQueuedMessage).toHaveBeenCalledWith(
+      'thread-1',
+      expect.objectContaining({ text: 'preserve preflight race' }),
+      undefined,
+      expect.any(AbortSignal),
+    )
   })
 
   it('queues a steer that implicitly reuses an attached image when ownership changes', async () => {
@@ -8047,6 +8191,17 @@ describe('external runtime ownership', () => {
     expect(state.selectedActiveTurnId.value).toBe('')
     expect(state.selectedThreadRuntimeOwnership.value).toBe('local')
     expect(state.selectedThread.value?.inProgress).toBe(true)
+    expect(state.messages.value).not.toEqual(expect.arrayContaining([
+      expect.objectContaining({ role: 'user', text: 'new request' }),
+    ]))
+
+    pendingTurn.resolve('turn-current')
+    await send
+    await flushMicrotasks()
+
+    expect(state.selectedActiveTurnId.value).toBe('turn-current')
+    expect(state.selectedThreadRuntimeOwnership.value).toBe('local')
+    expect(state.selectedThread.value?.inProgress).toBe(true)
     expect(state.messages.value).toEqual(expect.arrayContaining([
       expect.objectContaining({
         role: 'user',
@@ -8054,13 +8209,6 @@ describe('external runtime ownership', () => {
         messageType: 'userMessage.optimistic',
       }),
     ]))
-
-    pendingTurn.resolve('turn-current')
-    await send
-
-    expect(state.selectedActiveTurnId.value).toBe('turn-current')
-    expect(state.selectedThreadRuntimeOwnership.value).toBe('local')
-    expect(state.selectedThread.value?.inProgress).toBe(true)
   })
 
   it('keeps local ownership when lagging external detail is loaded', async () => {
@@ -11991,7 +12139,7 @@ describe('provider model selection', () => {
     expect(state.selectedModelId.value).toBe('big-pickle')
   })
 
-  it('renders a follow-up user message immediately in an existing thread while turn start is pending', async () => {
+  it('renders a follow-up user message after turn start is accepted', async () => {
     installTestWindow()
     const pendingTurn = deferred<string>()
     gatewayMocks.getThreadDetail.mockResolvedValue({
@@ -12021,12 +12169,14 @@ describe('provider model selection', () => {
     const send = state.sendMessageToSelectedThread('next question')
     await flushMicrotasks()
 
-    expect(state.messages.value.map((message) => `${message.role}:${message.text}`)).toContain('user:next question')
-    expect(state.messages.value.find((message) => message.text === 'next question')?.messageType)
-      .toBe('userMessage.optimistic')
+    expect(state.messages.value.map((message) => `${message.role}:${message.text}`)).not.toContain('user:next question')
 
     pendingTurn.resolve('turn-follow-up')
     await send
+
+    expect(state.messages.value.map((message) => `${message.role}:${message.text}`)).toContain('user:next question')
+    expect(state.messages.value.find((message) => message.text === 'next question')?.messageType)
+      .toBe('userMessage.optimistic')
   })
 
   it('keeps an optimistic user row visible across an empty running detail projection', async () => {
@@ -12066,16 +12216,17 @@ describe('provider model selection', () => {
 
     const send = state.sendMessageToSelectedThread('next question')
     await flushMicrotasks()
-    expect(state.messages.value.some((message) => message.text === 'next question')).toBe(true)
+    expect(state.messages.value.some((message) => message.text === 'next question')).toBe(false)
 
     pendingTurn.resolve('turn-follow-up')
     await send
+    expect(state.messages.value.some((message) => message.text === 'next question')).toBe(true)
     await state.loadMessages('thread-1', { force: true })
 
     expect(state.messages.value.some((message) => message.text === 'next question')).toBe(true)
   })
 
-  it('keeps an optimistic user row while a transient turn-start response is ambiguous', async () => {
+  it('does not show an unaccepted user row while a transient turn-start response is ambiguous', async () => {
     installTestWindow()
     gatewayMocks.getThreadDetail.mockResolvedValue({
       ...idleDetail(),
@@ -12105,7 +12256,7 @@ describe('provider model selection', () => {
       message.role === 'user'
       && message.text === 'next question'
       && message.messageType === 'userMessage.optimistic'
-    ))).toBe(true)
+    ))).toBe(false)
     expect(state.selectedLiveOverlay.value?.activityLabel).toBe('Thinking')
   })
 

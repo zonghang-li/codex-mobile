@@ -111,6 +111,7 @@ const IDLE_LIVE_STATE_HTTP_CACHE_TTL_MS = 3_000
 const THREAD_TEXT_PAGE_HTTP_CACHE_TTL_MS = 350
 const LIVE_STATE_HTTP_CACHE_MAX_ENTRIES = 256
 const THREAD_TEXT_PAGE_HTTP_CACHE_MAX_ENTRIES = 512
+const CODEX_MOBILE_THREAD_LIST_CURSOR_PREFIX = 'codex-mobile-list:'
 
 type RpcExecutor = {
   rpc: (method: string, params: unknown) => Promise<unknown>
@@ -326,6 +327,12 @@ const ARCHIVED_THREAD_BLOCKED_METHODS = new Set([
   ...THREAD_WRITER_METHODS_REQUIRING_IDLE,
   'thread/read',
   'thread/resume',
+])
+const FORBIDDEN_RAW_THREAD_LIFECYCLE_METHODS = new Set([
+  'thread/archive',
+  'thread/unarchive',
+  'thread/goal/set',
+  'thread/goal/clear',
 ])
 const THREAD_SEARCH_FULL_TEXT_THREAD_LIMIT = 100
 const PROJECTLESS_THREAD_DIRECTORY_MAX_ATTEMPTS = 100
@@ -1359,7 +1366,8 @@ type ThreadWriterInspection =
 
 async function inspectThreadWriter(
   appServer: RpcExecutor,
-  runtimeProbe: Pick<ThreadRuntimeProbe, 'registerThread' | 'inspect'>,
+  runtimeProbe: Pick<ThreadRuntimeProbe, 'registerThread' | 'inspect'> &
+    Partial<Pick<ExternalThreadRuntimeProbe, 'inspectWriterEvidence'>>,
   excludedPid: number | null,
   threadId: string,
 ): Promise<ThreadWriterInspection> {
@@ -1384,6 +1392,16 @@ async function inspectThreadWriter(
 
   runtimeProbe.registerThread(threadId, rolloutPath)
   const runtime = await runtimeProbe.inspect(threadId, excludedPid)
+  if (
+    runtime.state === 'idle'
+    && process.platform === 'linux'
+    && typeof runtimeProbe.inspectWriterEvidence === 'function'
+  ) {
+    const writerObserved = await runtimeProbe.inspectWriterEvidence(threadId, excludedPid)
+    if (writerObserved !== false) {
+      return { state: 'blocked', readResult, runtime: { state: 'unknown' } }
+    }
+  }
   return runtime.state === 'idle'
     ? { state: 'idle', readResult }
     : { state: 'blocked', readResult, runtime }
@@ -1391,7 +1409,8 @@ async function inspectThreadWriter(
 
 async function guardThreadResumeAgainstExternalWriter(
   appServer: RpcExecutor,
-  runtimeProbe: Pick<ThreadRuntimeProbe, 'registerThread' | 'inspect'>,
+  runtimeProbe: Pick<ThreadRuntimeProbe, 'registerThread' | 'inspect'> &
+    Partial<Pick<ExternalThreadRuntimeProbe, 'inspectWriterEvidence'>>,
   excludedPid: number | null,
   threadId: string,
 ): Promise<{ blocked: false } | { blocked: true; readResult: unknown }> {
@@ -1403,7 +1422,8 @@ async function guardThreadResumeAgainstExternalWriter(
 
 async function auditStartedTurnAgainstExternalWriter(
   appServer: RpcExecutor,
-  runtimeProbe: Pick<ThreadRuntimeProbe, 'registerThread' | 'inspect'>,
+  runtimeProbe: Pick<ThreadRuntimeProbe, 'registerThread' | 'inspect'> &
+    Partial<Pick<ExternalThreadRuntimeProbe, 'inspectWriterEvidence'>>,
   excludedPid: number | null,
   threadId: string,
   result: unknown,
@@ -1412,21 +1432,52 @@ async function auditStartedTurnAgainstExternalWriter(
   const inspection = await inspectThreadWriter(appServer, runtimeProbe, excludedPid, threadId)
   if (inspection.state === 'idle' || (allowUnmaterialized && inspection.state === 'unmaterialized')) return result
   const turnId = readNonEmptyString(asRecord(asRecord(result)?.turn)?.id)
+  if (inspection.state === 'blocked' && inspection.runtime.state === 'running' && inspection.runtime.turnId === turnId) {
+    if (
+      process.platform !== 'linux'
+      || typeof runtimeProbe.inspectWriterEvidence !== 'function'
+      || await runtimeProbe.inspectWriterEvidence(threadId, excludedPid) === false
+    ) {
+      return result
+    }
+  }
   if (turnId) {
     await appServer.rpc('turn/interrupt', { threadId, turnId }).catch(() => undefined)
   }
   const error = new Error('Cannot start a turn because task writer ownership is not idle.')
   error.name = 'ThreadWriterOwnershipConflictError'
+  Object.assign(error, { turnId })
   throw error
 }
 
 async function isThreadWriterIdleForMutation(
   appServer: RpcExecutor,
-  runtimeProbe: Pick<ThreadRuntimeProbe, 'registerThread' | 'inspect'>,
+  runtimeProbe: Pick<ThreadRuntimeProbe, 'registerThread' | 'inspect'> &
+    Partial<Pick<ExternalThreadRuntimeProbe, 'inspectWriterEvidence'>>,
   excludedPid: number | null,
   threadId: string,
 ): Promise<boolean> {
   return (await inspectThreadWriter(appServer, runtimeProbe, excludedPid, threadId)).state === 'idle'
+}
+
+async function waitForInterruptedThreadWriterIdle(
+  appServer: RpcExecutor,
+  runtimeProbe: Pick<ThreadRuntimeProbe, 'registerThread' | 'inspect'> &
+    Partial<Pick<ExternalThreadRuntimeProbe, 'inspectWriterEvidence'>>,
+  excludedPid: number | null,
+  threadId: string,
+  interruptedTurnId: string,
+): Promise<boolean> {
+  for (let attempt = 0; attempt < 10; attempt += 1) {
+    const inspection = await inspectThreadWriter(appServer, runtimeProbe, excludedPid, threadId)
+    if (inspection.state === 'idle') return true
+    const stillStoppingExpectedTurn = inspection.state === 'blocked'
+      && inspection.runtime.state === 'running'
+      && inspection.runtime.turnId === interruptedTurnId
+    if (!stillStoppingExpectedTurn || attempt === 9) return false
+    await new Promise((resolve) => setTimeout(resolve, 25))
+  }
+  return false
 }
 
 function isThreadTurnRunning(turn: unknown): boolean {
@@ -1436,6 +1487,16 @@ function isThreadTurnRunning(turn: unknown): boolean {
   if (status === 'inProgress' || status === 'active' || status === 'running') return true
   const statusType = readNonEmptyString(asRecord(turnRecord.status)?.type)
   return statusType === 'inProgress' || statusType === 'active' || statusType === 'running'
+}
+
+function isAmbiguousAppServerDeliveryError(error: unknown): boolean {
+  if (!(error instanceof Error)) return true
+  const message = error.message.toLowerCase()
+  return message.includes('app-server exited')
+    || message.includes('app-server stopped')
+    || message.includes('app-server is not running')
+    || message.includes('broken pipe')
+    || message.includes('epipe')
 }
 
 function isReasoningTurnItem(item: unknown): boolean {
@@ -2374,6 +2435,7 @@ type ExportedThreadMetadata = {
 
 type StateDbThreadReadMetadata = {
   hasUserEvent?: boolean
+  archived?: boolean
 }
 
 const ZIP_CRC_TABLE = new Uint32Array(256)
@@ -3048,21 +3110,149 @@ function sqlString(value: string): string {
   return `'${value.replace(/'/g, "''")}'`
 }
 
-function isStateDbThreadArchived(threadId: string): boolean {
+async function readStateDbThreadArchived(threadId: string): Promise<boolean | null> {
   const normalizedThreadId = threadId.trim()
-  if (!normalizedThreadId) return false
+  if (!normalizedThreadId) return null
+  return (await readStateDbArchiveRows([normalizedThreadId])).get(normalizedThreadId) ?? null
+}
+
+let stateDbArchiveRowCache: {
+  signature: string
+  rows: Map<string, boolean | null>
+} | null = null
+
+async function readStateDbArchiveSignature(stateDbPath: string): Promise<string> {
+  const signatureForPath = async (path: string): Promise<string> => {
+    try {
+      const info = await stat(path)
+      return `${String(info.mtimeMs)}:${String(info.ctimeMs)}:${String(info.size)}`
+    } catch {
+      return 'missing'
+    }
+  }
+  return `db:${await signatureForPath(stateDbPath)}|wal:${await signatureForPath(`${stateDbPath}-wal`)}`
+}
+
+async function readStateDbArchiveRows(threadIds: readonly string[]): Promise<Map<string, boolean | null>> {
+  const normalizedIds = Array.from(new Set(threadIds.map((id) => id.trim()).filter(Boolean)))
+  const result = new Map<string, boolean | null>()
+  if (normalizedIds.length === 0) return result
   const stateDbPath = join(getCodexHomeDir(), 'state_5.sqlite')
-  if (!existsSync(stateDbPath)) return false
-  const result = spawnSync('sqlite3', [
-    stateDbPath,
-    `SELECT archived FROM threads WHERE id = ${sqlString(normalizedThreadId)} LIMIT 1;`,
-  ], { encoding: 'utf8' })
-  if (result.status !== 0) {
+  if (!existsSync(stateDbPath)) return result
+  const signature = await readStateDbArchiveSignature(stateDbPath)
+  if (stateDbArchiveRowCache?.signature !== signature) {
+    stateDbArchiveRowCache = { signature, rows: new Map() }
+  }
+  const cache = stateDbArchiveRowCache.rows
+  const missingIds = normalizedIds.filter((id) => !cache.has(id))
+  for (let offset = 0; offset < missingIds.length; offset += 100) {
+    const batch = missingIds.slice(offset, offset + 100)
+    let stdout: string
+    try {
+      stdout = await runCommandCapture('sqlite3', [
+        '-json',
+        stateDbPath,
+        `SELECT id, archived FROM threads WHERE id IN (${batch.map(sqlString).join(', ')});`,
+      ], { timeoutMs: 2_000 })
+    } catch {
+      const error = new Error('Cannot verify archived task state.')
+      error.name = 'ArchivedThreadStateUnavailableError'
+      throw error
+    }
+    let rows: unknown[]
+    try {
+      const parsed = JSON.parse(stdout || '[]') as unknown
+      if (!Array.isArray(parsed)) throw new Error('Invalid archived task query result.')
+      rows = parsed
+    } catch {
+      const error = new Error('Cannot verify archived task state.')
+      error.name = 'ArchivedThreadStateUnavailableError'
+      throw error
+    }
+    const batchRows = new Map<string, boolean | null>(batch.map((id) => [id, null]))
+    for (const row of rows) {
+      const record = asRecord(row)
+      const id = readNonEmptyString(record?.id)
+      if (!id || !batchRows.has(id)) continue
+      if (record?.archived === 1) batchRows.set(id, true)
+      else if (record?.archived === 0) batchRows.set(id, false)
+      else {
+        const error = new Error('Cannot verify archived task state.')
+        error.name = 'ArchivedThreadStateUnavailableError'
+        throw error
+      }
+    }
+    for (const [id, archived] of batchRows) cache.set(id, archived)
+  }
+  for (const id of normalizedIds) result.set(id, cache.get(id) ?? null)
+  return result
+}
+
+async function readStateDbArchivedThreadIds(threadIds: readonly string[]): Promise<Set<string>> {
+  const normalizedIds = Array.from(new Set(threadIds.map((id) => id.trim()).filter(Boolean)))
+  const archivedIds = new Set<string>()
+  if (normalizedIds.length === 0) return archivedIds
+  for (const [id, archived] of await readStateDbArchiveRows(normalizedIds)) {
+    if (archived === true) archivedIds.add(id)
+  }
+  return archivedIds
+}
+
+async function readAuthoritativeArchivedThreadIds(threadIds: readonly string[]): Promise<Set<string>> {
+  const normalizedIds = Array.from(new Set(threadIds.map((id) => id.trim()).filter(Boolean)))
+  if (normalizedIds.length === 0) return new Set()
+  if (existsSync(join(getCodexHomeDir(), 'state_5.sqlite'))) {
+    return await readStateDbArchivedThreadIds(normalizedIds)
+  }
+  const archivedRoot = join(getCodexHomeDir(), 'archived_sessions')
+  let entries: string[]
+  try {
+    entries = await readdir(archivedRoot, { recursive: true })
+  } catch {
+    if (!existsSync(archivedRoot)) return new Set()
     const error = new Error('Cannot verify archived task state.')
     error.name = 'ArchivedThreadStateUnavailableError'
     throw error
   }
-  return result.stdout.trim() === '1'
+  const archivedIds = new Set<string>()
+  for (const id of normalizedIds) {
+    if (entries.some((entry) => entry.endsWith(`${id}.jsonl`))) archivedIds.add(id)
+  }
+  return archivedIds
+}
+
+async function readArchivedSessionsTreeSignature(): Promise<string> {
+  const archivedRoot = join(getCodexHomeDir(), 'archived_sessions')
+  try {
+    const entries = await readdir(archivedRoot, { recursive: true })
+    return createHash('sha256').update(entries.sort().join('\n')).digest('hex').slice(0, 24)
+  } catch {
+    return existsSync(archivedRoot) ? 'unreadable' : 'missing'
+  }
+}
+
+async function isThreadArchivedForMutation(appServer: RpcExecutor, threadId: string): Promise<boolean> {
+  const stateDbPath = join(getCodexHomeDir(), 'state_5.sqlite')
+  if (existsSync(stateDbPath)) {
+    const archived = await readStateDbThreadArchived(threadId)
+    if (archived !== null) return archived
+  } else if (!existsSync(join(getCodexHomeDir(), 'archived_sessions'))) {
+    return false
+  }
+  let readResult: unknown
+  try {
+    readResult = await appServer.rpc('thread/read', { threadId, includeTurns: false })
+  } catch {
+    const error = new Error('Cannot verify archived task state.')
+    error.name = 'ArchivedThreadStateUnavailableError'
+    throw error
+  }
+  const state = await readVerifiedThreadArchiveState(readResult, threadId)
+  if (state === 'archived') return true
+  if (state === 'active') return false
+  const error = new Error('Cannot verify archived task state.')
+  error.name = 'ArchivedThreadStateUnavailableError'
+  throw error
 }
 
 function ensureImportedThreadsStateDbTable(stateDbPath: string): boolean {
@@ -3160,23 +3350,61 @@ function registerImportedSessionsInStateDb(sessions: ImportedSessionRecord[]): v
   }
 }
 
-function listImportedThreadsFromStateDb(): Array<Record<string, unknown>> {
+type ImportedThreadListQuery = {
+  beforeUpdatedAt?: number | null
+  beforeId?: string
+  excludedIds?: string[]
+  limit?: number
+  threadIds?: string[]
+}
+
+const MAX_THREAD_LIST_PAGE_SIZE = 100
+
+async function listImportedThreadsFromStateDb(
+  query: ImportedThreadListQuery = {},
+): Promise<Array<Record<string, unknown>>> {
   const stateDbPath = join(getCodexHomeDir(), 'state_5.sqlite')
   if (!existsSync(stateDbPath)) return []
+  const predicates = [
+    'archived = 0',
+    `replace(rollout_path, '\\\\', '/') LIKE '%/sessions/%'`,
+    `id IN (SELECT id FROM threads WHERE first_user_message != '' OR title != '')`,
+  ]
+  const threadIds = normalizeStringArray(query.threadIds)
+  if (query.threadIds && threadIds.length === 0) return []
+  if (threadIds.length > 0) {
+    predicates.push(`id IN (${threadIds.map(sqlString).join(', ')})`)
+  }
+  const excludedIds = normalizeStringArray(query.excludedIds)
+  if (excludedIds.length > 0) {
+    predicates.push(`id NOT IN (${excludedIds.map(sqlString).join(', ')})`)
+  }
+  if (query.beforeUpdatedAt !== undefined && query.beforeUpdatedAt !== null) {
+    const beforeUpdatedAt = Number.isFinite(query.beforeUpdatedAt) ? query.beforeUpdatedAt : 0
+    const beforeId = readNonEmptyString(query.beforeId)
+    predicates.push(`(updated_at < ${beforeUpdatedAt} OR (updated_at = ${beforeUpdatedAt} AND id < ${sqlString(beforeId)}))`)
+  }
+  const limit = Math.min(
+    MAX_THREAD_LIST_PAGE_SIZE + 1,
+    Math.max(1, Number.isSafeInteger(query.limit) ? query.limit! : MAX_THREAD_LIST_PAGE_SIZE + 1),
+  )
   const sql = `
 SELECT id, rollout_path, created_at, updated_at, source, model_provider, cwd, title,
        cli_version, first_user_message, archived
 FROM threads
-WHERE archived = 0 AND replace(rollout_path, '\\', '/') LIKE '%/sessions/%' AND id IN (
-  SELECT id FROM threads WHERE first_user_message != '' OR title != ''
-)
-ORDER BY updated_at DESC
-LIMIT 200;
+WHERE ${predicates.join(' AND ')}
+ORDER BY updated_at DESC, id DESC
+LIMIT ${limit}
 `
-  const result = spawnSync('sqlite3', ['-json', stateDbPath, sql], { encoding: 'utf8' })
-  if (result.status !== 0 || !result.stdout.trim()) return []
+  let stdout: string
   try {
-    const rows = JSON.parse(result.stdout) as unknown
+    stdout = await runCommandCapture('sqlite3', ['-json', stateDbPath, sql])
+  } catch {
+    return []
+  }
+  if (!stdout.trim()) return []
+  try {
+    const rows = JSON.parse(stdout) as unknown
     if (!Array.isArray(rows)) return []
     return rows.flatMap((row) => {
       const record = asRecord(row)
@@ -3198,7 +3426,6 @@ LIMIT 200;
         cliVersion: readNonEmptyString(record?.cli_version),
         source: 'cli',
         gitInfo: null,
-        turns: [],
       }]
     })
   } catch {
@@ -3255,28 +3482,30 @@ ${archivedPredicate};
   }
 }
 
-function readStateDbThreadReadMetadata(threadIds: string[]): Map<string, StateDbThreadReadMetadata> {
+async function readStateDbThreadReadMetadata(threadIds: string[]): Promise<Map<string, StateDbThreadReadMetadata>> {
   const uniqueThreadIds = Array.from(new Set(threadIds.filter((id) => id.trim().length > 0)))
   if (uniqueThreadIds.length === 0) return new Map()
   const stateDbPath = join(getCodexHomeDir(), 'state_5.sqlite')
   if (!existsSync(stateDbPath)) return new Map()
-  const columnsResult = spawnSync('sqlite3', [stateDbPath, 'PRAGMA table_info(threads);'], { encoding: 'utf8' })
-  if (columnsResult.status !== 0) return new Map()
-  const availableColumns = new Set(columnsResult.stdout
-    .split(/\r?\n/u)
-    .map((line) => line.split('|')[1])
-    .filter((value): value is string => Boolean(value)))
-  if (!availableColumns.has('id') || !availableColumns.has('has_user_event')) return new Map()
-
-  const sql = `
-SELECT id, has_user_event
-FROM threads
-WHERE id IN (${uniqueThreadIds.map(sqlString).join(', ')});
-`
-  const result = spawnSync('sqlite3', ['-json', stateDbPath, sql], { encoding: 'utf8' })
-  if (result.status !== 0 || !result.stdout.trim()) return new Map()
+  const idList = uniqueThreadIds.map(sqlString).join(', ')
+  let stdout: string
   try {
-    const rows = JSON.parse(result.stdout) as unknown
+    stdout = await runCommandCapture('sqlite3', [
+      '-json', stateDbPath, `SELECT id, has_user_event, archived FROM threads WHERE id IN (${idList});`,
+    ])
+  } catch {
+    try {
+      stdout = await runCommandCapture('sqlite3', [
+        '-json', stateDbPath, `SELECT id, archived FROM threads WHERE id IN (${idList});`,
+      ])
+    } catch {
+      const error = new Error('Cannot verify archived task state.')
+      error.name = 'ArchivedThreadStateUnavailableError'
+      throw error
+    }
+  }
+  try {
+    const rows = JSON.parse(stdout || '[]') as unknown
     if (!Array.isArray(rows)) return new Map()
     const metadata = new Map<string, StateDbThreadReadMetadata>()
     for (const row of rows) {
@@ -3284,45 +3513,225 @@ WHERE id IN (${uniqueThreadIds.map(sqlString).join(', ')});
       const id = readNonEmptyString(record?.id)
       if (!id) continue
       const rawHasUserEvent = record?.has_user_event
-      if (typeof rawHasUserEvent === 'number') {
-        metadata.set(id, { hasUserEvent: rawHasUserEvent !== 0 })
+      if (record?.archived !== 0 && record?.archived !== 1) {
+        throw new Error('Invalid archived task query result.')
       }
+      metadata.set(id, {
+        ...(typeof rawHasUserEvent === 'number' ? { hasUserEvent: rawHasUserEvent !== 0 } : {}),
+        archived: record.archived === 1,
+      })
     }
     return metadata
   } catch {
-    return new Map()
+    const error = new Error('Cannot verify archived task state.')
+    error.name = 'ArchivedThreadStateUnavailableError'
+    throw error
   }
 }
 
-function mergeImportedThreadsIntoThreadListResult(result: unknown): unknown {
+type ThreadListCursorPayload =
+  | { kind: 'native'; cursor: string; seenImportedIds: string[] }
+  | { kind: 'imports'; beforeUpdatedAt: number | null; beforeId: string; seenImportedIds: string[] }
+  | { kind: 'session-index'; beforeUpdatedAtMs: number; beforeId: string; seenThreadIds: string[] }
+
+const THREAD_LIST_CURSOR_STATE_TTL_MS = 24 * 60 * 60 * 1000
+const MAX_THREAD_LIST_CURSOR_STATES = 4_096
+const threadListCursorStates = new Map<string, {
+  expiresAt: number
+  payload: ThreadListCursorPayload
+}>()
+
+function pruneThreadListCursorStates(now = Date.now()): void {
+  for (const [token, state] of threadListCursorStates) {
+    if (state.expiresAt <= now) threadListCursorStates.delete(token)
+  }
+  while (threadListCursorStates.size >= MAX_THREAD_LIST_CURSOR_STATES) {
+    const oldestToken = threadListCursorStates.keys().next().value
+    if (typeof oldestToken !== 'string') break
+    threadListCursorStates.delete(oldestToken)
+  }
+}
+
+function encodeThreadListCursor(payload: ThreadListCursorPayload): string {
+  const now = Date.now()
+  pruneThreadListCursorStates(now)
+  let token = randomBytes(18).toString('base64url')
+  while (threadListCursorStates.has(token)) token = randomBytes(18).toString('base64url')
+  threadListCursorStates.set(token, {
+    expiresAt: now + THREAD_LIST_CURSOR_STATE_TTL_MS,
+    payload,
+  })
+  return `${CODEX_MOBILE_THREAD_LIST_CURSOR_PREFIX}${token}`
+}
+
+function decodeThreadListCursor(value: unknown): ThreadListCursorPayload | null {
+  const cursor = readNonEmptyString(value)
+  if (!cursor.startsWith(CODEX_MOBILE_THREAD_LIST_CURSOR_PREFIX)) return null
+  const encoded = cursor.slice(CODEX_MOBILE_THREAD_LIST_CURSOR_PREFIX.length)
+  const registered = threadListCursorStates.get(encoded)
+  if (registered) {
+    if (registered.expiresAt > Date.now()) {
+      threadListCursorStates.delete(encoded)
+      threadListCursorStates.set(encoded, {
+        expiresAt: Date.now() + THREAD_LIST_CURSOR_STATE_TTL_MS,
+        payload: registered.payload,
+      })
+      return registered.payload
+    }
+    threadListCursorStates.delete(encoded)
+  }
+  try {
+    const parsed = asRecord(JSON.parse(Buffer.from(
+      encoded,
+      'base64url',
+    ).toString('utf8')))
+    const kind = readNonEmptyString(parsed?.kind)
+    if (kind === 'native') {
+      const nativeCursor = readNonEmptyString(parsed?.cursor)
+      if (!nativeCursor) throw new Error('Missing native cursor')
+      return { kind, cursor: nativeCursor, seenImportedIds: normalizeStringArray(parsed?.seenImportedIds) }
+    }
+    if (kind === 'imports') {
+      const beforeUpdatedAt = parsed?.beforeUpdatedAt === null
+        ? null
+        : typeof parsed?.beforeUpdatedAt === 'number' && Number.isFinite(parsed.beforeUpdatedAt)
+          ? parsed.beforeUpdatedAt
+          : Number.NaN
+      const beforeId = readNonEmptyString(parsed?.beforeId)
+      if (Number.isNaN(beforeUpdatedAt) || (beforeUpdatedAt !== null && !beforeId)) {
+        throw new Error('Invalid import cursor boundary')
+      }
+      return { kind, beforeUpdatedAt, beforeId, seenImportedIds: normalizeStringArray(parsed?.seenImportedIds) }
+    }
+    if (kind === 'session-index') {
+      const beforeUpdatedAtMs = parsed?.beforeUpdatedAtMs
+      const beforeId = readNonEmptyString(parsed?.beforeId)
+      if (
+        typeof beforeUpdatedAtMs !== 'number'
+        || !Number.isSafeInteger(beforeUpdatedAtMs)
+        || beforeUpdatedAtMs < 0
+        || !beforeId
+      ) {
+        throw new Error('Invalid session index cursor boundary')
+      }
+      return { kind, beforeUpdatedAtMs, beforeId, seenThreadIds: normalizeStringArray(parsed?.seenThreadIds) }
+    }
+  } catch {
+    const error = new Error('Invalid thread list cursor.')
+    error.name = 'InvalidThreadListCursorError'
+    throw error
+  }
+  const error = new Error('Invalid thread list cursor.')
+  error.name = 'InvalidThreadListCursorError'
+  throw error
+}
+
+async function readImportedThreadListCursorPage(
+  params: unknown,
+  cursor: Extract<ThreadListCursorPayload, { kind: 'imports' }>,
+): Promise<Record<string, unknown>> {
+  const paramsRecord = asRecord(params)
+  const limit = typeof paramsRecord?.limit === 'number' && Number.isInteger(paramsRecord.limit)
+    ? Math.min(MAX_THREAD_LIST_PAGE_SIZE, Math.max(1, paramsRecord.limit))
+    : 5
+  const available = await listImportedThreadsFromStateDb({
+    beforeUpdatedAt: cursor.beforeUpdatedAt,
+    beforeId: cursor.beforeId,
+    excludedIds: cursor.seenImportedIds,
+    limit: limit + 1,
+  })
+  const data = available.slice(0, limit)
+  const last = asRecord(data.at(-1))
+  const lastId = readNonEmptyString(last?.id)
+  const lastUpdatedAt = typeof last?.updatedAt === 'number' ? last.updatedAt : 0
+  return {
+    data,
+    nextCursor: available.length > data.length && lastId
+      ? encodeThreadListCursor({
+          kind: 'imports',
+          beforeUpdatedAt: lastUpdatedAt,
+          beforeId: lastId,
+          seenImportedIds: cursor.seenImportedIds,
+        })
+      : null,
+  }
+}
+
+async function mergeImportedThreadsIntoThreadListResult(
+  result: unknown,
+  params: unknown,
+  requestCursor: Extract<ThreadListCursorPayload, { kind: 'native' }> | null,
+): Promise<unknown> {
   const record = asRecord(result)
   const data = Array.isArray(record?.data) ? record.data : null
   if (!record || !data) return result
+  const paramsRecord = asRecord(params)
+  const nativeThreadIds = data
+    .map((item) => readNonEmptyString(asRecord(item)?.id))
+    .filter(Boolean)
   const importedById = new Map<string, Record<string, unknown>>()
-  for (const thread of listImportedThreadsFromStateDb()) {
+  for (const thread of await listImportedThreadsFromStateDb({
+    threadIds: nativeThreadIds,
+    limit: Math.min(MAX_THREAD_LIST_PAGE_SIZE + 1, nativeThreadIds.length || 1),
+  })) {
     const id = readNonEmptyString(thread.id)
     if (id) importedById.set(id, thread)
   }
-  if (importedById.size === 0) return result
+  const seenImportedIds = new Set(requestCursor?.seenImportedIds ?? [])
   const mergedData: unknown[] = []
   for (const item of data) {
     const id = readNonEmptyString(asRecord(item)?.id)
     const imported = id ? importedById.get(id) : undefined
     if (imported) {
+      seenImportedIds.add(id)
       mergedData.push({ ...asRecord(item), ...imported })
       importedById.delete(id)
     } else {
       mergedData.push(item)
     }
   }
-  mergedData.push(...importedById.values())
+  const limit = typeof paramsRecord?.limit === 'number' && Number.isInteger(paramsRecord.limit)
+    ? Math.min(MAX_THREAD_LIST_PAGE_SIZE, Math.max(1, paramsRecord.limit))
+    : data.length
+  const nativeNextCursor = readNonEmptyString(record.nextCursor)
+  const hasNextPage = nativeNextCursor.length > 0
+  let nextCursor: string | null = hasNextPage
+    ? encodeThreadListCursor({
+        kind: 'native',
+        cursor: nativeNextCursor,
+        seenImportedIds: [...seenImportedIds],
+      })
+    : null
+  if (!hasNextPage) {
+    const appendCount = Math.max(0, limit - mergedData.length)
+    const importedRemainder = await listImportedThreadsFromStateDb({
+      excludedIds: [...seenImportedIds],
+      limit: appendCount + 1,
+    })
+    const appendedImports = importedRemainder.slice(0, appendCount)
+    mergedData.push(...appendedImports)
+    if (importedRemainder.length > appendedImports.length) {
+      const lastAppended = asRecord(appendedImports.at(-1))
+      const lastAppendedId = readNonEmptyString(lastAppended?.id)
+      const lastAppendedUpdatedAt = typeof lastAppended?.updatedAt === 'number'
+        ? lastAppended.updatedAt
+        : null
+      nextCursor = encodeThreadListCursor({
+        kind: 'imports',
+        beforeUpdatedAt: lastAppendedId ? lastAppendedUpdatedAt : null,
+        beforeId: lastAppendedId,
+        seenImportedIds: [...seenImportedIds],
+      })
+    }
+  }
   return {
     ...record,
+    nextCursor,
     data: mergedData.sort((a, b) => {
       const aUpdated = typeof asRecord(a)?.updatedAt === 'number' ? asRecord(a)?.updatedAt as number : 0
       const bUpdated = typeof asRecord(b)?.updatedAt === 'number' ? asRecord(b)?.updatedAt as number : 0
       return bUpdated - aUpdated
-    }),
+    }).slice(0, limit),
   }
 }
 
@@ -4004,6 +4413,25 @@ async function readVerifiedThreadArchiveState(
   return 'unknown'
 }
 
+async function assertThreadActiveForRpc(
+  appServer: RpcExecutor,
+  method: string,
+  threadId: string,
+  result?: unknown,
+): Promise<void> {
+  if (!threadId || method === 'thread/archive' || !ARCHIVED_THREAD_BLOCKED_METHODS.has(method)) return
+  if (!(await isThreadArchivedForMutation(appServer, threadId))) return
+  if (method === 'turn/start') {
+    const turnId = readNonEmptyString(asRecord(asRecord(result)?.turn)?.id)
+    if (turnId) {
+      await appServer.rpc('turn/interrupt', { threadId, turnId }).catch(() => undefined)
+    }
+  }
+  const error = new Error('Cannot operate on an archived task.')
+  error.name = 'ArchivedThreadConflictError'
+  throw error
+}
+
 export async function callRpcWithArchiveRecovery(
   appServer: RpcExecutor,
   method: string,
@@ -4015,13 +4443,14 @@ export async function callRpcWithArchiveRecovery(
 ): Promise<unknown> {
   const paramsRecord = asRecord(params)
   const threadId = readNonEmptyString(paramsRecord?.threadId)
+  await assertThreadActiveForRpc(appServer, method, threadId)
   if (threadId && runtimeProbe && THREAD_WRITER_METHODS_REQUIRING_IDLE.has(method)) {
     const inspection = await inspectThreadWriter(appServer, runtimeProbe, excludedPid, threadId)
     const allowsUnmaterializedFirstTurn = method === 'turn/start'
       && options.locallyCreatedFirstTurn === true
       && inspection.state === 'unmaterialized'
     if (inspection.state !== 'idle' && !allowsUnmaterializedFirstTurn) {
-      const error = new Error('Cannot mutate a task because writer ownership is not idle.')
+      const error = new Error('Cannot mutate a task because task writer ownership is not idle.')
       error.name = 'ThreadWriterOwnershipConflictError'
       throw error
     }
@@ -4033,24 +4462,27 @@ export async function callRpcWithArchiveRecovery(
       excludedPid,
       threadId,
     )
-    if (guard.blocked) return guard.readResult
+    if (guard.blocked) {
+      await assertThreadActiveForRpc(appServer, method, threadId, guard.readResult)
+      return guard.readResult
+    }
   }
 
   try {
-    const result = await callRpcWithRateLimitDecodeRecovery(appServer, method, params)
+    await assertThreadActiveForRpc(appServer, method, threadId)
+    const rawResult = await callRpcWithRateLimitDecodeRecovery(appServer, method, params)
+    await assertThreadActiveForRpc(appServer, method, threadId, rawResult)
     if (method === 'turn/start' && threadId && runtimeProbe) {
       return await auditStartedTurnAgainstExternalWriter(
         appServer,
         runtimeProbe,
         excludedPid,
         threadId,
-        result,
+        rawResult,
         options.locallyCreatedFirstTurn === true,
       )
     }
-    return method === 'thread/list'
-      ? await canonicalizeThreadListResponseForRead(result)
-      : result
+    return rawResult
   } catch (error) {
     if (method === 'turn/start' && threadId && isThreadNotFoundError(error)) {
       if (runtimeProbe) {
@@ -4067,8 +4499,11 @@ export async function callRpcWithArchiveRecovery(
           throw new Error('Cannot resume a task owned by another app-server process.')
         }
       }
+      await assertThreadActiveForRpc(appServer, method, threadId)
       await appServer.rpc('thread/resume', { threadId })
+      await assertThreadActiveForRpc(appServer, method, threadId)
       const recovered = await appServer.rpc(method, params ?? null)
+      await assertThreadActiveForRpc(appServer, method, threadId, recovered)
       return runtimeProbe
         ? auditStartedTurnAgainstExternalWriter(
             appServer,
@@ -6464,11 +6899,19 @@ async function ensureRepoHasInitialCommit(repoRoot: string): Promise<void> {
   )
 }
 
-async function runCommandCapture(command: string, args: string[], options: { cwd?: string } = {}): Promise<string> {
+async function runCommandCapture(
+  command: string,
+  args: string[],
+  options: { cwd?: string; timeoutMs?: number } = {},
+): Promise<string> {
   return (await runCommandCaptureRaw(command, args, options)).trim()
 }
 
-async function runCommandCaptureRaw(command: string, args: string[], options: { cwd?: string } = {}): Promise<string> {
+async function runCommandCaptureRaw(
+  command: string,
+  args: string[],
+  options: { cwd?: string; timeoutMs?: number } = {},
+): Promise<string> {
   return await new Promise<string>((resolve, reject) => {
     const proc = spawn(command, args, {
       cwd: options.cwd,
@@ -6477,10 +6920,31 @@ async function runCommandCaptureRaw(command: string, args: string[], options: { 
     })
     let stdout = ''
     let stderr = ''
+    let settled = false
+    const timeoutMs = typeof options.timeoutMs === 'number' && Number.isFinite(options.timeoutMs)
+      ? Math.max(1, Math.floor(options.timeoutMs))
+      : 0
+    const timeout = timeoutMs > 0
+      ? setTimeout(() => {
+          if (settled) return
+          settled = true
+          proc.kill('SIGKILL')
+          reject(new Error(`Command timed out after ${timeoutMs}ms (${command})`))
+        }, timeoutMs)
+      : null
+    timeout?.unref?.()
     proc.stdout.on('data', (chunk: Buffer) => { stdout += chunk.toString() })
     proc.stderr.on('data', (chunk: Buffer) => { stderr += chunk.toString() })
-    proc.on('error', reject)
+    proc.on('error', (error) => {
+      if (settled) return
+      settled = true
+      if (timeout) clearTimeout(timeout)
+      reject(error)
+    })
     proc.on('close', (code) => {
+      if (settled) return
+      settled = true
+      if (timeout) clearTimeout(timeout)
       if (code === 0) {
         resolve(stdout)
         return
@@ -7685,6 +8149,14 @@ type SessionIndexThreadTitle = {
   updatedAtMs: number
 }
 
+let sessionIndexThreadListCache: {
+  archivedIds: Set<string> | null
+  archiveSignature: string | null
+  path: string
+  signature: string
+  entries: SessionIndexThreadTitle[]
+} | null = null
+
 function normalizeSessionIndexThreadTitle(value: unknown): SessionIndexThreadTitle | null {
   const record = asRecord(value)
   if (!record) return null
@@ -7702,22 +8174,21 @@ function normalizeSessionIndexThreadTitle(value: unknown): SessionIndexThreadTit
   }
 }
 
-async function readSessionIndexThreadListFallback(params: unknown): Promise<unknown | null> {
-  const record = asRecord(params)
-  if (!record) return null
-  if (record.archived !== false) return null
-  if (record.cursor !== null && record.cursor !== undefined) return null
-  if (record.sortKey !== 'updated_at') return null
-  const limit = typeof record.limit === 'number' && Number.isInteger(record.limit)
-    ? record.limit
-    : null
-  if (limit === null || limit < 1 || limit > 10) return null
-  const modelProviders = Array.isArray(record.modelProviders)
-    ? record.modelProviders.filter((value): value is string => typeof value === 'string')
-    : []
-  if (modelProviders.length > 0) return null
-
-  const sessionIndexPath = getCodexSessionIndexPath()
+async function readSessionIndexThreadListEntries(
+  sessionIndexPath: string,
+): Promise<SessionIndexThreadTitle[] | null> {
+  let signature: string
+  try {
+    signature = getSessionIndexFileSignature(await stat(sessionIndexPath))
+  } catch {
+    return null
+  }
+  if (
+    sessionIndexThreadListCache?.path === sessionIndexPath
+    && sessionIndexThreadListCache.signature === signature
+  ) {
+    return sessionIndexThreadListCache.entries
+  }
   const latestById = new Map<string, SessionIndexThreadTitle>()
   let input: ReturnType<typeof createReadStream> | null = null
   let lines: ReturnType<typeof createInterface> | null = null
@@ -7753,12 +8224,133 @@ async function readSessionIndexThreadListFallback(params: unknown): Promise<unkn
   }
 
   const entries = Array.from(latestById.values())
-    .sort((first, second) => second.updatedAtMs - first.updatedAtMs)
-    .slice(0, limit)
-  if (entries.length === 0) return null
+    .sort((first, second) => second.updatedAtMs - first.updatedAtMs || second.id.localeCompare(first.id))
+  sessionIndexThreadListCache = {
+    archivedIds: null,
+    archiveSignature: null,
+    path: sessionIndexPath,
+    signature,
+    entries,
+  }
+  return entries
+}
+
+function findSessionIndexPageStart(
+  entries: SessionIndexThreadTitle[],
+  cursor: Extract<ThreadListCursorPayload, { kind: 'session-index' }> | null,
+): number {
+  if (!cursor) return 0
+  let low = 0
+  let high = entries.length
+  while (low < high) {
+    const middle = Math.floor((low + high) / 2)
+    const entry = entries[middle]!
+    const afterBoundary = entry.updatedAtMs < cursor.beforeUpdatedAtMs
+      || (entry.updatedAtMs === cursor.beforeUpdatedAtMs && entry.id < cursor.beforeId)
+    if (afterBoundary) high = middle
+    else low = middle + 1
+  }
+  return low
+}
+
+async function readSessionIndexArchivedIds(entries: SessionIndexThreadTitle[]): Promise<Set<string>> {
+  const stateDbPath = join(getCodexHomeDir(), 'state_5.sqlite')
+  const archiveSignature = existsSync(stateDbPath)
+    ? await readStateDbArchiveSignature(stateDbPath)
+    : `tree:${await readArchivedSessionsTreeSignature()}`
+  if (
+    sessionIndexThreadListCache?.archiveSignature === archiveSignature
+    && sessionIndexThreadListCache.archivedIds
+  ) {
+    return sessionIndexThreadListCache.archivedIds
+  }
+  const archivedIds = await readAuthoritativeArchivedThreadIds(entries.map((entry) => entry.id))
+  if (sessionIndexThreadListCache) {
+    sessionIndexThreadListCache.archiveSignature = archiveSignature
+    sessionIndexThreadListCache.archivedIds = archivedIds
+  }
+  return archivedIds
+}
+
+async function readSessionIndexThreadListFallback(
+  params: unknown,
+  cursor: Extract<ThreadListCursorPayload, { kind: 'session-index' }> | null = null,
+): Promise<unknown | null> {
+  const record = asRecord(params)
+  if (!record) return null
+  if (record.archived !== false) return null
+  if (!cursor && record.cursor !== null && record.cursor !== undefined) return null
+  if (record.sortKey !== 'updated_at') return null
+  const limit = typeof record.limit === 'number' && Number.isInteger(record.limit)
+    ? record.limit
+    : null
+  if (limit === null || limit < 1 || limit > 10) return null
+  const modelProviders = Array.isArray(record.modelProviders)
+    ? record.modelProviders.filter((value): value is string => typeof value === 'string')
+    : []
+  if (modelProviders.length > 0) return null
+
+  if (!cursor && existsSync(join(getCodexHomeDir(), 'state_5.sqlite'))) {
+    const stateDbEntries = await listImportedThreadsFromStateDb({ limit: limit + 1 })
+    if (stateDbEntries.length > 0) {
+      const pageEntries = stateDbEntries.slice(0, limit)
+      const lastPageEntry = pageEntries.at(-1)
+      const lastUpdatedAt = typeof lastPageEntry?.updatedAt === 'number' ? lastPageEntry.updatedAt : null
+      const lastId = readNonEmptyString(lastPageEntry?.id)
+      return {
+        data: pageEntries,
+        nextCursor: stateDbEntries.length > pageEntries.length && lastUpdatedAt !== null && lastId
+          ? encodeThreadListCursor({
+              kind: 'imports',
+              beforeUpdatedAt: lastUpdatedAt,
+              beforeId: lastId,
+              seenImportedIds: pageEntries.map((entry) => readNonEmptyString(entry.id)).filter(Boolean),
+            })
+          : null,
+      }
+    }
+  }
+
+  const entries = await readSessionIndexThreadListEntries(getCodexSessionIndexPath())
+  if (!entries) return null
+  const archivedIds = await readSessionIndexArchivedIds(entries)
+  const seenThreadIds = new Set(cursor?.seenThreadIds ?? [])
+  if (entries.length === 0 && !cursor) return null
+  const available: SessionIndexThreadTitle[] = []
+  for (let index = findSessionIndexPageStart(entries, cursor); index < entries.length; index += 1) {
+    const entry = entries[index]!
+    if (archivedIds.has(entry.id) || seenThreadIds.has(entry.id)) continue
+    available.push(entry)
+    if (available.length > limit) break
+  }
+  const pageEntries = available.slice(0, limit)
+  for (const entry of pageEntries) seenThreadIds.add(entry.id)
+  const lastPageEntry = pageEntries.at(-1)
+  let nextCursor: string | null = available.length > pageEntries.length && lastPageEntry
+    ? encodeThreadListCursor({
+        kind: 'session-index',
+        beforeUpdatedAtMs: lastPageEntry.updatedAtMs,
+        beforeId: lastPageEntry.id,
+        seenThreadIds: [...seenThreadIds],
+      })
+    : null
+  if (!nextCursor) {
+    const hasUnseenImports = (await listImportedThreadsFromStateDb({
+      excludedIds: [...seenThreadIds],
+      limit: 1,
+    })).length > 0
+    if (hasUnseenImports) {
+      nextCursor = encodeThreadListCursor({
+        kind: 'imports',
+        beforeUpdatedAt: null,
+        beforeId: '',
+        seenImportedIds: [...seenThreadIds],
+      })
+    }
+  }
 
   return {
-    data: entries.map((entry) => {
+    data: pageEntries.map((entry) => {
       const updatedAtSeconds = Math.max(0, entry.updatedAtMs / 1000)
       return {
         id: entry.id,
@@ -7771,7 +8363,7 @@ async function readSessionIndexThreadListFallback(params: unknown): Promise<unkn
         source: { type: 'session-index' },
       }
     }),
-    nextCursor: null,
+    nextCursor,
   }
 }
 
@@ -7874,6 +8466,7 @@ type StoredQueuedMessage = {
   queueAfterId?: string
   queueBeforeId?: string
   dependencyWaitUntil?: number
+  ownershipRollbackTurnIds?: string[]
   text: string
   imageUrls: string[]
   skills: Array<{ name: string; path: string }>
@@ -7983,6 +8576,9 @@ function normalizeStoredQueuedMessage(value: unknown): StoredQueuedMessage | nul
     ...(readNonEmptyString(record.queueBeforeId) ? { queueBeforeId: readNonEmptyString(record.queueBeforeId) } : {}),
     ...(typeof record.dependencyWaitUntil === 'number' && Number.isFinite(record.dependencyWaitUntil)
       ? { dependencyWaitUntil: record.dependencyWaitUntil }
+      : {}),
+    ...(normalizeStringArray(record.ownershipRollbackTurnIds).length > 0
+      ? { ownershipRollbackTurnIds: normalizeStringArray(record.ownershipRollbackTurnIds) }
       : {}),
     text: typeof record.text === 'string' ? record.text : '',
     imageUrls: normalizeStringArray(record.imageUrls),
@@ -8353,11 +8949,22 @@ export async function replaceThreadQueueState(
   })
 }
 
-export async function removeThreadQueuedMessage(threadId: string, messageId: string): Promise<StoredQueuedMessage | null> {
+async function removeThreadQueuedMessageWithRevision(
+  threadId: string,
+  messageId: string,
+  expectedRevision?: number,
+): Promise<{ removedMessage: StoredQueuedMessage | null; revision: number }> {
   const normalizedThreadId = threadId.trim()
   const normalizedMessageId = messageId.trim()
-  if (!normalizedThreadId || !normalizedMessageId) return null
-  return withThreadQueueStateUpdate((state, _receipts, processing) => {
+  if (!normalizedThreadId || !normalizedMessageId) {
+    return { removedMessage: null, revision: (await readThreadQueueStore()).revision }
+  }
+  return withThreadQueueStateUpdate((state, _receipts, processing, revision) => {
+    if (expectedRevision !== undefined && revision !== expectedRevision) {
+      const error = new Error(`Thread queue revision changed from ${expectedRevision} to ${revision}`)
+      error.name = 'ThreadQueueRevisionConflictError'
+      throw error
+    }
     const queue = state[normalizedThreadId] ?? []
     const removedMessage = queue.find((message) => message.id === normalizedMessageId) ?? null
     if (
@@ -8377,15 +8984,37 @@ export async function removeThreadQueuedMessage(threadId: string, messageId: str
     if (nextProcessing[normalizedThreadId]?.messageId === normalizedMessageId) {
       delete nextProcessing[normalizedThreadId]
     }
-    return { nextState, nextProcessing, result: removedMessage }
+    return {
+      nextState,
+      nextProcessing,
+      result: { removedMessage, revision },
+      resolveResult: (nextRevision) => ({ removedMessage, revision: nextRevision }),
+    }
   })
 }
 
-export async function reorderThreadQueuedMessages(threadId: string, orderedMessageIds: string[]): Promise<void> {
+export async function removeThreadQueuedMessage(
+  threadId: string,
+  messageId: string,
+  expectedRevision?: number,
+): Promise<StoredQueuedMessage | null> {
+  return (await removeThreadQueuedMessageWithRevision(threadId, messageId, expectedRevision)).removedMessage
+}
+
+export async function reorderThreadQueuedMessages(
+  threadId: string,
+  orderedMessageIds: string[],
+  expectedRevision?: number,
+): Promise<number> {
   const normalizedThreadId = threadId.trim()
-  if (!normalizedThreadId) return
+  if (!normalizedThreadId) return (await readThreadQueueStore()).revision
   const order = new Map(normalizeStringArray(orderedMessageIds).map((messageId, index) => [messageId, index]))
-  await withThreadQueueStateUpdate((state, _receipts, processing) => {
+  return withThreadQueueStateUpdate((state, _receipts, processing, revision) => {
+    if (expectedRevision !== undefined && revision !== expectedRevision) {
+      const error = new Error(`Thread queue revision changed from ${expectedRevision} to ${revision}`)
+      error.name = 'ThreadQueueRevisionConflictError'
+      throw error
+    }
     const queue = state[normalizedThreadId] ?? []
     const known = queue
       .filter((message) => order.has(message.id))
@@ -8419,8 +9048,23 @@ export async function reorderThreadQueuedMessages(threadId: string, orderedMessa
         ...(reordered.length > 0 ? { [normalizedThreadId]: reordered } : {}),
       },
       nextProcessing,
-      result: undefined,
+      result: revision,
+      resolveResult: (nextRevision) => nextRevision,
     }
+  })
+}
+
+async function discardThreadQueuedMessages(threadId: string): Promise<StoredQueuedMessage[]> {
+  const normalizedThreadId = threadId.trim()
+  if (!normalizedThreadId) return []
+  return withThreadQueueStateUpdate((state, _receipts, processing) => {
+    const removed = state[normalizedThreadId] ?? []
+    if (removed.length === 0 && !processing[normalizedThreadId]) return { nextState: state, result: [] }
+    const nextState = { ...state }
+    const nextProcessing = { ...processing }
+    delete nextState[normalizedThreadId]
+    delete nextProcessing[normalizedThreadId]
+    return { nextState, nextProcessing, result: removed }
   })
 }
 
@@ -8428,13 +9072,13 @@ export async function appendThreadQueuedMessage(
   threadId: string,
   message: StoredQueuedMessage,
   queueInsertIndex?: number,
-): Promise<void> {
+): Promise<number> {
   const normalizedThreadId = threadId.trim()
   if (!normalizedThreadId) throw new Error('threadId is required')
-  await withThreadQueueStateUpdate((state, receipts, processing) => {
+  return withThreadQueueStateUpdate((state, receipts, processing, revision) => {
     const queue = state[normalizedThreadId] ?? []
     if (hasThreadQueueReceipt(receipts, normalizedThreadId, message.id)) {
-      return { nextState: state, result: undefined }
+      return { nextState: state, result: revision }
     }
     const nextReceipts = [...receipts, {
       threadId: normalizedThreadId,
@@ -8442,7 +9086,7 @@ export async function appendThreadQueuedMessage(
       acceptedAtMs: Date.now(),
     }]
     if (queue.some((queuedMessage) => queuedMessage.id === message.id)) {
-      return { nextState: state, nextReceipts, result: undefined }
+      return { nextState: state, nextReceipts, result: revision }
     }
     const nextQueue = [...queue]
     let insertIndex = typeof queueInsertIndex === 'number'
@@ -8483,7 +9127,8 @@ export async function appendThreadQueuedMessage(
       },
       nextReceipts,
       nextProcessing,
-      result: undefined,
+      result: revision,
+      resolveResult: (nextRevision) => nextRevision,
     }
   })
 }
@@ -8576,6 +9221,24 @@ export async function withThreadStartClaim<T>(
       if (Object.keys(claims).length > 0) payload[THREAD_START_CLAIMS_KEY] = claims
       else delete payload[THREAD_START_CLAIMS_KEY]
     })
+  }
+}
+
+async function withThreadStartClaimWait<T>(
+  threadId: string,
+  operation: () => Promise<T>,
+  timeoutMs = 5_000,
+): Promise<T> {
+  const deadline = Date.now() + timeoutMs
+  while (true) {
+    try {
+      return await withThreadStartClaim(threadId, operation)
+    } catch (error) {
+      if (!(error instanceof Error) || error.name !== 'ThreadStartClaimConflictError' || Date.now() >= deadline) {
+        throw error
+      }
+      await new Promise((resolve) => setTimeout(resolve, 25))
+    }
   }
 }
 
@@ -8735,15 +9398,29 @@ function firstPageThreadListRpcParams(): {
 }
 
 async function readThreadListRpcCacheSignature(): Promise<string> {
+  const signatureForPath = async (path: string): Promise<string> => {
+    try {
+      return getSessionIndexFileSignature(await stat(path))
+    } catch {
+      return 'missing'
+    }
+  }
+  const archiveStateSignature = async (): Promise<string> => [
+    `state:${await signatureForPath(join(getCodexHomeDir(), 'state_5.sqlite'))}`,
+    `wal:${await signatureForPath(join(getCodexHomeDir(), 'state_5.sqlite-wal'))}`,
+    ...(existsSync(join(getCodexHomeDir(), 'state_5.sqlite'))
+      ? []
+      : [`archived:${await readArchivedSessionsTreeSignature()}`]),
+  ].join('|')
   try {
     const stats = await stat(getCodexSessionIndexPath())
-      return `index:${getCodexHomeDir()}:${getSessionIndexFileSignature(stats)}`
+    return `index:${getCodexHomeDir()}:${getSessionIndexFileSignature(stats)}|${await archiveStateSignature()}`
   } catch {
     try {
       const stats = await stat(join(getCodexHomeDir(), 'sessions'))
-      return `sessions:${getCodexHomeDir()}:${getSessionIndexFileSignature(stats)}`
+      return `sessions:${getCodexHomeDir()}:${getSessionIndexFileSignature(stats)}|${await archiveStateSignature()}`
     } catch {
-      return 'missing'
+      return `missing|${await archiveStateSignature()}`
     }
   }
 }
@@ -8753,11 +9430,11 @@ function getPersistedThreadListRpcCachePath(key: string): string {
   return join(getCodexHomeDir(), 'codex-mobile-cache', `thread-list-${digest}.json`)
 }
 
-async function readPersistedThreadListRpcCache(key: string): Promise<unknown | null> {
+async function readPersistedThreadListRpcCache(key: string, signature: string): Promise<unknown | null> {
   try {
     const raw = await readFile(getPersistedThreadListRpcCachePath(key), 'utf8')
     const record = asRecord(JSON.parse(raw))
-    if (!record || record.version !== 1 || record.key !== key) return null
+    if (!record || record.version !== 1 || record.key !== key || record.signature !== signature) return null
     const savedAtMs = typeof record.savedAtMs === 'number' && Number.isFinite(record.savedAtMs)
       ? record.savedAtMs
       : 0
@@ -8769,7 +9446,7 @@ async function readPersistedThreadListRpcCache(key: string): Promise<unknown | n
   }
 }
 
-async function writePersistedThreadListRpcCache(key: string, result: unknown): Promise<void> {
+async function writePersistedThreadListRpcCache(key: string, signature: string, result: unknown): Promise<void> {
   const cachePath = getPersistedThreadListRpcCachePath(key)
   const tempPath = `${cachePath}.${process.pid}.${Date.now()}.tmp`
   try {
@@ -8777,6 +9454,7 @@ async function writePersistedThreadListRpcCache(key: string, result: unknown): P
     await writeFile(tempPath, JSON.stringify({
       version: 1,
       key,
+      signature,
       savedAtMs: Date.now(),
       result: cloneCacheableRpcResult(result),
     }), 'utf8')
@@ -8794,7 +9472,7 @@ async function prewarmFirstPageThreadListRpcCache(shared: SharedBridgeState): Pr
 
   const signature = await readThreadListRpcCacheSignature()
   if (shared.appServer.getCachedThreadListRpcResult(key, signature)) return
-  if (await readPersistedThreadListRpcCache(key)) return
+  if (await readPersistedThreadListRpcCache(key, signature)) return
 
   await shared.appServer.getOrStartThreadListRpcRefresh(key, async () => {
     const freshResult = await callRpcWithArchiveRecovery(
@@ -8804,9 +9482,10 @@ async function prewarmFirstPageThreadListRpcCache(shared: SharedBridgeState): Pr
       shared.runtimeProbe,
       shared.appServer.getPid(),
     )
-    shared.appServer.cacheThreadListRpcResult(key, signature, freshResult)
-    await writePersistedThreadListRpcCache(key, freshResult)
-    return freshResult
+    const canonicalResult = await canonicalizeThreadListResponseForRead(freshResult)
+    shared.appServer.cacheThreadListRpcResult(key, signature, canonicalResult)
+    await writePersistedThreadListRpcCache(key, signature, canonicalResult)
+    return canonicalResult
   })
 }
 
@@ -8978,7 +9657,16 @@ export async function canonicalizeThreadListResponseForRead(
   const threadIds = record.data
     .map((item) => readNonEmptyString(asRecord(item)?.id))
     .filter((id) => id.length > 0)
-  const readMetadataByThreadId = readStateDbThreadReadMetadata(threadIds)
+  const readMetadataByThreadId = await readStateDbThreadReadMetadata(threadIds)
+  const archivedThreadIds = existsSync(join(getCodexHomeDir(), 'state_5.sqlite'))
+    ? new Set(Array.from(readMetadataByThreadId.entries())
+        .filter(([, metadata]) => metadata.archived === true)
+        .map(([id]) => id))
+    : await readAuthoritativeArchivedThreadIds(threadIds)
+  const visibleData = record.data.filter((item) => {
+    const id = readNonEmptyString(asRecord(item)?.id)
+    return !id || !archivedThreadIds.has(id)
+  })
   const cwdCanonicalizationByValue = new Map<string, Promise<string>>()
   const canonicalizeCwd = (cwd: string): Promise<string> => {
     let canonicalized = cwdCanonicalizationByValue.get(cwd)
@@ -8990,7 +9678,7 @@ export async function canonicalizeThreadListResponseForRead(
   }
   return {
     ...record,
-    data: await Promise.all(record.data.map(async (item) => {
+    data: await Promise.all(visibleData.map(async (item) => {
       const canonicalItem = await canonicalizeThreadCwdRecord(item, canonicalizeCwd)
       const canonicalRecord = asRecord(canonicalItem)
       const threadId = readNonEmptyString(canonicalRecord?.id)
@@ -9486,14 +10174,12 @@ export async function reapExpiredManagedUploads(options: {
     )
     if (deletionDue) {
       await options.beforeDeleteCandidate?.(upload.directory)
-      const deleted = await deleteManagedUploadIfUnreferenced(root, upload.directory, () => (
-        deleteManagedUpload(handle, {
-          uploadRoot: root,
-          nowMs,
-          ttlMs,
-          minimumRetentionMs: 0,
-        })
-      ))
+      const deleted = await deleteManagedUpload(handle, {
+        uploadRoot: root,
+        nowMs,
+        ttlMs,
+        minimumRetentionMs: 0,
+      })
       if (deleted) {
         managedUploads.delete(handle)
         removed += 1
@@ -10569,7 +11255,10 @@ export class BackendQueueProcessor {
 
   constructor(
     private readonly appServer: AppServerProcess,
-    private readonly runtimeProbe: Pick<ThreadRuntimeProbe, 'registerThread' | 'inspect'> | null = null,
+    private readonly runtimeProbe: (
+      Pick<ThreadRuntimeProbe, 'registerThread' | 'inspect'>
+      & Partial<Pick<ExternalThreadRuntimeProbe, 'inspectWriterEvidence'>>
+    ) | null = null,
   ) {
     liveBackendQueueClaimOwnerIds.add(this.claimOwnerId)
     this.unsubscribe = appServer.onNotification((notification) => {
@@ -10686,6 +11375,10 @@ export class BackendQueueProcessor {
     if (this.disposed || this.processingThreadIds.has(threadId)) return
     this.processingThreadIds.add(threadId)
     try {
+      if (await isThreadArchivedForMutation(this.appServer, threadId)) {
+        await this.discardArchivedThreadQueue(threadId)
+        return
+      }
       const preview = await this.peekNextQueuedTurn(threadId)
       if (!preview) return
       const previewState = await this.inspectQueuedTurn(preview)
@@ -10716,6 +11409,10 @@ export class BackendQueueProcessor {
         this.scheduleThreadQueueDrain(threadId, BackendQueueProcessor.BLOCKED_RETRY_MS)
         return
       }
+      if (await isThreadArchivedForMutation(this.appServer, threadId)) {
+        await this.discardArchivedThreadQueue(threadId)
+        return
+      }
       try {
         await this.startQueuedTurn(next, managedMessage)
         const finalized = await this.finalizeQueuedTurn(next)
@@ -10723,16 +11420,30 @@ export class BackendQueueProcessor {
         if (await this.hasQueuedTurns(threadId)) {
           this.scheduleThreadQueueDrain(threadId)
         }
-      } catch {
-        const afterFailure = await this.inspectQueuedTurn(next)
-        if (afterFailure.accepted) {
-          const finalized = await this.finalizeQueuedTurn(next)
-          if (managedMessage && finalized) {
-            this.runtimeQueuedMessages.delete(runtimeKey)
-            await this.reconcileAcceptedManagedMessage(threadId, managedMessage, afterFailure.acceptedInProgress)
+      } catch (error) {
+        if (error instanceof Error && error.name === 'ThreadWriterOwnershipConflictError') {
+          const rollbackTurnId = readNonEmptyString((error as Error & { turnId?: unknown }).turnId)
+          await this.releaseQueuedTurnClaimAfterRollback(next, rollbackTurnId)
+          if (managedMessage && this.activeManagedMessagesByThreadId.get(threadId) === managedMessage) {
+            await this.deactivateManagedMessage(threadId, managedMessage)
           }
-        } else if (managedMessage && this.activeManagedMessagesByThreadId.get(threadId) === managedMessage) {
-          await this.deactivateManagedMessage(threadId, managedMessage)
+        } else {
+          const afterFailure = await this.inspectQueuedTurn(next)
+          if (afterFailure.accepted) {
+            const finalized = await this.finalizeQueuedTurn(next)
+            if (managedMessage && finalized) {
+              this.runtimeQueuedMessages.delete(runtimeKey)
+              await this.reconcileAcceptedManagedMessage(threadId, managedMessage, afterFailure.acceptedInProgress)
+            }
+          } else if (error instanceof Error && error.name === 'DefinitiveQueuedTurnStartError') {
+            const finalized = await this.finalizeQueuedTurn(next)
+            if (managedMessage && finalized) {
+              this.runtimeQueuedMessages.delete(runtimeKey)
+              await this.releaseActiveManagedMessage(threadId)
+            }
+          } else if (managedMessage && this.activeManagedMessagesByThreadId.get(threadId) === managedMessage) {
+            await this.deactivateManagedMessage(threadId, managedMessage)
+          }
         }
         this.scheduleThreadQueueDrain(threadId)
       }
@@ -10742,6 +11453,15 @@ export class BackendQueueProcessor {
     } finally {
       this.processingThreadIds.delete(threadId)
     }
+  }
+
+  async discardArchivedThreadQueue(threadId: string): Promise<void> {
+    const removed = await discardThreadQueuedMessages(threadId)
+    for (const message of removed) {
+      this.runtimeQueuedMessages.delete(this.runtimeQueueKey(threadId, message.id))
+      this.releaseManagedMessage(message)
+    }
+    await this.releaseActiveManagedMessage(threadId)
   }
 
   private async peekNextQueuedTurn(threadId: string): Promise<BackendQueuedTurn | null> {
@@ -10774,8 +11494,10 @@ export class BackendQueueProcessor {
     const thread = asRecord(response?.thread)
     if (!thread) return { accepted: false, acceptedInProgress: false, canStart: false }
     const turns = Array.isArray(thread.turns) ? thread.turns : []
+    const ownershipRollbackTurnIds = new Set(turn.message.ownershipRollbackTurnIds ?? [])
     const acceptedTurn = turns.find((rawTurn) => {
       const turnRecord = asRecord(rawTurn)
+      if (ownershipRollbackTurnIds.has(readNonEmptyString(turnRecord?.id))) return false
       const items = Array.isArray(turnRecord?.items) ? turnRecord.items : []
       return items.some((rawItem) => {
         const item = asRecord(rawItem)
@@ -10793,12 +11515,20 @@ export class BackendQueueProcessor {
     if (readThreadResultInProgress(thread)) return { accepted: false, acceptedInProgress: false, canStart: false }
 
     const rolloutPath = readNonEmptyString(thread.path)
-    if (!this.runtimeProbe || process.platform !== 'linux' || !rolloutPath) {
+    if (!rolloutPath) return { accepted: false, acceptedInProgress: false, canStart: false }
+    if (!this.runtimeProbe || process.platform !== 'linux') {
       return { accepted: false, acceptedInProgress: false, canStart: false }
     }
 
     this.runtimeProbe.registerThread(threadId, rolloutPath)
     const externalRuntime = await this.runtimeProbe.inspect(threadId, this.appServer.getPid())
+    if (
+      externalRuntime.state === 'idle'
+      && typeof this.runtimeProbe.inspectWriterEvidence === 'function'
+      && await this.runtimeProbe.inspectWriterEvidence(threadId, this.appServer.getPid()) !== false
+    ) {
+      return { accepted: false, acceptedInProgress: false, canStart: false }
+    }
     return { accepted: false, acceptedInProgress: false, canStart: externalRuntime.state === 'idle' }
   }
 
@@ -10862,7 +11592,14 @@ export class BackendQueueProcessor {
         nextProcessing,
         result: {
           threadId,
-          message: runtimeMessage ?? message,
+          message: runtimeMessage
+            ? {
+                ...runtimeMessage,
+                ...(message.ownershipRollbackTurnIds
+                  ? { ownershipRollbackTurnIds: message.ownershipRollbackTurnIds }
+                  : {}),
+              }
+            : message,
           attempted: existing?.attempted === true,
           ownerId: this.claimOwnerId,
         },
@@ -10904,6 +11641,32 @@ export class BackendQueueProcessor {
       const nextProcessing = { ...processing }
       delete nextProcessing[turn.threadId]
       return { nextState: state, nextProcessing, result: undefined }
+    })
+  }
+
+  private async releaseQueuedTurnClaimAfterRollback(turn: BackendQueuedTurn, rollbackTurnId: string): Promise<void> {
+    await withThreadQueueStateUpdate((state, _receipts, processing) => {
+      const current = processing[turn.threadId]
+      if (current?.messageId !== turn.message.id || current.ownerId !== turn.ownerId) {
+        return { nextState: state, result: undefined }
+      }
+      const nextQueue = (state[turn.threadId] ?? []).map((message) => {
+        if (message.id !== turn.message.id || !rollbackTurnId) return message
+        return {
+          ...message,
+          ownershipRollbackTurnIds: [
+            ...(message.ownershipRollbackTurnIds ?? []).filter((turnId) => turnId !== rollbackTurnId),
+            rollbackTurnId,
+          ],
+        }
+      })
+      const nextProcessing = { ...processing }
+      delete nextProcessing[turn.threadId]
+      return {
+        nextState: { ...state, [turn.threadId]: nextQueue },
+        nextProcessing,
+        result: undefined,
+      }
     })
   }
 
@@ -11160,7 +11923,19 @@ export class BackendQueueProcessor {
           throw new Error('Cannot resume a task owned by another app-server process.')
         }
       }
+      if (await isThreadArchivedForMutation(this.appServer, turn.threadId)) {
+        await this.discardArchivedThreadQueue(turn.threadId)
+        const error = new Error('Cannot start queued work for an archived task.')
+        error.name = 'ArchivedThreadConflictError'
+        throw error
+      }
       await this.appServer.rpc('thread/resume', { threadId: turn.threadId })
+      if (await isThreadArchivedForMutation(this.appServer, turn.threadId)) {
+        await this.discardArchivedThreadQueue(turn.threadId)
+        const error = new Error('Cannot resume queued work for an archived task.')
+        error.name = 'ArchivedThreadConflictError'
+        throw error
+      }
       if (!(await this.markQueuedTurnAttempted(turn))) {
         throw new Error('Queued turn claim was lost before turn/start.')
       }
@@ -11173,7 +11948,25 @@ export class BackendQueueProcessor {
       if (!finalState.canStart) {
         throw new Error('Cannot start a queued turn after writer ownership changed.')
       }
-      const result = await this.appServer.rpc('turn/start', params)
+      let result: unknown
+      try {
+        result = await this.appServer.rpc('turn/start', params)
+      } catch (error) {
+        if (isAmbiguousAppServerDeliveryError(error)) throw error
+        const definitiveError = new Error(getErrorMessage(error, 'Queued turn was rejected.'))
+        definitiveError.name = 'DefinitiveQueuedTurnStartError'
+        throw definitiveError
+      }
+      if (await isThreadArchivedForMutation(this.appServer, turn.threadId)) {
+        const turnId = readNonEmptyString(asRecord(asRecord(result)?.turn)?.id)
+        if (turnId) {
+          await this.appServer.rpc('turn/interrupt', { threadId: turn.threadId, turnId }).catch(() => undefined)
+        }
+        await this.discardArchivedThreadQueue(turn.threadId)
+        const error = new Error('Queued work started after the task was archived.')
+        error.name = 'ArchivedThreadConflictError'
+        throw error
+      }
       if (this.runtimeProbe) {
         await auditStartedTurnAgainstExternalWriter(
           this.appServer,
@@ -11432,7 +12225,9 @@ async function loadAllThreadsForSearch(appServer: AppServerProcess): Promise<Thr
     cursor = typeof response?.nextCursor === 'string' && response.nextCursor.length > 0 ? response.nextCursor : null
   } while (cursor)
 
-  const docs: ThreadSearchDocument[] = threads.map((thread) => {
+  const archivedIds = await readAuthoritativeArchivedThreadIds(threads.map((thread) => thread.id))
+  const visibleThreads = threads.filter((thread) => !archivedIds.has(thread.id))
+  const docs: ThreadSearchDocument[] = visibleThreads.map((thread) => {
     const searchableText = [thread.title, thread.preview].filter(Boolean).join('\n')
     return {
       id: thread.id,
@@ -11444,7 +12239,7 @@ async function loadAllThreadsForSearch(appServer: AppServerProcess): Promise<Thr
   })
 
   const docsById = new Map<string, ThreadSearchDocument>(docs.map((doc) => [doc.id, doc]))
-  const fullTextThreads = threads.slice(0, THREAD_SEARCH_FULL_TEXT_THREAD_LIMIT)
+  const fullTextThreads = visibleThreads.slice(0, THREAD_SEARCH_FULL_TEXT_THREAD_LIMIT)
   const concurrency = 4
   for (let offset = 0; offset < fullTextThreads.length; offset += concurrency) {
     const batch = fullTextThreads.slice(offset, offset + concurrency)
@@ -11538,6 +12333,8 @@ export function createCodexBridgeMiddleware(options: {
   }
   let threadSearchIndex: ThreadSearchIndex | null = null
   let threadSearchIndexPromise: Promise<ThreadSearchIndex> | null = null
+  let threadSearchIndexSignature = ''
+  let threadSearchIndexPromiseSignature = ''
   const pendingFirstTurnByThreadId = new Map<string, number>()
 
   function rememberPendingFirstTurn(threadId: string): void {
@@ -11561,16 +12358,25 @@ export function createCodexBridgeMiddleware(options: {
   }
 
   async function getThreadSearchIndex(): Promise<ThreadSearchIndex> {
-    if (threadSearchIndex) return threadSearchIndex
-    if (!threadSearchIndexPromise) {
-      threadSearchIndexPromise = buildThreadSearchIndex(appServer)
+    const signature = await readThreadListRpcCacheSignature()
+    if (threadSearchIndex && threadSearchIndexSignature === signature) return threadSearchIndex
+    if (!threadSearchIndexPromise || threadSearchIndexPromiseSignature !== signature) {
+      const promise = buildThreadSearchIndex(appServer)
         .then((index) => {
-          threadSearchIndex = index
+          if (threadSearchIndexPromise === promise) {
+            threadSearchIndex = index
+            threadSearchIndexSignature = signature
+          }
           return index
         })
         .finally(() => {
-          threadSearchIndexPromise = null
+          if (threadSearchIndexPromise === promise) {
+            threadSearchIndexPromise = null
+            threadSearchIndexPromiseSignature = ''
+          }
         })
+      threadSearchIndexPromiseSignature = signature
+      threadSearchIndexPromise = promise
     }
     return threadSearchIndexPromise
   }
@@ -12128,6 +12934,85 @@ export function createCodexBridgeMiddleware(options: {
         return
       }
 
+      if (req.method === 'POST' && (
+        url.pathname === '/codex-api/thread-goal-set'
+        || url.pathname === '/codex-api/thread-goal-clear'
+        || url.pathname === '/codex-api/thread-stop-and-archive'
+      )) {
+        const record = asRecord(await readJsonBody(req))
+        const threadId = readNonEmptyString(record?.threadId)
+        if (!threadId) {
+          setJson(res, 400, { error: 'Missing threadId' })
+          return
+        }
+        const result = await withThreadStartClaim(threadId, async () => {
+          if (await isThreadArchivedForMutation(appServer, threadId)) {
+            const error = new Error('Cannot mutate an archived task.')
+            error.name = 'ArchivedThreadConflictError'
+            throw error
+          }
+          const localTurn = url.pathname === '/codex-api/thread-stop-and-archive'
+            ? localRuntimeLedger.getRunning(threadId)
+            : null
+          if (localTurn) {
+            await appServer.rpc('turn/interrupt', { threadId, turnId: localTurn.turnId })
+          }
+          const writerIdle = localTurn
+            ? await waitForInterruptedThreadWriterIdle(
+                appServer,
+                runtimeProbe,
+                appServer.getPid(),
+                threadId,
+                localTurn.turnId,
+              )
+            : await isThreadWriterIdleForMutation(appServer, runtimeProbe, appServer.getPid(), threadId)
+          if (!writerIdle) {
+            const error = new Error('Cannot mutate a task because task writer ownership is not idle.')
+            error.name = 'ThreadWriterOwnershipConflictError'
+            throw error
+          }
+
+          if (url.pathname === '/codex-api/thread-goal-set') {
+            const status = readNonEmptyString(record?.status)
+            if (!status) throw new Error('Missing goal status')
+            return appServer.rpc('thread/goal/set', {
+              threadId,
+              status,
+              ...(typeof record?.objective === 'string' ? { objective: record.objective } : {}),
+            })
+          }
+          if (url.pathname === '/codex-api/thread-goal-clear') {
+            await appServer.rpc('thread/goal/clear', { threadId })
+            return { ok: true }
+          }
+
+          await callRpcWithArchiveRecovery(
+            appServer,
+            'thread/archive',
+            { threadId },
+            runtimeProbe,
+            appServer.getPid(),
+          )
+          if (!(await isThreadArchivedForMutation(appServer, threadId))) {
+            const error = new Error('Task archive could not be verified.')
+            error.name = 'ArchivedThreadStateUnavailableError'
+            throw error
+          }
+          await appServer.rpc('thread/goal/clear', { threadId })
+          await backendQueueProcessor.discardArchivedThreadQueue(threadId)
+          appServer.invalidateExternalRuntimeObservationCache(threadId)
+          appServer.invalidateLiveStateCache(threadId)
+          appServer.invalidateThreadListRpcCache()
+          threadSearchIndex = null
+          threadSearchIndexSignature = ''
+          threadSearchIndexPromise = null
+          threadSearchIndexPromiseSignature = ''
+          return { ok: true, archived: true, goalCleared: true, stopped: Boolean(localTurn) }
+        })
+        setJson(res, 200, result ?? { ok: true })
+        return
+      }
+
       if (req.method === 'POST' && url.pathname === '/codex-api/rpc') {
         const payload = await readJsonBody(req)
         const body = asRecord(payload) as RpcProxyRequest | null
@@ -12146,7 +13031,19 @@ export function createCodexBridgeMiddleware(options: {
           return
         }
 
+        if (FORBIDDEN_RAW_THREAD_LIFECYCLE_METHODS.has(body.method)) {
+          setJson(res, 403, { error: `RPC method is forbidden: ${body.method}` })
+          return
+        }
+
         const preparedRpcRequest = prepareRpcProxyRequest(body.method, body.params ?? null)
+        const rawThreadListParams = body.method === 'thread/list' ? asRecord(preparedRpcRequest.params) : null
+        const threadListCursor = rawThreadListParams
+          ? decodeThreadListCursor(rawThreadListParams.cursor)
+          : null
+        if (threadListCursor?.kind === 'native') {
+          preparedRpcRequest.params = { ...rawThreadListParams, cursor: threadListCursor.cursor }
+        }
 	        if (body.method === 'generate-thread-title') {
 	          setJson(res, 200, { result: { title: '' } })
 	          return
@@ -12158,18 +13055,27 @@ export function createCodexBridgeMiddleware(options: {
 	        }
 
         let rpcResult: unknown
+        let threadListResultSource: 'native' | 'imports' | 'session-index' = 'native'
         try {
           const requestThreadId = readNonEmptyString(asRecord(preparedRpcRequest.params)?.threadId)
           if (
             requestThreadId
             && ARCHIVED_THREAD_BLOCKED_METHODS.has(body.method)
-            && isStateDbThreadArchived(requestThreadId)
+            && await isThreadArchivedForMutation(appServer, requestThreadId)
           ) {
             const archivedError = new Error('Cannot operate on an archived task.')
             archivedError.name = 'ArchivedThreadConflictError'
             throw archivedError
           }
+          const importedThreadListCursorPage = threadListCursor?.kind === 'imports'
+            ? await readImportedThreadListCursorPage(preparedRpcRequest.params, threadListCursor)
+            : null
+          const sessionIndexThreadListCursorPage = threadListCursor?.kind === 'session-index'
+            ? await readSessionIndexThreadListFallback(preparedRpcRequest.params, threadListCursor)
+            : null
           const threadListCacheKey = body.method === 'thread/list'
+            && !importedThreadListCursorPage
+            && !sessionIndexThreadListCursorPage
             ? buildThreadListRpcCacheKey(preparedRpcRequest.params)
             : null
           const shouldBypassThreadListCache = body.method === 'thread/list'
@@ -12183,7 +13089,13 @@ export function createCodexBridgeMiddleware(options: {
           const cachedThreadListResult = threadListCacheKey && !shouldBypassThreadListCache
             ? appServer.getCachedThreadListRpcResult(threadListCacheKey, threadListCacheSignature)
             : null
-          if (cachedThreadListResult) {
+          if (importedThreadListCursorPage) {
+            threadListResultSource = 'imports'
+            rpcResult = importedThreadListCursorPage
+          } else if (sessionIndexThreadListCursorPage) {
+            threadListResultSource = 'session-index'
+            rpcResult = sessionIndexThreadListCursorPage
+          } else if (cachedThreadListResult) {
             rpcResult = cachedThreadListResult
           } else if (threadListCacheKey) {
             const startThreadListRefresh = () => appServer.getOrStartThreadListRpcRefresh(threadListCacheKey, async () => {
@@ -12197,11 +13109,15 @@ export function createCodexBridgeMiddleware(options: {
                   locallyCreatedFirstTurn: isPendingFirstTurn,
                 },
               )
-              appServer.cacheThreadListRpcResult(threadListCacheKey, threadListCacheSignature, freshResult)
-              await writePersistedThreadListRpcCache(threadListCacheKey, freshResult)
-              return freshResult
+              const canonicalResult = await canonicalizeThreadListResponseForRead(freshResult)
+              appServer.cacheThreadListRpcResult(threadListCacheKey, threadListCacheSignature, canonicalResult)
+              await writePersistedThreadListRpcCache(threadListCacheKey, threadListCacheSignature, canonicalResult)
+              return canonicalResult
             })
-            const persistedThreadListResult = await readPersistedThreadListRpcCache(threadListCacheKey)
+            const persistedThreadListResult = await readPersistedThreadListRpcCache(
+              threadListCacheKey,
+              threadListCacheSignature,
+            )
             if (persistedThreadListResult) {
               setTimeout(() => {
                 startThreadListRefresh().catch(() => {})
@@ -12212,6 +13128,7 @@ export function createCodexBridgeMiddleware(options: {
                 preparedRpcRequest.params,
               )
               if (sessionIndexThreadListResult) {
+                threadListResultSource = 'session-index'
                 setTimeout(() => {
                   startThreadListRefresh().catch(() => {})
                 }, 0)
@@ -12233,7 +13150,7 @@ export function createCodexBridgeMiddleware(options: {
                 },
               )
             }
-            rpcResult = body.method === 'turn/start' && requestThreadId
+            rpcResult = requestThreadId && THREAD_WRITER_METHODS_REQUIRING_IDLE.has(body.method)
               ? await withThreadStartClaim(requestThreadId, callPreparedRpc)
               : await callPreparedRpc()
           }
@@ -12289,8 +13206,12 @@ export function createCodexBridgeMiddleware(options: {
         const errorMergedResult = THREAD_METHODS_WITH_TURNS.has(body.method)
           ? mergeStreamTurnErrorsIntoThreadResult(appServer, trimmedResult)
           : trimmedResult
-        const listMergedResult = body.method === 'thread/list'
-          ? mergeImportedThreadsIntoThreadListResult(errorMergedResult)
+        const listMergedResult = body.method === 'thread/list' && threadListResultSource === 'native'
+          ? await mergeImportedThreadsIntoThreadListResult(
+              errorMergedResult,
+              preparedRpcRequest.params,
+              threadListCursor?.kind === 'native' ? threadListCursor : null,
+            )
           : errorMergedResult
         const clientThreadResult = await prepareThreadRpcResultForClient(
           body.method,
@@ -14061,7 +14982,8 @@ export function createCodexBridgeMiddleware(options: {
         }
         const queueStateRecord = asRecord(record.queueState) ?? record
         const runtimeState = normalizeThreadQueueState(queueStateRecord)
-        const existingQueueState = (await readThreadQueueStore()).state
+        const existingQueueStore = await readThreadQueueStore()
+        const existingQueueState = existingQueueStore.state
         for (const threadId of new Set([
           ...Object.keys(existingQueueState),
           ...Object.keys(runtimeState),
@@ -14106,6 +15028,13 @@ export function createCodexBridgeMiddleware(options: {
           setJson(res, 400, { error: 'Missing threadId or operation' })
           return
         }
+        const baseRevision = typeof record?.baseRevision === 'number' && Number.isSafeInteger(record.baseRevision)
+          ? record.baseRevision
+          : null
+        if (baseRevision === null || baseRevision < 0) {
+          setJson(res, 400, { error: 'Missing valid baseRevision' })
+          return
+        }
         if (!(await isThreadWriterIdleForMutation(appServer, runtimeProbe, appServer.getPid(), threadId))) {
           setJson(res, 409, { error: 'Cannot mutate queued work while another writer owns the task.' })
           return
@@ -14117,10 +15046,16 @@ export function createCodexBridgeMiddleware(options: {
             return
           }
           let removedMessage: StoredQueuedMessage | null
+          let committedRevision: number
           try {
-            removedMessage = await removeThreadQueuedMessage(threadId, messageId)
+            const removed = await removeThreadQueuedMessageWithRevision(threadId, messageId, baseRevision)
+            removedMessage = removed.removedMessage
+            committedRevision = removed.revision
           } catch (error) {
-            if (error instanceof Error && error.name === 'ThreadQueueMutationConflictError') {
+            if (error instanceof Error && (
+              error.name === 'ThreadQueueRevisionConflictError'
+              || error.name === 'ThreadQueueMutationConflictError'
+            )) {
               setJson(res, 409, { error: error.message })
               return
             }
@@ -14134,16 +15069,33 @@ export function createCodexBridgeMiddleware(options: {
               removedMessage,
             )
           }
+          setJson(res, 200, { ok: true, revision: committedRevision })
+          return
         } else if (operation === 'reorder') {
-          await reorderThreadQueuedMessages(threadId, normalizeStringArray(record?.orderedMessageIds))
+          let committedRevision: number
+          try {
+            committedRevision = await reorderThreadQueuedMessages(
+              threadId,
+              normalizeStringArray(record?.orderedMessageIds),
+              baseRevision,
+            )
+          } catch (error) {
+            if (error instanceof Error && (
+              error.name === 'ThreadQueueRevisionConflictError'
+              || error.name === 'ThreadQueueMutationConflictError'
+            )) {
+              setJson(res, 409, { error: error.message })
+              return
+            }
+            throw error
+          }
           backendQueueProcessor.scheduleThreadQueueDrain(threadId, 0)
+          setJson(res, 200, { ok: true, revision: committedRevision })
+          return
         } else {
           setJson(res, 400, { error: 'Unsupported queue operation' })
           return
         }
-        const { revision } = await readThreadQueueStore()
-        setJson(res, 200, { ok: true, revision })
-        return
       }
 
       if (req.method === 'POST' && url.pathname === '/codex-api/thread-queue-state') {
@@ -14158,10 +15110,18 @@ export function createCodexBridgeMiddleware(options: {
         const queueInsertIndex = typeof record?.queueInsertIndex === 'number'
           ? record.queueInsertIndex
           : undefined
-        await appendThreadQueuedMessage(threadId, message, queueInsertIndex)
-        backendQueueProcessor.rememberRuntimeQueuedMessage(threadId, message)
-        backendQueueProcessor.scheduleThreadQueueDrain(threadId, 0)
-        setJson(res, 200, { ok: true })
+        const committedRevision = await withThreadStartClaimWait(threadId, async () => {
+          if (await isThreadArchivedForMutation(appServer, threadId)) {
+            const error = new Error('Cannot queue work for an archived task.')
+            error.name = 'ArchivedThreadConflictError'
+            throw error
+          }
+          const revision = await appendThreadQueuedMessage(threadId, message, queueInsertIndex)
+          backendQueueProcessor.rememberRuntimeQueuedMessage(threadId, message)
+          backendQueueProcessor.scheduleThreadQueueDrain(threadId, 0)
+          return revision
+        })
+        setJson(res, 200, { ok: true, revision: committedRevision })
         return
       }
 
@@ -14498,8 +15458,9 @@ export function createCodexBridgeMiddleware(options: {
         }
 
         const index = await getThreadSearchIndex()
+        const archivedIds = await readAuthoritativeArchivedThreadIds(Array.from(index.docsById.keys()))
         const matchedIds = Array.from(index.docsById.entries())
-          .filter(([, doc]) => isExactPhraseMatch(query, doc))
+          .filter(([id, doc]) => !archivedIds.has(id) && isExactPhraseMatch(query, doc))
           .slice(0, limit)
           .map(([id]) => id)
 
@@ -14587,7 +15548,20 @@ export function createCodexBridgeMiddleware(options: {
           setJson(res, 404, { error: 'Automation not found for thread' })
           return
         }
-        await appendThreadQueuedMessage(threadId, buildHeartbeatQueuedMessage(automation))
+        await withThreadStartClaim(threadId, async () => {
+          if (await isThreadArchivedForMutation(appServer, threadId)) {
+            const error = new Error('Cannot queue automation for an archived task.')
+            error.name = 'ArchivedThreadConflictError'
+            throw error
+          }
+          await appendThreadQueuedMessage(threadId, buildHeartbeatQueuedMessage(automation))
+          if (await isThreadArchivedForMutation(appServer, threadId)) {
+            await backendQueueProcessor.discardArchivedThreadQueue(threadId)
+            const error = new Error('Cannot queue automation for an archived task.')
+            error.name = 'ArchivedThreadConflictError'
+            throw error
+          }
+        })
         backendQueueProcessor.scheduleThreadQueueDrain(threadId, 0)
         setJson(res, 200, { data: { queued: true } })
         return
@@ -14696,12 +15670,17 @@ export function createCodexBridgeMiddleware(options: {
       next()
     } catch (error) {
       const message = getErrorMessage(error, 'Unknown bridge error')
-      setJson(res, error instanceof Error && (
-        error.name === 'ThreadStartClaimConflictError'
-        || error.name === 'ThreadWriterOwnershipConflictError'
-        || error.name === 'ArchivedThreadConflictError'
-        || error.name === 'ArchivedThreadStateUnavailableError'
-      ) ? 409 : 502, { error: message })
+      const status = error instanceof Error && error.name === 'InvalidThreadListCursorError'
+        ? 400
+        : error instanceof Error && (
+            error.name === 'ThreadStartClaimConflictError'
+            || error.name === 'ThreadWriterOwnershipConflictError'
+            || error.name === 'ArchivedThreadConflictError'
+            || error.name === 'ArchivedThreadStateUnavailableError'
+          )
+          ? 409
+          : 502
+      setJson(res, status, { error: message })
     }
   }
 

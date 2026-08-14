@@ -1,12 +1,13 @@
 import { createServer } from 'node:http'
 import { spawnSync } from 'node:child_process'
 import type { AddressInfo } from 'node:net'
-import { appendFile, mkdir, mkdtemp, rm, truncate, utimes, writeFile } from 'node:fs/promises'
+import { appendFile, mkdir, mkdtemp, readFile, readdir, rm, truncate, utimes, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { afterEach, describe, expect, it, vi } from 'vitest'
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest'
 import type { ExternalThreadRuntime } from '../types/threadRuntime'
 import {
+  appendThreadQueuedMessage,
   augmentThreadResultWithExternalRuntime,
   createCodexBridgeMiddleware,
   pruneExpiredCachedHttpResponses,
@@ -280,16 +281,27 @@ describe('external thread runtime bridge augmentation', () => {
 
 const disposers: Array<() => void | Promise<void>> = []
 const originalCodexHome = process.env.CODEX_HOME
+let isolatedCodexHome = ''
+
+beforeAll(async () => {
+  isolatedCodexHome = await mkdtemp(join(tmpdir(), 'codex-mobile-runtime-bridge-test-home-'))
+  process.env.CODEX_HOME = isolatedCodexHome
+})
 
 afterEach(async () => {
   for (const dispose of disposers.splice(0)) await dispose()
-  if (originalCodexHome === undefined) delete process.env.CODEX_HOME
-  else process.env.CODEX_HOME = originalCodexHome
   vi.restoreAllMocks()
 })
 
+afterAll(async () => {
+  if (isolatedCodexHome) await rm(isolatedCodexHome, { recursive: true, force: true })
+  isolatedCodexHome = ''
+  if (originalCodexHome === undefined) delete process.env.CODEX_HOME
+  else process.env.CODEX_HOME = originalCodexHome
+})
+
 function sharedBridgeForTest() {
-  return (globalThis as typeof globalThis & {
+  const shared = (globalThis as typeof globalThis & {
     __codexRemoteSharedBridge__: {
       localRuntimeLedger: {
         record: (notification: { method: string; params: unknown }) => void
@@ -305,6 +317,7 @@ function sharedBridgeForTest() {
           turnId: string,
           excludedPid: number | null,
         ) => Promise<{ interrupted: boolean; reason?: string }>
+        inspectWriterEvidence: (threadId: string, excludedPid: number | null) => Promise<boolean | null>
       }
       appServer: {
         getPid: () => number | null
@@ -312,6 +325,10 @@ function sharedBridgeForTest() {
       }
     }
   }).__codexRemoteSharedBridge__
+  if (!vi.isMockFunction(shared.runtimeProbe.inspectWriterEvidence)) {
+    vi.spyOn(shared.runtimeProbe, 'inspectWriterEvidence').mockResolvedValue(false)
+  }
+  return shared
 }
 
 async function listenWithMiddleware(middleware: ReturnType<typeof createCodexBridgeMiddleware>) {
@@ -1719,6 +1736,17 @@ describe('POST /codex-api/rpc guarded resume', () => {
     expect(firstPayload.result?.data?.[0]).not.toHaveProperty('conversation')
     expect(firstPayload.result?.data?.[0]).not.toHaveProperty('transcript')
     expect(firstPayload.result?.data?.[0]).not.toHaveProperty('externalRuntime')
+    const cacheFiles = await readdir(join(codexHome, 'codex-mobile-cache'))
+    const persistedCache = JSON.parse(await readFile(
+      join(codexHome, 'codex-mobile-cache', cacheFiles[0]!),
+      'utf8',
+    )) as { result?: { data?: Array<Record<string, unknown>> } }
+    expect(persistedCache.result?.data?.[0]).not.toHaveProperty('turns')
+    expect(persistedCache.result?.data?.[0]).not.toHaveProperty('items')
+    expect(persistedCache.result?.data?.[0]).not.toHaveProperty('messages')
+    expect(persistedCache.result?.data?.[0]).not.toHaveProperty('conversation')
+    expect(persistedCache.result?.data?.[0]).not.toHaveProperty('transcript')
+    expect(persistedCache.result?.data?.[0]).not.toHaveProperty('externalRuntime')
     expect(second).not.toBe('timeout')
     expect(second).toHaveProperty('status', 200)
     expect(rpc).toHaveBeenCalledTimes(1)
@@ -1774,7 +1802,7 @@ describe('POST /codex-api/rpc guarded resume', () => {
     const response = responseOrTimeout as Response
     expect(response.status).toBe(200)
     const payload = await response.json() as {
-      result?: { data?: Array<{ id?: string; title?: string; turns?: unknown[] }>; nextCursor?: unknown }
+      result?: { data?: Array<{ id?: string; title?: string; turns?: unknown[] }>; nextCursor?: string | null }
     }
     expect(payload.result?.data?.map((row) => row.id)).toEqual([
       'thread-6',
@@ -1789,10 +1817,96 @@ describe('POST /codex-api/rpc guarded resume', () => {
       preview: '',
     })
     expect(payload.result?.data?.[0]).not.toHaveProperty('turns')
-    expect(payload.result?.nextCursor ?? null).toBe(null)
+    expect(payload.result?.nextCursor).toEqual(expect.any(String))
+    expect(payload.result?.nextCursor?.length).toBeLessThan(100)
+
+    await appendFile(
+      join(codexHome, 'session_index.jsonl'),
+      `${JSON.stringify({
+        id: 'thread-new-head',
+        thread_name: 'Inserted after page one',
+        updated_at: '2026-07-28T07:00:00.000Z',
+      })}\n`,
+      'utf8',
+    )
+
+    const secondPage = await fetch(`http://127.0.0.1:${port}/codex-api/rpc`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        method: 'thread/list',
+        params: {
+          archived: false,
+          limit: 5,
+          sortKey: 'updated_at',
+          modelProviders: [],
+          cursor: payload.result?.nextCursor,
+        },
+      }),
+    })
+    expect(secondPage.status).toBe(200)
+    const secondPayload = await secondPage.json() as {
+      result?: { data?: Array<Record<string, unknown>>; nextCursor?: string | null }
+    }
+    expect(secondPayload.result?.data?.map((row) => row.id)).toEqual(['thread-1'])
+    expect(secondPayload.result?.data?.[0]).not.toHaveProperty('turns')
+    expect(secondPayload.result?.data?.[0]).not.toHaveProperty('items')
+    expect(secondPayload.result?.data?.[0]).not.toHaveProperty('messages')
+    expect(secondPayload.result?.data?.[0]).not.toHaveProperty('transcript')
+    expect(secondPayload.result?.nextCursor ?? null).toBe(null)
 
     await new Promise((resolve) => setTimeout(resolve, 0))
     expect(rpc).toHaveBeenCalledTimes(1)
+    resolveRpc({ data: [], nextCursor: null })
+    await new Promise((resolve) => setTimeout(resolve, 0))
+  })
+
+  it('uses bounded state-db metadata with cwd for a cold first page', async () => {
+    const codexHome = await mkdtemp(join(tmpdir(), 'codex-mobile-thread-list-state-db-cold-'))
+    process.env.CODEX_HOME = codexHome
+    disposers.push(() => rm(codexHome, { recursive: true, force: true }))
+    await writeFile(join(codexHome, 'session_index.jsonl'), Array.from({ length: 12 }, (_, index) => JSON.stringify({
+      id: `thread-${index}`,
+      thread_name: `Index ${index}`,
+      updated_at: new Date((index + 1) * 1_000).toISOString(),
+    })).join('\n') + '\n')
+    const stateDbPath = join(codexHome, 'state_5.sqlite')
+    const inserts = Array.from({ length: 12 }, (_, index) => (
+      `INSERT INTO threads VALUES ('thread-${index}', '/tmp/sessions/thread-${index}.jsonl', 1, ${index + 1}, 'cli', 'openai', '/home/zonghangli/Desktop/prima.cpp', 'State ${index}', '', 'State ${index}', 0);`
+    ))
+    expect(spawnSync('sqlite3', [stateDbPath, [
+      'CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT, created_at INTEGER, updated_at INTEGER, source TEXT, model_provider TEXT, cwd TEXT, title TEXT, cli_version TEXT, first_user_message TEXT, archived INTEGER);',
+      ...inserts,
+    ].join(' ')], { encoding: 'utf8' }).status).toBe(0)
+    const middleware = createCodexBridgeMiddleware()
+    const shared = sharedBridgeForTest()
+    let resolveRpc!: (value: unknown) => void
+    vi.spyOn(shared.appServer as unknown as {
+      rpc(method: string, params: unknown): Promise<unknown>
+    }, 'rpc').mockImplementation(() => new Promise((resolve) => { resolveRpc = resolve }))
+    const port = await listenWithMiddleware(middleware)
+
+    const response = await fetch(`http://127.0.0.1:${port}/codex-api/rpc`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        method: 'thread/list',
+        params: { archived: false, limit: 5, sortKey: 'updated_at', modelProviders: [], cursor: null },
+      }),
+    })
+    const payload = await response.json() as {
+      result?: { data?: Array<Record<string, unknown>>; nextCursor?: string | null }
+    }
+
+    expect(response.status).toBe(200)
+    expect(payload.result?.data).toHaveLength(5)
+    expect(payload.result?.data?.map((row) => row.id)).toEqual([
+      'thread-11', 'thread-10', 'thread-9', 'thread-8', 'thread-7',
+    ])
+    expect(payload.result?.data?.every((row) => row.cwd === '/home/zonghangli/Desktop/prima.cpp')).toBe(true)
+    expect(payload.result?.data?.every((row) => !('turns' in row))).toBe(true)
+    expect(payload.result?.nextCursor).toEqual(expect.any(String))
+    await vi.waitFor(() => expect(resolveRpc).toBeTypeOf('function'))
     resolveRpc({ data: [], nextCursor: null })
     await new Promise((resolve) => setTimeout(resolve, 0))
   })
@@ -1966,6 +2080,249 @@ describe('POST /codex-api/rpc guarded resume', () => {
       ],
       nextCursor: null,
     })
+  })
+
+  it('rejects a persisted first-page snapshot after the session index changes', async () => {
+    const codexHome = await mkdtemp(join(tmpdir(), 'codex-mobile-thread-list-signature-cache-'))
+    process.env.CODEX_HOME = codexHome
+    disposers.push(() => {
+      void rm(codexHome, { recursive: true, force: true })
+    })
+    const sessionIndexPath = join(codexHome, 'session_index.jsonl')
+    await writeFile(sessionIndexPath, '{"id":"thread-cached","thread_name":"Cached","updated_at":"2026-07-27T00:00:00.000Z"}\n')
+
+    const middleware = createCodexBridgeMiddleware()
+    const shared = sharedBridgeForTest()
+    vi.spyOn(shared.appServer, 'getPid').mockReturnValue(4242)
+    const rpc = vi.spyOn(shared.appServer as unknown as {
+      rpc(method: string, params: unknown): Promise<unknown>
+    }, 'rpc')
+      .mockResolvedValueOnce({
+        data: [{ id: 'thread-stale', path: join(codexHome, 'sessions', 'thread-stale.jsonl') }],
+        nextCursor: null,
+      })
+      .mockResolvedValueOnce({ data: [], nextCursor: null })
+    vi.spyOn(shared.runtimeProbe, 'inspectMany').mockResolvedValue({})
+    const port = await listenWithMiddleware(middleware)
+    const body = JSON.stringify({
+      method: 'thread/list',
+      params: { archived: false, limit: 5, sortKey: 'updated_at', modelProviders: [], cursor: null },
+    })
+
+    const warm = await fetch(`http://127.0.0.1:${port}/codex-api/rpc`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body,
+    })
+    expect(warm.status).toBe(200)
+    shared.appServer.invalidateThreadListRpcCache()
+    await appendFile(
+      sessionIndexPath,
+      '{"id":"thread-unarchived","thread_name":"Unarchived","updated_at":"2026-07-28T00:00:00.000Z"}\n',
+    )
+
+    const cold = await fetch(`http://127.0.0.1:${port}/codex-api/rpc`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body,
+    })
+    const payload = await cold.json() as { result?: { data?: Array<{ id?: string }> } }
+
+    expect(cold.status).toBe(200)
+    expect(payload.result?.data?.[0]?.id).toBe('thread-unarchived')
+    await vi.waitFor(() => expect(rpc).toHaveBeenCalledTimes(2))
+  })
+
+  it('invalidates persisted thread/list data and filters the exact archived state-db row', async () => {
+    const codexHome = await mkdtemp(join(tmpdir(), 'codex-mobile-thread-list-archive-signature-'))
+    process.env.CODEX_HOME = codexHome
+    disposers.push(() => rm(codexHome, { recursive: true, force: true }))
+    await writeFile(join(codexHome, 'session_index.jsonl'), [
+      { id: 'thread-active-cache', thread_name: 'Active', updated_at: '2026-07-28T00:00:00.000Z' },
+      { id: 'thread-archive-cache', thread_name: 'Archive me', updated_at: '2026-07-29T00:00:00.000Z' },
+    ].map((entry) => JSON.stringify(entry)).join('\n') + '\n')
+    const stateDbPath = join(codexHome, 'state_5.sqlite')
+    expect(spawnSync('sqlite3', [stateDbPath, [
+      'CREATE TABLE threads (id TEXT PRIMARY KEY, archived INTEGER);',
+      "INSERT INTO threads VALUES ('thread-active-cache', 0), ('thread-archive-cache', 0);",
+    ].join(' ')], { encoding: 'utf8' }).status).toBe(0)
+    const middleware = createCodexBridgeMiddleware()
+    const shared = sharedBridgeForTest()
+    const listResult = {
+      data: [{ id: 'thread-archive-cache' }, { id: 'thread-active-cache' }],
+      nextCursor: null,
+    }
+    const rpc = vi.spyOn(shared.appServer as unknown as {
+      rpc(method: string, params: unknown): Promise<unknown>
+    }, 'rpc').mockResolvedValue(listResult)
+    const port = await listenWithMiddleware(middleware)
+    const body = JSON.stringify({
+      method: 'thread/list',
+      params: { archived: false, limit: 5, sortKey: 'updated_at', modelProviders: [], cursor: null },
+    })
+    expect((await fetch(`http://127.0.0.1:${port}/codex-api/rpc`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body,
+    })).status).toBe(200)
+    shared.appServer.invalidateThreadListRpcCache()
+    expect(spawnSync('sqlite3', [stateDbPath,
+      "UPDATE threads SET archived = 1 WHERE id = 'thread-archive-cache';",
+    ], { encoding: 'utf8' }).status).toBe(0)
+    const future = new Date(Date.now() + 2_000)
+    await utimes(stateDbPath, future, future)
+
+    const cold = await fetch(`http://127.0.0.1:${port}/codex-api/rpc`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body,
+    })
+    const payload = await cold.json() as { result?: { data?: Array<{ id?: string }> } }
+
+    expect(payload.result?.data?.map((row) => row.id)).toEqual(['thread-active-cache'])
+    await vi.waitFor(() => expect(rpc).toHaveBeenCalledTimes(2))
+  })
+
+  it('keeps a five-row native first page bounded and metadata-only when state-db imports exist', async () => {
+    const codexHome = await mkdtemp(join(tmpdir(), 'codex-mobile-thread-list-import-limit-'))
+    process.env.CODEX_HOME = codexHome
+    disposers.push(() => rm(codexHome, { recursive: true, force: true }))
+    const stateDbPath = join(codexHome, 'state_5.sqlite')
+    const inserts = Array.from({ length: 10 }, (_, index) => (
+      `INSERT INTO threads VALUES ('import-${index}', '/tmp/sessions/import-${index}.jsonl', 1, ${index + 1}, 'cli', 'openai', '/tmp/project', 'Import ${index}', '', 'Import ${index}', 0);`
+    ))
+    expect(spawnSync('sqlite3', [stateDbPath, [
+      'CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT, created_at INTEGER, updated_at INTEGER, source TEXT, model_provider TEXT, cwd TEXT, title TEXT, cli_version TEXT, first_user_message TEXT, archived INTEGER);',
+      ...inserts,
+    ].join(' ')], { encoding: 'utf8' }).status).toBe(0)
+    const middleware = createCodexBridgeMiddleware()
+    const shared = sharedBridgeForTest()
+    vi.spyOn(shared.appServer as unknown as {
+      rpc(method: string, params: unknown): Promise<unknown>
+    }, 'rpc').mockImplementation(async (_method, params) => (
+      (params as { cursor?: string | null }).cursor === 'native-next'
+        ? { data: [], nextCursor: null }
+        : {
+            data: Array.from({ length: 5 }, (_, index) => ({
+              id: index === 0 ? 'import-9' : `native-${index}`,
+              updatedAt: 100 - index,
+            })),
+            nextCursor: 'native-next',
+          }
+    ))
+    const port = await listenWithMiddleware(middleware)
+
+    const response = await fetch(`http://127.0.0.1:${port}/codex-api/rpc`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        method: 'thread/list',
+        params: { archived: false, limit: 5, sortKey: 'updated_at', modelProviders: [], cursor: null },
+      }),
+    })
+    const payload = await response.json() as {
+      result?: { data?: Array<Record<string, unknown>>; nextCursor?: string | null }
+    }
+
+    expect(payload.result?.data).toHaveLength(5)
+    expect(payload.result?.data?.every((row) => !('turns' in row))).toBe(true)
+    expect(payload.result?.nextCursor).toEqual(expect.any(String))
+
+    const terminal = await fetch(`http://127.0.0.1:${port}/codex-api/rpc`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        method: 'thread/list',
+        params: {
+          archived: false,
+          limit: 5,
+          sortKey: 'updated_at',
+          modelProviders: [],
+          cursor: payload.result?.nextCursor,
+        },
+      }),
+    })
+    const terminalPayload = await terminal.json() as {
+      result?: { data?: Array<Record<string, unknown>>; nextCursor?: string | null }
+    }
+    expect(terminalPayload.result?.data?.some((row) => String(row.id).startsWith('import-'))).toBe(true)
+    expect(terminalPayload.result?.data?.length).toBeLessThanOrEqual(5)
+
+    const importedIds = [...(payload.result?.data ?? []), ...(terminalPayload.result?.data ?? [])]
+      .map((row) => String(row.id))
+      .filter((id) => id.startsWith('import-'))
+    let cursor = terminalPayload.result?.nextCursor ?? null
+    while (cursor) {
+      const page = await fetch(`http://127.0.0.1:${port}/codex-api/rpc`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          method: 'thread/list',
+          params: { archived: false, limit: 5, sortKey: 'updated_at', modelProviders: [], cursor },
+        }),
+      })
+      const pagePayload = await page.json() as {
+        result?: { data?: Array<Record<string, unknown>>; nextCursor?: string | null }
+      }
+      expect(page.status).toBe(200)
+      expect(pagePayload.result?.data?.length).toBeLessThanOrEqual(5)
+      expect(pagePayload.result?.data?.every((row) => !('turns' in row))).toBe(true)
+      importedIds.push(...(pagePayload.result?.data ?? []).map((row) => String(row.id)))
+      cursor = pagePayload.result?.nextCursor ?? null
+    }
+    expect(importedIds.sort()).toEqual(Array.from({ length: 10 }, (_, index) => `import-${index}`).sort())
+  })
+
+  it('paginates more than 200 state-db imports across a new middleware instance', async () => {
+    const codexHome = await mkdtemp(join(tmpdir(), 'codex-mobile-thread-list-import-restart-'))
+    process.env.CODEX_HOME = codexHome
+    disposers.push(() => rm(codexHome, { recursive: true, force: true }))
+    const stateDbPath = join(codexHome, 'state_5.sqlite')
+    const inserts = Array.from({ length: 205 }, (_, index) => (
+      `INSERT INTO threads VALUES ('bulk-${String(index).padStart(3, '0')}', '/tmp/sessions/bulk-${index}.jsonl', 1, ${index + 1}, 'cli', 'openai', '/tmp/project', 'Bulk ${index}', '', 'Bulk ${index}', 0);`
+    ))
+    expect(spawnSync('sqlite3', [stateDbPath, [
+      'CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT, created_at INTEGER, updated_at INTEGER, source TEXT, model_provider TEXT, cwd TEXT, title TEXT, cli_version TEXT, first_user_message TEXT, archived INTEGER);',
+      ...inserts,
+    ].join(' ')], { encoding: 'utf8' }).status).toBe(0)
+
+    const firstMiddleware = createCodexBridgeMiddleware()
+    const shared = sharedBridgeForTest()
+    const rpc = vi.spyOn(shared.appServer as unknown as {
+      rpc(method: string, params: unknown): Promise<unknown>
+    }, 'rpc').mockResolvedValue({ data: [], nextCursor: null })
+    const firstPort = await listenWithMiddleware(firstMiddleware)
+    const first = await fetch(`http://127.0.0.1:${firstPort}/codex-api/rpc`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        method: 'thread/list',
+        params: { archived: false, limit: 100, sortKey: 'updated_at', modelProviders: [], cursor: null },
+      }),
+    })
+    expect(first.status).toBe(200)
+    const firstPayload = await first.json() as {
+      result?: { data?: Array<Record<string, unknown>>; nextCursor?: string | null }
+    }
+    expect(firstPayload.result?.data).toHaveLength(100)
+    expect(firstPayload.result?.nextCursor).toEqual(expect.any(String))
+
+    const secondMiddleware = createCodexBridgeMiddleware()
+    const secondPort = await listenWithMiddleware(secondMiddleware)
+    const allRows = [...(firstPayload.result?.data ?? [])]
+    let cursor = firstPayload.result?.nextCursor ?? null
+    while (cursor) {
+      const page = await fetch(`http://127.0.0.1:${secondPort}/codex-api/rpc`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          method: 'thread/list',
+          params: { archived: false, limit: 100, sortKey: 'updated_at', modelProviders: [], cursor },
+        }),
+      })
+      expect(page.status).toBe(200)
+      const payload = await page.json() as {
+        result?: { data?: Array<Record<string, unknown>>; nextCursor?: string | null }
+      }
+      expect(payload.result?.data?.length).toBeLessThanOrEqual(100)
+      allRows.push(...(payload.result?.data ?? []))
+      cursor = payload.result?.nextCursor ?? null
+    }
+
+    expect(allRows).toHaveLength(205)
+    expect(new Set(allRows.map((row) => row.id))).toHaveProperty('size', 205)
+    expect(allRows.every((row) => !('turns' in row))).toBe(true)
+    expect(allRows.every((row) => !('items' in row))).toBe(true)
+    expect(allRows.every((row) => !('messages' in row))).toBe(true)
+    expect(allRows.every((row) => !('transcript' in row))).toBe(true)
+    expect(rpc).toHaveBeenCalledTimes(1)
   })
 
   it('falls back to a persisted first-page thread/list snapshot when a forced fresh list is slow', async () => {
@@ -2213,6 +2570,386 @@ describe('POST /codex-api/rpc guarded resume', () => {
 })
 
 describe('POST /codex-api/rpc guarded user turns', () => {
+  it('routes goal mutation through the controlled endpoint while raw RPC stays forbidden', async () => {
+    const middleware = createCodexBridgeMiddleware()
+    const shared = sharedBridgeForTest()
+    vi.spyOn(shared.runtimeProbe, 'inspect').mockResolvedValue({ state: 'idle' })
+    const rpc = vi.spyOn(shared.appServer as unknown as {
+      rpc(method: string, params: unknown): Promise<unknown>
+    }, 'rpc').mockImplementation(async (method) => {
+      if (method === 'thread/read') return {
+        thread: { id: 'thread-goal-route', path: '/home/user/.codex/sessions/goal.jsonl', turns: [] },
+      }
+      if (method === 'thread/goal/set') return {
+        goal: { objective: 'finish', status: 'active', updatedAt: 1, timeUsedSeconds: 0, tokensUsed: 0 },
+      }
+      return {}
+    })
+    const port = await listenWithMiddleware(middleware)
+
+    const controlled = await fetch(`http://127.0.0.1:${port}/codex-api/thread-goal-set`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ threadId: 'thread-goal-route', objective: 'finish', status: 'active' }),
+    })
+    const raw = await fetch(`http://127.0.0.1:${port}/codex-api/rpc`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ method: 'thread/goal/set', params: { threadId: 'thread-goal-route' } }),
+    })
+
+    expect(controlled.status).toBe(200)
+    expect(raw.status).toBe(403)
+    expect(rpc).toHaveBeenCalledWith('thread/goal/set', {
+      threadId: 'thread-goal-route', objective: 'finish', status: 'active',
+    })
+  })
+
+  it('does not archive until the interrupted local writer is actually idle', async () => {
+    const codexHome = await mkdtemp(join(tmpdir(), 'codex-mobile-archive-quiescence-'))
+    process.env.CODEX_HOME = codexHome
+    disposers.push(() => rm(codexHome, { recursive: true, force: true }))
+    const sqlite = spawnSync('sqlite3', [join(codexHome, 'state_5.sqlite'), [
+      'CREATE TABLE threads (id TEXT PRIMARY KEY, archived INTEGER);',
+      "INSERT INTO threads (id, archived) VALUES ('thread-still-running', 0);",
+    ].join(' ')], { encoding: 'utf8' })
+    expect(sqlite.status).toBe(0)
+    const middleware = createCodexBridgeMiddleware()
+    const shared = sharedBridgeForTest()
+    shared.localRuntimeLedger.record({
+      method: 'turn/started',
+      params: { threadId: 'thread-still-running', turn: { id: 'turn-still-running' } },
+    })
+    vi.spyOn(shared.runtimeProbe, 'inspect').mockResolvedValue({
+      state: 'running', turnId: 'turn-still-running', interruptible: false, source: 'external-session-writer',
+    })
+    const rpc = vi.spyOn(shared.appServer as unknown as {
+      rpc(method: string, params: unknown): Promise<unknown>
+    }, 'rpc').mockImplementation(async (method) => method === 'thread/read'
+      ? { thread: { id: 'thread-still-running', path: '/tmp/still-running.jsonl', turns: [] } }
+      : {})
+    const port = await listenWithMiddleware(middleware)
+
+    const response = await fetch(`http://127.0.0.1:${port}/codex-api/thread-stop-and-archive`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ threadId: 'thread-still-running' }),
+    })
+    shared.localRuntimeLedger.record({
+      method: 'turn/completed',
+      params: { threadId: 'thread-still-running', turn: { id: 'turn-still-running' } },
+    })
+
+    expect(response.status).toBe(409)
+    expect(rpc).toHaveBeenCalledWith('turn/interrupt', {
+      threadId: 'thread-still-running', turnId: 'turn-still-running',
+    })
+    expect(rpc).not.toHaveBeenCalledWith('thread/goal/clear', expect.anything())
+    expect(rpc).not.toHaveBeenCalledWith('thread/archive', expect.anything())
+  })
+
+  it('rechecks writer ownership inside the final controlled archive call', async () => {
+    const codexHome = await mkdtemp(join(tmpdir(), 'codex-mobile-archive-final-guard-'))
+    process.env.CODEX_HOME = codexHome
+    disposers.push(() => rm(codexHome, { recursive: true, force: true }))
+    expect(spawnSync('sqlite3', [join(codexHome, 'state_5.sqlite'), [
+      'CREATE TABLE threads (id TEXT PRIMARY KEY, archived INTEGER);',
+      "INSERT INTO threads VALUES ('thread-final-archive-guard', 0);",
+    ].join(' ')], { encoding: 'utf8' }).status).toBe(0)
+    const middleware = createCodexBridgeMiddleware()
+    const shared = sharedBridgeForTest()
+    vi.spyOn(shared.runtimeProbe, 'inspect')
+      .mockResolvedValueOnce({ state: 'idle' })
+      .mockResolvedValueOnce({
+        state: 'running', turnId: 'turn-foreign-late', interruptible: false, source: 'external-session-writer',
+      })
+    const rpc = vi.spyOn(shared.appServer as unknown as {
+      rpc(method: string, params: unknown): Promise<unknown>
+    }, 'rpc').mockImplementation(async (method) => method === 'thread/read'
+      ? { thread: { id: 'thread-final-archive-guard', path: '/tmp/final-archive-guard.jsonl', turns: [] } }
+      : {})
+    const port = await listenWithMiddleware(middleware)
+
+    const response = await fetch(`http://127.0.0.1:${port}/codex-api/thread-stop-and-archive`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ threadId: 'thread-final-archive-guard' }),
+    })
+
+    expect(response.status).toBe(409)
+    expect(rpc).not.toHaveBeenCalledWith('thread/goal/clear', expect.anything())
+    expect(rpc).not.toHaveBeenCalledWith('thread/archive', expect.anything())
+  })
+
+  it.each(['NULL', '2', "'corrupt'"])('fails closed for invalid archived state %s', async (archivedValue) => {
+    const codexHome = await mkdtemp(join(tmpdir(), 'codex-mobile-invalid-archive-state-'))
+    process.env.CODEX_HOME = codexHome
+    disposers.push(() => rm(codexHome, { recursive: true, force: true }))
+    const threadId = '019fc67c-7c0c-7fc2-881f-e8dfd8edf372'
+    expect(spawnSync('sqlite3', [join(codexHome, 'state_5.sqlite'), [
+      'CREATE TABLE threads (id TEXT PRIMARY KEY, archived);',
+      `INSERT INTO threads VALUES ('${threadId}', ${archivedValue});`,
+    ].join(' ')], { encoding: 'utf8' }).status).toBe(0)
+    const middleware = createCodexBridgeMiddleware()
+    const shared = sharedBridgeForTest()
+    const rpc = vi.spyOn(shared.appServer as unknown as {
+      rpc(method: string, params: unknown): Promise<unknown>
+    }, 'rpc').mockResolvedValue({ thread: { id: threadId, turns: [] } })
+    const port = await listenWithMiddleware(middleware)
+
+    const response = await fetch(`http://127.0.0.1:${port}/codex-api/rpc`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ method: 'thread/read', params: { threadId } }),
+    })
+
+    expect(response.status).toBe(409)
+    expect(rpc).not.toHaveBeenCalled()
+  })
+
+  it('fails closed when thread/list metadata contains an invalid archived value', async () => {
+    const codexHome = await mkdtemp(join(tmpdir(), 'codex-mobile-invalid-list-archive-state-'))
+    process.env.CODEX_HOME = codexHome
+    disposers.push(() => rm(codexHome, { recursive: true, force: true }))
+    const threadId = '019fc67c-7c0c-7fc2-881f-e8dfd8edf373'
+    expect(spawnSync('sqlite3', [join(codexHome, 'state_5.sqlite'), [
+      'CREATE TABLE threads (id TEXT PRIMARY KEY, archived);',
+      `INSERT INTO threads VALUES ('${threadId}', 2);`,
+    ].join(' ')], { encoding: 'utf8' }).status).toBe(0)
+    const middleware = createCodexBridgeMiddleware()
+    const shared = sharedBridgeForTest()
+    vi.spyOn(shared.appServer as unknown as {
+      rpc(method: string, params: unknown): Promise<unknown>
+    }, 'rpc').mockResolvedValue({
+      data: [{ id: threadId, title: 'must not leak', cwd: '/tmp/project' }],
+      nextCursor: null,
+    })
+    const port = await listenWithMiddleware(middleware)
+
+    const response = await fetch(`http://127.0.0.1:${port}/codex-api/rpc`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        method: 'thread/list',
+        params: { archived: false, limit: 5, sortKey: 'updated_at', modelProviders: [], cursor: null },
+      }),
+    })
+
+    expect(response.status).toBe(409)
+  })
+
+  it('rejects queue append for an exact state-db archived thread', async () => {
+    const codexHome = await mkdtemp(join(tmpdir(), 'codex-mobile-queue-archived-'))
+    process.env.CODEX_HOME = codexHome
+    disposers.push(() => rm(codexHome, { recursive: true, force: true }))
+    const sqlite = spawnSync('sqlite3', [join(codexHome, 'state_5.sqlite'), [
+      'CREATE TABLE threads (id TEXT PRIMARY KEY, archived INTEGER);',
+      "INSERT INTO threads (id, archived) VALUES ('thread-archived-queue', 1);",
+    ].join(' ')], { encoding: 'utf8' })
+    expect(sqlite.status).toBe(0)
+    const middleware = createCodexBridgeMiddleware()
+    const port = await listenWithMiddleware(middleware)
+
+    const response = await fetch(`http://127.0.0.1:${port}/codex-api/thread-queue-state`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        threadId: 'thread-archived-queue',
+        message: {
+          id: 'queued-archived', text: 'must not queue', imageUrls: [], skills: [], fileAttachments: [],
+          collaborationMode: 'default', model: '', effort: '',
+        },
+      }),
+    })
+
+    expect(response.status).toBe(409)
+  })
+
+  it('rejects revisionless and stale exact queue mutations without changing the queue', async () => {
+    const threadId = '019fc67c-7c0c-7fc2-881f-e8dfd8edf371'
+    const codexHome = await mkdtemp(join(tmpdir(), 'codex-mobile-queue-patch-cas-'))
+    process.env.CODEX_HOME = codexHome
+    await appendThreadQueuedMessage(threadId, {
+      id: 'queued-cas', text: 'keep me', imageUrls: [], skills: [], fileAttachments: [],
+      collaborationMode: 'default', model: '', effort: '',
+    })
+    const middleware = createCodexBridgeMiddleware()
+    const shared = sharedBridgeForTest()
+    vi.spyOn(shared.appServer as unknown as {
+      rpc(method: string, params: unknown): Promise<unknown>
+    }, 'rpc').mockResolvedValue({
+      thread: { id: threadId, path: join(codexHome, 'sessions', `${threadId}.jsonl`), turns: [] },
+    })
+    vi.spyOn(shared.runtimeProbe, 'inspect').mockResolvedValue({ state: 'idle' })
+    vi.spyOn(shared.runtimeProbe, 'inspectWriterEvidence').mockResolvedValue(false)
+    const port = await listenWithMiddleware(middleware)
+    disposers.push(() => rm(codexHome, { recursive: true, force: true }))
+
+    const revisionless = await fetch(`http://127.0.0.1:${port}/codex-api/thread-queue-state`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ threadId, operation: 'remove', messageId: 'queued-cas' }),
+    })
+    expect(revisionless.status).toBe(400)
+
+    const stale = await fetch(`http://127.0.0.1:${port}/codex-api/thread-queue-state`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        threadId, operation: 'reorder', orderedMessageIds: ['queued-cas'], baseRevision: 0,
+      }),
+    })
+    expect(stale.status).toBe(409)
+
+    const queue = await (await fetch(`http://127.0.0.1:${port}/codex-api/thread-queue-state`)).json() as {
+      data?: Record<string, Array<{ id: string }>>
+    }
+    expect(queue.data?.[threadId]?.map((message) => message.id)).toEqual(['queued-cas'])
+  })
+
+  it('rejects automation queueing after its thread is archived', async () => {
+    const codexHome = await mkdtemp(join(tmpdir(), 'codex-mobile-automation-archived-'))
+    process.env.CODEX_HOME = codexHome
+    disposers.push(() => rm(codexHome, { recursive: true, force: true }))
+    const stateDbPath = join(codexHome, 'state_5.sqlite')
+    expect(spawnSync('sqlite3', [stateDbPath, [
+      'CREATE TABLE threads (id TEXT PRIMARY KEY, archived INTEGER);',
+      "INSERT INTO threads VALUES ('thread-automation-archived', 0);",
+    ].join(' ')], { encoding: 'utf8' }).status).toBe(0)
+    const middleware = createCodexBridgeMiddleware()
+    const port = await listenWithMiddleware(middleware)
+    const saved = await fetch(`http://127.0.0.1:${port}/codex-api/thread-automation`, {
+      method: 'PUT', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        threadId: 'thread-automation-archived', id: 'automation-1', name: 'Heartbeat',
+        prompt: 'continue', rrule: 'FREQ=DAILY', status: 'ACTIVE',
+      }),
+    })
+    expect(saved.status).toBe(200)
+    const savedPayload = await saved.json() as { data?: { id?: string } }
+    expect(savedPayload.data?.id).toBeTruthy()
+    expect(spawnSync('sqlite3', [stateDbPath,
+      "UPDATE threads SET archived = 1 WHERE id = 'thread-automation-archived';",
+    ], { encoding: 'utf8' }).status).toBe(0)
+
+    const run = await fetch(`http://127.0.0.1:${port}/codex-api/thread-automation/run`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ threadId: 'thread-automation-archived', automationId: savedPayload.data?.id }),
+    })
+
+    expect(run.status).toBe(409)
+    const queue = await (await fetch(`http://127.0.0.1:${port}/codex-api/thread-queue-state`)).json() as {
+      data?: Record<string, unknown>
+    }
+    expect(queue.data?.['thread-automation-archived']).toBeUndefined()
+  })
+
+  it('refreshes the search index and removes an exact state-db archived thread', async () => {
+    const codexHome = await mkdtemp(join(tmpdir(), 'codex-mobile-search-archived-'))
+    process.env.CODEX_HOME = codexHome
+    disposers.push(() => rm(codexHome, { recursive: true, force: true }))
+    const stateDbPath = join(codexHome, 'state_5.sqlite')
+    expect(spawnSync('sqlite3', [stateDbPath, [
+      'CREATE TABLE threads (id TEXT PRIMARY KEY, archived INTEGER);',
+      "INSERT INTO threads VALUES ('thread-search-archived', 0);",
+    ].join(' ')], { encoding: 'utf8' }).status).toBe(0)
+    const middleware = createCodexBridgeMiddleware()
+    const shared = sharedBridgeForTest()
+    vi.spyOn(shared.appServer as unknown as {
+      rpc(method: string, params: unknown): Promise<unknown>
+    }, 'rpc').mockImplementation(async (method) => {
+      if (method === 'thread/list') return {
+        data: [{ id: 'thread-search-archived', name: 'Unique searchable phrase', preview: '' }],
+        nextCursor: null,
+      }
+      if (method === 'thread/read') return {
+        thread: { id: 'thread-search-archived', turns: [] },
+      }
+      return {}
+    })
+    const port = await listenWithMiddleware(middleware)
+    const search = () => fetch(`http://127.0.0.1:${port}/codex-api/thread-search`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ query: 'Unique searchable phrase' }),
+    }).then((response) => response.json() as Promise<{ data?: { threadIds?: string[] } }>)
+    await expect(search()).resolves.toMatchObject({ data: { threadIds: ['thread-search-archived'] } })
+    expect(spawnSync('sqlite3', [stateDbPath,
+      "UPDATE threads SET archived = 1 WHERE id = 'thread-search-archived';",
+    ], { encoding: 'utf8' }).status).toBe(0)
+    const future = new Date(Date.now() + 2_000)
+    await utimes(stateDbPath, future, future)
+
+    await expect(search()).resolves.toMatchObject({ data: { threadIds: [] } })
+  })
+
+  it('checks only the requested state-db thread when the database is large', async () => {
+    const codexHome = await mkdtemp(join(tmpdir(), 'codex-mobile-large-state-db-'))
+    process.env.CODEX_HOME = codexHome
+    disposers.push(() => rm(codexHome, { recursive: true, force: true }))
+    const stateDbPath = join(codexHome, 'state_5.sqlite')
+    const sqlite = spawnSync('sqlite3', [stateDbPath, [
+      'CREATE TABLE threads (id TEXT PRIMARY KEY, archived INTEGER);',
+      'WITH RECURSIVE seq(x) AS (VALUES(1) UNION ALL SELECT x + 1 FROM seq WHERE x < 15000)',
+      "INSERT INTO threads (id, archived) SELECT printf('thread-%06d-%090d', x, x), 0 FROM seq;",
+      "INSERT INTO threads (id, archived) VALUES ('thread-active-target', 0);",
+    ].join(' ')], { encoding: 'utf8' })
+    expect(sqlite.status).toBe(0)
+    const middleware = createCodexBridgeMiddleware()
+    const shared = sharedBridgeForTest()
+    const rpc = vi.spyOn(shared.appServer as unknown as {
+      rpc(method: string, params: unknown): Promise<unknown>
+    }, 'rpc').mockResolvedValue({ thread: { id: 'thread-active-target', turns: [] } })
+    const port = await listenWithMiddleware(middleware)
+
+    const response = await fetch(`http://127.0.0.1:${port}/codex-api/rpc`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ method: 'thread/read', params: { threadId: 'thread-active-target' } }),
+    })
+
+    expect(response.status).toBe(200)
+    expect(rpc).toHaveBeenCalledWith('thread/read', { threadId: 'thread-active-target' })
+  })
+
+  it('serializes queue append with the per-thread lifecycle claim', async () => {
+    const threadId = 'thread-queue-archive-race'
+    let release!: () => void
+    const held = withThreadStartClaim(threadId, async () => (
+      new Promise<void>((resolve) => { release = resolve })
+    ))
+    await vi.waitFor(() => expect(release).toBeTypeOf('function'))
+    const middleware = createCodexBridgeMiddleware()
+    const port = await listenWithMiddleware(middleware)
+    try {
+      let settled = false
+      const responsePromise = fetch(`http://127.0.0.1:${port}/codex-api/thread-queue-state`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          threadId,
+          message: {
+            id: 'queued-race', text: 'must not cross archive', imageUrls: [], skills: [], fileAttachments: [],
+            collaborationMode: 'default', model: '', effort: '',
+          },
+        }),
+      }).then((response) => {
+        settled = true
+        return response
+      })
+      await new Promise((resolve) => setTimeout(resolve, 30))
+      expect(settled).toBe(false)
+      release()
+      const response = await responsePromise
+      expect(response.status).toBe(200)
+      await expect(response.json()).resolves.toMatchObject({ revision: expect.any(Number) })
+      const queue = await (await fetch(`http://127.0.0.1:${port}/codex-api/thread-queue-state`)).json() as {
+        data?: Record<string, Array<{ id: string }>>
+      }
+      expect(queue.data?.[threadId]?.map((message) => message.id)).toEqual(['queued-race'])
+    } finally {
+      if (release) release()
+      await held
+    }
+  })
+
   it('blocks only the exact state-db archived thread without affecting an active neighbor', async () => {
     const codexHome = await mkdtemp(join(tmpdir(), 'codex-mobile-rpc-archived-exact-'))
     process.env.CODEX_HOME = codexHome
@@ -2247,14 +2984,43 @@ describe('POST /codex-api/rpc guarded user turns', () => {
     expect(rpc).toHaveBeenCalledWith('thread/read', { threadId: 'thread-active' })
   })
 
+  it('discards a thread/read response when the thread is archived during the RPC', async () => {
+    const codexHome = await mkdtemp(join(tmpdir(), 'codex-mobile-rpc-archive-during-read-'))
+    process.env.CODEX_HOME = codexHome
+    disposers.push(() => rm(codexHome, { recursive: true, force: true }))
+    const stateDbPath = join(codexHome, 'state_5.sqlite')
+    expect(spawnSync('sqlite3', [stateDbPath, [
+      'CREATE TABLE threads (id TEXT PRIMARY KEY, archived INTEGER);',
+      "INSERT INTO threads (id, archived) VALUES ('thread-racing-archive', 0);",
+    ].join(' ')], { encoding: 'utf8' }).status).toBe(0)
+    const middleware = createCodexBridgeMiddleware()
+    const shared = sharedBridgeForTest()
+    const rpc = vi.spyOn(shared.appServer as unknown as {
+      rpc(method: string, params: unknown): Promise<unknown>
+    }, 'rpc').mockImplementation(async (method) => {
+      if (method === 'thread/read') {
+        expect(spawnSync('sqlite3', [stateDbPath,
+          "UPDATE threads SET archived = 1 WHERE id = 'thread-racing-archive';",
+        ], { encoding: 'utf8' }).status).toBe(0)
+      }
+      return { thread: { id: 'thread-racing-archive', turns: [] } }
+    })
+    const port = await listenWithMiddleware(middleware)
+
+    const response = await fetch(`http://127.0.0.1:${port}/codex-api/rpc`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ method: 'thread/read', params: { threadId: 'thread-racing-archive' } }),
+    })
+
+    expect(response.status).toBe(409)
+    expect(rpc).toHaveBeenCalledWith('thread/read', { threadId: 'thread-racing-archive' })
+  })
+
   it.each([
-    'thread/archive',
-    'thread/unarchive',
     'thread/fork',
     'thread/rollback',
     'thread/name/set',
-    'thread/goal/set',
-    'thread/goal/clear',
     'thread/start-turn',
     'turn/interrupt',
   ])('returns 409 without dispatching %s while a direct CLI owns the thread', async (method) => {
@@ -2297,6 +3063,29 @@ describe('POST /codex-api/rpc guarded user turns', () => {
       includeTurns: true,
     })
     expect(rpc).not.toHaveBeenCalledWith(method, expect.anything())
+  })
+
+  it.each([
+    'thread/archive',
+    'thread/unarchive',
+    'thread/goal/set',
+    'thread/goal/clear',
+  ])('rejects forbidden raw lifecycle RPC %s without dispatch', async (method) => {
+    const middleware = createCodexBridgeMiddleware()
+    const shared = sharedBridgeForTest()
+    const rpc = vi.spyOn(shared.appServer as unknown as {
+      rpc(method: string, params: unknown): Promise<unknown>
+    }, 'rpc')
+    const port = await listenWithMiddleware(middleware)
+
+    const response = await fetch(`http://127.0.0.1:${port}/codex-api/rpc`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ method, params: { threadId: 'thread-forbidden' } }),
+    })
+
+    expect(response.status).toBe(403)
+    expect(rpc).not.toHaveBeenCalled()
   })
 
   it('returns 409 when a cross-process turn-start claim already exists', async () => {
@@ -2784,6 +3573,7 @@ describe('POST /codex-api/rpc guarded user turns', () => {
         interruptible: false,
         source: 'external-session-writer',
       })
+    vi.spyOn(shared.runtimeProbe, 'inspectWriterEvidence').mockResolvedValue(false)
     const rpc = vi.spyOn(shared.appServer as unknown as {
       rpc(method: string, params: unknown): Promise<unknown>
     }, 'rpc').mockImplementation(async (method) => {
@@ -2868,6 +3658,139 @@ describe('POST /codex-api/rpc guarded user turns', () => {
       turnId: 'turn-mobile-losing',
     })
     expect(inspect).toHaveBeenCalledTimes(2)
+  })
+
+  it('does not interrupt the mobile turn when the post-start probe observes that exact turn', async () => {
+    const middleware = createCodexBridgeMiddleware()
+    const shared = sharedBridgeForTest()
+    vi.spyOn(shared.appServer, 'getPid').mockReturnValue(4242)
+    const inspect = vi.spyOn(shared.runtimeProbe, 'inspect')
+      .mockResolvedValueOnce({ state: 'idle' })
+      .mockResolvedValueOnce({
+        state: 'running',
+        turnId: 'turn-mobile-owned',
+        interruptible: false,
+        source: 'external-session-writer',
+      })
+    vi.spyOn(shared.runtimeProbe, 'inspectWriterEvidence').mockResolvedValue(false)
+    const rpc = vi.spyOn(shared.appServer as unknown as {
+      rpc(method: string, params: unknown): Promise<unknown>
+    }, 'rpc').mockImplementation(async (method) => {
+      if (method === 'thread/read') return {
+        thread: { id: 'thread-mobile-owned', path: '/home/user/.codex/sessions/mobile.jsonl', turns: [] },
+      }
+      if (method === 'turn/start') return { turn: { id: 'turn-mobile-owned' } }
+      return {}
+    })
+    const port = await listenWithMiddleware(middleware)
+
+    const response = await fetch(`http://127.0.0.1:${port}/codex-api/rpc`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        method: 'turn/start',
+        params: { threadId: 'thread-mobile-owned', input: [{ type: 'text', text: 'continue' }] },
+      }),
+    })
+
+    expect(response.status).toBe(200)
+    expect(rpc).not.toHaveBeenCalledWith('turn/interrupt', expect.anything())
+    expect(inspect).toHaveBeenCalledTimes(2)
+  })
+
+  it('interrupts a matching mobile turn when a foreign writable descriptor appears after start', async () => {
+    const middleware = createCodexBridgeMiddleware()
+    const shared = sharedBridgeForTest()
+    vi.spyOn(shared.appServer, 'getPid').mockReturnValue(4242)
+    vi.spyOn(shared.runtimeProbe, 'inspect')
+      .mockResolvedValueOnce({ state: 'idle' })
+      .mockResolvedValueOnce({
+        state: 'running', turnId: 'turn-mobile-contended', interruptible: false, source: 'external-session-writer',
+      })
+    vi.mocked(shared.runtimeProbe.inspectWriterEvidence)
+      .mockResolvedValueOnce(false)
+      .mockResolvedValueOnce(true)
+    const rpc = vi.spyOn(shared.appServer as unknown as {
+      rpc(method: string, params: unknown): Promise<unknown>
+    }, 'rpc').mockImplementation(async (method) => {
+      if (method === 'thread/read') return {
+        thread: { id: 'thread-mobile-contended', path: '/tmp/mobile-contended.jsonl', turns: [] },
+      }
+      if (method === 'turn/start') return { turn: { id: 'turn-mobile-contended' } }
+      return {}
+    })
+    const port = await listenWithMiddleware(middleware)
+
+    const response = await fetch(`http://127.0.0.1:${port}/codex-api/rpc`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        method: 'turn/start',
+        params: { threadId: 'thread-mobile-contended', input: [{ type: 'text', text: 'race' }] },
+      }),
+    })
+
+    expect(response.status).toBe(409)
+    expect(rpc).toHaveBeenCalledWith('turn/interrupt', {
+      threadId: 'thread-mobile-contended', turnId: 'turn-mobile-contended',
+    })
+  })
+
+  it('does not repeat writer evidence scanning after runtime already confirms a writer', async () => {
+    const middleware = createCodexBridgeMiddleware()
+    const shared = sharedBridgeForTest()
+    vi.spyOn(shared.appServer, 'getPid').mockReturnValue(4242)
+    vi.spyOn(shared.runtimeProbe, 'inspect').mockResolvedValue({
+      state: 'running',
+      turnId: 'turn-cli-confirmed',
+      interruptible: false,
+      source: 'external-session-writer',
+    })
+    const inspectWriterEvidence = vi.spyOn(shared.runtimeProbe, 'inspectWriterEvidence')
+    const rpc = vi.spyOn(shared.appServer as unknown as {
+      rpc(method: string, params: unknown): Promise<unknown>
+    }, 'rpc').mockImplementation(async (method) => method === 'thread/read'
+      ? { thread: { id: 'thread-cli-confirmed', path: '/home/user/.codex/sessions/confirmed.jsonl', turns: [] } }
+      : {})
+    const port = await listenWithMiddleware(middleware)
+
+    const response = await fetch(`http://127.0.0.1:${port}/codex-api/rpc`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        method: 'turn/start',
+        params: { threadId: 'thread-cli-confirmed', input: [{ type: 'text', text: 'must queue' }] },
+      }),
+    })
+
+    expect(response.status).toBe(409)
+    expect(inspectWriterEvidence).not.toHaveBeenCalled()
+    expect(rpc).not.toHaveBeenCalledWith('turn/start', expect.anything())
+  })
+
+  it('blocks an otherwise idle rollout while a foreign writable descriptor is present', async () => {
+    const middleware = createCodexBridgeMiddleware()
+    const shared = sharedBridgeForTest()
+    vi.spyOn(shared.appServer, 'getPid').mockReturnValue(4242)
+    vi.spyOn(shared.runtimeProbe, 'inspect').mockResolvedValue({ state: 'idle' })
+    vi.spyOn(shared.runtimeProbe, 'inspectWriterEvidence').mockResolvedValue(true)
+    const rpc = vi.spyOn(shared.appServer as unknown as {
+      rpc(method: string, params: unknown): Promise<unknown>
+    }, 'rpc').mockImplementation(async (method) => method === 'thread/read'
+      ? { thread: { id: 'thread-idle-cli', path: '/home/user/.codex/sessions/idle-cli.jsonl', turns: [] } }
+      : {})
+    const port = await listenWithMiddleware(middleware)
+
+    const response = await fetch(`http://127.0.0.1:${port}/codex-api/rpc`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        method: 'turn/start',
+        params: { threadId: 'thread-idle-cli', input: [{ type: 'text', text: 'must queue' }] },
+      }),
+    })
+
+    expect(response.status).toBe(409)
+    expect(rpc).not.toHaveBeenCalledWith('turn/start', expect.anything())
   })
 })
 

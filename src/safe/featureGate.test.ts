@@ -8,10 +8,10 @@ describe('safe feature gate', () => {
     expect(isAllowedRpcMethod('turn/start')).toBe(true)
   })
 
-  it('allows only the three exact native Goal RPC methods', () => {
+  it('allows only the read-only native Goal RPC method', () => {
     expect(isAllowedRpcMethod('thread/goal/get')).toBe(true)
-    expect(isAllowedRpcMethod('thread/goal/set')).toBe(true)
-    expect(isAllowedRpcMethod('thread/goal/clear')).toBe(true)
+    expect(isAllowedRpcMethod('thread/goal/set')).toBe(false)
+    expect(isAllowedRpcMethod('thread/goal/clear')).toBe(false)
     expect(isAllowedRpcMethod('thread/goal/*')).toBe(false)
     expect(isAllowedRpcMethod('thread/goal/get/metadata')).toBe(false)
     expect(isAllowedRpcMethod('thread/goal/delete')).toBe(false)

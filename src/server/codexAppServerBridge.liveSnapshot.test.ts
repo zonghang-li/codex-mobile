@@ -39,6 +39,8 @@ describe('external live snapshot RPC preparation', () => {
       params: {
         threadId: 'thread-1',
         input: [{ type: 'text', text: 'steer' }],
+        approvalPolicy: 'never',
+        sandboxPolicy: { type: 'dangerFullAccess' },
       },
       skipSessionSkillEnrichment: false,
       forceFreshThreadList: false,
