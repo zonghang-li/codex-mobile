@@ -1,8 +1,13 @@
-import { mkdtemp, readFile, rm, utimes, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, rm, utimes, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { describe, expect, it } from 'vitest'
-import { mutateJsonStateFile } from './atomicJsonState'
+import {
+  isProcessOwnerAlive,
+  mutateJsonStateFile,
+  readProcessStartIdentity,
+  recoverAbandonedLock,
+} from './atomicJsonState'
 
 function deferred() {
   let resolve!: () => void
@@ -73,6 +78,50 @@ describe('mutateJsonStateFile', () => {
       releaseFirst.resolve()
       await rm(root, { recursive: true, force: true })
     }
+  })
+
+  it('recovers an abandoned main lock even when its recovery gate was abandoned', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'codex-mobile-json-state-abandoned-recovery-'))
+    const lockPath = join(root, 'state.json.lock')
+    const recoveryPath = `${lockPath}.recovery`
+    const old = new Date(Date.now() - 60_000)
+
+    try {
+      await mkdir(lockPath)
+      await writeFile(join(lockPath, 'owner.json'), JSON.stringify({
+        pid: 2_147_483_647,
+        token: 'dead-main',
+        processStartIdentity: 'dead-main-start',
+      }))
+      await mkdir(recoveryPath)
+      await writeFile(join(recoveryPath, 'owner.json'), JSON.stringify({
+        pid: 2_147_483_647,
+        token: 'dead-recovery',
+        processStartIdentity: 'dead-recovery-start',
+      }))
+      await utimes(lockPath, old, old)
+      await utimes(recoveryPath, old, old)
+
+      await recoverAbandonedLock(lockPath)
+
+      await expect(readFile(join(lockPath, 'owner.json'), 'utf8')).rejects.toThrow()
+      await expect(readFile(join(recoveryPath, 'owner.json'), 'utf8')).rejects.toThrow()
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('distinguishes a reused live pid from the original process owner', async () => {
+    const processStartIdentity = await readProcessStartIdentity(process.pid)
+    expect(processStartIdentity).toBeTruthy()
+    await expect(isProcessOwnerAlive({
+      pid: process.pid,
+      processStartIdentity: `${processStartIdentity}-different`,
+    })).resolves.toBe(false)
+    await expect(isProcessOwnerAlive({
+      pid: process.pid,
+      processStartIdentity,
+    })).resolves.toBe(true)
   })
 
   it('does not replace malformed existing state with an empty snapshot', async () => {

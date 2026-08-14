@@ -437,6 +437,106 @@ describe('existing thread loading', () => {
       .toEqual(['queued-during-subscribe'])
   })
 
+  it('does not let a ready recovery snapshot resurrect an optimistic queue removal', async () => {
+    installTestWindow()
+    let notificationHandler: ((notification: { method: string; params?: unknown }) => void) | undefined
+    gatewayMocks.subscribeCodexNotifications.mockImplementation((handler) => {
+      notificationHandler = handler as typeof notificationHandler
+      return vi.fn()
+    })
+    gatewayMocks.getPendingServerRequests.mockResolvedValue([])
+    gatewayMocks.getThreadGroupsPage.mockResolvedValue({
+      groups: [{ projectName: 'Project', threads: [thread('thread-1', '/tmp/project')] }],
+      nextCursor: null,
+    })
+    const queued = {
+      id: 'queued-stale-ready',
+      text: 'must stay removed',
+      imageUrls: [],
+      skills: [],
+      fileAttachments: [],
+      collaborationMode: 'default' as const,
+      model: 'gpt-test',
+      effort: '' as const,
+    }
+    gatewayMocks.getThreadQueueSnapshot.mockResolvedValueOnce({
+      state: { 'thread-1': [queued] },
+      revision: 1,
+    })
+    const staleSnapshot = deferred<{ state: Record<string, typeof queued[]>; revision: number }>()
+    gatewayMocks.getThreadQueueSnapshot.mockReturnValueOnce(staleSnapshot.promise)
+    const removeResponse = deferred<number>()
+    gatewayMocks.removeThreadQueuedMessage.mockReturnValue(removeResponse.promise)
+    const state = useDesktopState()
+    state.primeSelectedThread('thread-1')
+    await state.refreshAll({ includeSelectedThreadMessages: false })
+    state.startPolling()
+    notificationHandler?.({ method: 'ready' })
+    await flushMicrotasks()
+
+    const removal = state.removeQueuedMessage(queued.id)
+    await flushMicrotasks()
+    staleSnapshot.resolve({ state: { 'thread-1': [queued] }, revision: 1 })
+    await flushMicrotasks()
+
+    expect(state.selectedThreadQueuedMessages.value).toEqual([])
+    removeResponse.resolve(2)
+    await removal
+    state.stopPolling()
+  })
+
+  it('invalidates an in-flight ready queue snapshot when polling stops', async () => {
+    installTestWindow()
+    let notificationHandler: ((notification: { method: string; params?: unknown }) => void) | undefined
+    gatewayMocks.subscribeCodexNotifications.mockImplementation((handler) => {
+      notificationHandler = handler as typeof notificationHandler
+      return vi.fn()
+    })
+    gatewayMocks.getPendingServerRequests.mockResolvedValue([])
+    gatewayMocks.getThreadGroupsPage.mockResolvedValue({ groups: [], nextCursor: null })
+    gatewayMocks.getThreadQueueSnapshot.mockResolvedValueOnce({ state: {}, revision: 1 })
+    const staleSnapshot = deferred<{
+      state: Record<string, Array<{
+        id: string
+        text: string
+        imageUrls: string[]
+        skills: never[]
+        fileAttachments: never[]
+        collaborationMode: 'default'
+        model: string
+        effort: ''
+      }>>
+      revision: number
+    }>()
+    gatewayMocks.getThreadQueueSnapshot.mockReturnValueOnce(staleSnapshot.promise)
+    const state = useDesktopState()
+    state.primeSelectedThread('thread-1')
+    await state.refreshAll({ includeSelectedThreadMessages: false })
+    state.startPolling()
+    notificationHandler?.({ method: 'ready' })
+    await flushMicrotasks()
+    state.stopPolling()
+
+    staleSnapshot.resolve({
+      state: {
+        'thread-1': [{
+          id: 'queued-after-stop',
+          text: 'must not reappear',
+          imageUrls: [],
+          skills: [],
+          fileAttachments: [],
+          collaborationMode: 'default',
+          model: 'gpt-test',
+          effort: '',
+        }],
+      },
+      revision: 2,
+    })
+    await flushMicrotasks()
+
+    expect(state.selectedThreadQueuedMessages.value).toEqual([])
+  })
+
   it('reads an existing thread without resuming it on selection or forced refresh', async () => {
     installTestWindow()
     gatewayMocks.getThreadDetail.mockResolvedValue(idleDetail())
@@ -7090,6 +7190,24 @@ describe('external runtime ownership', () => {
       expect.objectContaining({ text: 'retry until durable' }),
     ])
     expect(state.error.value).toBe('')
+  })
+
+  it('cancels ambiguous append retries when polling stops', async () => {
+    const { state } = await setupExternalRuntimeState()
+    gatewayMocks.getThreadDetail.mockResolvedValue(externalDetail())
+    await state.loadMessages('thread-1')
+    gatewayMocks.appendThreadQueuedMessage.mockRejectedValue(new TypeError('backend unavailable'))
+    gatewayMocks.getThreadQueueAppendReceipt.mockRejectedValue(new TypeError('receipt unavailable'))
+
+    const send = state.sendMessageToSelectedThread('cancel retry on stop', [], [], 'steer')
+    await flushMicrotasks()
+    await vi.advanceTimersByTimeAsync(250)
+    const callsAtStop = gatewayMocks.appendThreadQueuedMessage.mock.calls.length
+    state.stopPolling()
+    await vi.advanceTimersByTimeAsync(10_000)
+
+    expect(gatewayMocks.appendThreadQueuedMessage).toHaveBeenCalledTimes(callsAtStop)
+    await send
   })
 
   it('keeps an optimistic queue row while its append is still in flight', async () => {

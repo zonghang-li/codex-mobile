@@ -7,6 +7,7 @@ import {
   BackendQueueProcessor,
   appendThreadQueuedMessage,
   handleThreadQueueStoreChanged,
+  withThreadStartClaim,
   mergeSessionSkillInputsIntoTurns,
   parseAutomationToml,
   prepareThreadRpcResultForClient,
@@ -625,6 +626,57 @@ describe('thread session skill recovery', () => {
 })
 
 describe('backend queue scheduling', () => {
+  it('serializes competing turn starts for the same thread', async () => {
+    const originalCodexHome = process.env.CODEX_HOME
+    const codexHome = await mkdtemp(join(tmpdir(), 'codex-mobile-thread-start-claim-'))
+    process.env.CODEX_HOME = codexHome
+    const firstEntered = deferred<void>()
+    const releaseFirst = deferred<void>()
+
+    try {
+      const first = withThreadStartClaim('thread-start-claim', async () => {
+        firstEntered.resolve()
+        await releaseFirst.promise
+      })
+      await firstEntered.promise
+
+      await expect(withThreadStartClaim('thread-start-claim', async () => undefined))
+        .rejects.toMatchObject({ name: 'ThreadStartClaimConflictError' })
+      releaseFirst.resolve()
+      await first
+    } finally {
+      releaseFirst.resolve()
+      if (originalCodexHome === undefined) delete process.env.CODEX_HOME
+      else process.env.CODEX_HOME = originalCodexHome
+      await rm(codexHome, { recursive: true, force: true })
+    }
+  })
+
+  it('reclaims a thread-start claim whose pid now belongs to another process identity', async () => {
+    const originalCodexHome = process.env.CODEX_HOME
+    const codexHome = await mkdtemp(join(tmpdir(), 'codex-mobile-thread-start-reused-pid-'))
+    process.env.CODEX_HOME = codexHome
+
+    try {
+      await writeFile(join(codexHome, '.codex-global-state.json'), JSON.stringify({
+        'thread-start-claims': {
+          'thread-reused-pid': {
+            ownerId: 'dead-owner',
+            ownerPid: process.ppid,
+            ownerProcessStartIdentity: 'different-process-start',
+          },
+        },
+      }))
+
+      await expect(withThreadStartClaim('thread-reused-pid', async () => 'acquired'))
+        .resolves.toBe('acquired')
+    } finally {
+      if (originalCodexHome === undefined) delete process.env.CODEX_HOME
+      else process.env.CODEX_HOME = originalCodexHome
+      await rm(codexHome, { recursive: true, force: true })
+    }
+  })
+
   it('schedules local draining when another process commits queue changes', () => {
     const scheduleThreadQueueDrain = vi.fn()
 
@@ -1031,6 +1083,154 @@ describe('backend queue scheduling', () => {
       }
       expect(persisted['thread-queue-state']?.['thread-reorder']?.map((item) => item.id))
         .toEqual(['queued-2', 'queued-1', 'queued-3'])
+    } finally {
+      if (originalCodexHome === undefined) delete process.env.CODEX_HOME
+      else process.env.CODEX_HOME = originalCodexHome
+      await rm(codexHome, { recursive: true, force: true })
+    }
+  })
+
+  it('does not let a blocked unattempted claim freeze later queue reordering', async () => {
+    const originalCodexHome = process.env.CODEX_HOME
+    const codexHome = await mkdtemp(join(tmpdir(), 'codex-mobile-queue-blocked-reorder-'))
+    process.env.CODEX_HOME = codexHome
+    const processor = new BackendQueueProcessor({
+      rpc: vi.fn(async (method: string) => (
+        method === 'thread/read'
+          ? { thread: { id: 'thread-blocked-reorder', turns: [{ id: 'running', status: 'inProgress', items: [] }] } }
+          : {}
+      )),
+      onNotification: () => () => undefined,
+    } as never)
+    const message = (id: string) => ({
+      id,
+      text: id,
+      imageUrls: [],
+      skills: [],
+      fileAttachments: [],
+      collaborationMode: 'default' as const,
+      model: 'gpt-test',
+      effort: '' as const,
+    })
+
+    try {
+      await appendThreadQueuedMessage('thread-blocked-reorder', message('queued-first'))
+      await appendThreadQueuedMessage('thread-blocked-reorder', message('queued-second'))
+      await processor.processThreadQueue('thread-blocked-reorder')
+      await reorderThreadQueuedMessages('thread-blocked-reorder', ['queued-second', 'queued-first'])
+
+      await expect((processor as unknown as {
+        claimNextQueuedTurn: (threadId: string) => Promise<unknown>
+      }).claimNextQueuedTurn('thread-blocked-reorder')).resolves.toMatchObject({
+        message: { id: 'queued-second' },
+      })
+    } finally {
+      processor.dispose()
+      if (originalCodexHome === undefined) delete process.env.CODEX_HOME
+      else process.env.CODEX_HOME = originalCodexHome
+      await rm(codexHome, { recursive: true, force: true })
+    }
+  })
+
+  it('does not freeze queue order when a competing thread start claim wins', async () => {
+    const originalCodexHome = process.env.CODEX_HOME
+    const codexHome = await mkdtemp(join(tmpdir(), 'codex-mobile-queue-start-conflict-reorder-'))
+    process.env.CODEX_HOME = codexHome
+    const releaseStartClaim = deferred<void>()
+    const startClaimEntered = deferred<void>()
+    const heldStartClaim = withThreadStartClaim('thread-start-conflict', async () => {
+      startClaimEntered.resolve()
+      await releaseStartClaim.promise
+    })
+    await startClaimEntered.promise
+    const processor = new BackendQueueProcessor({
+      rpc: vi.fn(async (method: string) => (
+        method === 'thread/read'
+          ? { thread: { id: 'thread-start-conflict', turns: [] } }
+          : method === 'config/read'
+            ? { config: { model: 'gpt-test' } }
+            : {}
+      )),
+      onNotification: () => () => undefined,
+    } as never)
+    const message = (id: string) => ({
+      id,
+      text: id,
+      imageUrls: [],
+      skills: [],
+      fileAttachments: [],
+      collaborationMode: 'default' as const,
+      model: 'gpt-test',
+      effort: '' as const,
+    })
+
+    try {
+      await appendThreadQueuedMessage('thread-start-conflict', message('queued-first'))
+      await appendThreadQueuedMessage('thread-start-conflict', message('queued-second'))
+      await processor.processThreadQueue('thread-start-conflict')
+      await reorderThreadQueuedMessages('thread-start-conflict', ['queued-second', 'queued-first'])
+
+      await expect((processor as unknown as {
+        claimNextQueuedTurn: (threadId: string) => Promise<unknown>
+      }).claimNextQueuedTurn('thread-start-conflict')).resolves.toMatchObject({
+        message: { id: 'queued-second' },
+      })
+    } finally {
+      releaseStartClaim.resolve()
+      await heldStartClaim
+      processor.dispose()
+      if (originalCodexHome === undefined) delete process.env.CODEX_HOME
+      else process.env.CODEX_HOME = originalCodexHome
+      await rm(codexHome, { recursive: true, force: true })
+    }
+  })
+
+  it('records and broadcasts only queue threads whose rows actually changed', async () => {
+    const originalCodexHome = process.env.CODEX_HOME
+    const codexHome = await mkdtemp(join(tmpdir(), 'codex-mobile-queue-changed-ids-'))
+    process.env.CODEX_HOME = codexHome
+    const message = (id: string) => ({
+      id,
+      text: id,
+      imageUrls: [],
+      skills: [],
+      fileAttachments: [],
+      collaborationMode: 'default' as const,
+      model: 'gpt-test',
+      effort: '' as const,
+    })
+
+    try {
+      await appendThreadQueuedMessage('thread-a', message('queued-a'))
+      await appendThreadQueuedMessage('thread-b', message('queued-b'))
+      await removeThreadQueuedMessage('thread-a', 'queued-a')
+      const statePath = join(codexHome, '.codex-global-state.json')
+      const afterRemove = JSON.parse(await readFile(statePath, 'utf8')) as {
+        'thread-queue-changed-thread-ids'?: string[]
+        'thread-queue-revision'?: number
+      }
+      expect(afterRemove['thread-queue-changed-thread-ids']).toEqual(['thread-a'])
+
+      const revision = afterRemove['thread-queue-revision']
+      const first = new BackendQueueProcessor({ onNotification: () => () => undefined } as never)
+      const second = new BackendQueueProcessor({ onNotification: () => () => undefined } as never)
+      try {
+        await (first as unknown as {
+          claimNextQueuedTurn: (threadId: string) => Promise<unknown>
+        }).claimNextQueuedTurn('thread-b')
+        await (second as unknown as {
+          claimNextQueuedTurn: (threadId: string) => Promise<unknown>
+        }).claimNextQueuedTurn('thread-b')
+        const afterClaims = JSON.parse(await readFile(statePath, 'utf8')) as {
+          'thread-queue-changed-thread-ids'?: string[]
+          'thread-queue-revision'?: number
+        }
+        expect(afterClaims['thread-queue-revision']).toBe(revision)
+        expect(afterClaims['thread-queue-changed-thread-ids']).toEqual([])
+      } finally {
+        first.dispose()
+        second.dispose()
+      }
     } finally {
       if (originalCodexHome === undefined) delete process.env.CODEX_HOME
       else process.env.CODEX_HOME = originalCodexHome

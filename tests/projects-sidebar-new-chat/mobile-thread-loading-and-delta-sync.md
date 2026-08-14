@@ -46,7 +46,9 @@ Mobile sidebar and conversation loading use metadata-only sidebar pages, active-
 32. During cold startup, mutate the durable queue after the first queue GET but before the notification stream reports ready; confirm the ready recovery snapshot shows the new queue state and does not resurrect an older revision.
 33. Run two service processes against the same temporary CODEX_HOME, append/reorder/remove queue rows concurrently, and terminate one process after its durable append but before local scheduling; confirm no rows are lost or duplicated and the surviving process drains the committed row.
 34. Submit an inverse-arrival queue row whose declared predecessor never reaches the server; confirm it waits for the bounded dependency grace period and then becomes eligible instead of remaining stuck forever.
-35. Repeat the visible checks in dark theme.
+35. Race a direct mobile turn start and a backend queue drain for the same idle thread from separate service processes; confirm exactly one start reaches app-server, the loser remains queued, and later queue reordering still controls execution order.
+36. Disconnect the backend during an ambiguous queue append, then stop polling or switch account; confirm append/receipt retries use bounded backoff, stop immediately with the lifecycle reset, and release the optimistic row/upload lease.
+37. Repeat the visible checks in dark theme.
 
 #### Expected Results
 - Cold sidebar load and background sidebar pagination remain metadata-only.
@@ -82,6 +84,8 @@ Mobile sidebar and conversation loading use metadata-only sidebar pages, active-
 - Queue mutations remain serialized across service/CLI processes, live owners cannot be lease-stolen during slow RPC work, and a surviving service schedules rows committed by another process.
 - Managed attachments referenced by durable queue rows survive service restart and upload-reaper TTL until their queued turn actually starts or the row is removed.
 - Missing client-order predecessors delay execution only for the bounded grace period, while received predecessors still preserve submission order.
+- Direct and queued starts share one cross-process per-thread claim through app-server acceptance, so simultaneous idle inspections cannot create competing writers.
+- Ambiguous append recovery remains idempotent but uses bounded exponential backoff and cancels on polling/account lifecycle reset.
 - The behavior is readable and stable in light and dark themes.
 
 #### Rollback/Cleanup

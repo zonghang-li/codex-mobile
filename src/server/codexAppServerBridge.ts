@@ -58,7 +58,11 @@ import {
 } from './threadTextPage.js'
 import { ThreadTerminalManager } from './terminalManager.js'
 import { getSpawnInvocation } from '../utils/commandInvocation.js'
-import { isProcessAlive, mutateJsonStateFile } from '../utils/atomicJsonState.js'
+import {
+  isProcessOwnerAlive,
+  mutateJsonStateFile,
+  readProcessStartIdentity,
+} from '../utils/atomicJsonState.js'
 import {
   resolveCodexCommand,
   resolveRipgrepCommand,
@@ -7736,9 +7740,12 @@ const THREAD_QUEUE_RECEIPTS_KEY = 'thread-queue-receipts'
 const THREAD_QUEUE_PROCESSING_KEY = 'thread-queue-processing'
 const THREAD_QUEUE_REVISION_KEY = 'thread-queue-revision'
 const THREAD_QUEUE_CHANGED_THREAD_IDS_KEY = 'thread-queue-changed-thread-ids'
+const THREAD_QUEUE_WRITER_ID_KEY = 'thread-queue-writer-id'
+const THREAD_START_CLAIMS_KEY = 'thread-start-claims'
 const THREAD_QUEUE_RECEIPT_LIMIT = 2048
 const THREAD_QUEUE_DEPENDENCY_WAIT_MS = 30_000
 const threadQueueRevisionListeners = new Set<(event: { threadIds: string[]; revision: number }) => void>()
+const threadQueueWriterId = randomUUID()
 
 function subscribeThreadQueueRevisions(
   listener: (event: { threadIds: string[]; revision: number }) => void,
@@ -7774,6 +7781,7 @@ type ThreadQueueProcessingState = Record<string, {
   attempted: boolean
   ownerId?: string
   ownerPid?: number
+  ownerProcessStartIdentity?: string
   leaseExpiresAt?: number
 }>
 
@@ -7790,6 +7798,12 @@ type ThreadQueueStateUpdate<T> = {
   nextProcessing?: ThreadQueueProcessingState
   result: T
 }
+
+type ThreadStartClaimState = Record<string, {
+  ownerId: string
+  ownerPid: number
+  ownerProcessStartIdentity?: string
+}>
 
 type ResolvedCollaborationModeSettings = {
   model: string
@@ -7937,6 +7951,9 @@ function normalizeThreadQueueProcessingState(value: unknown): ThreadQueueProcess
       ...(typeof entry?.ownerPid === 'number' && Number.isSafeInteger(entry.ownerPid) && entry.ownerPid > 0
         ? { ownerPid: entry.ownerPid }
         : {}),
+      ...(readNonEmptyString(entry?.ownerProcessStartIdentity)
+        ? { ownerProcessStartIdentity: readNonEmptyString(entry?.ownerProcessStartIdentity) }
+        : {}),
       ...(typeof entry?.leaseExpiresAt === 'number' && Number.isFinite(entry.leaseExpiresAt)
         ? { leaseExpiresAt: entry.leaseExpiresAt }
         : {}),
@@ -8029,6 +8046,7 @@ async function readThreadQueueStore(): Promise<{
   processing: ThreadQueueProcessingState
   revision: number
   changedThreadIds: string[]
+  writerId: string
 }> {
   const payload = await readCodexGlobalStateSnapshot()
   const rawRevision = payload[THREAD_QUEUE_REVISION_KEY]
@@ -8040,6 +8058,7 @@ async function readThreadQueueStore(): Promise<{
       ? rawRevision
       : 0,
     changedThreadIds: normalizeStringArray(payload[THREAD_QUEUE_CHANGED_THREAD_IDS_KEY]),
+    writerId: readNonEmptyString(payload[THREAD_QUEUE_WRITER_ID_KEY]),
   }
 }
 
@@ -8098,14 +8117,15 @@ async function withThreadQueueStateUpdate<T>(
       nextProcessing = processing,
       result,
     } = await update(currentState, receipts, processing, revision)
-    const nextRevision = revision + 1
-    writeThreadQueueStoreToPayload(payload, nextState, nextReceipts, nextProcessing, nextRevision)
     const changedThreadIds = [...new Set([...Object.keys(currentState), ...Object.keys(nextState)])]
+      .filter((threadId) => currentState[threadId] !== nextState[threadId])
+    const nextRevision = changedThreadIds.length > 0 ? revision + 1 : revision
+    writeThreadQueueStoreToPayload(payload, nextState, nextReceipts, nextProcessing, nextRevision)
     payload[THREAD_QUEUE_CHANGED_THREAD_IDS_KEY] = changedThreadIds
-    committedEvent = {
-      threadIds: changedThreadIds,
-      revision: nextRevision,
-    }
+    payload[THREAD_QUEUE_WRITER_ID_KEY] = threadQueueWriterId
+    committedEvent = changedThreadIds.length > 0
+      ? { threadIds: changedThreadIds, revision: nextRevision }
+      : null
     return result
   })
   if (committedEvent) {
@@ -8154,7 +8174,7 @@ export async function reorderThreadQueuedMessages(threadId: string, orderedMessa
   const normalizedThreadId = threadId.trim()
   if (!normalizedThreadId) return
   const order = new Map(normalizeStringArray(orderedMessageIds).map((messageId, index) => [messageId, index]))
-  await withThreadQueueStateUpdate((state) => {
+  await withThreadQueueStateUpdate((state, _receipts, processing) => {
     const queue = state[normalizedThreadId] ?? []
     const known = queue
       .filter((message) => order.has(message.id))
@@ -8168,11 +8188,16 @@ export async function reorderThreadQueuedMessages(threadId: string, orderedMessa
         ...(messages[index + 1]?.id ? { queueBeforeId: messages[index + 1].id } : {}),
       }
     })
+    const nextProcessing = { ...processing }
+    if (nextProcessing[normalizedThreadId]?.attempted !== true) {
+      delete nextProcessing[normalizedThreadId]
+    }
     return {
       nextState: {
         ...state,
         ...(reordered.length > 0 ? { [normalizedThreadId]: reordered } : {}),
       },
+      nextProcessing,
       result: undefined,
     }
   })
@@ -8185,7 +8210,7 @@ export async function appendThreadQueuedMessage(
 ): Promise<void> {
   const normalizedThreadId = threadId.trim()
   if (!normalizedThreadId) throw new Error('threadId is required')
-  await withThreadQueueStateUpdate((state, receipts) => {
+  await withThreadQueueStateUpdate((state, receipts, processing) => {
     const queue = state[normalizedThreadId] ?? []
     if (hasThreadQueueReceipt(receipts, normalizedThreadId, message.id)) {
       return { nextState: state, result: undefined }
@@ -8210,12 +8235,21 @@ export async function appendThreadQueuedMessage(
         }
       : message
     nextQueue.splice(insertIndex, 0, storedMessage)
+    const orderedQueue = orderQueuedMessagesByClientPosition(nextQueue)
+    const nextProcessing = { ...processing }
+    if (
+      nextProcessing[normalizedThreadId]?.attempted !== true
+      && nextProcessing[normalizedThreadId]?.messageId !== orderedQueue[0]?.id
+    ) {
+      delete nextProcessing[normalizedThreadId]
+    }
     return {
       nextState: {
         ...state,
-        [normalizedThreadId]: orderQueuedMessagesByClientPosition(nextQueue),
+        [normalizedThreadId]: orderedQueue,
       },
       nextReceipts,
+      nextProcessing,
       result: undefined,
     }
   })
@@ -8227,6 +8261,91 @@ export async function hasThreadQueueAppendReceipt(threadId: string, messageId: s
   if (!normalizedThreadId || !normalizedMessageId) return false
   const { receipts } = await readThreadQueueStore()
   return hasThreadQueueReceipt(receipts, normalizedThreadId, normalizedMessageId)
+}
+
+function normalizeThreadStartClaims(value: unknown): ThreadStartClaimState {
+  const record = asRecord(value)
+  if (!record) return {}
+  const claims: ThreadStartClaimState = {}
+  for (const [threadId, rawClaim] of Object.entries(record)) {
+    const claim = asRecord(rawClaim)
+    const ownerId = readNonEmptyString(claim?.ownerId)
+    const ownerPid = typeof claim?.ownerPid === 'number' && Number.isSafeInteger(claim.ownerPid)
+      ? claim.ownerPid
+      : 0
+    if (threadId.trim() && ownerId && ownerPid > 0) {
+      claims[threadId.trim()] = {
+        ownerId,
+        ownerPid,
+        ...(readNonEmptyString(claim?.ownerProcessStartIdentity)
+          ? { ownerProcessStartIdentity: readNonEmptyString(claim?.ownerProcessStartIdentity) }
+          : {}),
+      }
+    }
+  }
+  return claims
+}
+
+export async function withThreadStartClaim<T>(
+  threadId: string,
+  operation: () => Promise<T>,
+): Promise<T> {
+  const normalizedThreadId = threadId.trim()
+  if (!normalizedThreadId) return operation()
+  const ownerId = randomUUID()
+  const ownerProcessStartIdentity = await getServerProcessStartIdentity()
+  liveThreadStartClaimOwnerIds.add(ownerId)
+  let acquired: boolean
+  try {
+    acquired = await updateCodexGlobalState(async (payload) => {
+    const claims = normalizeThreadStartClaims(payload[THREAD_START_CLAIMS_KEY])
+    const existing = claims[normalizedThreadId]
+    const existingIsLive = existing
+      ? (
+          existing.ownerPid === process.pid
+            ? liveThreadStartClaimOwnerIds.has(existing.ownerId)
+            : await isProcessOwnerAlive({
+                pid: existing.ownerPid,
+                processStartIdentity: existing.ownerProcessStartIdentity,
+              })
+        )
+      : false
+    if (existingIsLive) return false
+    payload[THREAD_START_CLAIMS_KEY] = {
+      ...claims,
+      [normalizedThreadId]: {
+        ownerId,
+        ownerPid: process.pid,
+        ...(ownerProcessStartIdentity ? { ownerProcessStartIdentity } : {}),
+      },
+    }
+    payload[THREAD_QUEUE_CHANGED_THREAD_IDS_KEY] = []
+    return true
+    })
+  } catch (error) {
+    liveThreadStartClaimOwnerIds.delete(ownerId)
+    throw error
+  }
+  if (!acquired) {
+    liveThreadStartClaimOwnerIds.delete(ownerId)
+    const error = new Error('Cannot start a turn because another start is already in progress.')
+    error.name = 'ThreadStartClaimConflictError'
+    throw error
+  }
+
+  try {
+    return await operation()
+  } finally {
+    liveThreadStartClaimOwnerIds.delete(ownerId)
+    await updateCodexGlobalState((payload) => {
+      const claims = normalizeThreadStartClaims(payload[THREAD_START_CLAIMS_KEY])
+      if (claims[normalizedThreadId]?.ownerId !== ownerId) return
+      delete claims[normalizedThreadId]
+      if (Object.keys(claims).length > 0) payload[THREAD_START_CLAIMS_KEY] = claims
+      else delete payload[THREAD_START_CLAIMS_KEY]
+      payload[THREAD_QUEUE_CHANGED_THREAD_IDS_KEY] = []
+    })
+  }
 }
 
 function normalizeReasoningEffort(value: unknown): ReasoningEffort | '' {
@@ -10160,12 +10279,6 @@ export class BackendQueueProcessor {
     this.queueDrainTimersByThreadId.clear()
     this.queueDrainDueAtByThreadId.clear()
     this.processingThreadIds.clear()
-    for (const message of this.runtimeQueuedMessages.values()) {
-      this.releaseManagedMessage(message)
-    }
-    for (const message of this.activeManagedMessagesByThreadId.values()) {
-      this.releaseManagedMessage(message)
-    }
     this.runtimeQueuedMessages.clear()
     this.activeManagedMessagesByThreadId.clear()
   }
@@ -10257,8 +10370,8 @@ export class BackendQueueProcessor {
         ?? (hasManagedQueuedCapabilities(next.message) ? next.message : undefined)
       const beforeStart = await this.inspectQueuedTurn(next)
       if (beforeStart.accepted) {
-        await this.finalizeQueuedTurn(next)
-        if (managedMessage) {
+        const finalized = await this.finalizeQueuedTurn(next)
+        if (managedMessage && finalized) {
           this.runtimeQueuedMessages.delete(runtimeKey)
           this.releaseManagedMessage(managedMessage)
         }
@@ -10266,28 +10379,22 @@ export class BackendQueueProcessor {
         return
       }
       if (!beforeStart.canStart) {
+        await this.releaseUnattemptedQueuedTurnClaim(next)
         this.scheduleThreadQueueDrain(threadId)
         return
-      }
-      if (!(await this.markQueuedTurnAttempted(next))) {
-        this.scheduleThreadQueueDrain(threadId)
-        return
-      }
-      if (managedMessage) {
-        this.activeManagedMessagesByThreadId.set(threadId, managedMessage)
       }
       try {
-        await this.startQueuedTurn(next)
-        await this.finalizeQueuedTurn(next)
-        if (managedMessage) this.runtimeQueuedMessages.delete(runtimeKey)
+        await this.startQueuedTurn(next, managedMessage)
+        const finalized = await this.finalizeQueuedTurn(next)
+        if (managedMessage && finalized) this.runtimeQueuedMessages.delete(runtimeKey)
         if (await this.hasQueuedTurns(threadId)) {
           this.scheduleThreadQueueDrain(threadId)
         }
       } catch {
         const afterFailure = await this.inspectQueuedTurn(next)
         if (afterFailure.accepted) {
-          await this.finalizeQueuedTurn(next)
-          if (managedMessage) this.runtimeQueuedMessages.delete(runtimeKey)
+          const finalized = await this.finalizeQueuedTurn(next)
+          if (managedMessage && finalized) this.runtimeQueuedMessages.delete(runtimeKey)
         } else if (managedMessage && this.activeManagedMessagesByThreadId.get(threadId) === managedMessage) {
           this.activeManagedMessagesByThreadId.delete(threadId)
         }
@@ -10339,7 +10446,7 @@ export class BackendQueueProcessor {
   }
 
   private async claimNextQueuedTurn(threadId: string): Promise<BackendQueuedTurn | null> {
-    return withThreadQueueStateUpdate((state, receipts, processing) => {
+    return withThreadQueueStateUpdate(async (state, receipts, processing) => {
       const queue = state[threadId]
       if (!queue || queue.length === 0) {
         const nextProcessing = { ...processing }
@@ -10354,7 +10461,10 @@ export class BackendQueueProcessor {
           (
             existing.ownerPid === process.pid
               ? liveBackendQueueClaimOwnerIds.has(existing.ownerId)
-              : existing.ownerPid !== undefined && isProcessAlive(existing.ownerPid)
+              : existing.ownerPid !== undefined && await isProcessOwnerAlive({
+                  pid: existing.ownerPid,
+                  processStartIdentity: existing.ownerProcessStartIdentity,
+                })
           )
           || (existing.ownerPid === undefined && (existing.leaseExpiresAt ?? 0) > Date.now())
         )
@@ -10378,6 +10488,7 @@ export class BackendQueueProcessor {
         return { nextState: state, result: null }
       }
       const runtimeMessage = this.runtimeQueuedMessages.get(this.runtimeQueueKey(threadId, message.id))
+      const ownerProcessStartIdentity = await getServerProcessStartIdentity()
       const nextProcessing = {
         ...processing,
         [threadId]: {
@@ -10385,6 +10496,7 @@ export class BackendQueueProcessor {
           attempted: existing?.attempted === true,
           ownerId: this.claimOwnerId,
           ownerPid: process.pid,
+          ...(ownerProcessStartIdentity ? { ownerProcessStartIdentity } : {}),
           leaseExpiresAt: Date.now() + BackendQueueProcessor.CLAIM_LEASE_MS,
         },
       }
@@ -10422,23 +10534,19 @@ export class BackendQueueProcessor {
     })
   }
 
-  private async renewQueuedTurnClaim(turn: BackendQueuedTurn): Promise<boolean> {
-    return withThreadQueueStateUpdate((state, _receipts, processing) => {
+  private async releaseUnattemptedQueuedTurnClaim(turn: BackendQueuedTurn): Promise<void> {
+    await withThreadQueueStateUpdate((state, _receipts, processing) => {
       const current = processing[turn.threadId]
-      if (current?.messageId !== turn.message.id || current.ownerId !== turn.ownerId) {
-        return { nextState: state, result: false }
+      if (
+        current?.messageId !== turn.message.id
+        || current.ownerId !== turn.ownerId
+        || current.attempted === true
+      ) {
+        return { nextState: state, result: undefined }
       }
-      return {
-        nextState: state,
-        nextProcessing: {
-          ...processing,
-          [turn.threadId]: {
-            ...current,
-            leaseExpiresAt: Date.now() + BackendQueueProcessor.CLAIM_LEASE_MS,
-          },
-        },
-        result: true,
-      }
+      const nextProcessing = { ...processing }
+      delete nextProcessing[turn.threadId]
+      return { nextState: state, nextProcessing, result: undefined }
     })
   }
 
@@ -10587,23 +10695,32 @@ export class BackendQueueProcessor {
     return params
   }
 
-  private async startQueuedTurn(turn: BackendQueuedTurn): Promise<void> {
-    if (this.runtimeProbe) {
-      const guard = await guardThreadResumeAgainstExternalWriter(
-        this.appServer,
-        this.runtimeProbe,
-        this.appServer.getPid(),
-        turn.threadId,
-      )
-      if (guard.blocked) {
-        throw new Error('Cannot resume a task owned by another app-server process.')
+  private async startQueuedTurn(
+    turn: BackendQueuedTurn,
+    managedMessage?: StoredQueuedMessage,
+  ): Promise<void> {
+    await withThreadStartClaim(turn.threadId, async () => {
+      if (this.runtimeProbe) {
+        const guard = await guardThreadResumeAgainstExternalWriter(
+          this.appServer,
+          this.runtimeProbe,
+          this.appServer.getPid(),
+          turn.threadId,
+        )
+        if (guard.blocked) {
+          throw new Error('Cannot resume a task owned by another app-server process.')
+        }
       }
-    }
-    await this.appServer.rpc('thread/resume', { threadId: turn.threadId })
-    if (!(await this.renewQueuedTurnClaim(turn))) {
-      throw new Error('Queued turn claim was lost before turn/start.')
-    }
-    await this.appServer.rpc('turn/start', await this.buildQueuedTurnParams(turn))
+      const params = await this.buildQueuedTurnParams(turn)
+      await this.appServer.rpc('thread/resume', { threadId: turn.threadId })
+      if (!(await this.markQueuedTurnAttempted(turn))) {
+        throw new Error('Queued turn claim was lost before turn/start.')
+      }
+      if (managedMessage) {
+        this.activeManagedMessagesByThreadId.set(turn.threadId, managedMessage)
+      }
+      await this.appServer.rpc('turn/start', params)
+    })
   }
 }
 
@@ -10743,6 +10860,13 @@ type SharedBridgeState = {
 const SHARED_BRIDGE_KEY = '__codexRemoteSharedBridge__'
 const SHARED_BRIDGE_VERSION = 'experimental-api-v5-durable-queue'
 const liveBackendQueueClaimOwnerIds = new Set<string>()
+const liveThreadStartClaimOwnerIds = new Set<string>()
+let serverProcessStartIdentityPromise: Promise<string | null> | null = null
+
+function getServerProcessStartIdentity(): Promise<string | null> {
+  serverProcessStartIdentityPromise ??= readProcessStartIdentity(process.pid)
+  return serverProcessStartIdentityPromise
+}
 
 export function handleThreadQueueStoreChanged(
   processor: Pick<BackendQueueProcessor, 'scheduleThreadQueueDrain'>,
@@ -10756,10 +10880,15 @@ function watchThreadQueueStateFile(
   processor: Pick<BackendQueueProcessor, 'scheduleThreadQueueDrain'>,
 ): FSWatcher | null {
   const statePath = getCodexGlobalStatePath()
+  let lastObservedRevision = -1
   try {
     return watch(dirname(statePath), { persistent: false }, (_eventType, fileName) => {
       if (fileName !== null && String(fileName) !== basename(statePath)) return
-      void readThreadQueueStore().then(({ changedThreadIds, revision }) => {
+      void readThreadQueueStore().then(({ changedThreadIds, revision, writerId }) => {
+        if (writerId === threadQueueWriterId) return
+        if (revision <= lastObservedRevision) return
+        lastObservedRevision = revision
+        if (changedThreadIds.length === 0) return
         const event = { threadIds: changedThreadIds, revision }
         handleThreadQueueStoreChanged(processor, event)
       }).catch(() => {})
@@ -11577,20 +11706,6 @@ export function createCodexBridgeMiddleware(options: {
           const isPendingFirstTurn = body.method === 'turn/start'
             && requestThreadId.length > 0
             && hasPendingFirstTurn(requestThreadId)
-          if (body.method === 'turn/start' && requestThreadId) {
-            const inspection = await inspectThreadWriter(
-              appServer,
-              runtimeProbe,
-              appServer.getPid(),
-              requestThreadId,
-            )
-            if (
-              inspection.state !== 'idle'
-              && !(inspection.state === 'unmaterialized' && isPendingFirstTurn)
-            ) {
-              throw new Error('Cannot start a turn because task writer ownership is not idle.')
-            }
-          }
           const cachedThreadListResult = threadListCacheKey && !shouldBypassThreadListCache
             ? appServer.getCachedThreadListRpcResult(threadListCacheKey, threadListCacheSignature)
             : null
@@ -11632,16 +11747,35 @@ export function createCodexBridgeMiddleware(options: {
               }
             }
           } else {
-            rpcResult = await callRpcWithArchiveRecovery(
-              appServer,
-              body.method,
-              preparedRpcRequest.params,
-              runtimeProbe,
-              appServer.getPid(),
-              {
-                locallyCreatedFirstTurn: isPendingFirstTurn,
-              },
-            )
+            const callPreparedRpc = async () => {
+              if (body.method === 'turn/start' && requestThreadId) {
+                const inspection = await inspectThreadWriter(
+                  appServer,
+                  runtimeProbe,
+                  appServer.getPid(),
+                  requestThreadId,
+                )
+                if (
+                  inspection.state !== 'idle'
+                  && !(inspection.state === 'unmaterialized' && isPendingFirstTurn)
+                ) {
+                  throw new Error('Cannot start a turn because task writer ownership is not idle.')
+                }
+              }
+              return callRpcWithArchiveRecovery(
+                appServer,
+                body.method,
+                preparedRpcRequest.params,
+                runtimeProbe,
+                appServer.getPid(),
+                {
+                  locallyCreatedFirstTurn: isPendingFirstTurn,
+                },
+              )
+            }
+            rpcResult = body.method === 'turn/start' && requestThreadId
+              ? await withThreadStartClaim(requestThreadId, callPreparedRpc)
+              : await callPreparedRpc()
           }
           if (body.method === 'thread/start') {
             const startedThreadId = readNonEmptyString(asRecord(asRecord(rpcResult)?.thread)?.id)

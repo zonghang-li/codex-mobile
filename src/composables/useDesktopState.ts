@@ -2286,7 +2286,12 @@ export function useDesktopState() {
   let hasLoadedPersistedQueueState = false
   let queueMutationVersion = 0
   let queueRefreshRequestVersion = 0
+  let queueLifecycleGeneration = 0
   let latestQueueRevision = 0
+  const pendingQueueAppendRetryWaits = new Set<{
+    timer: ReturnType<typeof setTimeout>
+    resolve: (continueRetrying: boolean) => void
+  }>()
   const eventUnreadByThreadId = ref<Record<string, boolean>>({})
   const availableModelIds = ref<string[]>([])
   const availableCollaborationModes = ref<CollaborationModeOption[]>([
@@ -7584,18 +7589,42 @@ export function useDesktopState() {
       || (queueError instanceof Error && queueError.name === 'ThreadQueueAppendAmbiguousError')
   }
 
+  function queueAppendCancelledError(): Error {
+    const error = new Error('Queue append retry was cancelled.')
+    error.name = 'ThreadQueueAppendCancelledError'
+    return error
+  }
+
+  async function waitForQueueAppendRetry(delayMs: number, generation: number): Promise<boolean> {
+    if (generation !== queueLifecycleGeneration) return false
+    return new Promise<boolean>((resolve) => {
+      const wait = {
+        timer: globalThis.setTimeout(() => {
+          pendingQueueAppendRetryWaits.delete(wait)
+          resolve(generation === queueLifecycleGeneration)
+        }, delayMs),
+        resolve,
+      }
+      pendingQueueAppendRetryWaits.add(wait)
+    })
+  }
+
   async function persistQueuedMessageUntilConfirmed(
     threadId: string,
     queuedMessage: QueuedMessage,
     queueInsertIndex?: number,
   ): Promise<void> {
+    const lifecycleGeneration = queueLifecycleGeneration
     let ambiguousAttempts = 0
-    while (true) {
+    let lastAmbiguousError: unknown = new Error('Failed to append thread queue message')
+    while (ambiguousAttempts < 6) {
+      if (lifecycleGeneration !== queueLifecycleGeneration) throw queueAppendCancelledError()
       try {
         await appendThreadQueuedMessage(threadId, queuedMessage, queueInsertIndex)
         return
       } catch (queueError) {
         if (!isAmbiguousQueueAppendError(queueError)) throw queueError
+        lastAmbiguousError = queueError
         ambiguousAttempts += 1
         if (ambiguousAttempts >= 2) {
           try {
@@ -7604,11 +7633,15 @@ export function useDesktopState() {
             // Keep the optimistic row pending and retry the idempotent append.
           }
         }
-        if (ambiguousAttempts >= 2) {
-          await new Promise<void>((resolve) => globalThis.setTimeout(resolve, 250))
+        if (ambiguousAttempts >= 2 && ambiguousAttempts < 6) {
+          const delayMs = Math.min(2_000, 250 * (2 ** (ambiguousAttempts - 2)))
+          if (!(await waitForQueueAppendRetry(delayMs, lifecycleGeneration))) {
+            throw queueAppendCancelledError()
+          }
         }
       }
     }
+    throw lastAmbiguousError
   }
 
   async function enqueueThreadMessageDurably(
@@ -7635,6 +7668,9 @@ export function useDesktopState() {
       return queuedMessage
     } catch (queueError) {
       removeLocallyQueuedMessage(threadId, queuedMessage.id)
+      if (queueError instanceof Error && queueError.name === 'ThreadQueueAppendCancelledError') {
+        return null
+      }
       queuePositionRepairThreadIds.add(threadId)
       const message = queueError instanceof Error ? queueError.message : 'Failed to append thread queue message'
       setTurnErrorForThread(threadId, message)
@@ -7693,9 +7729,17 @@ export function useDesktopState() {
   }
 
   async function refreshPersistedQueueState(): Promise<void> {
+    const lifecycleGeneration = queueLifecycleGeneration
+    const mutationVersionAtStart = queueMutationVersion
+    const refreshRequestVersion = ++queueRefreshRequestVersion
     try {
       const snapshot = await getThreadQueueSnapshot()
-      if (snapshot.revision >= latestQueueRevision) {
+      if (
+        lifecycleGeneration === queueLifecycleGeneration
+        && mutationVersionAtStart === queueMutationVersion
+        && refreshRequestVersion === queueRefreshRequestVersion
+        && snapshot.revision >= latestQueueRevision
+      ) {
         queuedMessagesByThreadId.value = mergePendingQueueAppends(snapshot.state)
         latestQueueRevision = snapshot.revision
       }
@@ -10469,6 +10513,13 @@ export function useDesktopState() {
   }
 
   function stopPolling(): void {
+    queueLifecycleGeneration += 1
+    queueRefreshRequestVersion += 1
+    for (const wait of pendingQueueAppendRetryWaits) {
+      globalThis.clearTimeout(wait.timer)
+      wait.resolve(false)
+    }
+    pendingQueueAppendRetryWaits.clear()
     threadGoalRequestGeneration += 1
     threadGoalRequestEpochByThreadId.clear()
     externalRuntimePollingEnabled = false
@@ -10572,7 +10623,6 @@ export function useDesktopState() {
     pendingQueueAppendMessageIdsByThreadId.clear()
     queueRefreshDuringPendingAppendThreadIds.clear()
     queuePositionRepairThreadIds.clear()
-    queueRefreshRequestVersion = 0
     latestQueueRevision = 0
     codexRateLimit.value = null
     threadTokenUsageByThreadId.value = {}

@@ -57,52 +57,43 @@ async function tryCreateOwnedLock(lockPath: string, token: string): Promise<bool
     await writeFile(join(candidatePath, 'owner.json'), JSON.stringify({
       pid: process.pid,
       token,
+      processStartIdentity: await getCurrentProcessStartIdentity(),
     }), { encoding: 'utf8', mode: 0o600 })
     try {
       await rename(candidatePath, lockPath)
       return true
     } catch (error) {
-      const code = (error as NodeJS.ErrnoException).code
-      if (code !== 'EEXIST' && code !== 'ENOTEMPTY') throw error
-      return false
+      try {
+        await stat(lockPath)
+        return false
+      } catch {
+        throw error
+      }
     }
   } finally {
     await rm(candidatePath, { recursive: true, force: true }).catch(() => {})
   }
 }
 
-async function recoverAbandonedLock(lockPath: string): Promise<void> {
-  const recoveryPath = `${lockPath}.recovery`
-  try {
-    await mkdir(recoveryPath, { recursive: false, mode: 0o700 })
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'EEXIST') return
-    throw error
-  }
-
+export async function recoverAbandonedLock(lockPath: string): Promise<void> {
   try {
     const lockInfo = await stat(lockPath)
     if (Date.now() - lockInfo.mtimeMs <= 30_000) return
-    const ownerPath = join(lockPath, 'owner.json')
-    const owner = JSON.parse(await readFile(ownerPath, 'utf8')) as {
-      pid?: unknown
-      token?: unknown
-    }
-    const ownerPid = typeof owner.pid === 'number' && Number.isSafeInteger(owner.pid)
-      ? owner.pid
-      : null
-    if (ownerPid === null || isProcessAlive(ownerPid)) return
-    const confirmed = JSON.parse(await readFile(ownerPath, 'utf8')) as {
-      pid?: unknown
-      token?: unknown
-    }
-    if (confirmed.pid === owner.pid && confirmed.token === owner.token) {
-      await rm(lockPath, { recursive: true, force: true })
-    }
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return
+    throw error
+  }
+  const recoveryPath = `${lockPath}.recovery`
+  const recoveryToken = randomUUID()
+  if (!(await tryCreateOwnedLock(recoveryPath, recoveryToken))) {
+    await removeAbandonedOwnedLock(recoveryPath, 30_000)
+    if (!(await tryCreateOwnedLock(recoveryPath, recoveryToken))) return
+  }
+
+  try {
+    await removeAbandonedOwnedLock(lockPath, 30_000)
   } finally {
-    await rm(recoveryPath, { recursive: true, force: true })
+    await releaseOwnedLock(recoveryPath, recoveryToken)
   }
 }
 
@@ -112,5 +103,92 @@ export function isProcessAlive(pid: number): boolean {
     return true
   } catch (error) {
     return (error as NodeJS.ErrnoException).code === 'EPERM'
+  }
+}
+
+export async function readProcessStartIdentity(pid: number): Promise<string | null> {
+  if (process.platform !== 'linux' || !Number.isSafeInteger(pid) || pid <= 0) return null
+  try {
+    const statLine = await readFile(`/proc/${pid}/stat`, 'utf8')
+    const commandEnd = statLine.lastIndexOf(') ')
+    if (commandEnd < 0) return null
+    const fieldsAfterCommand = statLine.slice(commandEnd + 2).trim().split(/\s+/u)
+    const startTime = fieldsAfterCommand[19]?.trim() ?? ''
+    return startTime ? `${pid}:${startTime}` : null
+  } catch {
+    return null
+  }
+}
+
+export async function isProcessOwnerAlive(owner: {
+  pid: number
+  processStartIdentity?: string | null
+}): Promise<boolean> {
+  if (!isProcessAlive(owner.pid)) return false
+  if (!owner.processStartIdentity) return true
+  const currentIdentity = await readProcessStartIdentity(owner.pid)
+  return currentIdentity === null ? process.platform !== 'linux' : currentIdentity === owner.processStartIdentity
+}
+
+let currentProcessStartIdentityPromise: Promise<string | null> | null = null
+
+async function getCurrentProcessStartIdentity(): Promise<string | null> {
+  currentProcessStartIdentityPromise ??= readProcessStartIdentity(process.pid)
+  return currentProcessStartIdentityPromise
+}
+
+async function readLockOwner(lockPath: string): Promise<{
+  pid: number
+  token: string
+  processStartIdentity: string | null
+} | null> {
+  try {
+    const owner = JSON.parse(await readFile(join(lockPath, 'owner.json'), 'utf8')) as {
+      pid?: unknown
+      token?: unknown
+      processStartIdentity?: unknown
+    }
+    if (
+      typeof owner.pid !== 'number'
+      || !Number.isSafeInteger(owner.pid)
+      || owner.pid <= 0
+      || typeof owner.token !== 'string'
+      || !owner.token
+    ) return null
+    return {
+      pid: owner.pid,
+      token: owner.token,
+      processStartIdentity: typeof owner.processStartIdentity === 'string'
+        ? owner.processStartIdentity
+        : null,
+    }
+  } catch {
+    return null
+  }
+}
+
+async function removeAbandonedOwnedLock(lockPath: string, staleAfterMs: number): Promise<void> {
+  try {
+    const lockInfo = await stat(lockPath)
+    if (Date.now() - lockInfo.mtimeMs <= staleAfterMs) return
+    const owner = await readLockOwner(lockPath)
+    if (!owner || await isProcessOwnerAlive(owner)) return
+    const confirmed = await readLockOwner(lockPath)
+    if (
+      confirmed?.pid === owner.pid
+      && confirmed.token === owner.token
+      && confirmed.processStartIdentity === owner.processStartIdentity
+    ) {
+      await rm(lockPath, { recursive: true, force: true })
+    }
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
+  }
+}
+
+async function releaseOwnedLock(lockPath: string, token: string): Promise<void> {
+  const owner = await readLockOwner(lockPath)
+  if (owner?.token === token) {
+    await rm(lockPath, { recursive: true, force: true })
   }
 }

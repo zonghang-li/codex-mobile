@@ -3,6 +3,7 @@ import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import {
+  BackendQueueProcessor,
   appendThreadQueuedMessage,
   createCodexBridgeMiddleware,
   createManagedUpload,
@@ -23,7 +24,7 @@ describe('Codex bridge security-policy wiring', () => {
     expect(source).toContain('securityPolicy.isRouteDisabled')
     expect(source).toContain('securityPolicy.isRpcMethodAllowed')
     expect(source).toContain('securityPolicy.terminalInputEnabled')
-    expect(source.indexOf('securityPolicy.isRpcMethodAllowed')).toBeLessThan(source.indexOf('rpcResult = await callRpcWithArchiveRecovery('))
+    expect(source.indexOf('securityPolicy.isRpcMethodAllowed')).toBeLessThan(source.indexOf('return callRpcWithArchiveRecovery('))
     expect(source.indexOf('securityPolicy.terminalInputEnabled')).toBeLessThan(source.indexOf('terminalManager.write(sessionId, data)'))
   })
 
@@ -95,6 +96,43 @@ describe('Codex bridge security-policy wiring', () => {
       })).resolves.toBe(0)
       await expect(readFile(upload.path, 'utf8')).resolves.toBe('queued-image')
     } finally {
+      if (originalCodexHome === undefined) delete process.env.CODEX_HOME
+      else process.env.CODEX_HOME = originalCodexHome
+    }
+  })
+
+  it('does not release durable queued uploads when a processor is disposed', async () => {
+    const originalCodexHome = process.env.CODEX_HOME
+    const codexHome = await mkdtemp(join(tmpdir(), 'codex-managed-upload-dispose-home-'))
+    const root = await mkdtemp(join(tmpdir(), 'codex-managed-upload-dispose-'))
+    cleanupRoots.push(codexHome, root)
+    process.env.CODEX_HOME = codexHome
+    const now = Date.now()
+    vi.spyOn(Date, 'now').mockReturnValue(now)
+
+    try {
+      const upload = await createManagedUpload('queued.png', Buffer.from('durable-image'), root)
+      const imageUrl = `/codex-local-image?path=${encodeURIComponent(upload.path)}&uploadHandle=${encodeURIComponent(upload.uploadHandle)}`
+      const message = {
+        id: 'queued-dispose-upload',
+        text: 'survive processor replacement',
+        imageUrls: [imageUrl],
+        skills: [],
+        fileAttachments: [],
+        collaborationMode: 'default' as const,
+        model: 'gpt-test',
+        effort: '' as const,
+      }
+      await appendThreadQueuedMessage('thread-dispose-upload', message)
+      const processor = new BackendQueueProcessor({ onNotification: () => () => undefined } as never)
+      processor.rememberRuntimeQueuedMessage('thread-dispose-upload', message)
+      vi.mocked(Date.now).mockReturnValue(now + (6 * 60 * 1000))
+      processor.dispose()
+      await new Promise((resolve) => setTimeout(resolve, 10))
+
+      await expect(readFile(upload.path, 'utf8')).resolves.toBe('durable-image')
+    } finally {
+      vi.mocked(Date.now).mockRestore()
       if (originalCodexHome === undefined) delete process.env.CODEX_HOME
       else process.env.CODEX_HOME = originalCodexHome
     }
