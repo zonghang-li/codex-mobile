@@ -2372,7 +2372,6 @@ export async function forkThread(
 }
 
 export type FileAttachmentParam = { label: string; path: string; fsPath: string; uploadHandle?: string }
-export type StartThreadTurnOptions = { externalSteer?: boolean }
 
 type ManagedLocalImage = { path: string; uploadHandle: string; label: string }
 
@@ -2492,7 +2491,6 @@ export async function startThreadTurn(
   skills?: Array<{ name: string; path: string }>,
   fileAttachments: FileAttachmentParam[] = [],
   collaborationMode?: CollaborationModeKind,
-  options: StartThreadTurnOptions = {},
 ): Promise<string> {
   const managedImages = imageUrls.flatMap((imageUrl) => {
     const image = extractManagedLocalImageFromUrl(imageUrl.trim())
@@ -2553,9 +2551,6 @@ export async function startThreadTurn(
           developer_instructions: null,
         },
       }
-    }
-    if (options.externalSteer === true) {
-      params.__codexMobileExternalSteer = true
     }
     const payload = await callRpc<{ turn?: Turn }>('turn/start', params)
     return typeof payload?.turn?.id === 'string' ? payload.turn.id.trim() : ''
@@ -3331,6 +3326,25 @@ export async function setThreadQueueState(
   })
   if (!response.ok) {
     throw new Error('Failed to save thread queue state')
+  }
+}
+
+export async function appendThreadQueuedMessage(
+  threadId: string,
+  message: StoredQueuedMessage,
+  queueInsertIndex?: number,
+): Promise<void> {
+  const response = await fetch('/codex-api/thread-queue-state', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      threadId,
+      message,
+      ...(typeof queueInsertIndex === 'number' ? { queueInsertIndex } : {}),
+    }),
+  })
+  if (!response.ok) {
+    throw new Error('Failed to append thread queue message')
   }
 }
 

@@ -1,10 +1,11 @@
 import { existsSync } from 'node:fs'
-import { mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import {
   BackendQueueProcessor,
+  appendThreadQueuedMessage,
   mergeSessionSkillInputsIntoTurns,
   parseAutomationToml,
   prepareThreadRpcResultForClient,
@@ -609,6 +610,43 @@ describe('thread session skill recovery', () => {
 })
 
 describe('backend queue scheduling', () => {
+  it('atomically appends queued messages without resurrecting a popped snapshot', async () => {
+    const originalCodexHome = process.env.CODEX_HOME
+    const codexHome = await mkdtemp(join(tmpdir(), 'codex-mobile-atomic-queue-'))
+    process.env.CODEX_HOME = codexHome
+    const statePath = join(codexHome, '.codex-global-state.json')
+    const message = {
+      id: 'queued-b',
+      text: 'new work',
+      imageUrls: [],
+      skills: [],
+      fileAttachments: [],
+      collaborationMode: 'default' as const,
+      model: 'gpt-test',
+      effort: '' as const,
+    }
+
+    try {
+      await writeFile(statePath, JSON.stringify({
+        'thread-queue-state': {},
+      }))
+
+      await appendThreadQueuedMessage('thread-1', message)
+      await appendThreadQueuedMessage('thread-1', message)
+
+      const persisted = JSON.parse(await readFile(statePath, 'utf8')) as {
+        'thread-queue-state': Record<string, Array<{ id: string }>>
+      }
+      expect(persisted['thread-queue-state']['thread-1']).toEqual([
+        expect.objectContaining({ id: 'queued-b' }),
+      ])
+    } finally {
+      if (originalCodexHome === undefined) delete process.env.CODEX_HOME
+      else process.env.CODEX_HOME = originalCodexHome
+      await rm(codexHome, { recursive: true, force: true })
+    }
+  })
+
   it('reschedules a pending drain when a run-now request needs an earlier drain', async () => {
     vi.useFakeTimers()
     const processor = new BackendQueueProcessor({

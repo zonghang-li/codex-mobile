@@ -9,6 +9,7 @@ describe('external thread runtime read-only wiring', () => {
     expect(appSource).toContain(':disabled="selectedThreadRuntimeOwnership === \'external\'"')
     expect(appSource).toContain(':steer-disabled-message-ids="selectedThreadQueuedSteerDisabledMessageIds"')
     expect(appSource).toContain('const selectedThreadQueuedSteerDisabledMessageIds = computed(() => {')
+    expect(appSource).toContain('return selectedThreadQueuedMessages.value.map((message) => message.id)')
     expect(appSource).toContain(':read-only="selectedThreadRuntimeOwnership === \'external\'"')
     expect(appSource).toMatch(/function onEditQueuedMessage\(messageId: string\): void \{\n  if \(selectedThreadRuntimeOwnership\.value === 'external'\) return/u)
   })

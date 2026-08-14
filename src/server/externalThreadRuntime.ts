@@ -506,10 +506,25 @@ async function readStableFdSnapshot(
   return { path, ...identityAfter, ...descriptorAfter }
 }
 
-function isCodexAppServerCommand(cmdline: string): boolean {
+function readCodexCommandArgs(cmdline: string): string[] | null {
   const argv = cmdline.split('\0').filter((value) => value.length > 0)
   const codexIndex = argv.findIndex((value) => basename(value) === 'codex')
-  return codexIndex >= 0 && argv.slice(codexIndex + 1).includes('app-server')
+  if (codexIndex < 0) return null
+  if (codexIndex > 0 && !(codexIndex === 1 && basename(argv[0] ?? '').startsWith('node'))) return null
+  return argv.slice(codexIndex + 1)
+}
+
+function isCodexAppServerCommand(cmdline: string): boolean {
+  return readCodexCommandArgs(cmdline)?.includes('app-server') === true
+}
+
+function isDirectCodexCliCommand(cmdline: string): boolean {
+  const args = readCodexCommandArgs(cmdline)
+  return args !== null && !args.includes('app-server')
+}
+
+function isCodexRolloutWriterCommand(cmdline: string): boolean {
+  return isCodexAppServerCommand(cmdline) || isDirectCodexCliCommand(cmdline)
 }
 
 async function* listLinuxFdSnapshots(
@@ -550,7 +565,7 @@ async function* listLinuxFdSnapshots(
   for (const process of processes.values()) {
     if (yieldedSnapshots >= EXTERNAL_RUNTIME_MAX_FD_SNAPSHOTS || !hasTimeRemaining()) return false
     const { pid, uid, cmdline } = process
-    if (uid !== ownUid || !isCodexAppServerCommand(cmdline)) continue
+    if (uid !== ownUid || !isCodexRolloutWriterCommand(cmdline)) continue
     const processRoot = `/proc/${pid}`
     const ancestorPids = collectAncestorPids(pid, processes)
     if (!(await validateProcessChain(process, ancestorPids, processes))) continue
@@ -725,7 +740,7 @@ function matchesWriter(
     && typeof fd.startTime === 'string'
     && fd.startTime.length > 0
     && !belongsToExcludedProcessTree(fd, excludedPid)
-    && isCodexAppServerCommand(fd.cmdline)
+    && isCodexRolloutWriterCommand(fd.cmdline)
     && fd.dev === identity.dev
     && fd.ino === identity.ino
     && isWritableDescriptor(fd.flags)
@@ -808,7 +823,7 @@ export async function discoverExternalRolloutWriterSnapshot(
     }
     const fd = next.value
     if (fd.uid !== system.uid || belongsToExcludedProcessTree(fd, excludedPid)) continue
-    if (!isCodexAppServerCommand(fd.cmdline) || !isWritableDescriptor(fd.flags)) continue
+    if (!isCodexRolloutWriterCommand(fd.cmdline) || !isWritableDescriptor(fd.flags)) continue
     let path: string
     try {
       path = await system.realpath(fd.path)
@@ -900,7 +915,7 @@ export class ExternalThreadRuntimeProbe {
     if (unmatchedNeedingWriterEvidence.length === 0) return states
 
     try {
-      const writers = new Set<string>()
+      const writers = new Map<string, boolean>()
       let complete = true
       const iterator = this.system.listFdSnapshots()[Symbol.asyncIterator]()
       while (true) {
@@ -914,7 +929,11 @@ export class ExternalThreadRuntimeProbe {
           const runtime = entry.runtime
           if (runtime.state !== 'unmatched') continue
           if (matchesWriter(fd, runtime.identity, this.system.uid!, excludedPid)) {
-            writers.add(entry.threadId)
+            const interruptible = isCodexAppServerCommand(fd.cmdline)
+            writers.set(
+              entry.threadId,
+              (writers.get(entry.threadId) ?? true) && interruptible,
+            )
           }
         }
       }
@@ -922,7 +941,7 @@ export class ExternalThreadRuntimeProbe {
         const runtime = entry.runtime
         if (runtime.state !== 'unmatched') continue
         states[entry.threadId] = complete && writers.has(entry.threadId)
-          ? runningRuntimeFromUnmatched(runtime, true)
+          ? runningRuntimeFromUnmatched(runtime, writers.get(entry.threadId) === true)
           : isRecentActiveRollout(runtime.identity)
             ? runningRuntimeFromUnmatched(runtime, false)
             : { state: 'unknown' }
@@ -1010,7 +1029,10 @@ export class ExternalThreadRuntimeProbe {
           break
         }
         const fd = next.value
-        if (!matchesWriter(fd, runtime.identity, this.system.uid!, excludedPid)) continue
+        if (
+          !matchesWriter(fd, runtime.identity, this.system.uid!, excludedPid)
+          || !isCodexAppServerCommand(fd.cmdline)
+        ) continue
         if (expectedWriter) {
           if (fd.pid !== expectedWriter.pid) continue
           if (expectedWriter.startTime && fd.startTime !== expectedWriter.startTime) continue

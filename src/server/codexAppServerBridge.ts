@@ -698,42 +698,6 @@ function asRecord(value: unknown): Record<string, unknown> | null {
     : null
 }
 
-function hasExternalSteerNonTextField(record: Record<string, unknown>, key: string): boolean {
-  const value = record[key]
-  if (value === null || value === undefined) return false
-  if (Array.isArray(value)) return value.length > 0
-  return true
-}
-
-function isTextOnlyExternalSteerInput(input: unknown): boolean {
-  if (typeof input === 'string') return input.trim().length > 0
-  if (!Array.isArray(input) || input.length === 0) return false
-
-  return input.every((item) => {
-    if (typeof item === 'string') return item.trim().length > 0
-    const record = asRecord(item)
-    if (!record) return false
-    const type = typeof record.type === 'string' ? record.type.trim() : ''
-    if (type !== 'text' && type !== 'input_text') return false
-    return typeof record.text === 'string'
-  })
-}
-
-export function isTextOnlyExternalSteerTurnStartParams(params: unknown): boolean {
-  const record = asRecord(params)
-  if (!record) return false
-  if (
-    hasExternalSteerNonTextField(record, 'attachments')
-    || hasExternalSteerNonTextField(record, 'fileAttachments')
-    || hasExternalSteerNonTextField(record, 'imageUrls')
-    || hasExternalSteerNonTextField(record, 'images')
-    || hasExternalSteerNonTextField(record, 'skills')
-  ) {
-    return false
-  }
-  return isTextOnlyExternalSteerInput(record.input)
-}
-
 export function prepareRpcProxyRequest(
   method: string,
   params: unknown,
@@ -741,7 +705,6 @@ export function prepareRpcProxyRequest(
   params: unknown
   skipSessionSkillEnrichment: boolean
   forceFreshThreadList: boolean
-  allowExternalSteer: boolean
 } {
   const record = asRecord(params)
   const isLiveSnapshot = method === 'thread/read'
@@ -755,7 +718,6 @@ export function prepareRpcProxyRequest(
       params: params ?? null,
       skipSessionSkillEnrichment: false,
       forceFreshThreadList: false,
-      allowExternalSteer: false,
     }
   }
 
@@ -773,7 +735,6 @@ export function prepareRpcProxyRequest(
     params: forwardedParams,
     skipSessionSkillEnrichment: isLiveSnapshot,
     forceFreshThreadList: isForceFreshThreadList,
-    allowExternalSteer: isExplicitExternalSteer,
   }
 }
 
@@ -1340,13 +1301,27 @@ export async function augmentThreadResultWithExternalRuntime(
 
   runtimeProbe.registerThread(threadId, readNonEmptyString(thread.path))
 
+  const externalRuntime = localRuntimeLedger
+    ? await observeThreadRuntimeState(threadId, runtimeProbe, localRuntimeLedger, excludedPid)
+    : await runtimeProbe.inspect(threadId, excludedPid)
+  const turns = Array.isArray(thread.turns) ? thread.turns : null
+  const canonicalTurns = externalRuntime.state === 'running'
+    && externalRuntime.source === 'external-session-writer'
+    && turns
+    ? turns.map((turn) => {
+        const turnRecord = asRecord(turn)
+        return readNonEmptyString(turnRecord?.id) === externalRuntime.turnId
+          ? { ...turnRecord, status: 'inProgress' }
+          : turn
+      })
+    : turns
+
   return {
     ...record,
     thread: {
       ...thread,
-      externalRuntime: localRuntimeLedger
-        ? await observeThreadRuntimeState(threadId, runtimeProbe, localRuntimeLedger, excludedPid)
-        : await runtimeProbe.inspect(threadId, excludedPid),
+      ...(canonicalTurns ? { turns: canonicalTurns } : {}),
+      externalRuntime,
     },
   }
 }
@@ -1355,12 +1330,6 @@ type ThreadWriterInspection =
   | { state: 'idle'; readResult: unknown }
   | { state: 'blocked'; readResult: unknown; runtime: ExternalThreadRuntime }
   | { state: 'unmaterialized'; readResult: unknown; error?: unknown }
-
-function isRunningExternalWriterInspection(inspection: ThreadWriterInspection): boolean {
-  return inspection.state === 'blocked'
-    && inspection.runtime.state === 'running'
-    && inspection.runtime.source === 'external-session-writer'
-}
 
 async function inspectThreadWriter(
   appServer: RpcExecutor,
@@ -3956,7 +3925,7 @@ export async function callRpcWithArchiveRecovery(
   runtimeProbe?: Pick<ThreadRuntimeProbe, 'registerThread' | 'inspect'> &
     Partial<Pick<ExternalThreadRuntimeProbe, 'interrupt'>>,
   excludedPid: number | null = null,
-  options: { locallyCreatedFirstTurn?: boolean; allowExternalSteer?: boolean } = {},
+  options: { locallyCreatedFirstTurn?: boolean } = {},
 ): Promise<unknown> {
   const paramsRecord = asRecord(params)
   const threadId = readNonEmptyString(paramsRecord?.threadId)
@@ -3987,7 +3956,6 @@ export async function callRpcWithArchiveRecovery(
         if (
           inspection.state !== 'idle'
           && !(inspection.state === 'unmaterialized' && options.locallyCreatedFirstTurn === true)
-          && !(options.allowExternalSteer === true && isRunningExternalWriterInspection(inspection))
         ) {
           throw new Error('Cannot resume a task owned by another app-server process.')
         }
@@ -7953,16 +7921,31 @@ async function writeThreadQueueState(nextState: ThreadQueueState): Promise<void>
   }))
 }
 
-async function appendThreadQueuedMessage(threadId: string, message: StoredQueuedMessage): Promise<void> {
+export async function appendThreadQueuedMessage(
+  threadId: string,
+  message: StoredQueuedMessage,
+  queueInsertIndex?: number,
+): Promise<void> {
   const normalizedThreadId = threadId.trim()
   if (!normalizedThreadId) throw new Error('threadId is required')
-  await withThreadQueueStateUpdate((state) => ({
-    nextState: {
-      ...state,
-      [normalizedThreadId]: [...(state[normalizedThreadId] ?? []), message],
-    },
-    result: undefined,
-  }))
+  await withThreadQueueStateUpdate((state) => {
+    const queue = state[normalizedThreadId] ?? []
+    if (queue.some((queuedMessage) => queuedMessage.id === message.id)) {
+      return { nextState: state, result: undefined }
+    }
+    const nextQueue = [...queue]
+    const insertIndex = typeof queueInsertIndex === 'number'
+      ? Math.max(0, Math.min(Math.trunc(queueInsertIndex), nextQueue.length))
+      : nextQueue.length
+    nextQueue.splice(insertIndex, 0, message)
+    return {
+      nextState: {
+        ...state,
+        [normalizedThreadId]: nextQueue,
+      },
+      result: undefined,
+    }
+  })
 }
 
 function normalizeReasoningEffort(value: unknown): ReasoningEffort | '' {
@@ -9909,6 +9892,11 @@ export class BackendQueueProcessor {
     }
   }
 
+  rememberRuntimeQueuedMessage(threadId: string, message: StoredQueuedMessage): void {
+    if (!hasManagedQueuedCapabilities(message)) return
+    this.runtimeQueuedMessages.set(this.runtimeQueueKey(threadId, message.id), message)
+  }
+
   async scheduleAllQueuedThreads(delayMs = 0): Promise<void> {
     try {
       const state = await readThreadQueueState()
@@ -11091,11 +11079,6 @@ export function createCodexBridgeMiddleware(options: {
         }
 
         const preparedRpcRequest = prepareRpcProxyRequest(body.method, body.params ?? null)
-        if (preparedRpcRequest.allowExternalSteer && !isTextOnlyExternalSteerTurnStartParams(body.params ?? null)) {
-          setJson(res, 400, { error: 'External steer only supports text input.' })
-          return
-        }
-
 	        if (body.method === 'generate-thread-title') {
 	          setJson(res, 200, { result: { title: '' } })
 	          return
@@ -11130,7 +11113,6 @@ export function createCodexBridgeMiddleware(options: {
             if (
               inspection.state !== 'idle'
               && !(inspection.state === 'unmaterialized' && isPendingFirstTurn)
-              && !(preparedRpcRequest.allowExternalSteer === true && isRunningExternalWriterInspection(inspection))
             ) {
               throw new Error('Cannot start a turn because task writer ownership is not idle.')
             }
@@ -11150,7 +11132,6 @@ export function createCodexBridgeMiddleware(options: {
                 appServer.getPid(),
                 {
                   locallyCreatedFirstTurn: isPendingFirstTurn,
-                  allowExternalSteer: preparedRpcRequest.allowExternalSteer,
                 },
               )
               appServer.cacheThreadListRpcResult(threadListCacheKey, threadListCacheSignature, freshResult)
@@ -11185,7 +11166,6 @@ export function createCodexBridgeMiddleware(options: {
               appServer.getPid(),
               {
                 locallyCreatedFirstTurn: isPendingFirstTurn,
-                allowExternalSteer: preparedRpcRequest.allowExternalSteer,
               },
             )
           }
@@ -12984,6 +12964,25 @@ export function createCodexBridgeMiddleware(options: {
         backendQueueProcessor.replaceRuntimeQueueState(runtimeState, transferManagedMessageIds)
         await writeThreadQueueState(runtimeState)
         void backendQueueProcessor.scheduleAllQueuedThreads()
+        setJson(res, 200, { ok: true })
+        return
+      }
+
+      if (req.method === 'POST' && url.pathname === '/codex-api/thread-queue-state') {
+        const payload = await readJsonBody(req)
+        const record = asRecord(payload)
+        const threadId = readNonEmptyString(record?.threadId)
+        const message = normalizeStoredQueuedMessage(record?.message)
+        if (!threadId || !message) {
+          setJson(res, 400, { error: 'Invalid body: expected threadId and queued message' })
+          return
+        }
+        const queueInsertIndex = typeof record?.queueInsertIndex === 'number'
+          ? record.queueInsertIndex
+          : undefined
+        await appendThreadQueuedMessage(threadId, message, queueInsertIndex)
+        backendQueueProcessor.rememberRuntimeQueuedMessage(threadId, message)
+        backendQueueProcessor.scheduleThreadQueueDrain(threadId, 0)
         setJson(res, 200, { ok: true })
         return
       }

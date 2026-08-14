@@ -15,6 +15,7 @@ import type { UiMessage, UiProjectGroup } from '../types/codex'
 import type { WorkspaceRootsState } from '../api/codexGateway'
 
 const gatewayMocks = vi.hoisted(() => ({
+  appendThreadQueuedMessage: vi.fn(),
   archiveThread: vi.fn(),
   forkThread: vi.fn(),
   getAccountRateLimits: vi.fn(),
@@ -356,11 +357,13 @@ beforeEach(() => {
   gatewayMocks.getExternalThreadLiveSnapshot.mockImplementation(
     (threadId: string, signal?: AbortSignal) => gatewayMocks.getThreadDetail(threadId, signal),
   )
-  gatewayMocks.getThreadQueueState.mockResolvedValue({})
+  gatewayMocks.getThreadQueueState.mockReset().mockResolvedValue({})
   gatewayMocks.getThreadGoal.mockResolvedValue(null)
   gatewayMocks.getThreadRuntimeStates.mockResolvedValue({})
-  gatewayMocks.setThreadQueueState.mockResolvedValue(undefined)
-  gatewayMocks.cleanupManagedUploads.mockResolvedValue(true)
+  gatewayMocks.setThreadQueueState.mockReset().mockResolvedValue(undefined)
+  gatewayMocks.cleanupManagedUploads.mockReset().mockResolvedValue(true)
+  gatewayMocks.startThreadTurn.mockReset()
+  gatewayMocks.appendThreadQueuedMessage.mockReset().mockResolvedValue(undefined)
   gatewayMocks.getThreadTitleCache.mockResolvedValue({ titles: {} })
   gatewayMocks.getWorkspaceRootsState.mockRejectedValue(new Error('no workspace roots state'))
 })
@@ -3014,19 +3017,21 @@ describe('turn completion lifecycle', () => {
     const { state, emit } = await setupTurnLifecycleNotificationState('thread-1')
     gatewayMocks.startThreadTurn.mockResolvedValue('turn-steer')
     emit({ method: 'turn/started', params: { threadId: 'thread-1', turn: { id: 'turn-active' } } })
-    const persistenceCalls = gatewayMocks.setThreadQueueState.mock.calls.length
+    const persistenceCalls = gatewayMocks.appendThreadQueuedMessage.mock.calls.length
     const managedImageUrl = '/codex-local-image?path=%2Ftmp%2Fcodex-web-uploads%2Fupload%2Fphoto.png&uploadHandle=queue-handle'
 
     await state.sendMessageToSelectedThread('send later', [managedImageUrl], [], 'queue')
 
     expect(gatewayMocks.startThreadTurn).not.toHaveBeenCalled()
-    expect(gatewayMocks.setThreadQueueState).toHaveBeenCalledTimes(persistenceCalls + 1)
-    expect(gatewayMocks.setThreadQueueState).toHaveBeenLastCalledWith({
-      'thread-1': [expect.objectContaining({
+    expect(gatewayMocks.appendThreadQueuedMessage).toHaveBeenCalledTimes(persistenceCalls + 1)
+    expect(gatewayMocks.appendThreadQueuedMessage).toHaveBeenLastCalledWith(
+      'thread-1',
+      expect.objectContaining({
         text: 'send later',
         imageUrls: [managedImageUrl],
-      })],
-    })
+      }),
+      undefined,
+    )
     expect(state.selectedThreadQueuedMessages.value).toEqual([
       expect.objectContaining({ text: 'send later', imageUrls: [managedImageUrl] }),
     ])
@@ -6774,18 +6779,10 @@ describe('external runtime ownership', () => {
 
     const blockedSend = state.sendMessageToSelectedThread('must wait for terminal detail')
     await flushMicrotasks()
-    expect(gatewayMocks.startThreadTurn).toHaveBeenCalledTimes(1)
-    expect(gatewayMocks.startThreadTurn).toHaveBeenCalledWith(
-      'thread-1',
-      'must wait for terminal detail',
-      [],
-      undefined,
-      'medium',
-      undefined,
-      [],
-      'default',
-      { externalSteer: true },
-    )
+    expect(gatewayMocks.startThreadTurn).not.toHaveBeenCalled()
+    expect(state.selectedThreadQueuedMessages.value).toEqual([
+      expect.objectContaining({ text: 'must wait for terminal detail' }),
+    ])
     expect(state.selectedThreadRuntimeOwnership.value).toBe('external')
     await blockedSend
 
@@ -6797,10 +6794,10 @@ describe('external runtime ownership', () => {
     })
     await flushMicrotasks()
     expect(state.selectedThreadRuntimeOwnership.value).toBe('idle')
-
-    void state.sendMessageToSelectedThread('safe follow-up')
-    await flushMicrotasks()
-    expect(gatewayMocks.startThreadTurn).toHaveBeenCalledTimes(2)
+    expect(gatewayMocks.startThreadTurn).not.toHaveBeenCalled()
+    expect(state.selectedThreadQueuedMessages.value).toEqual([
+      expect.objectContaining({ text: 'must wait for terminal detail' }),
+    ])
   })
 
   it.each([
@@ -6816,11 +6813,13 @@ describe('external runtime ownership', () => {
 
     expect(gatewayMocks.resumeThread).toHaveBeenCalledWith('thread-1')
     expect(gatewayMocks.startThreadTurn).not.toHaveBeenCalled()
-    expect(gatewayMocks.setThreadQueueState).toHaveBeenLastCalledWith({
-      'thread-1': [expect.objectContaining({
+    expect(gatewayMocks.appendThreadQueuedMessage).toHaveBeenLastCalledWith(
+      'thread-1',
+      expect.objectContaining({
         text: 'do not race desktop',
-      })],
-    })
+      }),
+      undefined,
+    )
     expect(state.selectedThreadQueuedMessages.value).toEqual([
       expect.objectContaining({ text: 'do not race desktop' }),
     ])
@@ -6871,11 +6870,13 @@ describe('external runtime ownership', () => {
     await flushMicrotasks()
 
     expect(gatewayMocks.startThreadTurn).not.toHaveBeenCalled()
-    expect(gatewayMocks.setThreadQueueState).toHaveBeenLastCalledWith({
-      'thread-1': [expect.objectContaining({
+    expect(gatewayMocks.appendThreadQueuedMessage).toHaveBeenLastCalledWith(
+      'thread-1',
+      expect.objectContaining({
         text: 'queue while desktop owns writer',
-      })],
-    })
+      }),
+      undefined,
+    )
     expect(state.selectedThreadQueuedMessages.value).toEqual([
       expect.objectContaining({ text: 'queue while desktop owns writer' }),
     ])
@@ -6883,7 +6884,7 @@ describe('external runtime ownership', () => {
     expect(state.error.value).toBe('')
   })
 
-  it('steers immediately when the selected thread is already externally owned and steer mode is requested', async () => {
+  it('queues steer mode without starting a turn when the selected thread is externally owned', async () => {
     const { state } = await setupExternalRuntimeState()
     gatewayMocks.getThreadDetail.mockResolvedValue({
       ...externalDetail(),
@@ -6897,31 +6898,38 @@ describe('external runtime ownership', () => {
     await expect(state.sendMessageToSelectedThread('steer while desktop owns writer', [], [], 'steer')).resolves.toBeUndefined()
     await flushMicrotasks()
 
-    expect(gatewayMocks.startThreadTurn).toHaveBeenCalledTimes(1)
-    expect(gatewayMocks.startThreadTurn).toHaveBeenCalledWith(
+    expect(gatewayMocks.startThreadTurn).not.toHaveBeenCalled()
+    expect(gatewayMocks.appendThreadQueuedMessage).toHaveBeenLastCalledWith(
       'thread-1',
-      'steer while desktop owns writer',
-      [],
+      expect.objectContaining({ text: 'steer while desktop owns writer' }),
       undefined,
-      'medium',
-      undefined,
-      [],
-      'default',
-      { externalSteer: true },
     )
-    expect(state.selectedThreadQueuedMessages.value).toEqual([])
-    expect(state.messages.value).toEqual(expect.arrayContaining([
-      expect.objectContaining({
-        role: 'user',
-        text: 'steer while desktop owns writer',
-      }),
+    expect(state.selectedThreadQueuedMessages.value).toEqual([
+      expect.objectContaining({ text: 'steer while desktop owns writer' }),
+    ])
+    expect(state.messages.value).not.toEqual(expect.arrayContaining([
+      expect.objectContaining({ text: 'steer while desktop owns writer' }),
     ]))
     expect(state.selectedThreadRuntimeOwnership.value).toBe('external')
     expect(state.selectedThreadCanInterrupt.value).toBe(true)
     expect(state.error.value).toBe('')
   })
 
-  it('retries a text-only local steer through external ownership instead of moving it to the queue', async () => {
+  it('removes an external queue row and surfaces an atomic append failure', async () => {
+    const { state } = await setupExternalRuntimeState()
+    gatewayMocks.getThreadDetail.mockResolvedValue(externalDetail())
+    gatewayMocks.appendThreadQueuedMessage.mockRejectedValue(new Error('queue storage unavailable'))
+    await state.loadMessages('thread-1')
+
+    await state.sendMessageToSelectedThread('must persist before success', [], [], 'steer')
+
+    expect(gatewayMocks.startThreadTurn).not.toHaveBeenCalled()
+    expect(gatewayMocks.appendThreadQueuedMessage).toHaveBeenCalledOnce()
+    expect(state.selectedThreadQueuedMessages.value).toEqual([])
+    expect(state.error.value).toContain('queue storage unavailable')
+  })
+
+  it('moves a local steer to the queue when writer ownership changes', async () => {
     const { state, emit } = await setupExternalRuntimeState()
     gatewayMocks.getThreadDetail.mockResolvedValue(localDetail('turn-local'))
     gatewayMocks.resumeThread.mockResolvedValue(idleDetail())
@@ -6936,9 +6944,7 @@ describe('external runtime ownership', () => {
 
     await state.sendMessageToSelectedThread('steer across ownership race', [], [], 'steer')
     await flushMicrotasks()
-    const beforeRetry = state.messages.value.filter((message) => message.text === 'steer across ownership race')
-    expect(beforeRetry).toHaveLength(1)
-    const optimisticMessageId = beforeRetry[0]!.id
+    expect(state.messages.value.filter((message) => message.text === 'steer across ownership race')).toHaveLength(1)
 
     firstStart.reject(new CodexApiError(
       'RPC turn/start failed with HTTP 502: Cannot start a turn because task writer ownership is not idle.',
@@ -6950,28 +6956,16 @@ describe('external runtime ownership', () => {
     ))
     await flushMicrotasks()
 
-    expect(gatewayMocks.startThreadTurn).toHaveBeenCalledTimes(2)
-    expect(gatewayMocks.startThreadTurn).toHaveBeenNthCalledWith(
-      2,
+    expect(gatewayMocks.startThreadTurn).toHaveBeenCalledTimes(1)
+    expect(gatewayMocks.appendThreadQueuedMessage).toHaveBeenLastCalledWith(
       'thread-1',
-      'steer across ownership race',
-      [],
+      expect.objectContaining({ text: 'steer across ownership race' }),
       undefined,
-      'medium',
-      undefined,
-      [],
-      'default',
-      { externalSteer: true },
     )
-    expect(gatewayMocks.setThreadQueueState).not.toHaveBeenCalled()
-    expect(state.selectedThreadQueuedMessages.value).toEqual([])
-    const afterRetry = state.messages.value.filter((message) => message.text === 'steer across ownership race')
-    expect(afterRetry).toHaveLength(1)
-    expect(afterRetry[0]).toMatchObject({
-      id: optimisticMessageId,
-      role: 'user',
-      messageType: 'userMessage.optimistic',
-    })
+    expect(state.selectedThreadQueuedMessages.value).toEqual([
+      expect.objectContaining({ text: 'steer across ownership race' }),
+    ])
+    expect(state.messages.value.filter((message) => message.text === 'steer across ownership race')).toHaveLength(0)
     expect(state.selectedThreadRuntimeOwnership.value).toBe('external')
     expect(state.error.value).toBe('')
   })
@@ -6980,64 +6974,67 @@ describe('external runtime ownership', () => {
     const { state, emit } = await setupExternalRuntimeState()
     gatewayMocks.getThreadDetail.mockResolvedValue(localDetail('turn-local'))
     gatewayMocks.resumeThread.mockResolvedValue(idleDetail())
-    const attachmentStart = deferred<string>()
-    const textStart = deferred<string>()
-    let startCallCount = 0
-    gatewayMocks.startThreadTurn.mockImplementation(() => {
-      startCallCount += 1
-      if (startCallCount === 1) return attachmentStart.promise
-      if (startCallCount === 2) return textStart.promise
-      return Promise.resolve('turn-external-steer')
-    })
     const managedImageUrl = '/codex-local-image?path=%2Ftmp%2Fcodex-web-uploads%2Fupload%2Fconcurrent.png&uploadHandle=concurrent-image'
-
-    emit({ method: 'turn/started', params: { threadId: 'thread-1', turn: { id: 'turn-local' } } })
-    await flushMicrotasks()
-    gatewayMocks.setThreadQueueState.mockClear()
-
-    await state.sendMessageToSelectedThread('attachment steer', [managedImageUrl], [], 'steer')
-    await state.sendMessageToSelectedThread('text steer', [], [], 'steer')
-    await flushMicrotasks()
-
-    const ownershipError = new CodexApiError(
+    gatewayMocks.startThreadTurn.mockRejectedValue(new CodexApiError(
       'RPC turn/start failed with HTTP 502: Cannot start a turn because task writer ownership is not idle.',
       {
         code: 'http_error',
         method: 'turn/start',
         status: 502,
       },
-    )
-    attachmentStart.reject(ownershipError)
+    ))
+
+    emit({ method: 'turn/started', params: { threadId: 'thread-1', turn: { id: 'turn-local' } } })
+    await flushMicrotasks()
+    gatewayMocks.setThreadQueueState.mockClear()
+
+    await state.sendMessageToSelectedThread('attachment steer', [managedImageUrl], [], 'steer')
+    await flushMicrotasks()
+    await state.sendMessageToSelectedThread('text steer', [], [], 'steer')
     await flushMicrotasks()
 
-    expect(gatewayMocks.startThreadTurn).toHaveBeenCalledTimes(2)
-    expect(state.selectedThreadQueuedMessages.value).toEqual([
-      expect.objectContaining({ text: 'attachment steer' }),
-    ])
+    expect(gatewayMocks.startThreadTurn.mock.calls.length).toBeGreaterThanOrEqual(1)
+    expect(gatewayMocks.startThreadTurn.mock.calls.length).toBeLessThanOrEqual(2)
+    await vi.waitFor(() => {
+      expect(state.selectedThreadQueuedMessages.value.map((message) => message.text).sort()).toEqual([
+        'attachment steer',
+        'text steer',
+      ])
+    })
     expect(gatewayMocks.cleanupManagedUploads).toHaveBeenCalledWith([managedImageUrl], [])
+  })
 
-    textStart.reject(ownershipError)
+  it('keeps a local queue append when an older queue refresh settles', async () => {
+    const { state, emit } = await setupExternalRuntimeState()
+    const staleQueueRefresh = deferred<Record<string, never[]>>()
+    gatewayMocks.getThreadQueueState.mockClear()
+    gatewayMocks.getThreadQueueState.mockReturnValueOnce(staleQueueRefresh.promise)
+
+    emit({ method: 'turn/started', params: { threadId: 'thread-1', turn: { id: 'turn-local' } } })
+    await flushMicrotasks()
+    expect(gatewayMocks.getThreadQueueState).toHaveBeenCalledOnce()
+
+    await state.sendMessageToSelectedThread('queued after refresh started', [], [], 'queue')
+    expect(state.selectedThreadQueuedMessages.value).toEqual([
+      expect.objectContaining({ text: 'queued after refresh started' }),
+    ])
+
+    staleQueueRefresh.resolve({})
     await flushMicrotasks()
 
-    expect(gatewayMocks.startThreadTurn).toHaveBeenCalledTimes(3)
-    expect(gatewayMocks.startThreadTurn).toHaveBeenNthCalledWith(
-      3,
-      'thread-1',
-      'text steer',
-      [],
-      undefined,
-      'medium',
-      undefined,
-      [],
-      'default',
-      { externalSteer: true },
-    )
     expect(state.selectedThreadQueuedMessages.value).toEqual([
-      expect.objectContaining({ text: 'attachment steer' }),
+      expect.objectContaining({ text: 'queued after refresh started' }),
+    ])
+
+    await vi.advanceTimersByTimeAsync(650)
+    await flushMicrotasks()
+    expect(gatewayMocks.getThreadQueueState).toHaveBeenCalledOnce()
+    expect(state.selectedThreadQueuedMessages.value).toEqual([
+      expect.objectContaining({ text: 'queued after refresh started' }),
     ])
   })
 
-  it('retries an idle text-only submit through external ownership after turn/start is issued', async () => {
+  it('queues an idle text-only submit when writer ownership changes after turn/start is issued', async () => {
     const { state } = await setupExternalRuntimeState()
     gatewayMocks.resumeThread.mockResolvedValue(idleDetail())
     gatewayMocks.startThreadTurn
@@ -7055,20 +7052,15 @@ describe('external runtime ownership', () => {
     await state.sendMessageToSelectedThread('idle steer ownership race', [], [], 'steer')
     await flushMicrotasks()
 
-    expect(gatewayMocks.startThreadTurn).toHaveBeenCalledTimes(2)
-    expect(gatewayMocks.startThreadTurn).toHaveBeenLastCalledWith(
+    expect(gatewayMocks.startThreadTurn).toHaveBeenCalledTimes(1)
+    expect(gatewayMocks.appendThreadQueuedMessage).toHaveBeenLastCalledWith(
       'thread-1',
-      'idle steer ownership race',
-      [],
+      expect.objectContaining({ text: 'idle steer ownership race' }),
       undefined,
-      'medium',
-      undefined,
-      [],
-      'default',
-      { externalSteer: true },
     )
-    expect(gatewayMocks.setThreadQueueState).not.toHaveBeenCalled()
-    expect(state.selectedThreadQueuedMessages.value).toEqual([])
+    expect(state.selectedThreadQueuedMessages.value).toEqual([
+      expect.objectContaining({ text: 'idle steer ownership race' }),
+    ])
   })
 
   it('queues a steer that implicitly reuses an attached image when ownership changes', async () => {
@@ -7110,14 +7102,16 @@ describe('external runtime ownership', () => {
       [],
       'default',
     )
-    expect(state.selectedThreadQueuedMessages.value).toEqual([
-      expect.objectContaining({
-        text: 'copy the screenshot',
-        imageUrls: [],
-        skills: [],
-        fileAttachments: [],
-      }),
-    ])
+    await vi.waitFor(() => {
+      expect(state.selectedThreadQueuedMessages.value).toEqual([
+        expect.objectContaining({
+          text: 'copy the screenshot',
+          imageUrls: [],
+          skills: [],
+          fileAttachments: [],
+        }),
+      ])
+    })
   })
 
   it('queues a steer when turn/start reports a non-idle writer owner', async () => {
@@ -7150,14 +7144,16 @@ describe('external runtime ownership', () => {
     await flushMicrotasks()
 
     expect(gatewayMocks.startThreadTurn).toHaveBeenCalledTimes(1)
-    expect(gatewayMocks.setThreadQueueState).toHaveBeenLastCalledWith({
-      'thread-1': [expect.objectContaining({
+    expect(gatewayMocks.appendThreadQueuedMessage).toHaveBeenLastCalledWith(
+      'thread-1',
+      expect.objectContaining({
         text: 'append while desktop is writing',
         imageUrls: [],
         skills: [],
         fileAttachments: [],
-      })],
-    })
+      }),
+      undefined,
+    )
     expect(state.selectedThreadQueuedMessages.value).toEqual([
       expect.objectContaining({
         text: 'append while desktop is writing',
@@ -7203,14 +7199,16 @@ describe('external runtime ownership', () => {
     )
     await flushMicrotasks()
 
-    expect(gatewayMocks.setThreadQueueState).toHaveBeenLastCalledWith({
-      'thread-1': [expect.objectContaining({
+    expect(gatewayMocks.appendThreadQueuedMessage).toHaveBeenLastCalledWith(
+      'thread-1',
+      expect.objectContaining({
         text: 'steer with external race',
         imageUrls: [],
         skills: [],
         fileAttachments: [],
-      })],
-    })
+      }),
+      undefined,
+    )
     expect(state.selectedThreadQueuedMessages.value).toEqual([
       expect.objectContaining({
         text: 'steer with external race',
@@ -7593,7 +7591,7 @@ describe('external runtime ownership', () => {
     await state.loadMessages('thread-1')
     gatewayMocks.getThreadDetail.mockClear()
     const queueBeforeMutations = state.selectedThreadQueuedMessages.value.map((message) => message.id)
-    const persistenceCallsBeforeMutations = gatewayMocks.setThreadQueueState.mock.calls.length
+    const persistenceCallsBeforeMutations = gatewayMocks.appendThreadQueuedMessage.mock.calls.length
     const managedImageUrl = '/codex-local-image?path=%2Ftmp%2Fcodex-web-uploads%2Fupload%2Fowned.png&uploadHandle=owned-image'
     const managedFile = {
       label: 'owned.txt',
@@ -7640,12 +7638,12 @@ describe('external runtime ownership', () => {
     ])
     expect(gatewayMocks.cleanupManagedUploads).toHaveBeenCalledWith([managedImageUrl], [managedFile])
     expect(state.selectedThreadQueuedMessages.value.slice(0, 2).map((message) => message.id)).toEqual(queueBeforeMutations)
-    expect(gatewayMocks.setThreadQueueState.mock.calls.length).toBeGreaterThanOrEqual(
+    expect(gatewayMocks.appendThreadQueuedMessage.mock.calls.length).toBeGreaterThanOrEqual(
       persistenceCallsBeforeMutations + 2,
     )
   })
 
-  it('steers a queued text message while externally owned without enabling edit, delete, or reorder', async () => {
+  it('keeps queued text read-only while externally owned', async () => {
     gatewayMocks.getThreadQueueState.mockResolvedValue({
       'thread-1': [
         {
@@ -7677,18 +7675,8 @@ describe('external runtime ownership', () => {
     await state.steerQueuedMessage('queued-1')
     await flushMicrotasks()
 
-    expect(gatewayMocks.startThreadTurn).toHaveBeenCalledWith(
-      'thread-1',
-      'first queued',
-      [],
-      undefined,
-      'medium',
-      undefined,
-      [],
-      'default',
-      { externalSteer: true },
-    )
-    expect(state.selectedThreadQueuedMessages.value.map((message) => message.id)).toEqual(['queued-2'])
+    expect(gatewayMocks.startThreadTurn).not.toHaveBeenCalled()
+    expect(state.selectedThreadQueuedMessages.value.map((message) => message.id)).toEqual(['queued-1', 'queued-2'])
   })
 
   it('keeps rollback and pending-request replies available for an idle selected thread', async () => {
@@ -8091,13 +8079,15 @@ describe('external runtime ownership', () => {
 
     await state.sendMessageToSelectedThread('queued with selected settings', [], [], 'queue')
 
-    expect(gatewayMocks.setThreadQueueState).toHaveBeenLastCalledWith({
-      'thread-1': [expect.objectContaining({
+    expect(gatewayMocks.appendThreadQueuedMessage).toHaveBeenLastCalledWith(
+      'thread-1',
+      expect.objectContaining({
         text: 'queued with selected settings',
         model: 'gpt-5.6-sol',
         effort: 'max',
-      })],
-    })
+      }),
+      undefined,
+    )
   })
 })
 

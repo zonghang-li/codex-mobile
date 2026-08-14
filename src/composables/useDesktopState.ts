@@ -1,6 +1,7 @@
 import { computed, ref } from 'vue'
 import {
 
+  appendThreadQueuedMessage,
   archiveThread,
   forkThread,
   getAvailableCollaborationModes,
@@ -2275,6 +2276,7 @@ export function useDesktopState() {
   const queuedMessagesByThreadId = ref<Record<string, QueuedMessage[]>>({})
   const queueProcessingByThreadId = ref<Record<string, boolean>>({})
   let hasLoadedPersistedQueueState = false
+  let queueMutationVersion = 0
   const eventUnreadByThreadId = ref<Record<string, boolean>>({})
   const availableModelIds = ref<string[]>([])
   const availableCollaborationModes = ref<CollaborationModeOption[]>([
@@ -7483,6 +7485,7 @@ export function useDesktopState() {
   }
 
   function persistQueueState(transferManagedMessageIds: string[] = []): void {
+    queueMutationVersion += 1
     const request = transferManagedMessageIds.length > 0
       ? setThreadQueueState(queuedMessagesByThreadId.value, { transferManagedMessageIds })
       : setThreadQueueState(queuedMessagesByThreadId.value)
@@ -7531,19 +7534,59 @@ export function useDesktopState() {
       ...queuedMessagesByThreadId.value,
       [threadId]: nextQueue,
     }
-    persistQueueState()
+    queueMutationVersion += 1
     return queuedMessage
   }
 
-  function enqueueExternalTextOnlyThreadMessage(
+  function removeLocallyQueuedMessage(threadId: string, messageId: string): void {
+    const queue = queuedMessagesByThreadId.value[threadId] ?? []
+    const nextQueue = queue.filter((message) => message.id !== messageId)
+    if (nextQueue.length === queue.length) return
+    queuedMessagesByThreadId.value = nextQueue.length > 0
+      ? { ...queuedMessagesByThreadId.value, [threadId]: nextQueue }
+      : omitKey(queuedMessagesByThreadId.value, threadId)
+    queueMutationVersion += 1
+  }
+
+  async function enqueueThreadMessageDurably(
+    threadId: string,
+    nextText: string,
+    imageUrls: string[],
+    skills: Array<{ name: string; path: string }>,
+    fileAttachments: FileAttachment[],
+    collaborationModeOverride?: CollaborationModeKind,
+    queueInsertIndex?: number,
+  ): Promise<QueuedMessage | null> {
+    const queuedMessage = enqueueThreadMessage(
+      threadId,
+      nextText,
+      imageUrls,
+      skills,
+      fileAttachments,
+      collaborationModeOverride,
+      queueInsertIndex,
+    )
+    try {
+      await appendThreadQueuedMessage(threadId, queuedMessage, queueInsertIndex)
+      return queuedMessage
+    } catch (queueError) {
+      removeLocallyQueuedMessage(threadId, queuedMessage.id)
+      const message = queueError instanceof Error ? queueError.message : 'Failed to append thread queue message'
+      setTurnErrorForThread(threadId, message)
+      error.value = message
+      return null
+    }
+  }
+
+  async function enqueueExternalTextOnlyThreadMessage(
     threadId: string,
     nextText: string,
     collaborationModeOverride?: CollaborationModeKind,
     queueInsertIndex?: number,
-  ): QueuedMessage | null {
+  ): Promise<QueuedMessage | null> {
     const textOnly = nextText.trim()
     if (!textOnly) return null
-    return enqueueThreadMessage(
+    return enqueueThreadMessageDurably(
       threadId,
       textOnly,
       [],
@@ -8928,74 +8971,6 @@ export function useDesktopState() {
     })
   }
 
-  function canStartExternalTextSteer(
-    imageUrls: string[] = [],
-    skills: Array<{ name: string; path: string }> = [],
-    fileAttachments: FileAttachment[] = [],
-  ): boolean {
-    return imageUrls.length === 0 && skills.length === 0 && fileAttachments.length === 0
-  }
-
-  function canRetryPendingTurnAsExternalTextSteer(
-    mode: 'steer' | 'queue',
-    submission: LocalSubmissionState,
-    pendingTurnRequest: PendingTurnRequest | undefined,
-  ): boolean {
-    return mode === 'steer'
-      && submission.turnStartIssued
-      && pendingTurnRequest !== undefined
-      && canStartExternalTextSteer(
-        pendingTurnRequest.imageUrls,
-        pendingTurnRequest.skills,
-        pendingTurnRequest.fileAttachments,
-      )
-  }
-
-  async function startExternalTextSteer(
-    threadId: string,
-    nextText: string,
-    collaborationModeOverride?: CollaborationModeKind,
-    optimisticMessageIdOverride = '',
-  ): Promise<boolean> {
-    const normalizedText = nextText.trim()
-    if (!threadId || !normalizedText) return false
-    const collaborationMode = collaborationModeOverride === 'plan'
-      ? 'plan'
-      : collaborationModeOverride === 'default'
-        ? 'default'
-        : selectedCollaborationMode.value
-    error.value = ''
-    shouldAutoScrollOnNextAgentEvent = true
-    setTurnErrorForThread(threadId, null)
-    setThreadRuntimeOwnership(threadId, 'external', {
-      canInterrupt: runtimeCanInterruptByThreadId.value[threadId] === true,
-    })
-    setThreadInProgress(threadId, true)
-    const optimisticMessageId = optimisticMessageIdOverride
-      || appendOptimisticUserMessage(threadId, normalizedText)
-
-    try {
-      await startThreadTurn(
-        threadId,
-        normalizedText,
-        [],
-        readModelIdForThread(threadId) || undefined,
-        readReasoningEffortForThread(threadId) || undefined,
-        undefined,
-        [],
-        collaborationMode,
-        { externalSteer: true },
-      )
-      return true
-    } catch (unknownError) {
-      removeOptimisticUserMessage(threadId, optimisticMessageId)
-      const errorMessage = unknownError instanceof Error ? unknownError.message : 'Unknown application error'
-      setTurnErrorForThread(threadId, errorMessage)
-      error.value = errorMessage
-      return false
-    }
-  }
-
   async function sendMessageToSelectedThread(
     text: string,
     imageUrls: string[] = [],
@@ -9022,14 +8997,7 @@ export function useDesktopState() {
       return
     }
     if (isExternallyOwned(threadId)) {
-      if (mode === 'steer' && canStartExternalTextSteer(imageUrls, skills, fileAttachments)) {
-        const steered = await startExternalTextSteer(threadId, nextText, collaborationModeOverride)
-        if (steered) {
-          await uploadLease.release()
-          return
-        }
-      }
-      enqueueExternalTextOnlyThreadMessage(
+      await enqueueExternalTextOnlyThreadMessage(
         threadId,
         nextText,
         collaborationModeOverride,
@@ -9047,14 +9015,7 @@ export function useDesktopState() {
         return
       }
       if (isExternallyOwned(threadId)) {
-        if (mode === 'steer' && canStartExternalTextSteer(imageUrls, skills, fileAttachments)) {
-          const steered = await startExternalTextSteer(threadId, nextText, collaborationModeOverride)
-          if (steered) {
-            await uploadLease.release()
-            return
-          }
-        }
-        enqueueExternalTextOnlyThreadMessage(
+        await enqueueExternalTextOnlyThreadMessage(
           threadId,
           nextText,
           collaborationModeOverride,
@@ -9073,7 +9034,7 @@ export function useDesktopState() {
     const isInProgress = inProgressById.value[threadId] === true
 
     if (isInProgress && mode === 'queue') {
-      enqueueThreadMessage(
+      const queuedMessage = await enqueueThreadMessageDurably(
         threadId,
         nextText,
         imageUrls,
@@ -9082,7 +9043,7 @@ export function useDesktopState() {
         collaborationModeOverride,
         queueInsertIndex,
       )
-      uploadLease.transfer()
+      if (queuedMessage) uploadLease.transfer()
       await uploadLease.release()
       return
     }
@@ -9109,27 +9070,11 @@ export function useDesktopState() {
       ).catch(async (unknownError) => {
         if (isWriterOwnershipNotIdleError(unknownError)) {
           const pendingTurnRequest = submission.pendingTurnRequest
-          const shouldRetryExternalTextSteer = canRetryPendingTurnAsExternalTextSteer(
-            mode,
-            submission,
-            pendingTurnRequest,
-          )
           clearPendingStopRequest(threadId, submission.generation)
           clearLocalSubmission(threadId, submission.generation)
           releasePendingTurnRequest(threadId, pendingTurnRequest)
-          if (
-            shouldRetryExternalTextSteer
-            && await startExternalTextSteer(
-              threadId,
-              nextText,
-              collaborationModeOverride,
-              optimisticMessageId,
-            )
-          ) {
-            return
-          }
           removeOptimisticUserMessage(threadId, optimisticMessageId)
-          enqueueExternalTextOnlyThreadMessage(
+          const queuedMessage = await enqueueExternalTextOnlyThreadMessage(
             threadId,
             nextText,
             collaborationModeOverride,
@@ -9137,8 +9082,10 @@ export function useDesktopState() {
           )
           setThreadRuntimeOwnership(threadId, 'external', { externalPollDelayMs: 0 })
           setThreadInProgress(threadId, true)
-          setTurnErrorForThread(threadId, null)
-          error.value = ''
+          if (queuedMessage) {
+            setTurnErrorForThread(threadId, null)
+            error.value = ''
+          }
           return
         }
         if (!isAmbiguousTurnStartError(unknownError)) {
@@ -9199,28 +9146,12 @@ export function useDesktopState() {
     } catch (unknownError) {
       if (isWriterOwnershipNotIdleError(unknownError)) {
         const pendingTurnRequest = submission.pendingTurnRequest
-        const shouldRetryExternalTextSteer = canRetryPendingTurnAsExternalTextSteer(
-          mode,
-          submission,
-          pendingTurnRequest,
-        )
         releasePendingTurnRequest(threadId, pendingTurnRequest)
         await uploadLease.release()
         clearPendingStopRequest(threadId, submission.generation)
         clearLocalSubmission(threadId, submission.generation)
-        if (
-          shouldRetryExternalTextSteer
-          && await startExternalTextSteer(
-            threadId,
-            nextText,
-            collaborationModeOverride,
-            optimisticMessageId,
-          )
-        ) {
-          return
-        }
         removeOptimisticUserMessage(threadId, optimisticMessageId)
-        enqueueExternalTextOnlyThreadMessage(
+        const queuedMessage = await enqueueExternalTextOnlyThreadMessage(
           threadId,
           nextText,
           collaborationModeOverride,
@@ -9229,9 +9160,9 @@ export function useDesktopState() {
         setThreadRuntimeOwnership(threadId, 'external', { externalPollDelayMs: 0 })
         setThreadInProgress(threadId, true)
         setTurnActivityForThread(threadId, null)
-        setTurnErrorForThread(threadId, null)
+        if (queuedMessage) setTurnErrorForThread(threadId, null)
         shouldAutoScrollOnNextAgentEvent = true
-        error.value = ''
+        if (queuedMessage) error.value = ''
         return
       }
       await uploadLease.release()
@@ -9573,14 +9504,22 @@ export function useDesktopState() {
     }
   }
 
-  async function processQueuedMessages(threadId: string): Promise<void> {
+  async function processQueuedMessages(
+    threadId: string,
+    scheduledMutationVersion = queueMutationVersion,
+  ): Promise<void> {
+    if (queueMutationVersion !== scheduledMutationVersion) return
     if (queueProcessingByThreadId.value[threadId] === true) return
     queueProcessingByThreadId.value = {
       ...queueProcessingByThreadId.value,
       [threadId]: true,
     }
+    const mutationVersionAtStart = queueMutationVersion
     try {
-      queuedMessagesByThreadId.value = await getThreadQueueState()
+      const refreshedQueueState = await getThreadQueueState()
+      if (queueMutationVersion === mutationVersionAtStart) {
+        queuedMessagesByThreadId.value = refreshedQueueState
+      }
     } catch {
       // Backend queue state is optional during transient bridge failures.
     } finally {
@@ -9589,10 +9528,11 @@ export function useDesktopState() {
   }
 
   function scheduleQueueStateRefresh(threadId: string): void {
-    void processQueuedMessages(threadId)
+    const scheduledMutationVersion = queueMutationVersion
+    void processQueuedMessages(threadId, scheduledMutationVersion)
     if (typeof window === 'undefined') return
     window.setTimeout(() => {
-      void processQueuedMessages(threadId)
+      void processQueuedMessages(threadId, scheduledMutationVersion)
     }, 650)
   }
 
@@ -10552,14 +10492,7 @@ export function useDesktopState() {
     if (!queue) return
     const msg = queue.find((m) => m.id === messageId)
     if (!msg) return
-    if (isExternallyOwned(threadId)) {
-      if (!canStartExternalTextSteer(msg.imageUrls, msg.skills, msg.fileAttachments)) return
-      const steered = await startExternalTextSteer(threadId, msg.text, msg.collaborationMode)
-      if (steered) {
-        removeQueuedMessage(messageId, true, true)
-      }
-      return
-    }
+    if (isExternallyOwned(threadId)) return
     removeQueuedMessage(messageId, true)
     setSelectedCollaborationMode(msg.collaborationMode)
     void sendMessageToSelectedThread(msg.text, msg.imageUrls, msg.skills, 'steer', msg.fileAttachments)

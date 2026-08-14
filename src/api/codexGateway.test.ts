@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { ThreadReadResponse } from './appServerDtos'
 import {
+  appendThreadQueuedMessage,
   getAvailableModelIds,
   getCurrentModelConfig,
   getExternalThreadLiveSnapshot,
@@ -90,16 +91,14 @@ describe('startThreadTurn collaboration mode payloads', () => {
     })
   })
 
-  it('marks explicit external steers without exposing the marker to ordinary starts', async () => {
+  it('does not add an external-steer bypass marker to turn starts', async () => {
     const { requests } = mockRpcFetch()
 
-    await startThreadTurn('thread-1', 'mobile steer', [], 'gpt-5.4', 'medium', undefined, [], 'default', {
-      externalSteer: true,
-    })
+    await startThreadTurn('thread-1', 'mobile message', [], 'gpt-5.4', 'medium', undefined, [], 'default')
 
     expect(requests).toHaveLength(1)
     expect(requests[0].method).toBe('turn/start')
-    expect(requests[0].params.__codexMobileExternalSteer).toBe(true)
+    expect(requests[0].params.__codexMobileExternalSteer).toBeUndefined()
   })
 
   it('allows max and ultra reasoning efforts in turn payloads and config reads', async () => {
@@ -364,6 +363,36 @@ describe('managed uploads', () => {
       queueState: {
         'thread-1': [expect.objectContaining({ imageUrls: [managedImageUrl] })],
       },
+    })
+  })
+
+  it('appends one queued message atomically instead of replacing queue state', async () => {
+    const requests: Array<{ input: RequestInfo | URL; init?: RequestInit }> = []
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      requests.push({ input, init })
+      return new Response(JSON.stringify({ ok: true }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      })
+    }))
+
+    await appendThreadQueuedMessage('thread-1', {
+      id: 'queued-atomic',
+      text: 'wait for CLI',
+      imageUrls: [],
+      skills: [],
+      fileAttachments: [],
+      collaborationMode: 'default',
+      model: 'gpt-5.6-sol',
+      effort: 'high',
+    }, 1)
+
+    expect(String(requests[0]?.input)).toBe('/codex-api/thread-queue-state')
+    expect(requests[0]?.init?.method).toBe('POST')
+    expect(JSON.parse(String(requests[0]?.init?.body))).toEqual({
+      threadId: 'thread-1',
+      message: expect.objectContaining({ id: 'queued-atomic', text: 'wait for CLI' }),
+      queueInsertIndex: 1,
     })
   })
 })

@@ -46,6 +46,50 @@ describe('HTTP response cache bounds', () => {
 })
 
 describe('external thread runtime bridge augmentation', () => {
+  it('canonicalizes a stale interrupted CLI turn as the single running projection', async () => {
+    const probe = fakeProbe({
+      state: 'running',
+      turnId: 'turn-cli',
+      interruptible: false,
+      source: 'external-session-writer',
+    })
+    const payload = {
+      thread: {
+        id: 'thread-cli',
+        path: '/home/user/.codex/sessions/rollout-thread-cli.jsonl',
+        status: { type: 'notLoaded' },
+        turns: [{
+          id: 'turn-cli',
+          status: 'interrupted',
+          items: [{ id: 'agent-existing', type: 'agentMessage', text: 'existing output' }],
+        }],
+      },
+    }
+
+    await expect(augmentThreadResultWithExternalRuntime(
+      'thread/read',
+      payload,
+      probe,
+      4242,
+    )).resolves.toEqual({
+      thread: {
+        ...payload.thread,
+        turns: [{
+          id: 'turn-cli',
+          status: 'inProgress',
+          items: [{ id: 'agent-existing', type: 'agentMessage', text: 'existing output' }],
+        }],
+        externalRuntime: {
+          state: 'running',
+          turnId: 'turn-cli',
+          interruptible: false,
+          source: 'external-session-writer',
+        },
+      },
+    })
+    expect(payload.thread.turns[0]?.status).toBe('interrupted')
+  })
+
   it('attaches external runtime to an idle thread without mutating the sanitized response', async () => {
     const probe = fakeProbe({
       state: 'running',
@@ -2220,7 +2264,7 @@ describe('POST /codex-api/rpc guarded user turns', () => {
     expect(rpc).not.toHaveBeenCalledWith('turn/start', expect.anything())
   })
 
-  it('allows explicit external steer turn/start when the immediate writer probe is a running external owner', async () => {
+  it('blocks explicit external steer turn/start when another writer owns the task', async () => {
     const middleware = createCodexBridgeMiddleware()
     const shared = sharedBridgeForTest()
     vi.spyOn(shared.appServer, 'getPid').mockReturnValue(4242)
@@ -2261,16 +2305,15 @@ describe('POST /codex-api/rpc guarded user turns', () => {
       }),
     })
 
-    expect(response.status).toBe(200)
-    await expect(response.json()).resolves.toEqual({ result: { turn: { id: 'turn-steered' } } })
-    expect(inspect).toHaveBeenCalledWith('thread-existing', 4242)
-    expect(rpc).toHaveBeenCalledWith('turn/start', {
-      threadId: 'thread-existing',
-      input: [{ type: 'text', text: 'steer' }],
+    expect(response.status).toBe(502)
+    await expect(response.json()).resolves.toMatchObject({
+      error: expect.stringContaining('writer ownership is not idle'),
     })
+    expect(inspect).toHaveBeenCalledWith('thread-existing', 4242)
+    expect(rpc).not.toHaveBeenCalledWith('turn/start', expect.anything())
   })
 
-  it('rejects explicit external steer turn/start when the payload is not text-only', async () => {
+  it('blocks an old external-steer marker regardless of payload shape', async () => {
     const middleware = createCodexBridgeMiddleware()
     const shared = sharedBridgeForTest()
     const inspect = vi.spyOn(shared.runtimeProbe, 'inspect').mockResolvedValue({
@@ -2281,7 +2324,19 @@ describe('POST /codex-api/rpc guarded user turns', () => {
     })
     const rpc = vi.spyOn(shared.appServer as unknown as {
       rpc(method: string, params: unknown): Promise<unknown>
-    }, 'rpc').mockResolvedValue({})
+    }, 'rpc').mockImplementation(async (method) => {
+      if (method === 'thread/read') {
+        return {
+          thread: {
+            id: 'thread-existing',
+            path: '/home/user/.codex/sessions/rollout-thread-existing.jsonl',
+            status: { type: 'idle' },
+            turns: [],
+          },
+        }
+      }
+      return {}
+    })
     const port = await listenWithMiddleware(middleware)
 
     const response = await fetch(`http://127.0.0.1:${port}/codex-api/rpc`, {
@@ -2298,10 +2353,12 @@ describe('POST /codex-api/rpc guarded user turns', () => {
       }),
     })
 
-    expect(response.status).toBe(400)
-    await expect(response.json()).resolves.toEqual({ error: 'External steer only supports text input.' })
-    expect(inspect).not.toHaveBeenCalled()
-    expect(rpc).not.toHaveBeenCalled()
+    expect(response.status).toBe(502)
+    await expect(response.json()).resolves.toMatchObject({
+      error: expect.stringContaining('writer ownership is not idle'),
+    })
+    expect(inspect).toHaveBeenCalledWith('thread-existing', null)
+    expect(rpc).not.toHaveBeenCalledWith('turn/start', expect.anything())
   })
 
   it('allows the first turn only after a materialized rollout has an explicit idle probe', async () => {

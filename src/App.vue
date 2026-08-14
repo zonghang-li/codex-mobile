@@ -1801,9 +1801,7 @@ const isSelectedThreadInProgress = computed(() => !isHomeRoute.value && selected
 const hasSidebarAttentionIndicator = computed(() => hasSidebarAttention(projectGroups.value))
 const selectedThreadQueuedSteerDisabledMessageIds = computed(() => {
   if (selectedThreadRuntimeOwnership.value !== 'external') return []
-  return selectedThreadQueuedMessages.value
-    .filter((message) => message.imageUrls.length > 0 || message.skills.length > 0 || message.fileAttachments.length > 0)
-    .map((message) => message.id)
+  return selectedThreadQueuedMessages.value.map((message) => message.id)
 })
 const showThreadContextBadge = computed(() => !isHomeRoute.value && !isSkillsRoute.value && !isAutomationsRoute.value && selectedThreadId.value.trim().length > 0)
 const isAccountSwitchBlocked = computed(() =>

@@ -8,7 +8,7 @@ Mobile sidebar and conversation loading use metadata-only sidebar pages, active-
 2. A workspace with more than 20 threads, including at least one running or recently completed thread.
 3. One selected thread with enough assistant output and reasoning text to require active-turn text pagination.
 4. Two mobile browser windows or tabs can be opened on the same origin.
-5. A running thread owned by another Codex client is available for mobile takeover checks.
+5. A running thread owned by a direct Codex CLI process is available for mobile read-authority checks.
 6. Light theme and dark theme both available from the appearance switcher.
 
 #### Steps
@@ -35,12 +35,12 @@ Mobile sidebar and conversation loading use metadata-only sidebar pages, active-
 21. Restart the safe service while another Codex client owns the selected running thread, then leave that client quiet for several minutes without a terminal lifecycle record; confirm `/codex-api/thread-text-page` keeps returning the active page from the local rollout path instead of falling back to slow `thread/read` or `409`.
 22. Confirm intermediate assistant progress/commentary rows may render as transcript body, but `Copy` and `Fork` controls plus the completion time appear only on a completed final assistant response, including responses whose persisted phase is `final_answer`; copying that response excludes prior commentary/progress text.
 23. Let the selected running turn complete from another Codex client and confirm the final detail refresh happens immediately rather than waiting for the generic event-sync debounce or an external runtime poll.
-24. Open a running thread owned by another Codex client, refresh the mobile page, and confirm the composer textarea, send button with a non-empty draft, and stop button with an empty draft remain usable.
+24. Open a running thread owned by a direct Codex CLI process, refresh the mobile page, and confirm the transcript continues updating without issuing `thread/resume` or `turn/start`; the composer remains available for queueing while Stop cannot interrupt the CLI-owned turn.
 25. Refresh a selected thread whose initial detail briefly reports local running while another Codex client is the real writer; confirm the next runtime probe hands the thread to the external realtime path and immediately appends the selected active text tail.
 26. With "When busy, send as" set to Queue, submit a mobile prompt while the external turn is still running and confirm it appears in the queue without starting a competing turn.
-27. With "When busy, send as" set to Steer, submit a plain-text mobile prompt during an externally owned running turn and confirm the request uses the explicit external steer path and immediately renders an optimistic user bubble. Repeat while runtime ownership changes from local to external between the initial submit and `turn/start`; confirm the client retries once through the explicit external steer path, keeps the same user bubble visible, and does not move the prompt into the queue. Repeat with an attachment or skill selected and confirm that unsupported external steer payload is sanitized into a text-only queued message instead of racing the writer.
-28. Tap Stop on an externally owned running thread and confirm the request uses the current active turn id, then refreshes the selected thread state without clearing visible output.
-29. Confirm existing queued-message edit, delete, and reorder controls remain disabled while an external writer owns the thread; explicit queued-row "Steer" remains available only for text-only queued messages and is disabled for queued messages that still contain images, skills, or file attachments.
+27. With "When busy, send as" set to Steer, submit a plain-text mobile prompt during an externally owned running turn and confirm it is persisted as a text-only queued message without an optimistic sent bubble or `turn/start`. Repeat while runtime ownership changes from local to external between submit and `turn/start`; confirm the rejected local attempt is removed and exactly one queued row remains. Repeat with an attachment or skill selected and confirm managed uploads are released while the text is queued rather than racing the writer.
+28. Confirm Stop cannot interrupt a direct CLI-owned turn. For a separately validated interruptible app-server-owned turn, confirm Stop uses the exact current active turn id and refreshes state without clearing visible output.
+29. Confirm queued-message Steer, edit, delete, and reorder controls all remain disabled while an external writer owns the thread.
 30. Repeat the visible checks in dark theme.
 
 #### Expected Results
@@ -68,11 +68,11 @@ Mobile sidebar and conversation loading use metadata-only sidebar pages, active-
 - A selected long thread that was previously showing a truncated terminal/live window repairs itself after the compressed projection changes; existing output stays visible and the newest tail appears.
 - Historical reasoning remains hidden, running-last-turn reasoning body remains visible, and title-only reasoning statuses are filtered.
 - Response actions and completion time are anchored to final assistant body text only, including `final_answer` phase payloads; retained commentary/progress rows do not expose `Copy` or `Fork`.
-- Refreshing an externally owned running thread does not leave the mobile composer read-only: text input, new-message submit, and Stop stay available.
+- Refreshing a direct CLI-owned running thread keeps transcript polling active and leaves the composer available for append-only queueing, without granting Stop or cross-process turn control.
 - If a refreshed selected thread inherits a stale local-running lease, runtime discovery promotes it to external ownership unless a real local mobile submission is still pending, and the active text tail resumes without a page-wide reload.
-- Mobile submissions during external ownership honor the selected Queue/Steer mode for plain text: Queue stays append-only queued, Steer sends through the explicit external steer path, and a local-to-external ownership race retries that explicit path once without withdrawing the optimistic user bubble or moving it into the queue. Unsupported attachment/skill steers are sanitized into text-only queued messages.
-- Mobile Stop can target the external active turn id, and the follow-up refresh does not clear or overwrite visible transcript history.
-- Existing queued-message mutation controls stay disabled while an external writer owns the thread.
+- Mobile submissions during external ownership are always append-only queued, including Steer mode and local-to-external ownership races; no external-steer marker or competing `turn/start` is issued. Unsupported attachment/skill payloads are sanitized to queued text and their managed uploads are released.
+- Direct CLI ownership is non-interruptible. A validated interruptible app-server owner may still be stopped by exact active turn id, and the follow-up refresh does not clear or overwrite visible transcript history.
+- Queued-message Steer and mutation controls stay disabled while an external writer owns the thread.
 - The behavior is readable and stable in light and dark themes.
 
 #### Rollback/Cleanup

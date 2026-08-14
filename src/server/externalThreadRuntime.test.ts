@@ -851,6 +851,51 @@ describe('ExternalThreadRuntimeProbe', () => {
     })
   })
 
+  it('recognizes a direct Codex CLI rollout writer as non-interruptible', async () => {
+    const system = fakeRuntimeSystem({
+      log: lifecycle('task_started', 'turn-cli'),
+      fds: [writerFd({ cmdline: '/usr/local/bin/codex\0resume\0' })],
+    })
+
+    await expect(registeredProbe(system).inspect('thread-1', 99)).resolves.toEqual({
+      state: 'running',
+      turnId: 'turn-cli',
+      interruptible: false,
+      source: 'external-session-writer',
+    })
+  })
+
+  it('recognizes a flag-only interactive Codex CLI writer as non-interruptible', async () => {
+    const system = fakeRuntimeSystem({
+      log: lifecycle('task_started', 'turn-cli'),
+      fds: [writerFd({ cmdline: '/usr/local/bin/codex\0-C\0/tmp/project\0' })],
+    })
+
+    await expect(registeredProbe(system).inspect('thread-1', 99)).resolves.toEqual({
+      state: 'running',
+      turnId: 'turn-cli',
+      interruptible: false,
+      source: 'external-session-writer',
+    })
+  })
+
+  it('keeps direct CLI ownership non-interruptible beside an app-server descriptor', async () => {
+    const system = fakeRuntimeSystem({
+      log: lifecycle('task_started', 'turn-cli'),
+      fds: [
+        writerFd({ pid: 42, cmdline: '/usr/local/bin/codex\0app-server\0' }),
+        writerFd({ pid: 43, startTime: '43000', cmdline: '/usr/local/bin/codex\0resume\0' }),
+      ],
+    })
+
+    await expect(registeredProbe(system).inspect('thread-1', 99)).resolves.toEqual({
+      state: 'running',
+      turnId: 'turn-cli',
+      interruptible: false,
+      source: 'external-session-writer',
+    })
+  })
+
   it('reports the latest active exec_command workdir as runtime cwd', async () => {
     const system = fakeRuntimeSystem({
       log:
@@ -1353,7 +1398,6 @@ describe('ExternalThreadRuntimeProbe', () => {
   it.each([
     ['codex-like basename', '/usr/bin/my-codex\0app-server\0'],
     ['app-server before codex', 'app-server\0/usr/bin/codex\0'],
-    ['missing app-server token', '/usr/bin/codex\0-c\0app-server-like\0'],
   ])('rejects writer evidence from a %s command', async (_label, cmdline) => {
     const system = fakeRuntimeSystem({
       log: lifecycle('task_started', 'turn-a'),
