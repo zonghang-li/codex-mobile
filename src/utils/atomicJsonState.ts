@@ -73,11 +73,13 @@ async function replaceFileDurably(path: string, contents: string): Promise<void>
       await file.close()
     }
     await rename(tempPath, path)
-    const directoryHandle = await open(directory, 'r')
-    try {
-      await directoryHandle.sync()
-    } finally {
-      await directoryHandle.close()
+    if (process.platform !== 'win32') {
+      const directoryHandle = await open(directory, 'r')
+      try {
+        await directoryHandle.sync()
+      } finally {
+        await directoryHandle.close()
+      }
     }
   } finally {
     await rm(tempPath, { force: true }).catch(() => {})

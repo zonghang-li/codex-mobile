@@ -318,6 +318,7 @@ const THREAD_WRITER_METHODS_REQUIRING_IDLE = new Set([
   'thread/goal/set',
   'thread/goal/clear',
   'thread/start-turn',
+  'review/start',
   'turn/interrupt',
   'turn/start',
 ])
@@ -733,7 +734,8 @@ export function prepareRpcProxyRequest(
     && record?.[CODEX_MOBILE_FORCE_FRESH_THREAD_LIST_PARAM] === true
   const isExplicitExternalSteer = method === 'turn/start'
     && record?.[CODEX_MOBILE_EXTERNAL_STEER_PARAM] === true
-  if ((!isLiveSnapshot && !isForceFreshThreadList && !isExplicitExternalSteer) || !record) {
+  const enforceTurnPolicy = method === 'turn/start'
+  if ((!isLiveSnapshot && !isForceFreshThreadList && !isExplicitExternalSteer && !enforceTurnPolicy) || !record) {
     return {
       params: params ?? null,
       skipSessionSkillEnrichment: false,
@@ -750,6 +752,10 @@ export function prepareRpcProxyRequest(
   }
   if (isExplicitExternalSteer) {
     delete forwardedParams[CODEX_MOBILE_EXTERNAL_STEER_PARAM]
+  }
+  if (enforceTurnPolicy) {
+    forwardedParams.approvalPolicy = readQueuedTurnApprovalPolicy()
+    forwardedParams.sandboxPolicy = readQueuedTurnSandboxPolicy()
   }
   return {
     params: forwardedParams,
@@ -1393,6 +1399,34 @@ async function guardThreadResumeAgainstExternalWriter(
   if (inspection.state === 'idle') return { blocked: false }
   if (inspection.state === 'unmaterialized' && inspection.error) throw inspection.error
   return { blocked: true, readResult: inspection.readResult }
+}
+
+async function auditStartedTurnAgainstExternalWriter(
+  appServer: RpcExecutor,
+  runtimeProbe: Pick<ThreadRuntimeProbe, 'registerThread' | 'inspect'>,
+  excludedPid: number | null,
+  threadId: string,
+  result: unknown,
+  allowUnmaterialized = false,
+): Promise<unknown> {
+  const inspection = await inspectThreadWriter(appServer, runtimeProbe, excludedPid, threadId)
+  if (inspection.state === 'idle' || (allowUnmaterialized && inspection.state === 'unmaterialized')) return result
+  const turnId = readNonEmptyString(asRecord(asRecord(result)?.turn)?.id)
+  if (turnId) {
+    await appServer.rpc('turn/interrupt', { threadId, turnId }).catch(() => undefined)
+  }
+  const error = new Error('Cannot start a turn because task writer ownership is not idle.')
+  error.name = 'ThreadWriterOwnershipConflictError'
+  throw error
+}
+
+async function isThreadWriterIdleForMutation(
+  appServer: RpcExecutor,
+  runtimeProbe: Pick<ThreadRuntimeProbe, 'registerThread' | 'inspect'>,
+  excludedPid: number | null,
+  threadId: string,
+): Promise<boolean> {
+  return (await inspectThreadWriter(appServer, runtimeProbe, excludedPid, threadId)).state === 'idle'
 }
 
 function isThreadTurnRunning(turn: unknown): boolean {
@@ -3023,7 +3057,12 @@ function isStateDbThreadArchived(threadId: string): boolean {
     stateDbPath,
     `SELECT archived FROM threads WHERE id = ${sqlString(normalizedThreadId)} LIMIT 1;`,
   ], { encoding: 'utf8' })
-  return result.status === 0 && result.stdout.trim() === '1'
+  if (result.status !== 0) {
+    const error = new Error('Cannot verify archived task state.')
+    error.name = 'ArchivedThreadStateUnavailableError'
+    throw error
+  }
+  return result.stdout.trim() === '1'
 }
 
 function ensureImportedThreadsStateDbTable(stateDbPath: string): boolean {
@@ -3999,6 +4038,16 @@ export async function callRpcWithArchiveRecovery(
 
   try {
     const result = await callRpcWithRateLimitDecodeRecovery(appServer, method, params)
+    if (method === 'turn/start' && threadId && runtimeProbe) {
+      return await auditStartedTurnAgainstExternalWriter(
+        appServer,
+        runtimeProbe,
+        excludedPid,
+        threadId,
+        result,
+        options.locallyCreatedFirstTurn === true,
+      )
+    }
     return method === 'thread/list'
       ? await canonicalizeThreadListResponseForRead(result)
       : result
@@ -4019,7 +4068,17 @@ export async function callRpcWithArchiveRecovery(
         }
       }
       await appServer.rpc('thread/resume', { threadId })
-      return appServer.rpc(method, params ?? null)
+      const recovered = await appServer.rpc(method, params ?? null)
+      return runtimeProbe
+        ? auditStartedTurnAgainstExternalWriter(
+            appServer,
+            runtimeProbe,
+            excludedPid,
+            threadId,
+            recovered,
+            options.locallyCreatedFirstTurn === true,
+          )
+        : recovered
     }
 
     if (
@@ -9357,8 +9416,10 @@ export async function deleteManagedUpload(
         }
         return true
       }
-      await rm(canonicalDirectory, { recursive: true, force: false })
-      return true
+      return deleteManagedUploadIfUnreferenced(root, canonicalDirectory, async () => {
+        await rm(canonicalDirectory, { recursive: true, force: false })
+        return true
+      })
     } catch {
       return false
     }
@@ -10494,11 +10555,14 @@ class AppServerProcess {
 
 export class BackendQueueProcessor {
   private static readonly CLAIM_LEASE_MS = 10_000
+  private static readonly BLOCKED_RETRY_MS = 30_000
+  private static readonly DRAIN_BATCH_LIMIT = 16
   private readonly processingThreadIds = new Set<string>()
-  private readonly queueDrainTimersByThreadId = new Map<string, ReturnType<typeof setTimeout>>()
   private readonly queueDrainDueAtByThreadId = new Map<string, number>()
+  private queueDrainTimer: ReturnType<typeof setTimeout> | null = null
   private readonly runtimeQueuedMessages = new Map<string, StoredQueuedMessage>()
   private readonly activeManagedMessagesByThreadId = new Map<string, StoredQueuedMessage>()
+  private activeManagedReconcileTimer: ReturnType<typeof setTimeout> | null = null
   private readonly claimOwnerId = randomUUID()
   private readonly unsubscribe: () => void
   private disposed = false
@@ -10523,11 +10587,11 @@ export class BackendQueueProcessor {
     this.disposed = true
     liveBackendQueueClaimOwnerIds.delete(this.claimOwnerId)
     this.unsubscribe()
-    for (const timer of this.queueDrainTimersByThreadId.values()) {
-      clearTimeout(timer)
-    }
-    this.queueDrainTimersByThreadId.clear()
+    if (this.queueDrainTimer) clearTimeout(this.queueDrainTimer)
+    this.queueDrainTimer = null
     this.queueDrainDueAtByThreadId.clear()
+    if (this.activeManagedReconcileTimer) clearTimeout(this.activeManagedReconcileTimer)
+    this.activeManagedReconcileTimer = null
     this.processingThreadIds.clear()
     this.runtimeQueuedMessages.clear()
     this.activeManagedMessagesByThreadId.clear()
@@ -10590,27 +10654,45 @@ export class BackendQueueProcessor {
     const normalizedDelayMs = Math.max(0, delayMs)
     const nextDueAt = Date.now() + normalizedDelayMs
     const existingDueAt = this.queueDrainDueAtByThreadId.get(threadId)
-    const existingTimer = this.queueDrainTimersByThreadId.get(threadId)
-    if (existingTimer) {
-      if (existingDueAt !== undefined && existingDueAt <= nextDueAt) return
-      clearTimeout(existingTimer)
-      this.queueDrainTimersByThreadId.delete(threadId)
-      this.queueDrainDueAtByThreadId.delete(threadId)
-    }
-    const timer = setTimeout(() => {
-      this.queueDrainTimersByThreadId.delete(threadId)
-      this.queueDrainDueAtByThreadId.delete(threadId)
-      void this.processThreadQueue(threadId)
-    }, normalizedDelayMs)
-    timer.unref?.()
-    this.queueDrainTimersByThreadId.set(threadId, timer)
+    if (existingDueAt !== undefined && existingDueAt <= nextDueAt) return
     this.queueDrainDueAtByThreadId.set(threadId, nextDueAt)
+    this.armQueueDrainTimer()
+  }
+
+  private armQueueDrainTimer(): void {
+    if (this.disposed) return
+    if (this.queueDrainTimer) clearTimeout(this.queueDrainTimer)
+    const earliest = Math.min(...this.queueDrainDueAtByThreadId.values())
+    if (!Number.isFinite(earliest)) {
+      this.queueDrainTimer = null
+      return
+    }
+    this.queueDrainTimer = setTimeout(() => {
+      this.queueDrainTimer = null
+      const now = Date.now()
+      const dueThreadIds = [...this.queueDrainDueAtByThreadId.entries()]
+        .filter(([, dueAt]) => dueAt <= now)
+        .sort((left, right) => left[1] - right[1])
+        .slice(0, BackendQueueProcessor.DRAIN_BATCH_LIMIT)
+        .map(([threadId]) => threadId)
+      for (const threadId of dueThreadIds) this.queueDrainDueAtByThreadId.delete(threadId)
+      for (const threadId of dueThreadIds) void this.processThreadQueue(threadId)
+      this.armQueueDrainTimer()
+    }, Math.max(0, earliest - Date.now()))
+    this.queueDrainTimer.unref?.()
   }
 
   async processThreadQueue(threadId: string): Promise<void> {
     if (this.disposed || this.processingThreadIds.has(threadId)) return
     this.processingThreadIds.add(threadId)
     try {
+      const preview = await this.peekNextQueuedTurn(threadId)
+      if (!preview) return
+      const previewState = await this.inspectQueuedTurn(preview)
+      if (!previewState.accepted && !previewState.canStart) {
+        this.scheduleThreadQueueDrain(threadId, BackendQueueProcessor.BLOCKED_RETRY_MS)
+        return
+      }
       const next = await this.claimNextQueuedTurn(threadId)
       if (!next) {
         if (await this.hasQueuedTurns(threadId)) this.scheduleThreadQueueDrain(threadId)
@@ -10631,7 +10713,7 @@ export class BackendQueueProcessor {
       }
       if (!beforeStart.canStart) {
         await this.releaseUnattemptedQueuedTurnClaim(next)
-        this.scheduleThreadQueueDrain(threadId)
+        this.scheduleThreadQueueDrain(threadId, BackendQueueProcessor.BLOCKED_RETRY_MS)
         return
       }
       try {
@@ -10660,6 +10742,20 @@ export class BackendQueueProcessor {
     } finally {
       this.processingThreadIds.delete(threadId)
     }
+  }
+
+  private async peekNextQueuedTurn(threadId: string): Promise<BackendQueuedTurn | null> {
+    const store = await readThreadQueueStore()
+    const processing = store.processing[threadId]
+    const message = processing
+      ? store.state[threadId]?.find((candidate) => candidate.id === processing.messageId)
+      : store.state[threadId]?.[0]
+    return message ? {
+      threadId,
+      message,
+      attempted: processing?.attempted === true,
+      ownerId: processing?.ownerId ?? '',
+    } : null
   }
 
   private async hasQueuedTurns(threadId: string): Promise<boolean> {
@@ -10882,6 +10978,7 @@ export class BackendQueueProcessor {
     } catch {
       return
     }
+    let needsRetry = false
     for (const [threadId, message] of Object.entries(activeMessages)) {
       if (this.disposed) return
       try {
@@ -10897,7 +10994,10 @@ export class BackendQueueProcessor {
               || readNonEmptyString(item?.client_id) === message.id
           })
         })
-        if (!acceptedTurn) continue
+        if (!acceptedTurn) {
+          needsRetry = true
+          continue
+        }
         if (readThreadResultInProgress({ turns: [acceptedTurn] })) {
           this.activeManagedMessagesByThreadId.set(threadId, message)
           continue
@@ -10906,7 +11006,15 @@ export class BackendQueueProcessor {
         if (released) this.releaseManagedMessage(released)
       } catch {
         // Ambiguous recovery remains protected until a later completion or restart.
+        needsRetry = true
       }
+    }
+    if (needsRetry && !this.disposed && !this.activeManagedReconcileTimer) {
+      this.activeManagedReconcileTimer = setTimeout(() => {
+        this.activeManagedReconcileTimer = null
+        void this.reconcilePersistedActiveManagedMessages()
+      }, 5_000)
+      this.activeManagedReconcileTimer.unref?.()
     }
   }
 
@@ -11024,7 +11132,7 @@ export class BackendQueueProcessor {
         },
       }
     } catch {
-      // Older app-server versions still accept a plain turn/start without collaborationMode.
+      throw new Error('Cannot preserve queued collaboration settings.')
     }
 
     return params
@@ -11065,7 +11173,16 @@ export class BackendQueueProcessor {
       if (!finalState.canStart) {
         throw new Error('Cannot start a queued turn after writer ownership changed.')
       }
-      await this.appServer.rpc('turn/start', params)
+      const result = await this.appServer.rpc('turn/start', params)
+      if (this.runtimeProbe) {
+        await auditStartedTurnAgainstExternalWriter(
+          this.appServer,
+          this.runtimeProbe,
+          this.appServer.getPid(),
+          turn.threadId,
+          result,
+        )
+      }
     })
   }
 }
@@ -13218,6 +13335,20 @@ export function createCodexBridgeMiddleware(options: {
 
       if (req.method === 'POST' && url.pathname === '/codex-api/server-requests/respond') {
         const payload = await readJsonBody(req)
+        const requestId = asRecord(payload)?.id
+        const pendingRequest = typeof requestId === 'number'
+          ? appServer.listPendingServerRequests().find((request) => request.id === requestId)
+          : undefined
+        const pendingThreadId = readNonEmptyString(asRecord(pendingRequest?.params)?.threadId)
+        if (pendingThreadId && !(await isThreadWriterIdleForMutation(
+          appServer,
+          runtimeProbe,
+          appServer.getPid(),
+          pendingThreadId,
+        ))) {
+          setJson(res, 409, { error: 'Cannot reply while another writer owns the task.' })
+          return
+        }
         await appServer.respondToServerRequest(payload)
         setJson(res, 200, { ok: true })
         return
@@ -13930,6 +14061,16 @@ export function createCodexBridgeMiddleware(options: {
         }
         const queueStateRecord = asRecord(record.queueState) ?? record
         const runtimeState = normalizeThreadQueueState(queueStateRecord)
+        const existingQueueState = (await readThreadQueueStore()).state
+        for (const threadId of new Set([
+          ...Object.keys(existingQueueState),
+          ...Object.keys(runtimeState),
+        ])) {
+          if (!(await isThreadWriterIdleForMutation(appServer, runtimeProbe, appServer.getPid(), threadId))) {
+            setJson(res, 409, { error: 'Cannot replace a queue while another writer owns the task.' })
+            return
+          }
+        }
         const baseRevision = typeof record.baseRevision === 'number' && Number.isSafeInteger(record.baseRevision)
           ? record.baseRevision
           : null
@@ -13965,6 +14106,10 @@ export function createCodexBridgeMiddleware(options: {
           setJson(res, 400, { error: 'Missing threadId or operation' })
           return
         }
+        if (!(await isThreadWriterIdleForMutation(appServer, runtimeProbe, appServer.getPid(), threadId))) {
+          setJson(res, 409, { error: 'Cannot mutate queued work while another writer owns the task.' })
+          return
+        }
         if (operation === 'remove') {
           const messageId = readNonEmptyString(record?.messageId)
           if (!messageId) {
@@ -13991,6 +14136,7 @@ export function createCodexBridgeMiddleware(options: {
           }
         } else if (operation === 'reorder') {
           await reorderThreadQueuedMessages(threadId, normalizeStringArray(record?.orderedMessageIds))
+          backendQueueProcessor.scheduleThreadQueueDrain(threadId, 0)
         } else {
           setJson(res, 400, { error: 'Unsupported queue operation' })
           return
@@ -14554,6 +14700,7 @@ export function createCodexBridgeMiddleware(options: {
         error.name === 'ThreadStartClaimConflictError'
         || error.name === 'ThreadWriterOwnershipConflictError'
         || error.name === 'ArchivedThreadConflictError'
+        || error.name === 'ArchivedThreadStateUnavailableError'
       ) ? 409 : 502, { error: message })
     }
   }

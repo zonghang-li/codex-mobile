@@ -917,14 +917,14 @@ const props = defineProps<{
   isThreadListFullyLoaded: boolean
   searchQuery: string
   searchMatchedThreadIds: string[] | null
-  externallyOwnedThreadIds: string[]
+  externallyOwnedThreadIds: Record<string, boolean>
 }>()
 
 const { t } = useUiLanguage()
 const { recordVisibleFailure } = useFeedbackDiagnostics()
 
 function isThreadExternallyOwned(threadId: string): boolean {
-  return props.externallyOwnedThreadIds.includes(threadId)
+  return props.externallyOwnedThreadIds[threadId] === true
 }
 
 const emit = defineEmits<{

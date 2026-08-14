@@ -2569,6 +2569,7 @@ describe('POST /codex-api/rpc guarded user turns', () => {
       'thread/start',
       'thread/read',
       'turn/start',
+      'thread/read',
     ])
     expect(rpc).toHaveBeenCalledWith('turn/start', expect.objectContaining({ threadId: 'thread-new' }))
   })
@@ -2618,6 +2619,7 @@ describe('POST /codex-api/rpc guarded user turns', () => {
       'thread/read',
       'thread/resume',
       'turn/start',
+      'thread/read',
     ])
     expect(inspect).not.toHaveBeenCalled()
   })
@@ -2667,6 +2669,7 @@ describe('POST /codex-api/rpc guarded user turns', () => {
       'thread/start',
       'thread/read',
       'turn/start',
+      'thread/read',
     ])
     expect(inspect).not.toHaveBeenCalled()
   })
@@ -2824,6 +2827,47 @@ describe('POST /codex-api/rpc guarded user turns', () => {
     expect(turnResponse.status).toBe(409)
     expect(inspect).toHaveBeenCalledTimes(2)
     expect(rpc).not.toHaveBeenCalledWith('turn/start', expect.anything())
+  })
+
+  it('interrupts its exact turn when a direct writer appears after the final pre-start probe', async () => {
+    const middleware = createCodexBridgeMiddleware()
+    const shared = sharedBridgeForTest()
+    vi.spyOn(shared.appServer, 'getPid').mockReturnValue(4242)
+    const inspect = vi.spyOn(shared.runtimeProbe, 'inspect')
+      .mockResolvedValueOnce({ state: 'idle' })
+      .mockResolvedValueOnce({
+        state: 'running',
+        turnId: 'turn-cli-late',
+        interruptible: false,
+        source: 'external-session-writer',
+      })
+    const rpc = vi.spyOn(shared.appServer as unknown as {
+      rpc(method: string, params: unknown): Promise<unknown>
+    }, 'rpc').mockImplementation(async (method) => {
+      if (method === 'thread/read') return {
+        thread: { id: 'thread-late-race', path: '/home/user/.codex/sessions/late.jsonl', turns: [] },
+      }
+      if (method === 'turn/start') return { turn: { id: 'turn-mobile-losing' } }
+      if (method === 'turn/interrupt') return {}
+      return {}
+    })
+    const port = await listenWithMiddleware(middleware)
+
+    const response = await fetch(`http://127.0.0.1:${port}/codex-api/rpc`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        method: 'turn/start',
+        params: { threadId: 'thread-late-race', input: [{ type: 'text', text: 'race' }] },
+      }),
+    })
+
+    expect(response.status).toBe(409)
+    expect(rpc).toHaveBeenCalledWith('turn/interrupt', {
+      threadId: 'thread-late-race',
+      turnId: 'turn-mobile-losing',
+    })
+    expect(inspect).toHaveBeenCalledTimes(2)
   })
 })
 

@@ -169,6 +169,18 @@ const SELECTED_IDLE_LIVE_PROJECTION_POLL_MS = BACKGROUND_RUNTIME_POLL_MS
 const BACKGROUND_RUNTIME_BATCH_LIMIT = 16
 const TURN_START_FOLLOW_UP_SYNC_DELAY_MS = 3000
 const THREAD_QUEUE_REQUEST_TIMEOUT_MS = 10_000
+let queuedMessageIdCounter = 0
+
+export function buildQueuedMessageId(): string {
+  const cryptoApi = globalThis.crypto
+  if (typeof cryptoApi?.randomUUID === 'function') return `q-${cryptoApi.randomUUID()}`
+  if (typeof cryptoApi?.getRandomValues === 'function') {
+    const bytes = cryptoApi.getRandomValues(new Uint8Array(16))
+    return `q-${Array.from(bytes, (value) => value.toString(16).padStart(2, '0')).join('')}`
+  }
+  queuedMessageIdCounter = (queuedMessageIdCounter + 1) % Number.MAX_SAFE_INTEGER
+  return `q-${Date.now().toString(36)}-${queuedMessageIdCounter.toString(36)}-${Math.random().toString(36).slice(2)}`
+}
 const RECENT_THREAD_MESSAGE_LOAD_REUSE_MS = 2000
 const RECENT_THREAD_LIST_LOAD_REUSE_MS = 2000
 const RECENT_SKILLS_LOAD_REUSE_MS = 2000
@@ -2523,9 +2535,11 @@ export function useDesktopState() {
     const threadId = selectedThreadId.value
     return threadId ? runtimeOwnershipByThreadId.value[threadId] ?? 'idle' : 'idle'
   })
-  const externallyOwnedThreadIds = computed(() => Object.entries(runtimeOwnershipByThreadId.value)
-    .filter(([, ownership]) => ownership === 'external')
-    .map(([threadId]) => threadId))
+  const externallyOwnedThreadIds = computed<Record<string, boolean>>(() => Object.fromEntries(
+    Object.entries(runtimeOwnershipByThreadId.value)
+      .filter(([, ownership]) => ownership === 'external')
+      .map(([threadId]) => [threadId, true]),
+  ))
   const selectedThreadTerminalOpen = computed(() => {
     const threadId = selectedThreadId.value
     return Boolean(threadId && terminalOpenByThreadId.value[threadId] === true)
@@ -7548,7 +7562,7 @@ export function useDesktopState() {
     settingsOverride?: Pick<QueuedMessage, 'collaborationMode' | 'model' | 'effort'>,
   ): QueuedMessage {
     const queue = queuedMessagesByThreadId.value[threadId] ?? []
-    const id = `q-${globalThis.crypto.randomUUID()}`
+    const id = buildQueuedMessageId()
     const nextQueue = [...queue]
     const insertIndex = typeof queueInsertIndex === 'number'
       ? Math.max(0, Math.min(queueInsertIndex, nextQueue.length))
@@ -10772,8 +10786,9 @@ export function useDesktopState() {
     try {
       const revision = await removeThreadQueuedMessageFromServer(threadId, messageId, { transferManagedUploads })
       latestQueueRevision = Math.max(latestQueueRevision, revision)
-    } catch {
+    } catch (removeError) {
       void processQueuedMessages(threadId)
+      throw removeError
     }
   }
 
@@ -10811,9 +10826,22 @@ export function useDesktopState() {
     const msg = queue.find((m) => m.id === messageId)
     if (!msg) return
     if (isExternallyOwned(threadId)) return
-    await removeQueuedMessage(messageId, true)
-    setSelectedCollaborationMode(msg.collaborationMode)
-    void sendMessageToSelectedThread(msg.text, msg.imageUrls, msg.skills, 'steer', msg.fileAttachments)
+    const prioritized = [msg, ...queue.filter((message) => message.id !== messageId)]
+    queuedMessagesByThreadId.value = {
+      ...queuedMessagesByThreadId.value,
+      [threadId]: prioritized,
+    }
+    queueMutationVersion += 1
+    try {
+      const revision = await reorderThreadQueuedMessagesOnServer(
+        threadId,
+        prioritized.map((message) => message.id),
+      )
+      latestQueueRevision = Math.max(latestQueueRevision, revision)
+    } catch (reorderError) {
+      void processQueuedMessages(threadId)
+      throw reorderError
+    }
   }
 
   async function updateSelectedThreadGoal(input: {

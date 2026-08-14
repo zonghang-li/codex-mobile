@@ -646,8 +646,10 @@ describe('backend queue scheduling', () => {
       processor.dispose()
       await processor.scheduleAllQueuedThreads(0)
       expect((processor as unknown as {
-        queueDrainTimersByThreadId: Map<string, unknown>
-      }).queueDrainTimersByThreadId.size).toBe(0)
+        queueDrainDueAtByThreadId: Map<string, unknown>
+        queueDrainTimer: unknown
+      }).queueDrainDueAtByThreadId.size).toBe(0)
+      expect((processor as unknown as { queueDrainTimer: unknown }).queueDrainTimer).toBeNull()
     } finally {
       processor.dispose()
       if (originalCodexHome === undefined) delete process.env.CODEX_HOME
@@ -2043,6 +2045,8 @@ describe('backend queue scheduling', () => {
     } as never, runtimeProbe)
 
     try {
+      const statePath = join(codexHome, '.codex-global-state.json')
+      const beforeBlockedDrain = await readFile(statePath, 'utf8')
       await processor.scheduleAllQueuedThreads(0)
       await vi.advanceTimersByTimeAsync(0)
       await vi.waitFor(() => {
@@ -2054,6 +2058,7 @@ describe('backend queue scheduling', () => {
       expect(runtimeProbe.inspect).toHaveBeenCalledWith('thread-1', 31337)
       expect(rpc).not.toHaveBeenCalledWith('thread/resume', expect.anything())
       expect(rpc).not.toHaveBeenCalledWith('turn/start', expect.anything())
+      expect(await readFile(statePath, 'utf8')).toBe(beforeBlockedDrain)
     } finally {
       processor.dispose()
       if (originalCodexHome === undefined) delete process.env.CODEX_HOME
@@ -2244,6 +2249,27 @@ describe('backend queue scheduling', () => {
           },
         },
       })
+    } finally {
+      processor.dispose()
+    }
+  })
+
+  it('fails closed when queued collaboration settings cannot be preserved', async () => {
+    const processor = new BackendQueueProcessor({
+      rpc: vi.fn(async () => { throw new Error('config unavailable') }),
+      getPid: () => 31337,
+      onNotification: () => () => undefined,
+    } as never)
+    try {
+      await expect((processor as unknown as {
+        buildQueuedTurnParams: (turn: unknown) => Promise<Record<string, unknown>>
+      }).buildQueuedTurnParams({
+        threadId: 'thread-policy',
+        message: {
+          id: 'queued-policy', text: 'preserve plan', imageUrls: [], skills: [], fileAttachments: [],
+          collaborationMode: 'plan', model: '', effort: '',
+        },
+      })).rejects.toThrow('Cannot preserve queued collaboration settings')
     } finally {
       processor.dispose()
     }

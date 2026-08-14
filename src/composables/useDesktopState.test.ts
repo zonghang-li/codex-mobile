@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { watch } from 'vue'
 import {
   buildWorkspaceRootsProjectOrderState,
+  buildQueuedMessageId,
   collectWorkspaceRootPathsForProjectRemoval,
   filterGroupsByWorkspaceRoots,
   findAdjacentThreadId,
@@ -82,6 +83,27 @@ describe('isThreadNotFoundError', () => {
       status: 502,
     }))).toBe(false)
     expect(isThreadNotFoundError(new Error('network failed'))).toBe(false)
+  })
+})
+
+describe('buildQueuedMessageId', () => {
+  it('keeps generating distinct ids when randomUUID is unavailable on an HTTP origin', () => {
+    const originalCrypto = globalThis.crypto
+    vi.stubGlobal('crypto', {
+      getRandomValues: (bytes: Uint8Array) => {
+        bytes.fill(queuedIdByte++)
+        return bytes
+      },
+    })
+    let queuedIdByte = 1
+    try {
+      const first = buildQueuedMessageId()
+      const second = buildQueuedMessageId()
+      expect(first).toMatch(/^q-[0-9a-f]{32}$/u)
+      expect(second).not.toBe(first)
+    } finally {
+      vi.stubGlobal('crypto', originalCrypto)
+    }
   })
 })
 
@@ -3245,11 +3267,12 @@ describe('turn completion lifecycle', () => {
     const queuedId = state.selectedThreadQueuedMessages.value[0]!.id
     state.steerQueuedMessage(queuedId)
     await flushMicrotasks()
-    expect(gatewayMocks.removeThreadQueuedMessage).toHaveBeenLastCalledWith(
+    expect(gatewayMocks.reorderThreadQueuedMessages).toHaveBeenLastCalledWith(
       'thread-1',
-      queuedId,
-      { transferManagedUploads: true },
+      [queuedId],
     )
+    expect(gatewayMocks.removeThreadQueuedMessage).not.toHaveBeenCalled()
+    expect(gatewayMocks.startThreadTurn).not.toHaveBeenCalled()
   })
 
   it('marks a successful background completion unread', async () => {
