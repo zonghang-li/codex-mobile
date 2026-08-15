@@ -25,6 +25,7 @@
 - [../raw/features/thread-heartbeat-automations.md](../raw/features/thread-heartbeat-automations.md): source facts for thread heartbeat automations, multiple automations per thread, and Run now queue behavior.
 - [../raw/features/project-cron-automations.md](../raw/features/project-cron-automations.md): source facts for project cron automations in the sidebar.
 - [../raw/features/project-zip-portability.md](../raw/features/project-zip-portability.md): source facts for project ZIP export/import, chat JSONL import, and local-only review-bot security posture.
+- [../raw/features/project-zip-round-trip-limits-2026-08-15.md](../raw/features/project-zip-round-trip-limits-2026-08-15.md): source facts for project ZIP round-trip limits, reserved paths, and transactional import behavior.
 - [../raw/features/manual-test-domain-folders.md](../raw/features/manual-test-domain-folders.md): source facts for the manual test documentation split into domain folders.
 - [../raw/projects/codex-web-local.md](../raw/projects/codex-web-local.md): immutable source snapshot for project facts.
 - [../raw/fixes/codex-thread-link-pr174.md](../raw/fixes/codex-thread-link-pr174.md): source facts for PR #174 chat link parsing fixes, review-bot findings, and dynamic-origin thread URLs.

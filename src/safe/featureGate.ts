@@ -14,6 +14,26 @@ const DISABLED_ROUTE_PREFIXES = [
   '/codex-api/skills-sync/',
 ]
 
+const CONTROLLED_THREAD_ROUTE_METHODS = new Map<string, ReadonlySet<string>>([
+  ['/codex-api/thread-goal-set', new Set(['POST'])],
+  ['/codex-api/thread-goal-clear', new Set(['POST'])],
+  ['/codex-api/thread-stop-and-archive', new Set(['POST'])],
+  ['/codex-api/thread-queue-state', new Set(['GET', 'PUT', 'PATCH', 'POST'])],
+  ['/codex-api/thread-queue-receipt', new Set(['GET'])],
+  ['/codex-api/thread-runtime-state', new Set(['GET'])],
+  ['/codex-api/thread-runtime-states', new Set(['POST'])],
+  ['/codex-api/thread-runtime-interrupt', new Set(['POST'])],
+  ['/codex-api/thread-summary', new Set(['GET'])],
+])
+
+const CONTROLLED_THREAD_ROUTE_PREFIXES = [
+  '/codex-api/thread-goal-',
+  '/codex-api/thread-stop-',
+  '/codex-api/thread-queue-',
+  '/codex-api/thread-runtime-',
+  '/codex-api/thread-summary',
+]
+
 const ALLOWED_RPC_METHODS = new Set([
   'account/rateLimits/read',
   'app/list',
@@ -40,10 +60,15 @@ const ALLOWED_RPC_METHODS = new Set([
   'turn/start',
 ])
 
-export function isDisabledRoute(_method: string, pathname: string): boolean {
-  return DISABLED_ROUTE_PREFIXES.some((prefix) => (
+export function isDisabledRoute(method: string, pathname: string): boolean {
+  if (DISABLED_ROUTE_PREFIXES.some((prefix) => (
     pathname === prefix.replace(/\/$/u, '') || pathname.startsWith(prefix)
-  ))
+  ))) return true
+
+  if (!CONTROLLED_THREAD_ROUTE_PREFIXES.some((prefix) => pathname.startsWith(prefix))) {
+    return false
+  }
+  return !CONTROLLED_THREAD_ROUTE_METHODS.get(pathname)?.has(method.toUpperCase())
 }
 
 export function isAllowedRpcMethod(method: string): boolean {

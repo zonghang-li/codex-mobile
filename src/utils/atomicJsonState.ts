@@ -25,6 +25,7 @@ export async function mutateJsonStateFile<T>(
 
   try {
     let payload: Record<string, unknown> = {}
+    let recoveredFromBackup = false
     try {
       const parsed = JSON.parse(await readFile(statePath, 'utf8')) as unknown
       if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
@@ -38,14 +39,17 @@ export async function mutateJsonStateFile<T>(
           const backup = JSON.parse(await readFile(`${statePath}.bak`, 'utf8')) as unknown
           if (!backup || typeof backup !== 'object' || Array.isArray(backup)) throw error
           payload = backup as Record<string, unknown>
+          recoveredFromBackup = true
         } catch {
           throw error
         }
       }
     }
 
+    const originalSerialized = JSON.stringify(payload)
     const result = await update(payload)
     const serialized = JSON.stringify(payload)
+    if (serialized === originalSerialized && !recoveredFromBackup) return result
     await replaceFileDurably(`${statePath}.bak`, serialized)
     await replaceFileDurably(statePath, serialized)
     return result
@@ -61,7 +65,11 @@ export async function mutateJsonStateFile<T>(
   }
 }
 
-async function replaceFileDurably(path: string, contents: string): Promise<void> {
+export async function replaceFileDurably(
+  path: string,
+  contents: string,
+  operations: { beforeRename?: () => Promise<void> } = {},
+): Promise<void> {
   const directory = dirname(path)
   const tempPath = join(directory, `.${basename(path)}.${process.pid}.${randomUUID()}.tmp`)
   try {
@@ -72,6 +80,7 @@ async function replaceFileDurably(path: string, contents: string): Promise<void>
     } finally {
       await file.close()
     }
+    await operations.beforeRename?.()
     await rename(tempPath, path)
     if (process.platform !== 'win32') {
       const directoryHandle = await open(directory, 'r')

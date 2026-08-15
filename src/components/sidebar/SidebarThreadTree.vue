@@ -888,6 +888,7 @@ import {
   upsertProjectAutomation,
   upsertThreadAutomation,
 } from '../../api/codexGateway'
+import { CodexApiError } from '../../api/codexErrors'
 import type { UiProjectGroup, UiThread, UiThreadAutomation, UiThreadAutomationStatus } from '../../types/codex'
 import IconTablerChevronDown from '../icons/IconTablerChevronDown.vue'
 import IconTablerChevronRight from '../icons/IconTablerChevronRight.vue'
@@ -903,7 +904,15 @@ import { useFeedbackDiagnostics } from '../../composables/useFeedbackDiagnostics
 import { getPathLeafName, getPathParent, isAbsoluteLikePath, isProjectlessChatPath } from '../../pathUtils.js'
 import ComposerDropdown from '../content/ComposerDropdown.vue'
 import SidebarMenuRow from './SidebarMenuRow.vue'
-import { reconcilePinnedThreadIds } from './pinnedThreadUtils'
+import {
+  createBoundedRetryScheduler,
+  createSingleFlightTask,
+  getPinnedHydrationRetryDelay,
+  hydratePinnedThreadSummaries,
+  prunePinnedHydrationBookkeeping,
+  reconcilePinnedThreadIds,
+  removeAuthoritativelyMissingPinnedThreadIds,
+} from './pinnedThreadUtils'
 import { dispatchThreadRowInteraction } from './threadRowInteraction'
 import { getSidebarThreadState } from './threadSidebarState'
 
@@ -1005,6 +1014,9 @@ const chatSortMode = ref<ChatSortMode>(loadChatSortMode())
 let hasLoadedPinnedThreadState = false
 const pinnedThreadIds = ref<string[]>([])
 const hydratedPinnedThreadById = ref<Record<string, UiThread>>({})
+const authoritativelyMissingPinnedThreadIds = new Set<string>()
+const pinnedHydrationRetryAfterById = new Map<string, number>()
+const pinnedHydrationRetryAttemptById = new Map<string, number>()
 const inlineDeleteConfirmThreadId = ref('')
 const optimisticallyArchivedThreadIds = ref<string[]>([])
 const openProjectMenuId = ref('')
@@ -1333,48 +1345,107 @@ watch(
   },
 )
 
-watch([threadById, () => props.isThreadListFullyLoaded], ([threadsById]) => {
-  const filtered = reconcilePinnedThreadIds(pinnedThreadIds.value, new Set(threadsById.keys()), {
-    canPruneMissing: props.isThreadListFullyLoaded,
+watch([threadById, hydratedPinnedThreadById, () => props.isThreadListFullyLoaded], ([threadsById, hydratedById]) => {
+  const knownThreadIds = new Set([...threadsById.keys(), ...Object.keys(hydratedById)])
+  const hasResolvedEveryMissingPin = pinnedThreadIds.value.every(
+    (threadId) => knownThreadIds.has(threadId) || authoritativelyMissingPinnedThreadIds.has(threadId),
+  )
+  const filtered = reconcilePinnedThreadIds(pinnedThreadIds.value, knownThreadIds, {
+    canPruneMissing: props.isThreadListFullyLoaded && hasResolvedEveryMissingPin,
   })
   if (filtered.length === pinnedThreadIds.value.length) return
   const filteredIdSet = new Set(filtered)
-  const nextHydratedPinnedThreads = Object.fromEntries(
+  hydratedPinnedThreadById.value = Object.fromEntries(
     Object.entries(hydratedPinnedThreadById.value).filter(([threadId]) => filteredIdSet.has(threadId)),
   )
-  hydratedPinnedThreadById.value = nextHydratedPinnedThreads
   pinnedThreadIds.value = filtered
 })
 
-let pinnedThreadHydrationVersion = 0
+function isAuthoritativePinnedSummaryMissing(error: unknown): boolean {
+  return error instanceof CodexApiError
+    && error.status === 409
+    && error.message === 'Cannot operate on an archived task.'
+}
 
-async function hydrateMissingPinnedThreads(): Promise<void> {
+function schedulePinnedThreadHydrationRetry(): void {
+  const retryAt = Math.min(...pinnedHydrationRetryAfterById.values())
+  if (!Number.isFinite(retryAt)) {
+    pinnedThreadHydrationRetryScheduler.clear()
+    return
+  }
+  pinnedThreadHydrationRetryScheduler.scheduleAt(retryAt)
+}
+
+async function hydrateMissingPinnedThreadsOnce(): Promise<void> {
   if (props.isLoading) return
-  const missingThreadIds = pinnedThreadIds.value.filter((threadId) => !threadById.value.has(threadId) && !hydratedPinnedThreadById.value[threadId])
-  if (missingThreadIds.length === 0) return
-
-  const version = (pinnedThreadHydrationVersion += 1)
-  const loadedThreads = await Promise.all(
-    missingThreadIds.map(async (threadId) => {
-      try {
-        return await getThreadSummary(threadId)
-      } catch {
-        return null
-      }
-    }),
+  const loadedThreadIds = new Set([
+    ...threadById.value.keys(),
+    ...Object.keys(hydratedPinnedThreadById.value),
+  ])
+  prunePinnedHydrationBookkeeping(
+    pinnedThreadIds.value,
+    loadedThreadIds,
+    pinnedHydrationRetryAfterById,
+    authoritativelyMissingPinnedThreadIds,
   )
-  if (version !== pinnedThreadHydrationVersion) return
+  const activePinnedThreadIds = new Set(pinnedThreadIds.value)
+  for (const threadId of pinnedHydrationRetryAttemptById.keys()) {
+    if (!activePinnedThreadIds.has(threadId) || loadedThreadIds.has(threadId)) {
+      pinnedHydrationRetryAttemptById.delete(threadId)
+    }
+  }
+  const now = Date.now()
+  const missingThreadIds = pinnedThreadIds.value.filter(
+    (threadId) => !threadById.value.has(threadId)
+      && !hydratedPinnedThreadById.value[threadId]
+      && !authoritativelyMissingPinnedThreadIds.has(threadId)
+      && (pinnedHydrationRetryAfterById.get(threadId) ?? 0) <= now,
+  )
+  if (missingThreadIds.length === 0) {
+    schedulePinnedThreadHydrationRetry()
+    return
+  }
+
+  const result = await hydratePinnedThreadSummaries(
+    missingThreadIds,
+    getThreadSummary,
+    isAuthoritativePinnedSummaryMissing,
+  )
+  for (const threadId of result.authoritativeMissingIds) {
+    authoritativelyMissingPinnedThreadIds.add(threadId)
+    pinnedHydrationRetryAfterById.delete(threadId)
+    pinnedHydrationRetryAttemptById.delete(threadId)
+  }
+  for (const threadId of result.retryableIds) {
+    const attempt = (pinnedHydrationRetryAttemptById.get(threadId) ?? 0) + 1
+    pinnedHydrationRetryAttemptById.set(threadId, attempt)
+    const delay = getPinnedHydrationRetryDelay(attempt)
+    if (delay !== null) pinnedHydrationRetryAfterById.set(threadId, Date.now() + delay)
+  }
 
   const next = { ...hydratedPinnedThreadById.value }
-  for (const thread of loadedThreads) {
-    if (thread) next[thread.id] = thread
+  for (const thread of result.loaded) {
+    authoritativelyMissingPinnedThreadIds.delete(thread.id)
+    pinnedHydrationRetryAfterById.delete(thread.id)
+    pinnedHydrationRetryAttemptById.delete(thread.id)
+    next[thread.id] = thread
   }
-  hydratedPinnedThreadById.value = next
+  if (result.loaded.length > 0) hydratedPinnedThreadById.value = next
+  if (result.authoritativeMissingIds.length > 0) {
+    pinnedThreadIds.value = removeAuthoritativelyMissingPinnedThreadIds(
+      pinnedThreadIds.value,
+      result.authoritativeMissingIds,
+    )
+  }
+  schedulePinnedThreadHydrationRetry()
 }
+
+const runPinnedThreadHydration = createSingleFlightTask(hydrateMissingPinnedThreadsOnce)
+const pinnedThreadHydrationRetryScheduler = createBoundedRetryScheduler(runPinnedThreadHydration)
 
 watch([pinnedThreadIds, threadById, () => props.isLoading], () => {
   if (!hasLoadedPinnedThreadState) return
-  void hydrateMissingPinnedThreads()
+  void runPinnedThreadHydration()
 })
 
 onMounted(async () => {
@@ -1400,7 +1471,7 @@ onMounted(async () => {
     automationByProjectName.value = {}
   }
   hasLoadedPinnedThreadState = true
-  void hydrateMissingPinnedThreads()
+  void runPinnedThreadHydration()
 })
 
 const deleteThreadHasAutomation = computed(() => threadHasAutomation(deleteThreadDialogThreadId.value))
@@ -3007,6 +3078,7 @@ watch(openThreadMenuId, (threadId) => {
 })
 
 onBeforeUnmount(() => {
+  pinnedThreadHydrationRetryScheduler.dispose()
   for (const element of projectGroupElementByName.values()) {
     projectGroupResizeObserver?.unobserve(element)
   }

@@ -1,4 +1,4 @@
-import { spawnSync } from 'node:child_process'
+import { spawn, spawnSync } from 'node:child_process'
 import { existsSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { delimiter, join } from 'node:path'
@@ -7,6 +7,9 @@ export type CommandInvocation = {
   command: string
   args: string[]
 }
+
+let sqliteCommandCache: { signature: string; command: string | null } | null = null
+let sqliteCommandAsyncCache: { signature: string; promise: Promise<string | null> } | null = null
 
 function uniqueStrings(values: Array<string | null | undefined>): string[] {
   const unique: string[] = []
@@ -147,6 +150,77 @@ export function resolveRipgrepCommand(): string | null {
   }
 
   return null
+}
+
+export function resolveSqliteCommand(): string | null {
+  const home = process.env.HOME?.trim() || homedir()
+  const explicit = process.env.CODEXUI_SQLITE_COMMAND?.trim()
+  const signature = [process.platform, home, process.env.PATH ?? '', explicit ?? ''].join('\n')
+  if (sqliteCommandCache?.signature === signature) return sqliteCommandCache.command
+
+  const fallbackCandidates = process.platform === 'win32'
+    ? ['sqlite3']
+    : [
+        'sqlite3',
+        join(home, 'miniconda3', 'bin', 'sqlite3'),
+        join(home, 'anaconda3', 'bin', 'sqlite3'),
+        join(home, '.local', 'bin', 'sqlite3'),
+        '/opt/homebrew/bin/sqlite3',
+      ]
+  let command: string | null = null
+  for (const candidate of uniqueStrings([explicit, ...fallbackCandidates])) {
+    if (isRunnableCommand(candidate, ['--version'])) {
+      command = candidate
+      break
+    }
+  }
+  sqliteCommandCache = { signature, command }
+  return command
+}
+
+function isRunnableCommandAsync(command: string, args: string[] = []): Promise<boolean> {
+  if (isPathLike(command) && !existsSync(command)) return Promise.resolve(false)
+  return new Promise((resolve) => {
+    const child = spawn(command, args, { stdio: 'ignore', windowsHide: true })
+    let settled = false
+    const finish = (result: boolean) => {
+      if (settled) return
+      settled = true
+      clearTimeout(timeout)
+      resolve(result)
+    }
+    const timeout = setTimeout(() => {
+      child.kill()
+      finish(false)
+    }, 1_000)
+    timeout.unref?.()
+    child.once('error', () => finish(false))
+    child.once('close', (code) => finish(code === 0))
+  })
+}
+
+export function resolveSqliteCommandAsync(): Promise<string | null> {
+  const home = process.env.HOME?.trim() || homedir()
+  const explicit = process.env.CODEXUI_SQLITE_COMMAND?.trim()
+  const signature = [process.platform, home, process.env.PATH ?? '', explicit ?? ''].join('\n')
+  if (sqliteCommandAsyncCache?.signature === signature) return sqliteCommandAsyncCache.promise
+  const fallbackCandidates = process.platform === 'win32'
+    ? ['sqlite3']
+    : [
+        'sqlite3',
+        join(home, 'miniconda3', 'bin', 'sqlite3'),
+        join(home, 'anaconda3', 'bin', 'sqlite3'),
+        join(home, '.local', 'bin', 'sqlite3'),
+        '/opt/homebrew/bin/sqlite3',
+      ]
+  const promise = (async () => {
+    for (const candidate of uniqueStrings([explicit, ...fallbackCandidates])) {
+      if (await isRunnableCommandAsync(candidate, ['--version'])) return candidate
+    }
+    return null
+  })()
+  sqliteCommandAsyncCache = { signature, promise }
+  return promise
 }
 
 export function resolvePythonCommand(): CommandInvocation | null {

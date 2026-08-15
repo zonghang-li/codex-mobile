@@ -1,5 +1,5 @@
 import type { RpcEnvelope, RpcMethodCatalog } from '../types/codex'
-import { CodexApiError, extractErrorMessage } from './codexErrors'
+import { CodexApiError, extractErrorMessage, type TurnStartDelivery } from './codexErrors'
 
 type RpcRequestBody = {
   method: string
@@ -63,12 +63,18 @@ export async function rpcCall<T>(
   if (!response.ok) {
     const detail = extractErrorMessage(payload, '') || rawText?.slice(0, 500) || ''
     const prefix = `RPC ${method} failed with HTTP ${response.status}`
+    const turnStartDeliveryValue = asRecord(payload)?.turnStartDelivery
+    const turnStartDelivery: TurnStartDelivery | undefined =
+      turnStartDeliveryValue === 'not_started' || turnStartDeliveryValue === 'started'
+        ? turnStartDeliveryValue
+        : undefined
     throw new CodexApiError(
       detail ? `${prefix}: ${detail}` : prefix,
       {
         code: 'http_error',
         method,
         status: response.status,
+        turnStartDelivery,
       },
     )
   }

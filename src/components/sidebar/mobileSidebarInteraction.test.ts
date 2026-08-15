@@ -40,6 +40,21 @@ function extractThreadRows(source: string): string[] {
 }
 
 describe('mobile sidebar interaction policy', () => {
+  it('hydrates unloaded pinned rows through the passive summary API', async () => {
+    const source = await readFile(new URL('./SidebarThreadTree.vue', import.meta.url), 'utf8')
+
+    expect(source).toContain('getThreadSummary')
+    expect(source).toContain('hydrateMissingPinnedThreads')
+    expect(source).toContain('hydratedPinnedThreadById.value[threadId]')
+  })
+
+  it('keeps retryable pinned summaries eligible after a long backoff', async () => {
+    const source = await readFile(new URL('./SidebarThreadTree.vue', import.meta.url), 'utf8')
+
+    expect(source).not.toContain('exhaustedPinnedHydrationIds')
+    expect(source).toContain('pinnedHydrationRetryAfterById')
+  })
+
   it('contains every hover/focus slot swap inside the fine-pointer block', async () => {
     const source = await readFile(new URL('./SidebarMenuRow.vue', import.meta.url), 'utf8')
     const fine = extractCssBlock(source, '@media (hover: hover) and (pointer: fine)')

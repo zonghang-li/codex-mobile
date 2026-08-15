@@ -80,6 +80,83 @@ describe('thread text hydration', () => {
     expect(merged[1]).toBe(ordered)
   })
 
+  it('keeps longer live text when an ordered rollout row is an older prefix', () => {
+    const live = {
+      ...textMessage('agent-shared', 'agentMessage'),
+      text: 'complete live response',
+      sessionOrder: undefined,
+    }
+    const staleRollout = {
+      ...textMessage('agent-shared', 'agentMessage', 'turn-active', 200),
+      text: 'complete live',
+    }
+
+    expect(mergeThreadTextPage([live], [staleRollout])).toEqual([{
+      ...live,
+      sessionOrder: 200,
+    }])
+  })
+
+  it('keeps growing unordered live text after an ordered rollout prefix', () => {
+    const rollout = {
+      ...textMessage('agent-shared', 'agentMessage', 'turn-active', 200),
+      text: 'partial response',
+    }
+    const live = {
+      ...textMessage('agent-shared', 'agentMessage'),
+      text: 'partial response completed live',
+      sessionOrder: undefined,
+    }
+
+    expect(mergeThreadTextPage([rollout], [live])).toEqual([{
+      ...live,
+      sessionOrder: 200,
+    }])
+  })
+
+  it('does not let an older page replace newer text for the same message ID', () => {
+    const newer = {
+      ...textMessage('agent-shared', 'agentMessage', 'turn-active', 300),
+      text: 'newer complete transcript',
+    }
+    const stale = {
+      ...textMessage('agent-shared', 'agentMessage', 'turn-active', 200),
+      text: 'stale partial transcript',
+    }
+
+    expect(mergeThreadTextPage([newer], [stale])).toEqual([newer])
+  })
+
+  it('does not let divergent equal-order text replace the current transcript row', () => {
+    const current = {
+      ...textMessage('agent-shared', 'agentMessage', 'turn-active', 300),
+      text: 'authoritative current output',
+    }
+    const divergent = {
+      ...textMessage('agent-shared', 'agentMessage', 'turn-active', 300),
+      text: 'stale but longer divergent output',
+    }
+
+    expect(mergeThreadTextPage([current], [divergent])).toEqual([current])
+  })
+
+  it('does not let stale hydration replace newer transcript text for the same message ID', () => {
+    const newer = {
+      ...textMessage('agent-shared', 'agentMessage', 'turn-active', 300),
+      text: 'newer complete transcript',
+    }
+    const staleHydration = {
+      ...textMessage('agent-shared', 'agentMessage', 'turn-active', 200),
+      text: 'stale partial transcript',
+    }
+
+    expect(mergeHydratedTurnTextIntoTranscript(
+      [newer],
+      [staleHydration],
+      'turn-active',
+    )).toEqual([newer])
+  })
+
   it('upgrades an in-progress context compaction row when the completed event arrives', () => {
     const compacting = {
       ...textMessage('compact-start', 'contextCompaction', 'turn-active', 100),

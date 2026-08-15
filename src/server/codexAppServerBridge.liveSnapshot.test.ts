@@ -31,11 +31,12 @@ describe('external live snapshot RPC preparation', () => {
   })
 
   it('strips the internal external-steer marker before forwarding turn/start', () => {
-    expect(prepareRpcProxyRequest('turn/start', {
+    const prepared = prepareRpcProxyRequest('turn/start', {
       threadId: 'thread-1',
       input: [{ type: 'text', text: 'steer' }],
       __codexMobileExternalSteer: true,
-    })).toEqual({
+    })
+    expect(prepared).toMatchObject({
       params: {
         threadId: 'thread-1',
         input: [{ type: 'text', text: 'steer' }],
@@ -45,6 +46,8 @@ describe('external live snapshot RPC preparation', () => {
       skipSessionSkillEnrichment: false,
       forceFreshThreadList: false,
     })
+    expect((prepared.params as { clientUserMessageId?: string }).clientUserMessageId)
+      .toMatch(/^[0-9a-f-]{36}$/u)
   })
 
   it('keeps ordinary thread/read enrichment semantics', async () => {

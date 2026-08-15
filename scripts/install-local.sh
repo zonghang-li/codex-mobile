@@ -4,6 +4,19 @@ set -eu
 root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd -P)
 prefix=${PREFIX:-${CODEX_MOBILE_PREFIX:-"$HOME/.local"}}
 
+node_version=$(node -p 'process.versions.node' 2>/dev/null || true)
+node_major=${node_version%%.*}
+node_remainder=${node_version#*.}
+node_minor=${node_remainder%%.*}
+case "$node_major:$node_minor" in
+  :|*:|:*|*[!0-9:]*) node_major=0; node_minor=0 ;;
+esac
+if [ "$node_major" -lt 22 ] || { [ "$node_major" -eq 22 ] && [ "$node_minor" -lt 13 ]; }; then
+  printf 'Node.js 22.13 or newer is required; found %s. No installation changes were made.\n' \
+    "${node_version:-unavailable}" >&2
+  exit 1
+fi
+
 cd "$root"
 pnpm run build
 if npm list --global --prefix "$prefix" --depth=0 codex-mobile-safe >/dev/null 2>&1; then

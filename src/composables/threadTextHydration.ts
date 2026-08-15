@@ -311,7 +311,34 @@ export function mergeThreadTextPage(
       continue
     }
 
-    if (hasSessionOrder(message) || !hasSessionOrder(current.message)) {
+    const incomingOrder = hasSessionOrder(message) ? message.sessionOrder : null
+    const currentOrder = hasSessionOrder(current.message) ? current.message.sessionOrder : null
+    if (incomingOrder !== null && currentOrder === null && current.message.text.startsWith(message.text)) {
+      current.message = { ...current.message, sessionOrder: incomingOrder }
+      continue
+    }
+    if (incomingOrder === null && currentOrder !== null && message.text.startsWith(current.message.text)) {
+      current.message = { ...message, sessionOrder: currentOrder }
+      continue
+    }
+    if (
+      (incomingOrder !== null && currentOrder === null)
+      || (incomingOrder !== null && currentOrder !== null && incomingOrder > currentOrder)
+      || (
+        incomingOrder !== null
+        && currentOrder !== null
+        && incomingOrder === currentOrder
+        && (
+          message.text === current.message.text
+          || message.text.startsWith(current.message.text)
+          || (
+            message.messageType === 'contextCompaction'
+            && current.message.messageType === 'contextCompaction'
+          )
+        )
+      )
+      || (incomingOrder === null && currentOrder === null)
+    ) {
       current.message = message
     }
   }
@@ -349,9 +376,17 @@ export function mergeHydratedTurnTextIntoTranscript(
   hydrated: UiMessage[],
   turnId: string,
 ): UiMessage[] {
+  const hydrationCandidates = hydrated.filter(
+    (message) => message.turnId === turnId && isMergeableHydratedTextMessage(message),
+  )
+  const hydrationCandidateIds = new Set(hydrationCandidates.map((message) => message.id))
   const orderedHydrated = mergeThreadTextPage(
-    [],
-    hydrated.filter((message) => message.turnId === turnId && isMergeableHydratedTextMessage(message)),
+    transcript.filter((message) => (
+      message.turnId === turnId
+      && isMergeableHydratedTextMessage(message)
+      && hydrationCandidateIds.has(message.id)
+    )),
+    hydrationCandidates,
   )
   const hydratedIds = new Set(orderedHydrated.map((message) => message.id))
   const hydratedContentKeys = new Set(

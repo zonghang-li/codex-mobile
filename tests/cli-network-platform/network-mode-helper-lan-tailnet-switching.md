@@ -2,7 +2,7 @@
 
 ## Prerequisites / setup
 
-- Linux with Node.js 18+, pnpm, systemd user services, Tailscale, and `${HOME}/.local/bin` on `PATH`.
+- Linux with Node.js 22.13+, pnpm, systemd user services, Tailscale, and `${HOME}/.local/bin` on `PATH`.
 - The checkout has been installed locally with `pnpm run install:local`.
 - The device can authenticate to the intended tailnet with `tailscale up`.
 - The password file either exists at `~/.codex/codex-mobile-safe-password` with mode `0600` or can be created by the helper.

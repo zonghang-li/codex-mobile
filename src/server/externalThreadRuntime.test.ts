@@ -1138,6 +1138,89 @@ describe('ExternalThreadRuntimeProbe', () => {
     await expect(probe.inspectWriterEvidence('thread-1', 99)).resolves.toBe(true)
   })
 
+  it('detects a foreign turn that starts and finishes inside an ownership window', async () => {
+    const system = fakeRuntimeSystem({
+      log: lifecycle('task_started', 'turn-complete') + lifecycle('task_complete', 'turn-complete'),
+    })
+    const probe = registeredProbe(system)
+    const baseline = await probe.inspectWriterEvidenceSnapshot('thread-1', 99)
+    expect(baseline?.rollout).toBeDefined()
+
+    system.append(lifecycle('task_started', 'turn-foreign') + lifecycle('task_complete', 'turn-foreign'))
+
+    await expect(probe.inspectUnexpectedLifecycleSince('thread-1', baseline!, 'turn-mobile'))
+      .resolves.toBe(true)
+  })
+
+  it('accepts lifecycle records belonging only to the started mobile turn', async () => {
+    const system = fakeRuntimeSystem({
+      log: lifecycle('task_started', 'turn-complete') + lifecycle('task_complete', 'turn-complete'),
+    })
+    const probe = registeredProbe(system)
+    const baseline = await probe.inspectWriterEvidenceSnapshot('thread-1', 99)
+    system.append(lifecycle('task_started', 'turn-mobile') + turnContext('turn-mobile', '/workspace'))
+
+    await expect(probe.inspectUnexpectedLifecycleSince('thread-1', baseline!, 'turn-mobile'))
+      .resolves.toBe(false)
+  })
+
+  it('fails closed when the rollout is rewritten in place to the same size', async () => {
+    const original = `${'x'.repeat(300)}\n`
+    const system = fakeRuntimeSystem({ log: original })
+    const probe = registeredProbe(system)
+    const baseline = await probe.inspectWriterEvidenceSnapshot('thread-1', 99)
+
+    system.truncate(`${'y'.repeat(300)}\n`)
+
+    await expect(probe.inspectUnexpectedLifecycleSince('thread-1', baseline!, 'turn-mobile'))
+      .resolves.toBeNull()
+  })
+
+  it('fails closed for an unowned no-turn-id user message inside the ownership window', async () => {
+    const system = fakeRuntimeSystem({ log: lifecycle('task_started', 'done') + lifecycle('task_complete', 'done') })
+    const probe = registeredProbe(system)
+    const baseline = await probe.inspectWriterEvidenceSnapshot('thread-1', 99)
+    system.append(`${JSON.stringify({
+      type: 'event_msg', payload: { type: 'user_message', client_id: 'foreign-client', message: 'steer' },
+    })}\n`)
+
+    await expect(probe.inspectUnexpectedLifecycleSince(
+      'thread-1', baseline!, 'turn-mobile', 'mobile-client',
+    )).resolves.toBeNull()
+  })
+
+  it('accepts the owned no-turn-id user message inside the ownership window', async () => {
+    const system = fakeRuntimeSystem({ log: lifecycle('task_started', 'done') + lifecycle('task_complete', 'done') })
+    const probe = registeredProbe(system)
+    const baseline = await probe.inspectWriterEvidenceSnapshot('thread-1', 99)
+    system.append(`${JSON.stringify({
+      type: 'event_msg', payload: { type: 'user_message', client_id: 'mobile-client', message: 'continue' },
+    })}\n`)
+
+    await expect(probe.inspectUnexpectedLifecycleSince(
+      'thread-1', baseline!, 'turn-mobile', 'mobile-client',
+    )).resolves.toBe(false)
+  })
+
+  it('accepts ordinary turnless output after the owned mobile lifecycle starts', async () => {
+    const system = fakeRuntimeSystem({ log: lifecycle('task_started', 'done') + lifecycle('task_complete', 'done') })
+    const probe = registeredProbe(system)
+    const baseline = await probe.inspectWriterEvidenceSnapshot('thread-1', 99)
+    system.append([
+      JSON.stringify({
+        type: 'event_msg', payload: { type: 'user_message', client_id: 'mobile-client', message: 'continue' },
+      }),
+      JSON.stringify({ type: 'event_msg', payload: { type: 'task_started', turn_id: 'turn-mobile' } }),
+      JSON.stringify({ type: 'response_item', payload: { type: 'reasoning', summary: [] } }),
+      JSON.stringify({ type: 'event_msg', payload: { type: 'agent_reasoning', text: 'working' } }),
+      '',
+    ].join('\n'))
+
+    await expect(probe.inspectUnexpectedLifecycleSince(
+      'thread-1', baseline!, 'turn-mobile', 'mobile-client',
+    )).resolves.toBe(false)
+  })
+
   it('does not let an older terminal event clear a newer start', async () => {
     const system = fakeRuntimeSystem({
       log: lifecycle('task_started', 'turn-a'),

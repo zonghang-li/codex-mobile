@@ -872,6 +872,14 @@ function isTurnStartQueueFallbackError(error: unknown): boolean {
   return isWriterOwnershipNotIdleError(error) || isThreadStartClaimConflictError(error)
 }
 
+function isDefinitivePreDeliveryTurnStartError(error: unknown): boolean {
+  return error instanceof CodexApiError
+    && error.code === 'http_error'
+    && error.status === 409
+    && error.turnStartDelivery === 'not_started'
+    && isTurnStartQueueFallbackError(error)
+}
+
 function isThreadNotFoundInterruptError(error: unknown): boolean {
   if (!(error instanceof Error)) return false
   const message = error.message.toLowerCase()
@@ -1083,7 +1091,7 @@ function shouldKeepPreviousOrderedMessage(
   if ((incoming.sessionOrder as number) < (previous.sessionOrder as number)) return true
   if ((incoming.sessionOrder as number) !== (previous.sessionOrder as number)) return false
   if (incoming.text === previous.text) return false
-  if (options.allowEqualOrderTextGrowth === true && incoming.text.length >= previous.text.length) {
+  if (options.allowEqualOrderTextGrowth === true && incoming.text.startsWith(previous.text)) {
     return false
   }
   return true
@@ -4394,6 +4402,12 @@ export function useDesktopState() {
         continue
       }
       const runtime = states[threadId] ?? { state: 'unknown' }
+      if (runtime.state === 'archived') {
+        const fallbackThreadId = findAdjacentThreadId(flattenThreads(projectGroups.value), threadId)
+        removeArchivedThreadFromLoadedLists(threadId)
+        rollbackOptimisticNewThread(threadId, fallbackThreadId)
+        continue
+      }
       if (runtime.state === 'running' && isKnownTerminalTurnRuntime(threadId, runtime.turnId)) {
         backgroundExternalThreadIds.delete(threadId)
         setThreadRuntimeOwnership(threadId, 'idle', { canInterrupt: false })
@@ -4464,7 +4478,7 @@ export function useDesktopState() {
               )
             )
           } catch {
-            // Retain the established external lease until detail confirms terminal text.
+            // Retain the established external lease after transient detail failures.
           } finally {
             releaseThreadDetailRequest(threadId, detailRequest)
           }
@@ -4510,7 +4524,7 @@ export function useDesktopState() {
             allowIdleLocalLeaseRelease: true,
           })
         } catch {
-          // Keep the local lease until a later batch can confirm and load terminal detail.
+          // Keep the local lease after transient detail failures.
         } finally {
           releaseThreadDetailRequest(threadId, detailRequest)
         }
@@ -4543,7 +4557,7 @@ export function useDesktopState() {
               detailEpoch: detailRequest.epoch,
             })
           } catch {
-            // The runtime state is already idle; a later metadata/detail refresh can recover final text.
+            // The runtime state is idle; a later refresh can recover transient detail failures.
           } finally {
             releaseThreadDetailRequest(threadId, detailRequest)
           }
@@ -8365,7 +8379,7 @@ export function useDesktopState() {
         typeof message.turnIndex === 'number'
         && Number.isFinite(message.turnIndex)
       ))
-    const liveProjectionHasOrderedActiveTextRows = isLiveProjection
+    const runningProjectionHasOrderedActiveTextRows = isIncrementalProjection
       && inProgress
       && activeTurnId.length > 0
       && detailMessages.some((message) => (
@@ -8373,26 +8387,25 @@ export function useDesktopState() {
         && typeof message.sessionOrder === 'number'
         && Number.isFinite(message.sessionOrder)
       ))
-    // A running live projection without absolute turn indices is a bounded,
-    // append-style view of an active writer. Rollout rows with `sessionOrder`
-    // are also incremental even when the projection carries a rebased
-    // `turnIndex`; treating those as authoritative replacements can briefly
-    // erase already hydrated transcript rows until the text page catches up.
-    // Paged projections without ordered active text remain authoritative so
-    // stale rebased rows can still be dropped.
-    const shouldPreserveLiveProjection = isLiveProjection
-      && inProgress
+    // Running projections are bounded views of an active writer. Ordered
+    // rollout rows remain incremental even when a page rebases `turnIndex`;
+    // replacing them can erase newer hydrated text until the next poll.
+    const shouldPreserveRunningProjection = inProgress
       && (
-        isPartialTurnProjection
-        || (
-          !rawLiveProjectionHasAuthoritativeTurnIndices
-          || liveProjectionHasOrderedActiveTextRows
+        (
+          isLiveProjection
+          && (
+            isPartialTurnProjection
+            || !rawLiveProjectionHasAuthoritativeTurnIndices
+            || runningProjectionHasOrderedActiveTextRows
+          )
         )
+        || (isPagedProjection && runningProjectionHasOrderedActiveTextRows)
       )
     const shouldPreserveLoadedIdleOrderedRows = hadLoadedMessages && !inProgress
     const shouldAllowEqualOrderTextGrowth =
       shouldPreserveLoadedIdleOrderedRows && mergedCompletionSummaries.length > 0
-    const shouldUseAuthoritativeIdleMerge = !inProgress && hadLoadedMessages && !shouldPreserveLiveProjection
+    const shouldUseAuthoritativeIdleMerge = !inProgress && hadLoadedMessages && !shouldPreserveRunningProjection
     const authoritativeIdleTurnIds = shouldUseAuthoritativeIdleMerge
       ? Object.keys(detailTurnIndexByTurnId)
       : []
@@ -8421,8 +8434,12 @@ export function useDesktopState() {
           { prunableTurnIds: authoritativeIdlePrunableTurnIds },
         )
       : previousPersisted
-    const mergedMessages = shouldPreserveLiveProjection
-      ? mergeMessages(previousPersisted, nextMessages, { preserveMissing: true })
+    const mergedMessages = shouldPreserveRunningProjection
+      ? mergeMessages(previousPersisted, nextMessages, {
+          preserveMissing: true,
+          preserveOrderedRows: true,
+          allowEqualOrderTextGrowth: isIncrementalProjection,
+        })
       : isIncrementalProjection
         ? shouldPreserveLoadedIdleOrderedRows
           ? mergeMessages(previousForAuthoritativeIdleMerge, effectiveNextMessages, {
@@ -9298,7 +9315,10 @@ export function useDesktopState() {
 
     const isInProgress = inProgressById.value[threadId] === true
 
-    if (isInProgress && mode === 'queue') {
+    if (
+      isInProgress
+      && (mode === 'queue' || runtimeOwnershipByThreadId.value[threadId] !== 'local')
+    ) {
       const queuedMessage = await enqueueThreadMessageDurably(
         threadId,
         nextText,
@@ -9337,7 +9357,10 @@ export function useDesktopState() {
         submission,
         revealAcceptedMessage,
       ).catch(async (unknownError) => {
-        if (isTurnStartQueueFallbackError(unknownError)) {
+        if (
+          isTurnStartQueueFallbackError(unknownError)
+          && (!submission.turnStartIssued || isDefinitivePreDeliveryTurnStartError(unknownError))
+        ) {
           const pendingTurnRequest = submission.pendingTurnRequest
           clearPendingStopRequest(threadId, submission.generation)
           clearLocalSubmission(threadId, submission.generation)
@@ -9426,7 +9449,10 @@ export function useDesktopState() {
       )
       await uploadLease.release()
     } catch (unknownError) {
-      if (isTurnStartQueueFallbackError(unknownError)) {
+      if (
+        isTurnStartQueueFallbackError(unknownError)
+        && (!submission.turnStartIssued || isDefinitivePreDeliveryTurnStartError(unknownError))
+      ) {
         const pendingTurnRequest = submission.pendingTurnRequest
         await uploadLease.release()
         clearPendingStopRequest(threadId, submission.generation)
@@ -10374,6 +10400,12 @@ export function useDesktopState() {
 
     for (const threadId of requestedThreadIds) {
       const runtime = states[threadId] ?? { state: 'unknown' }
+      if (runtime.state === 'archived') {
+        const fallbackThreadId = findAdjacentThreadId(flattenThreads(projectGroups.value), threadId)
+        removeArchivedThreadFromLoadedLists(threadId)
+        rollbackOptimisticNewThread(threadId, fallbackThreadId)
+        continue
+      }
       if (runtime.state === 'unknown') continue
       const isSelectedNow = selectedThreadId.value === threadId
 

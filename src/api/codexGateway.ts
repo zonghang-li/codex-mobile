@@ -604,10 +604,13 @@ function parseExternalThreadRuntime(value: unknown): ExternalThreadRuntime {
 }
 
 function parseThreadRuntimeObservation(value: unknown): ThreadRuntimeObservation {
+  const runtime = asRecord(value)
+  if (runtime?.state === 'archived' && hasOnlyKeys(runtime, ['state'])) {
+    return { state: 'archived' }
+  }
   const external = parseExternalThreadRuntime(value)
   if (external.state !== 'unknown') return external
 
-  const runtime = asRecord(value)
   if (
     runtime
     && runtime.state === 'running'
@@ -631,8 +634,11 @@ function unknownRuntimeMap(threadIds: readonly string[]): Record<string, ThreadR
   return Object.fromEntries(threadIds.map((threadId) => [threadId, { state: 'unknown' }]))
 }
 
-function readThreadRuntimeObservation(payload: ThreadReadResponse): ThreadRuntimeObservation {
-  return parseThreadRuntimeObservation(asRecord(payload.thread)?.externalRuntime)
+function readThreadRuntimeObservation(
+  payload: ThreadReadResponse,
+): Exclude<ThreadRuntimeObservation, { state: 'archived' }> {
+  const runtime = parseThreadRuntimeObservation(asRecord(payload.thread)?.externalRuntime)
+  return runtime.state === 'archived' ? { state: 'unknown' } : runtime
 }
 
 export function readThreadDetailRuntime(payload: ThreadReadResponse): ThreadDetailRuntime {
@@ -681,7 +687,8 @@ export async function getThreadRuntimeState(
     const response = await fetch(`/codex-api/thread-runtime-state?${params.toString()}`, { signal })
     if (!response.ok) return { state: 'unknown' }
     return parseThreadRuntimeObservation(await response.json())
-  } catch {
+  } catch (error) {
+    if (error instanceof Error && error.name === 'AbortError') throw error
     return { state: 'unknown' }
   }
 }
@@ -994,11 +1001,19 @@ async function getThreadMessagesV2(threadId: string): Promise<UiMessage[]> {
 }
 
 async function getThreadSummaryV2(threadId: string): Promise<UiThread> {
-  const payload = await callRpc<ThreadReadResponse>('thread/read', {
-    threadId,
-    includeTurns: false,
-  })
-  return normalizeThreadSummaryV2(payload)
+  const params = new URLSearchParams({ threadId })
+  const response = await fetch(`/codex-api/thread-summary?${params.toString()}`)
+  const payload = await response.json().catch(() => null) as {
+    result?: ThreadReadResponse
+    error?: unknown
+  } | null
+  if (!response.ok || !payload?.result) {
+    throw new CodexApiError(
+      extractErrorMessage(payload, `Failed to load thread ${threadId}`),
+      { code: 'http_error', method: 'thread/summary', status: response.status },
+    )
+  }
+  return normalizeThreadSummaryV2(payload.result)
 }
 
 function hasRawItemCompression(rawTurn: unknown): boolean {
@@ -1063,19 +1078,23 @@ async function getThreadDetailV2(
   externalRuntimeState: ThreadDetailRuntime['externalRuntimeState']
   runtimeCwd?: string
 }> {
-  const metadata = await callRpc<ThreadReadResponse>('thread/read', {
-    threadId,
-    includeTurns: false,
-  }, signal)
+  const runtimeObservation = await getThreadRuntimeState(threadId, signal)
   try {
-    const metadataRuntime = readThreadDetailRuntime(metadata)
     const page = await getThreadTurnPageV2(
       threadId,
       null,
       3,
       signal,
-      metadataRuntime.inProgress ? metadataRuntime.activeTurnId : '',
+      runtimeObservation.state === 'running' ? runtimeObservation.turnId : '',
     )
+    const metadata = {
+      ...page.result,
+      thread: {
+        ...page.result.thread,
+        turns: page.rawTurns,
+        externalRuntime: runtimeObservation,
+      },
+    } as unknown as ThreadReadResponse
     if (
       page.rawTurns.length === 0
       && page.messages.length === 0
@@ -1095,14 +1114,7 @@ async function getThreadDetailV2(
         if (error instanceof Error && error.name === 'AbortError') throw error
       }
     }
-    const payload = {
-      ...metadata,
-      thread: {
-        ...metadata.thread,
-        turns: page.rawTurns,
-      },
-    } as ThreadReadResponse
-    const runtime = readThreadDetailRuntime(payload)
+    const runtime = readThreadDetailRuntime(metadata)
     return {
       isPagedProjection: true,
       isPartialTurnProjection: isPartialActiveTurnProjection(page.rawTurns, runtime),
@@ -1118,21 +1130,29 @@ async function getThreadDetailV2(
     }
   } catch (error) {
     if (!(error instanceof ThreadTurnPaginationUnsupportedError)) throw error
-    const payload = await callRpc<ThreadReadResponse>('thread/read', {
-      threadId,
-      includeTurns: true,
-    }, signal)
-    const startTurnIndex = readThreadTurnStartIndex(payload)
+    try {
+      return await getExternalThreadLiveStateSnapshotV2(threadId, signal)
+    } catch (liveError) {
+      if (liveError instanceof Error && liveError.name === 'AbortError') throw liveError
+    }
+    const payload = {
+      thread: {
+        id: threadId,
+        turns: [],
+        externalRuntime: runtimeObservation,
+      },
+    } as unknown as ThreadReadResponse
     return {
+      isPagedProjection: true,
       model: normalizeThreadModelFromPayload(payload),
       modelProvider: normalizeThreadModelProviderFromPayload(payload),
       reasoningEffort: normalizeThreadReasoningEffortFromPayload(payload),
-      messages: normalizeThreadMessagesV2(payload, startTurnIndex),
-      completionSummaries: readThreadCompletionSummaries(payload),
+      messages: [],
+      completionSummaries: [],
       ...readThreadDetailRuntime(payload),
-      hasMoreOlder: startTurnIndex > 0,
+      hasMoreOlder: false,
       olderCursor: null,
-      turnIndexByTurnId: buildTurnIndexByTurnId(payload, startTurnIndex),
+      turnIndexByTurnId: {},
     }
   }
 }
@@ -1217,6 +1237,7 @@ async function getExternalThreadLiveStateSnapshotV2(
 
 type InternalThreadTurnPage = ThreadTurnPage & {
   rawTurns: unknown[]
+  result: ThreadReadResponse
 }
 
 async function getThreadTurnPageV2(
@@ -1249,7 +1270,7 @@ async function getThreadTurnPageV2(
     nextCursor?: unknown
     startTurnIndex?: unknown
   } | null
-  if (response.status === 501 && payload?.fallback === 'thread/read') {
+  if (response.status === 501) {
     throw new ThreadTurnPaginationUnsupportedError()
   }
   if (!response.ok) {
@@ -1263,6 +1284,7 @@ async function getThreadTurnPageV2(
   const nextCursor = readString(payload.nextCursor)
 
   return {
+    result: payload.result,
     rawTurns,
     messages: normalizeThreadMessagesV2(payload.result, startTurnIndex),
     completionSummaries: readThreadCompletionSummaries(payload.result),
@@ -1345,6 +1367,12 @@ export async function getThreadDetail(threadId: string, signal?: AbortSignal): P
   try {
     return await getThreadDetailV2(threadId, signal)
   } catch (error) {
+    if (error instanceof Error && error.name === 'AbortError') {
+      throw new CodexApiError(error.message || `Failed to load thread ${threadId}`, {
+        code: 'network_error',
+        method: 'thread/read',
+      })
+    }
     throw normalizeCodexApiError(error, `Failed to load thread ${threadId}`, 'thread/read')
   }
 }
@@ -3418,10 +3446,14 @@ export async function setThreadQueueState(
     }),
     signal: options.signal,
   })
+  const payload = await response.json().catch(() => ({})) as { revision?: unknown }
   if (!response.ok) {
+    const committedRevision = (payload as { committedRevision?: unknown }).committedRevision
+    if (response.status === 409 && typeof committedRevision === 'number' && Number.isSafeInteger(committedRevision)) {
+      return committedRevision
+    }
     throw new Error('Failed to save thread queue state')
   }
-  const payload = await response.json() as { revision?: unknown }
   if (typeof payload.revision !== 'number' || !Number.isSafeInteger(payload.revision) || payload.revision < 0) {
     throw new Error('Invalid thread queue revision')
   }
@@ -3459,7 +3491,13 @@ export async function removeThreadQueuedMessage(
     })
   }
   const payload = await response.json() as { revision?: unknown }
-  if (!response.ok) throw new Error('Failed to remove queued message')
+  if (!response.ok) {
+    const committedRevision = (payload as { committedRevision?: unknown }).committedRevision
+    if (response.status === 409 && typeof committedRevision === 'number' && Number.isSafeInteger(committedRevision)) {
+      return committedRevision
+    }
+    throw new Error('Failed to remove queued message')
+  }
   if (typeof payload.revision !== 'number' || !Number.isSafeInteger(payload.revision) || payload.revision < 0) {
     throw new Error('Invalid thread queue revision')
   }
@@ -3494,7 +3532,13 @@ export async function reorderThreadQueuedMessages(
     return setThreadQueueState(nextState, { baseRevision: snapshot.revision })
   }
   const payload = await response.json() as { revision?: unknown }
-  if (!response.ok) throw new Error('Failed to reorder queued messages')
+  if (!response.ok) {
+    const committedRevision = (payload as { committedRevision?: unknown }).committedRevision
+    if (response.status === 409 && typeof committedRevision === 'number' && Number.isSafeInteger(committedRevision)) {
+      return committedRevision
+    }
+    throw new Error('Failed to reorder queued messages')
+  }
   if (typeof payload.revision !== 'number' || !Number.isSafeInteger(payload.revision) || payload.revision < 0) {
     throw new Error('Invalid thread queue revision')
   }
@@ -3546,7 +3590,10 @@ export async function appendThreadQueuedMessage(
       response.status >= 500
       || (
         response.status === 409
-        && responseError.toLowerCase().includes('another start is already in progress')
+        && (
+          responseError.toLowerCase().includes('another start is already in progress')
+          || responseError.toLowerCase().includes('cannot verify archived task state')
+        )
       )
     ) {
       error.name = 'ThreadQueueAppendAmbiguousError'

@@ -2,7 +2,7 @@
 
 ## Prerequisites / setup
 
-- Linux with Node.js 18+, pnpm, curl, systemd user services, and Tailscale installed.
+- Linux with Node.js 22.13+, pnpm, curl, systemd user services, and Tailscale installed.
 - The device is logged in to the intended tailnet and `${HOME}/.local/bin` is on `PATH`.
 - A clean clone of `https://github.com/zonghang-li/codex-mobile.git`.
 - One known existing thread created before the policy change. Record its id as `EXISTING_THREAD_ID`; its baseline `approvalPolicy` and `sandbox` will be captured before installing the new unit.

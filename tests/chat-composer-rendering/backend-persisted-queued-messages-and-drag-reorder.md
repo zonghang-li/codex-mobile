@@ -18,6 +18,8 @@ Queued messages are saved through the backend, survive page refresh, and can be 
 6. Refresh again and confirm the reordered queue order is preserved
 7. Let the active turn finish and confirm the next sent queued message is the first reordered item
 8. Queue at least two more messages, switch to dark theme, and repeat the drag reorder check
+9. While an external CLI turn owns the thread, open and refresh the mobile page without submitting anything
+10. Submit one Steer message and observe it through the next runtime/text synchronization cycle
 
 #### Expected Results
 - Queued rows survive a page refresh because they are restored from backend state
@@ -25,6 +27,8 @@ Queued messages are saved through the backend, survive page refresh, and can be 
 - The reordered queue order survives page refresh
 - The reordered queue order controls which message sends next after the active turn finishes
 - Edit, Steer, and Delete actions still operate on the correct queued row after reordering
+- Passive open and refresh do not resume, fork, or otherwise take writer ownership from the CLI
+- A successful Steer stays in the sent transcript and does not reappear in the queue after synchronization
 - Drag handle, hover/drop target, and row text remain readable in both light theme and dark theme
 
 #### Rollback/Cleanup

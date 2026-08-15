@@ -19,6 +19,7 @@ export type LocalAppServerRunningRuntime = {
 export type ThreadRuntimeObservation =
   | ExternalThreadRuntime
   | LocalAppServerRunningRuntime
+  | { state: 'archived' }
 
 export type ThreadRuntimeOwnership = 'idle' | 'local' | 'external'
 

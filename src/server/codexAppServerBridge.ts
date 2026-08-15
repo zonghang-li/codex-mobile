@@ -1,7 +1,15 @@
 import { spawn, spawnSync, type ChildProcessWithoutNullStreams } from 'node:child_process'
-import { createHash, createHmac, randomBytes, randomUUID, timingSafeEqual } from 'node:crypto'
-import { link, mkdtemp, open, readFile, readdir, rename, rm, mkdir, stat, cp, lstat, readlink, symlink, realpath, utimes, type FileHandle } from 'node:fs/promises'
-import { createReadStream, existsSync, readFileSync, statSync, watch, type FSWatcher } from 'node:fs'
+import {
+  createCipheriv,
+  createDecipheriv,
+  createHash,
+  createHmac,
+  randomBytes,
+  randomUUID,
+  timingSafeEqual,
+} from 'node:crypto'
+import { link, mkdtemp, open, opendir, readFile, readdir, rename, rm, mkdir, stat, cp, lstat, readlink, symlink, realpath, utimes, type FileHandle } from 'node:fs/promises'
+import { constants as fsConstants, createReadStream, existsSync, readFileSync, statSync, watch, type FSWatcher } from 'node:fs'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { request as httpRequest } from 'node:http'
 import { request as httpsRequest } from 'node:https'
@@ -10,6 +18,7 @@ import { tmpdir } from 'node:os'
 import { basename, dirname, extname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 import { createInterface } from 'node:readline'
 import { once } from 'node:events'
+import { Worker } from 'node:worker_threads'
 import { writeFile } from 'node:fs/promises'
 import { handleAccountRoutes } from './accountRoutes.js'
 import { buildAppServerArgs } from './appServerRuntimeConfig.js'
@@ -40,7 +49,10 @@ import {
 import { handleOpenRouterProxyRequest } from './openRouterProxy.js'
 import { handleZenProxyRequest } from './zenProxy.js'
 import { handleCustomEndpointProxyRequest } from './customEndpointProxy.js'
-import { ExternalThreadRuntimeProbe } from './externalThreadRuntime.js'
+import {
+  ExternalThreadRuntimeProbe,
+  type ExternalWriterEvidenceSnapshot,
+} from './externalThreadRuntime.js'
 import { LocalThreadRuntimeLedger } from './localThreadRuntime.js'
 import {
   readThreadLiveSnapshotFile,
@@ -58,6 +70,7 @@ import {
 } from './threadTextPage.js'
 import { ThreadTerminalManager } from './terminalManager.js'
 import { getSpawnInvocation } from '../utils/commandInvocation.js'
+import { withCrossProcessDirectoryLock } from './crossProcessFileLock.js'
 import {
   isProcessOwnerAlive,
   mutateJsonStateFile,
@@ -66,6 +79,7 @@ import {
 import {
   resolveCodexCommand,
   resolveRipgrepCommand,
+  resolveSqliteCommandAsync,
 } from '../commandResolution.js'
 import type { CollaborationModeKind, ReasoningEffort } from '../types/codex.js'
 import type { ExternalThreadRuntime, ThreadRuntimeObservation } from '../types/threadRuntime.js'
@@ -112,6 +126,13 @@ const THREAD_TEXT_PAGE_HTTP_CACHE_TTL_MS = 350
 const LIVE_STATE_HTTP_CACHE_MAX_ENTRIES = 256
 const THREAD_TEXT_PAGE_HTTP_CACHE_MAX_ENTRIES = 512
 const CODEX_MOBILE_THREAD_LIST_CURSOR_PREFIX = 'codex-mobile-list:'
+const PROJECT_ZIP_SESSION_META_MAX_BYTES = 1024 * 1024
+const PROJECT_ZIP_IMPORT_MAX_BYTES = 256 * 1024 * 1024
+const PROJECT_ZIP_IMPORT_MAX_ENTRIES = 10_000
+const PROJECT_ZIP_IMPORT_MAX_LOGICAL_BYTES = PROJECT_ZIP_IMPORT_MAX_BYTES
+const PROJECT_ZIP_SESSION_SCAN_MAX_FILES = 50_000
+const PROJECT_ZIP_SESSION_SCAN_MAX_META_BYTES = PROJECT_ZIP_IMPORT_MAX_BYTES
+const SQLITE_IN_QUERY_MAX_BYTES = 64 * 1024
 
 type RpcExecutor = {
   rpc: (method: string, params: unknown) => Promise<unknown>
@@ -763,6 +784,9 @@ export function prepareRpcProxyRequest(
   if (enforceTurnPolicy) {
     forwardedParams.approvalPolicy = readQueuedTurnApprovalPolicy()
     forwardedParams.sandboxPolicy = readQueuedTurnSandboxPolicy()
+    if (!readNonEmptyString(forwardedParams.clientUserMessageId)) {
+      forwardedParams.clientUserMessageId = randomUUID()
+    }
   }
   return {
     params: forwardedParams,
@@ -1359,15 +1383,61 @@ export async function augmentThreadResultWithExternalRuntime(
   }
 }
 
+type ThreadWriterRuntimeProbe = Pick<ThreadRuntimeProbe, 'registerThread' | 'inspect'> & Partial<Pick<
+  ExternalThreadRuntimeProbe,
+  'inspectWriterEvidence' | 'inspectWriterEvidenceSnapshot' | 'inspectUnexpectedLifecycleSince'
+>>
+
 type ThreadWriterInspection =
-  | { state: 'idle'; readResult: unknown }
-  | { state: 'blocked'; readResult: unknown; runtime: ExternalThreadRuntime }
+  | { state: 'idle'; readResult: unknown; writerEvidenceSnapshot?: ExternalWriterEvidenceSnapshot }
+  | {
+      state: 'blocked'
+      readResult: unknown
+      runtime: ExternalThreadRuntime
+      writerEvidenceSnapshot?: ExternalWriterEvidenceSnapshot
+    }
   | { state: 'unmaterialized'; readResult: unknown; error?: unknown }
+
+function hasNewWriterEvidence(
+  baseline: ExternalWriterEvidenceSnapshot,
+  current: ExternalWriterEvidenceSnapshot,
+): boolean {
+  const baselineWriters = new Set(baseline.writers)
+  return current.writers.some((writer) => !baselineWriters.has(writer))
+}
+
+async function readWriterEvidenceSnapshot(
+  runtimeProbe: ThreadWriterRuntimeProbe,
+  threadId: string,
+  excludedPid: number | null,
+): Promise<ExternalWriterEvidenceSnapshot | null | undefined> {
+  if (process.platform !== 'linux' || typeof runtimeProbe.inspectWriterEvidenceSnapshot !== 'function') {
+    return undefined
+  }
+  return await runtimeProbe.inspectWriterEvidenceSnapshot(threadId, excludedPid)
+}
+
+async function inspectUnexpectedWriterLifecycle(
+  runtimeProbe: ThreadWriterRuntimeProbe,
+  threadId: string,
+  baseline: ExternalWriterEvidenceSnapshot | undefined,
+  expectedTurnId: string,
+  expectedClientUserMessageId = '',
+): Promise<boolean | null | undefined> {
+  if (!baseline?.rollout || typeof runtimeProbe.inspectUnexpectedLifecycleSince !== 'function') {
+    return undefined
+  }
+  return await runtimeProbe.inspectUnexpectedLifecycleSince(
+    threadId,
+    baseline,
+    expectedTurnId,
+    expectedClientUserMessageId,
+  )
+}
 
 async function inspectThreadWriter(
   appServer: RpcExecutor,
-  runtimeProbe: Pick<ThreadRuntimeProbe, 'registerThread' | 'inspect'> &
-    Partial<Pick<ExternalThreadRuntimeProbe, 'inspectWriterEvidence'>>,
+  runtimeProbe: ThreadWriterRuntimeProbe,
   excludedPid: number | null,
   threadId: string,
 ): Promise<ThreadWriterInspection> {
@@ -1392,8 +1462,26 @@ async function inspectThreadWriter(
 
   runtimeProbe.registerThread(threadId, rolloutPath)
   const runtime = await runtimeProbe.inspect(threadId, excludedPid)
+  if (runtime.state === 'idle') {
+    const writerEvidenceSnapshot = await readWriterEvidenceSnapshot(runtimeProbe, threadId, excludedPid)
+    if (writerEvidenceSnapshot === null) {
+      return { state: 'blocked', readResult, runtime: { state: 'unknown' } }
+    }
+    if (writerEvidenceSnapshot) {
+      if (readThreadResultInProgress(thread) && writerEvidenceSnapshot.writers.length > 0) {
+        return {
+          state: 'blocked',
+          readResult,
+          runtime: { state: 'unknown' },
+          writerEvidenceSnapshot,
+        }
+      }
+      return { state: 'idle', readResult, writerEvidenceSnapshot }
+    }
+  }
   if (
     runtime.state === 'idle'
+    && readThreadResultInProgress(thread)
     && process.platform === 'linux'
     && typeof runtimeProbe.inspectWriterEvidence === 'function'
   ) {
@@ -1409,8 +1497,7 @@ async function inspectThreadWriter(
 
 async function guardThreadResumeAgainstExternalWriter(
   appServer: RpcExecutor,
-  runtimeProbe: Pick<ThreadRuntimeProbe, 'registerThread' | 'inspect'> &
-    Partial<Pick<ExternalThreadRuntimeProbe, 'inspectWriterEvidence'>>,
+  runtimeProbe: ThreadWriterRuntimeProbe,
   excludedPid: number | null,
   threadId: string,
 ): Promise<{ blocked: false } | { blocked: true; readResult: unknown }> {
@@ -1422,16 +1509,50 @@ async function guardThreadResumeAgainstExternalWriter(
 
 async function auditStartedTurnAgainstExternalWriter(
   appServer: RpcExecutor,
-  runtimeProbe: Pick<ThreadRuntimeProbe, 'registerThread' | 'inspect'> &
-    Partial<Pick<ExternalThreadRuntimeProbe, 'inspectWriterEvidence'>>,
+  runtimeProbe: ThreadWriterRuntimeProbe,
   excludedPid: number | null,
   threadId: string,
   result: unknown,
   allowUnmaterialized = false,
+  writerEvidenceBaseline?: ExternalWriterEvidenceSnapshot,
+  expectedClientUserMessageId = '',
 ): Promise<unknown> {
   const inspection = await inspectThreadWriter(appServer, runtimeProbe, excludedPid, threadId)
-  if (inspection.state === 'idle' || (allowUnmaterialized && inspection.state === 'unmaterialized')) return result
   const turnId = readNonEmptyString(asRecord(asRecord(result)?.turn)?.id)
+  if (writerEvidenceBaseline) {
+    const unexpectedLifecycle = await inspectUnexpectedWriterLifecycle(
+      runtimeProbe,
+      threadId,
+      writerEvidenceBaseline,
+      turnId,
+      expectedClientUserMessageId,
+    )
+    const currentWriterEvidence = inspection.state === 'idle' || inspection.state === 'blocked'
+      ? inspection.writerEvidenceSnapshot
+        ?? await readWriterEvidenceSnapshot(runtimeProbe, threadId, excludedPid)
+      : await readWriterEvidenceSnapshot(runtimeProbe, threadId, excludedPid)
+    const writerEvidenceIsUnchanged = currentWriterEvidence !== null
+      && currentWriterEvidence !== undefined
+      && !hasNewWriterEvidence(writerEvidenceBaseline, currentWriterEvidence)
+    const runtimeMatchesStartedTurn = inspection.state === 'blocked'
+      && inspection.runtime.state === 'running'
+      && inspection.runtime.turnId === turnId
+    const onlyBaselineWriterIsUnknown = inspection.state === 'blocked'
+      && inspection.runtime.state === 'unknown'
+    if (
+      (unexpectedLifecycle === undefined || unexpectedLifecycle === false)
+      &&
+      writerEvidenceIsUnchanged
+      && (
+        inspection.state === 'idle'
+        || runtimeMatchesStartedTurn
+        || onlyBaselineWriterIsUnknown
+        || (allowUnmaterialized && inspection.state === 'unmaterialized')
+      )
+    ) return result
+  } else {
+    if (inspection.state === 'idle' || (allowUnmaterialized && inspection.state === 'unmaterialized')) return result
+  }
   if (inspection.state === 'blocked' && inspection.runtime.state === 'running' && inspection.runtime.turnId === turnId) {
     if (
       process.platform !== 'linux'
@@ -1446,14 +1567,13 @@ async function auditStartedTurnAgainstExternalWriter(
   }
   const error = new Error('Cannot start a turn because task writer ownership is not idle.')
   error.name = 'ThreadWriterOwnershipConflictError'
-  Object.assign(error, { turnId })
+  Object.assign(error, { turnId, turnStartDelivery: 'started' })
   throw error
 }
 
 async function isThreadWriterIdleForMutation(
   appServer: RpcExecutor,
-  runtimeProbe: Pick<ThreadRuntimeProbe, 'registerThread' | 'inspect'> &
-    Partial<Pick<ExternalThreadRuntimeProbe, 'inspectWriterEvidence'>>,
+  runtimeProbe: ThreadWriterRuntimeProbe,
   excludedPid: number | null,
   threadId: string,
 ): Promise<boolean> {
@@ -1462,8 +1582,7 @@ async function isThreadWriterIdleForMutation(
 
 async function waitForInterruptedThreadWriterIdle(
   appServer: RpcExecutor,
-  runtimeProbe: Pick<ThreadRuntimeProbe, 'registerThread' | 'inspect'> &
-    Partial<Pick<ExternalThreadRuntimeProbe, 'inspectWriterEvidence'>>,
+  runtimeProbe: ThreadWriterRuntimeProbe,
   excludedPid: number | null,
   threadId: string,
   interruptedTurnId: string,
@@ -2401,6 +2520,18 @@ type ParsedProjectZipEntry = {
   isDirectory: boolean
 }
 
+type ProjectZipExportBoundEntry = {
+  zipPath: string
+  size: number
+}
+
+type ProjectZipExportBoundsState = {
+  archiveBytes: number
+  entryCount: number
+  logicalBytes: number
+  paths: Set<string>
+}
+
 type ImportedSessionRecord = {
   id: string
   path: string
@@ -2475,14 +2606,55 @@ function assertZipUInt32(value: number, label: string): void {
 }
 
 function assertZipEntryCount(value: number): void {
-  if (value > 0xffff) {
+  if (value > PROJECT_ZIP_IMPORT_MAX_ENTRIES) {
     throw new Error('Project has too many files for ZIP export')
   }
+}
+
+function createProjectZipExportBoundsState(): ProjectZipExportBoundsState {
+  return { archiveBytes: 22, entryCount: 0, logicalBytes: 0, paths: new Set() }
+}
+
+function addProjectZipExportBound(
+  state: ProjectZipExportBoundsState,
+  entry: ProjectZipExportBoundEntry,
+): void {
+  const nextEntryCount = state.entryCount + 1
+  assertZipEntryCount(nextEntryCount)
+  const nameBytes = Buffer.byteLength(entry.zipPath)
+  if (nameBytes > 0xffff) throw new Error('Project ZIP entry path is too long')
+  if (!Number.isSafeInteger(entry.size) || entry.size < 0) {
+    throw new Error('Project ZIP entry has an invalid size')
+  }
+  if (state.paths.has(entry.zipPath)) throw new Error('Project ZIP export contains duplicate paths')
+  const nextLogicalBytes = state.logicalBytes + entry.size
+  const nextArchiveBytes = state.archiveBytes + 30 + nameBytes + entry.size + 16 + 46 + nameBytes
+  if (
+    nextLogicalBytes > PROJECT_ZIP_IMPORT_MAX_LOGICAL_BYTES
+    || nextArchiveBytes > PROJECT_ZIP_IMPORT_MAX_BYTES
+  ) throw new Error('Project ZIP export exceeds the import limit')
+  state.entryCount = nextEntryCount
+  state.logicalBytes = nextLogicalBytes
+  state.archiveBytes = nextArchiveBytes
+  state.paths.add(entry.zipPath)
+}
+
+export function assertProjectZipExportBounds(entries: readonly ProjectZipExportBoundEntry[]): void {
+  const state = createProjectZipExportBoundsState()
+  for (const entry of entries) addProjectZipExportBound(state, entry)
 }
 
 function addZipOffset(offset: number, size: number): number {
   const next = offset + size
   assertZipUInt32(next, 'ZIP archive')
+  return next
+}
+
+function addProjectZipExportOffset(offset: number, size: number): number {
+  const next = addZipOffset(offset, size)
+  if (next > PROJECT_ZIP_IMPORT_MAX_BYTES) {
+    throw new Error('Project ZIP export exceeds the import limit')
+  }
   return next
 }
 
@@ -2597,24 +2769,135 @@ async function createProjectZipIgnoreMatcher(root: string): Promise<ProjectZipIg
   }
 }
 
+export function projectZipDescriptorDirectoryPath(
+  fd: number,
+  platform: NodeJS.Platform = process.platform,
+): string {
+  if (platform === 'linux') return `/proc/self/fd/${fd}`
+  if (platform === 'darwin' || platform === 'freebsd') return `/dev/fd/${fd}`
+  return ''
+}
+
 async function* walkProjectZipEntries(
   root: string,
   ignoreMatcher: ProjectZipIgnoreMatcher,
   current = root,
-): AsyncGenerator<{ path: string; isDirectory: boolean; mtime: Date }> {
-  const entries = await readdir(current, { withFileTypes: true })
-  for (const entry of entries) {
-    if (PROJECT_ZIP_SKIPPED_NAMES.has(entry.name)) continue
-    const absolutePath = join(current, entry.name)
-    if (ignoreMatcher.isIgnored(absolutePath)) continue
-    const info = await lstat(absolutePath)
-    if (info.isSymbolicLink()) continue
-    if (info.isDirectory()) {
-      yield { path: absolutePath, isDirectory: true, mtime: info.mtime }
-      yield* walkProjectZipEntries(root, ignoreMatcher, absolutePath)
-    } else if (info.isFile()) {
-      yield { path: absolutePath, isDirectory: false, mtime: info.mtime }
+  displayPath = root,
+): AsyncGenerator<{
+  path: string
+  isDirectory: boolean
+  mtime: Date
+  size: number
+  handle?: FileHandle
+  identity?: { dev: number; ino: number; size: number; mtimeMs: number }
+}> {
+  const openingInfo = await lstat(current)
+  if (!openingInfo.isDirectory() || openingInfo.isSymbolicLink()) throw new Error('Unsafe project ZIP directory.')
+  const noFollowFlag = typeof fsConstants.O_NOFOLLOW === 'number' ? fsConstants.O_NOFOLLOW : 0
+  const directoryFlag = typeof fsConstants.O_DIRECTORY === 'number' ? fsConstants.O_DIRECTORY : 0
+  const handle = await open(current, fsConstants.O_RDONLY | noFollowFlag | directoryFlag)
+  let directory: Awaited<ReturnType<typeof opendir>> | null = null
+  try {
+    const openedInfo = await handle.stat()
+    if (
+      !openedInfo.isDirectory()
+      || openedInfo.dev !== openingInfo.dev
+      || openedInfo.ino !== openingInfo.ino
+    ) throw new Error('Project ZIP directory changed while opening.')
+    const descriptorPath = projectZipDescriptorDirectoryPath(handle.fd)
+    if (!descriptorPath) throw new Error('Project ZIP export is unavailable on this platform.')
+    directory = await opendir(descriptorPath)
+    for await (const entry of directory) {
+      if (PROJECT_ZIP_SKIPPED_NAMES.has(entry.name)) continue
+      const absolutePath = join(displayPath, entry.name)
+      if (isSameOrDescendantPath(absolutePath, join(root, '.codex-project', 'chats'))) continue
+      if (ignoreMatcher.isIgnored(absolutePath)) continue
+      const descriptorEntryPath = join(descriptorPath, entry.name)
+      const info = await lstat(descriptorEntryPath)
+      if (info.isSymbolicLink()) continue
+      if (info.isDirectory()) {
+        yield { path: absolutePath, isDirectory: true, mtime: info.mtime, size: 0 }
+        yield* walkProjectZipEntries(root, ignoreMatcher, descriptorEntryPath, absolutePath)
+      } else if (info.isFile()) {
+        const fileHandle = await open(descriptorEntryPath, fsConstants.O_RDONLY | noFollowFlag)
+        try {
+          const fileInfo = await fileHandle.stat()
+          if (
+            !fileInfo.isFile()
+            || fileInfo.dev !== info.dev
+            || fileInfo.ino !== info.ino
+          ) throw new Error('Project ZIP file changed while opening.')
+          yield {
+            path: absolutePath,
+            isDirectory: false,
+            mtime: fileInfo.mtime,
+            size: fileInfo.size,
+            handle: fileHandle,
+            identity: {
+              dev: fileInfo.dev,
+              ino: fileInfo.ino,
+              size: fileInfo.size,
+              mtimeMs: fileInfo.mtimeMs,
+            },
+          }
+        } catch (error) {
+          await fileHandle.close().catch(() => undefined)
+          throw error
+        }
+      }
     }
+  } finally {
+    await directory?.close().catch(() => undefined)
+    await handle.close().catch(() => undefined)
+  }
+}
+
+async function* stableProjectZipFileChunks(
+  handle: FileHandle,
+  identity: { dev: number; ino: number; size: number; mtimeMs: number },
+): AsyncGenerator<Buffer> {
+  try {
+    let offset = 0
+    while (offset < identity.size) {
+      const buffer = Buffer.allocUnsafe(Math.min(64 * 1024, identity.size - offset))
+      const { bytesRead } = await handle.read(buffer, 0, buffer.length, offset)
+      if (bytesRead <= 0) throw new Error('Project ZIP file changed while reading.')
+      offset += bytesRead
+      yield buffer.subarray(0, bytesRead)
+    }
+    const closingInfo = await handle.stat()
+    if (
+      !closingInfo.isFile()
+      || closingInfo.dev !== identity.dev
+      || closingInfo.ino !== identity.ino
+      || closingInfo.size !== identity.size
+      || closingInfo.mtimeMs !== identity.mtimeMs
+    ) throw new Error('Project ZIP file changed while reading.')
+  } finally {
+    await handle.close().catch(() => undefined)
+  }
+}
+
+async function openStableProjectZipFile(path: string): Promise<{
+  handle: FileHandle
+  identity: { dev: number; ino: number; size: number; mtimeMs: number }
+}> {
+  const pathInfo = await lstat(path)
+  if (!pathInfo.isFile() || pathInfo.isSymbolicLink()) throw new Error('Unsafe project ZIP file.')
+  const noFollowFlag = typeof fsConstants.O_NOFOLLOW === 'number' ? fsConstants.O_NOFOLLOW : 0
+  const handle = await open(path, fsConstants.O_RDONLY | noFollowFlag)
+  try {
+    const info = await handle.stat()
+    if (!info.isFile() || info.dev !== pathInfo.dev || info.ino !== pathInfo.ino) {
+      throw new Error('Project ZIP file changed while opening.')
+    }
+    return {
+      handle,
+      identity: { dev: info.dev, ino: info.ino, size: info.size, mtimeMs: info.mtimeMs },
+    }
+  } catch (error) {
+    await handle.close().catch(() => undefined)
+    throw error
   }
 }
 
@@ -2625,10 +2908,12 @@ async function writeProjectZipEntry(
   entry: { zipPath: string; mtime: Date; isDirectory: boolean; chunks: AsyncIterable<Buffer> },
 ): Promise<number> {
   if (!entry.zipPath) return offset
+  assertZipEntryCount(centralEntries.length + 1)
   const localHeaderOffset = offset
   const localHeader = buildZipLocalHeader(entry.zipPath, entry.mtime)
+  const afterLocalHeader = addProjectZipExportOffset(offset, localHeader.length)
   await writeZipChunk(res, localHeader)
-  offset = addZipOffset(offset, localHeader.length)
+  offset = afterLocalHeader
 
   let crc = 0xffffffff
   let size = 0
@@ -2637,17 +2922,18 @@ async function writeProjectZipEntry(
       crc = updateZipCrc32(crc, buffer)
       size += buffer.length
       assertZipUInt32(size, 'Project file')
+      const afterBuffer = addProjectZipExportOffset(offset, buffer.length)
       await writeZipChunk(res, buffer)
-      offset = addZipOffset(offset, buffer.length)
+      offset = afterBuffer
     }
   }
 
   const crc32 = (crc ^ 0xffffffff) >>> 0
   const descriptor = buildZipDataDescriptor(crc32, size)
+  const afterDescriptor = addProjectZipExportOffset(offset, descriptor.length)
   await writeZipChunk(res, descriptor)
-  offset = addZipOffset(offset, descriptor.length)
+  offset = afterDescriptor
 
-  assertZipEntryCount(centralEntries.length + 1)
   const { dosDate, dosTime } = toDosDateTime(entry.mtime)
   centralEntries.push({
     path: entry.zipPath,
@@ -2667,6 +2953,37 @@ async function* singleZipBufferChunk(data: Buffer): AsyncGenerator<Buffer> {
   yield data
 }
 
+export async function assertProjectZipCanRoundTrip(
+  root: string,
+  virtualEntries: readonly ProjectZipVirtualEntry[],
+): Promise<void> {
+  const bounds = createProjectZipExportBoundsState()
+  const ignoreMatcher = await createProjectZipIgnoreMatcher(root)
+  for await (const entry of walkProjectZipEntries(root, ignoreMatcher)) {
+    const zipPath = toZipEntryPath(root, entry.path, entry.isDirectory)
+    try {
+      if (zipPath === '.codex-project/manifest.json') continue
+      addProjectZipExportBound(bounds, {
+        zipPath,
+        size: entry.size,
+      })
+    } finally {
+      await entry.handle?.close().catch(() => undefined)
+    }
+  }
+  for (const entry of virtualEntries) {
+    const stableFile = entry.filePath ? await openStableProjectZipFile(entry.filePath) : null
+    try {
+      addProjectZipExportBound(bounds, {
+        zipPath: entry.path,
+        size: stableFile?.identity.size ?? (entry.data?.length ?? 0),
+      })
+    } finally {
+      await stableFile?.handle.close().catch(() => undefined)
+    }
+  }
+}
+
 async function streamProjectZip(root: string, res: ServerResponse, virtualEntries: ProjectZipVirtualEntry[] = []): Promise<void> {
   const centralEntries: ZipCentralDirectoryEntry[] = []
   let offset = 0
@@ -2674,33 +2991,56 @@ async function streamProjectZip(root: string, res: ServerResponse, virtualEntrie
 
   for await (const entry of walkProjectZipEntries(root, ignoreMatcher)) {
     const zipPath = toZipEntryPath(root, entry.path, entry.isDirectory)
-    if (zipPath === '.codex-project/manifest.json') continue
-    offset = await writeProjectZipEntry(res, centralEntries, offset, {
-      zipPath,
-      mtime: entry.mtime,
-      isDirectory: entry.isDirectory,
-      chunks: entry.isDirectory ? singleZipBufferChunk(Buffer.alloc(0)) : createReadStream(entry.path) as AsyncIterable<Buffer>,
-    })
+    if (zipPath === '.codex-project/manifest.json') {
+      await entry.handle?.close().catch(() => undefined)
+      continue
+    }
+    if (!entry.isDirectory && (!entry.handle || !entry.identity)) {
+      throw new Error('Project ZIP file handle is unavailable.')
+    }
+    try {
+      offset = await writeProjectZipEntry(res, centralEntries, offset, {
+        zipPath,
+        mtime: entry.mtime,
+        isDirectory: entry.isDirectory,
+        chunks: entry.isDirectory
+          ? singleZipBufferChunk(Buffer.alloc(0))
+          : stableProjectZipFileChunks(entry.handle!, entry.identity!),
+      })
+    } catch (error) {
+      await entry.handle?.close().catch(() => undefined)
+      throw error
+    }
   }
 
   for (const entry of virtualEntries) {
-    offset = await writeProjectZipEntry(res, centralEntries, offset, {
-      zipPath: entry.path,
-      mtime: entry.mtime,
-      isDirectory: false,
-      chunks: entry.filePath ? createReadStream(entry.filePath) as AsyncIterable<Buffer> : singleZipBufferChunk(entry.data ?? Buffer.alloc(0)),
-    })
+    const stableFile = entry.filePath ? await openStableProjectZipFile(entry.filePath) : null
+    try {
+      offset = await writeProjectZipEntry(res, centralEntries, offset, {
+        zipPath: entry.path,
+        mtime: entry.mtime,
+        isDirectory: false,
+        chunks: stableFile
+          ? stableProjectZipFileChunks(stableFile.handle, stableFile.identity)
+          : singleZipBufferChunk(entry.data ?? Buffer.alloc(0)),
+      })
+    } catch (error) {
+      await stableFile?.handle.close().catch(() => undefined)
+      throw error
+    }
   }
 
   const centralOffset = offset
   let centralSize = 0
   for (const entry of centralEntries) {
     const header = buildZipCentralHeader(entry)
+    const afterHeader = addProjectZipExportOffset(offset, header.length)
     await writeZipChunk(res, header)
     centralSize = addZipOffset(centralSize, header.length)
-    offset = addZipOffset(offset, header.length)
+    offset = afterHeader
   }
   const footer = buildZipEndOfCentralDirectory(centralEntries.length, centralSize, centralOffset)
+  addProjectZipExportOffset(offset, footer.length)
   await writeZipChunk(res, footer)
 }
 
@@ -2734,13 +3074,13 @@ async function resolveAllowedProjectZipCwd(rawCwd: string): Promise<string> {
 }
 
 async function* walkFiles(root: string, current = root): AsyncGenerator<string> {
-  let entries
+  let directory
   try {
-    entries = await readdir(current, { withFileTypes: true })
+    directory = await opendir(current)
   } catch {
     return
   }
-  for (const entry of entries) {
+  for await (const entry of directory) {
     const absolutePath = join(current, entry.name)
     if (entry.isDirectory()) {
       yield* walkFiles(root, absolutePath)
@@ -2770,7 +3110,8 @@ function readSessionMetaId(raw: string): string {
     const parsed = JSON.parse(firstLine) as unknown
     const record = asRecord(parsed)
     const payload = asRecord(record?.payload)
-    return readNonEmptyString(payload?.id)
+    const id = readNonEmptyString(payload?.id)
+    return isSafeThreadIdForLocalRolloutPath(id) ? id : ''
   } catch {
     return ''
   }
@@ -3110,10 +3451,40 @@ function sqlString(value: string): string {
   return `'${value.replace(/'/g, "''")}'`
 }
 
-async function readStateDbThreadArchived(threadId: string): Promise<boolean | null> {
+export function chunkSqlInValues(
+  values: readonly string[],
+  maxCount: number,
+  maxBytes: number,
+): string[][] {
+  if (!Number.isSafeInteger(maxCount) || maxCount < 1 || !Number.isSafeInteger(maxBytes) || maxBytes < 1) {
+    throw new Error('Invalid SQL batch limits.')
+  }
+  const batches: string[][] = []
+  let batch: string[] = []
+  let batchBytes = 0
+  for (const value of values) {
+    const literalBytes = Buffer.byteLength(sqlString(value))
+    if (literalBytes > maxBytes) throw new Error('SQL value exceeds the query byte limit.')
+    const nextBytes = batchBytes + literalBytes + (batch.length > 0 ? 1 : 0)
+    if (batch.length >= maxCount || nextBytes > maxBytes) {
+      batches.push(batch)
+      batch = []
+      batchBytes = 0
+    }
+    batch.push(value)
+    batchBytes += literalBytes + (batch.length > 1 ? 1 : 0)
+  }
+  if (batch.length > 0) batches.push(batch)
+  return batches
+}
+
+async function readStateDbThreadArchived(
+  threadId: string,
+  options: { fresh?: boolean } = {},
+): Promise<boolean | null> {
   const normalizedThreadId = threadId.trim()
   if (!normalizedThreadId) return null
-  return (await readStateDbArchiveRows([normalizedThreadId])).get(normalizedThreadId) ?? null
+  return (await readStateDbArchiveRows([normalizedThreadId], options)).get(normalizedThreadId) ?? null
 }
 
 let stateDbArchiveRowCache: {
@@ -3130,10 +3501,13 @@ async function readStateDbArchiveSignature(stateDbPath: string): Promise<string>
       return 'missing'
     }
   }
-  return `db:${await signatureForPath(stateDbPath)}|wal:${await signatureForPath(`${stateDbPath}-wal`)}`
+  return `path:${stateDbPath}|db:${await signatureForPath(stateDbPath)}|wal:${await signatureForPath(`${stateDbPath}-wal`)}`
 }
 
-async function readStateDbArchiveRows(threadIds: readonly string[]): Promise<Map<string, boolean | null>> {
+async function readStateDbArchiveRows(
+  threadIds: readonly string[],
+  options: { fresh?: boolean } = {},
+): Promise<Map<string, boolean | null>> {
   const normalizedIds = Array.from(new Set(threadIds.map((id) => id.trim()).filter(Boolean)))
   const result = new Map<string, boolean | null>()
   if (normalizedIds.length === 0) return result
@@ -3143,17 +3517,20 @@ async function readStateDbArchiveRows(threadIds: readonly string[]): Promise<Map
   if (stateDbArchiveRowCache?.signature !== signature) {
     stateDbArchiveRowCache = { signature, rows: new Map() }
   }
-  const cache = stateDbArchiveRowCache.rows
+  const cache = options.fresh ? new Map<string, boolean | null>() : stateDbArchiveRowCache.rows
   const missingIds = normalizedIds.filter((id) => !cache.has(id))
-  for (let offset = 0; offset < missingIds.length; offset += 100) {
-    const batch = missingIds.slice(offset, offset + 100)
+  const queryIds = missingIds.filter(isSafeThreadIdForLocalRolloutPath)
+  for (const id of missingIds) {
+    if (!isSafeThreadIdForLocalRolloutPath(id)) cache.set(id, null)
+  }
+  for (const batch of chunkSqlInValues(queryIds, 10_000, SQLITE_IN_QUERY_MAX_BYTES)) {
     let stdout: string
     try {
-      stdout = await runCommandCapture('sqlite3', [
-        '-json',
+      stdout = await runSqliteQueryCapture(
         stateDbPath,
         `SELECT id, archived FROM threads WHERE id IN (${batch.map(sqlString).join(', ')});`,
-      ], { timeoutMs: 2_000 })
+        { json: true, timeoutMs: 2_000 },
+      )
     } catch {
       const error = new Error('Cannot verify archived task state.')
       error.name = 'ArchivedThreadStateUnavailableError'
@@ -3188,54 +3565,623 @@ async function readStateDbArchiveRows(threadIds: readonly string[]): Promise<Map
   return result
 }
 
-async function readStateDbArchivedThreadIds(threadIds: readonly string[]): Promise<Set<string>> {
+async function readStateDbArchivedThreadIds(
+  threadIds: readonly string[],
+  options: { fresh?: boolean } = {},
+): Promise<Set<string>> {
   const normalizedIds = Array.from(new Set(threadIds.map((id) => id.trim()).filter(Boolean)))
   const archivedIds = new Set<string>()
   if (normalizedIds.length === 0) return archivedIds
-  for (const [id, archived] of await readStateDbArchiveRows(normalizedIds)) {
+  for (const [id, archived] of await readStateDbArchiveRows(normalizedIds, options)) {
     if (archived === true) archivedIds.add(id)
+  }
+  for (const id of await readArchivedThreadIdsFromTree(normalizedIds, options)) archivedIds.add(id)
+  return archivedIds
+}
+
+function archivedRolloutPathCandidates(threadId: string): string[] {
+  const compactId = threadId.replace(/-/gu, '')
+  if (!/^[0-9a-f]{32}$/iu.test(compactId)) return []
+  const timestampMs = Number.parseInt(compactId.slice(0, 12), 16)
+  if (!Number.isSafeInteger(timestampMs) || timestampMs <= 0) return []
+  const component = (value: number): string => String(value).padStart(2, '0')
+  const archivedRoot = join(getCodexHomeDir(), 'archived_sessions')
+  const candidates = new Set<string>()
+  for (const timestampOffsetMs of [0, 1_000]) {
+    const createdAt = new Date(timestampMs + timestampOffsetMs)
+    if (!Number.isFinite(createdAt.getTime())) continue
+    for (const utc of [false, true]) {
+      const year = String(utc ? createdAt.getUTCFullYear() : createdAt.getFullYear())
+      const month = component((utc ? createdAt.getUTCMonth() : createdAt.getMonth()) + 1)
+      const day = component(utc ? createdAt.getUTCDate() : createdAt.getDate())
+      const hour = component(utc ? createdAt.getUTCHours() : createdAt.getHours())
+      const minute = component(utc ? createdAt.getUTCMinutes() : createdAt.getMinutes())
+      const second = component(utc ? createdAt.getUTCSeconds() : createdAt.getSeconds())
+      const fileName = `rollout-${year}-${month}-${day}T${hour}-${minute}-${second}-${threadId}.jsonl`
+      candidates.add(join(archivedRoot, fileName))
+      candidates.add(join(archivedRoot, year, month, day, fileName))
+    }
+  }
+  return [...candidates]
+}
+
+let archivedThreadIndexCache: {
+  root: string
+  signature: string
+  directorySignatures: Map<string, string>
+  fileSignatures: Map<string, string>
+  ids: Set<string>
+} | null = null
+
+type ArchivedUuidIndexRecord = {
+  root: string
+  directorySignatures: Map<string, string>
+  directoryEntriesSignatures: Map<string, string>
+  fileSignatures: Map<string, string>
+  ids: Set<string>
+  complete: boolean
+}
+
+let archivedUuidIndexCache: ArchivedUuidIndexRecord | null = null
+let archivedUuidIndexInFlight: { root: string; operation: Promise<ArchivedUuidIndexRecord> } | null = null
+
+const ARCHIVED_THREAD_INDEX_MAX_VALIDATION_INSPECTIONS = 4_096
+const ARCHIVED_THREAD_INDEX_MAX_FILES = ARCHIVED_THREAD_INDEX_MAX_VALIDATION_INSPECTIONS
+const ARCHIVED_THREAD_INDEX_MAX_NON_UUID_FILES = 10_000
+const ARCHIVED_THREAD_INDEX_MAX_BUILD_MS = 2_000
+const ARCHIVED_THREAD_EXACT_LOOKUP_MAX_IDS = 16
+const ARCHIVED_THREAD_INDEX_MAX_DIRECTORIES = ARCHIVED_THREAD_INDEX_MAX_VALIDATION_INSPECTIONS
+const ARCHIVED_THREAD_INDEX_MAX_DIRECTORY_ENTRIES = 10_000
+const ARCHIVED_THREAD_UUID_SCAN_MAX_DIRECTORIES = 16_384
+const ARCHIVED_THREAD_UUID_SCAN_MAX_FILES = 100_000
+const ARCHIVED_THREAD_UUID_SCAN_MAX_BYTES = 256 * 1024 * 1024
+const ARCHIVED_THREAD_UUID_SCAN_MAX_MS = 5_000
+const ARCHIVED_THREAD_UUID_VALIDATION_CONCURRENCY = 128
+
+export function isArchivedThreadIndexSizeSupported(directoryCount: number, fileCount: number): boolean {
+  return Number.isSafeInteger(directoryCount)
+    && Number.isSafeInteger(fileCount)
+    && directoryCount >= 0
+    && fileCount >= 0
+    && directoryCount + fileCount <= ARCHIVED_THREAD_INDEX_MAX_VALIDATION_INSPECTIONS
+}
+
+function archivedThreadStateUnavailable(): Error {
+  const error = new Error('Cannot verify archived task state.')
+  error.name = 'ArchivedThreadStateUnavailableError'
+  return error
+}
+
+async function runArchivedThreadIndexOperation<T>(
+  operation: Promise<T>,
+  deadline: number,
+): Promise<T> {
+  const remainingMs = deadline - Date.now()
+  if (remainingMs <= 0) throw archivedThreadStateUnavailable()
+  let timeout: ReturnType<typeof setTimeout> | null = null
+  try {
+    return await Promise.race([
+      operation,
+      new Promise<T>((_resolve, reject) => {
+        timeout = setTimeout(() => reject(archivedThreadStateUnavailable()), remainingMs)
+        timeout.unref?.()
+      }),
+    ])
+  } finally {
+    if (timeout) clearTimeout(timeout)
+  }
+}
+
+function archivedUuidFromFileName(fileName: string): string {
+  const match = fileName.match(/(?:^|-)([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.jsonl$/iu)
+  return match?.[1] ?? ''
+}
+
+export async function readArchivedThreadIdFromFile(
+  path: string,
+  fileName: string,
+  openFile: (path: string, flags: number) => Promise<FileHandle> = open,
+  onBytesRead?: (bytesRead: number) => void,
+): Promise<string> {
+  let handle: FileHandle | null = null
+  try {
+    const pathInfo = await lstat(path)
+    if (!pathInfo.isFile() || pathInfo.isSymbolicLink()) return ''
+    const noFollowFlag = typeof fsConstants.O_NOFOLLOW === 'number' ? fsConstants.O_NOFOLLOW : 0
+    try {
+      handle = await openFile(path, fsConstants.O_RDONLY | noFollowFlag)
+    } catch (error) {
+      if (getErrorCode(error) === 'ELOOP') return ''
+      throw error
+    }
+    const descriptorInfo = await handle.stat()
+    if (
+      !descriptorInfo.isFile()
+      || descriptorInfo.dev !== pathInfo.dev
+      || descriptorInfo.ino !== pathInfo.ino
+    ) return ''
+    const threadId = readSessionMetaId(await readFirstJsonlLineFromHandle(handle, onBytesRead))
+    const fileNameUuid = archivedUuidFromFileName(fileName)
+    if (fileNameUuid && threadId.toLowerCase() !== fileNameUuid.toLowerCase()) return ''
+    return threadId
+  } finally {
+    await handle?.close().catch(() => undefined)
+  }
+}
+
+function archiveDirectorySignature(info: { mtimeMs: number; ctimeMs: number; size: number }): string {
+  return `${String(info.mtimeMs)}:${String(info.ctimeMs)}:${String(info.size)}`
+}
+
+function archiveDirectoryEntriesSignature(entries: ReadonlyArray<{
+  name: string
+  isDirectory: () => boolean
+  isFile: () => boolean
+}>): string {
+  return entries
+    .map((entry) => `${entry.name}\0${entry.isDirectory() ? 'd' : entry.isFile() ? 'f' : 'o'}`)
+    .sort((left, right) => left.localeCompare(right))
+    .join('\n')
+}
+
+async function buildArchivedUuidIndex(archivedRoot: string): Promise<ArchivedUuidIndexRecord> {
+  const ids = new Set<string>()
+  let complete = true
+  const directories = [archivedRoot]
+  const directorySignatures = new Map<string, string>()
+  const directoryEntriesSignatures = new Map<string, string>()
+  const fileSignatures = new Map<string, string>()
+  const deadline = Date.now() + ARCHIVED_THREAD_UUID_SCAN_MAX_MS
+  let inspectedDirectories = 0
+  let inspectedFiles = 0
+  let inspectedBytes = 0
+  while (directories.length > 0) {
+    if (Date.now() > deadline || inspectedDirectories >= ARCHIVED_THREAD_UUID_SCAN_MAX_DIRECTORIES) {
+      throw archivedThreadStateUnavailable()
+    }
+    const directory = directories.shift()!
+    inspectedDirectories += 1
+    const openingInfo = await runArchivedThreadIndexOperation(lstat(directory), deadline)
+    if (!openingInfo.isDirectory() || openingInfo.isSymbolicLink()) throw archivedThreadStateUnavailable()
+    const openingSignature = archiveDirectorySignature(openingInfo)
+    const entries = await runArchivedThreadIndexOperation(
+      readdir(directory, { withFileTypes: true }),
+      deadline,
+    )
+    if (entries.length > ARCHIVED_THREAD_INDEX_MAX_DIRECTORY_ENTRIES) {
+      throw archivedThreadStateUnavailable()
+    }
+    const openingEntriesSignature = archiveDirectoryEntriesSignature(entries)
+    directorySignatures.set(directory, openingSignature)
+    directoryEntriesSignatures.set(directory, openingEntriesSignature)
+    for (const entry of entries) {
+      const entryPath = join(directory, entry.name)
+      let isDirectory = entry.isDirectory()
+      let isFile = entry.isFile()
+      if (!isDirectory && !isFile) {
+        const entryInfo = await runArchivedThreadIndexOperation(lstat(entryPath), deadline)
+        if (entryInfo.isSymbolicLink()) throw archivedThreadStateUnavailable()
+        isDirectory = entryInfo.isDirectory()
+        isFile = entryInfo.isFile()
+        if (!isDirectory && !isFile && entry.name.endsWith('.jsonl')) {
+          throw archivedThreadStateUnavailable()
+        }
+      }
+      if (isDirectory) {
+        directories.push(entryPath)
+        continue
+      }
+      if (!isFile || !entry.name.endsWith('.jsonl')) continue
+      inspectedFiles += 1
+      if (inspectedFiles > ARCHIVED_THREAD_UUID_SCAN_MAX_FILES) throw archivedThreadStateUnavailable()
+      const fileNameUuid = archivedUuidFromFileName(entry.name).toLowerCase()
+      if (!fileNameUuid) {
+        complete = false
+        continue
+      }
+      const openingFileInfo = await runArchivedThreadIndexOperation(lstat(entryPath), deadline)
+      if (!openingFileInfo.isFile() || openingFileInfo.isSymbolicLink()) throw archivedThreadStateUnavailable()
+      const openingFileSignature = archiveDirectorySignature(openingFileInfo)
+      const archivedId = await runArchivedThreadIndexOperation(
+        readArchivedThreadIdFromFile(entryPath, entry.name, open, (bytesRead) => {
+          inspectedBytes += bytesRead
+          if (inspectedBytes > ARCHIVED_THREAD_UUID_SCAN_MAX_BYTES) {
+            throw archivedThreadStateUnavailable()
+          }
+        }),
+        deadline,
+      )
+      if (archivedId.toLowerCase() !== fileNameUuid) throw archivedThreadStateUnavailable()
+      const closingFileInfo = await runArchivedThreadIndexOperation(lstat(entryPath), deadline)
+      if (
+        !closingFileInfo.isFile()
+        || closingFileInfo.isSymbolicLink()
+        || closingFileInfo.dev !== openingFileInfo.dev
+        || closingFileInfo.ino !== openingFileInfo.ino
+        || archiveDirectorySignature(closingFileInfo) !== openingFileSignature
+      ) throw archivedThreadStateUnavailable()
+      fileSignatures.set(entryPath, `${String(openingFileInfo.dev)}:${String(openingFileInfo.ino)}:${openingFileSignature}`)
+      ids.add(fileNameUuid)
+    }
+    const closingInfo = await runArchivedThreadIndexOperation(lstat(directory), deadline)
+    const closingEntries = await runArchivedThreadIndexOperation(
+      readdir(directory, { withFileTypes: true }),
+      deadline,
+    )
+    if (
+      !closingInfo.isDirectory()
+      || closingInfo.isSymbolicLink()
+      || archiveDirectorySignature(closingInfo) !== openingSignature
+      || closingEntries.length > ARCHIVED_THREAD_INDEX_MAX_DIRECTORY_ENTRIES
+      || archiveDirectoryEntriesSignature(closingEntries) !== openingEntriesSignature
+    ) throw archivedThreadStateUnavailable()
+  }
+  for (const [directory, openingSignature] of directorySignatures) {
+    const closingInfo = await runArchivedThreadIndexOperation(lstat(directory), deadline)
+    const closingEntries = await runArchivedThreadIndexOperation(
+      readdir(directory, { withFileTypes: true }),
+      deadline,
+    )
+    if (
+      !closingInfo.isDirectory()
+      || closingInfo.isSymbolicLink()
+      || archiveDirectorySignature(closingInfo) !== openingSignature
+      || closingEntries.length > ARCHIVED_THREAD_INDEX_MAX_DIRECTORY_ENTRIES
+      || archiveDirectoryEntriesSignature(closingEntries) !== directoryEntriesSignatures.get(directory)
+    ) throw archivedThreadStateUnavailable()
+  }
+  return { root: archivedRoot, directorySignatures, directoryEntriesSignatures, fileSignatures, ids, complete }
+}
+
+async function isArchivedUuidIndexCurrent(record: ArchivedUuidIndexRecord): Promise<boolean> {
+  const deadline = Date.now() + ARCHIVED_THREAD_UUID_SCAN_MAX_MS
+  let inspectedDirectories = 0
+  for (const [directory, openingSignature] of record.directorySignatures) {
+    inspectedDirectories += 1
+    if (inspectedDirectories > ARCHIVED_THREAD_UUID_SCAN_MAX_DIRECTORIES) {
+      throw archivedThreadStateUnavailable()
+    }
+    try {
+      const info = await runArchivedThreadIndexOperation(lstat(directory), deadline)
+      const entries = await runArchivedThreadIndexOperation(readdir(directory, { withFileTypes: true }), deadline)
+      if (
+        !info.isDirectory()
+        || info.isSymbolicLink()
+        || archiveDirectorySignature(info) !== openingSignature
+        || entries.length > ARCHIVED_THREAD_INDEX_MAX_DIRECTORY_ENTRIES
+        || archiveDirectoryEntriesSignature(entries) !== record.directoryEntriesSignatures.get(directory)
+      ) return false
+    } catch {
+      return false
+    }
+  }
+  const files = [...record.fileSignatures]
+  if (files.length > ARCHIVED_THREAD_UUID_SCAN_MAX_FILES) throw archivedThreadStateUnavailable()
+  for (let offset = 0; offset < files.length; offset += ARCHIVED_THREAD_UUID_VALIDATION_CONCURRENCY) {
+    const valid = await Promise.all(files
+      .slice(offset, offset + ARCHIVED_THREAD_UUID_VALIDATION_CONCURRENCY)
+      .map(async ([path, openingSignature]) => {
+        try {
+          const info = await runArchivedThreadIndexOperation(lstat(path), deadline)
+          const currentSignature = `${String(info.dev)}:${String(info.ino)}:${archiveDirectorySignature(info)}`
+          return info.isFile() && !info.isSymbolicLink() && currentSignature === openingSignature
+        } catch {
+          return false
+        }
+      }))
+    if (valid.some((entry) => !entry)) return false
+  }
+  return true
+}
+
+async function readArchivedUuidIdsByFileNameScan(
+  archivedRoot: string,
+  threadIds: ReadonlySet<string>,
+  fresh = false,
+): Promise<{ archivedIds: Set<string>; complete: boolean }> {
+  let record = archivedUuidIndexCache?.root === archivedRoot ? archivedUuidIndexCache : null
+  if (fresh || !record || !(await isArchivedUuidIndexCurrent(record))) {
+    let operation = archivedUuidIndexInFlight?.root === archivedRoot
+      ? archivedUuidIndexInFlight.operation
+      : null
+    if (!operation) {
+      operation = buildArchivedUuidIndex(archivedRoot)
+      archivedUuidIndexInFlight = { root: archivedRoot, operation }
+    }
+    try {
+      record = await operation
+      archivedUuidIndexCache = record
+    } finally {
+      if (archivedUuidIndexInFlight?.operation === operation) archivedUuidIndexInFlight = null
+    }
+  }
+  const archivedIds = new Set<string>()
+  for (const id of threadIds) {
+    if (record.ids.has(id.toLowerCase())) archivedIds.add(id)
+  }
+  return { archivedIds, complete: record.complete }
+}
+
+async function isArchivedThreadIndexCurrent(
+  cache: NonNullable<typeof archivedThreadIndexCache>,
+): Promise<boolean> {
+  const deadline = Date.now() + ARCHIVED_THREAD_INDEX_MAX_BUILD_MS
+  let inspections = 0
+  for (const [directory, signature] of cache.directorySignatures) {
+    inspections += 1
+    if (inspections > ARCHIVED_THREAD_INDEX_MAX_VALIDATION_INSPECTIONS || Date.now() > deadline) {
+      throw archivedThreadStateUnavailable()
+    }
+    try {
+      const info = await runArchivedThreadIndexOperation(lstat(directory), deadline)
+      if (!info.isDirectory() || info.isSymbolicLink() || archiveDirectorySignature(info) !== signature) {
+        return false
+      }
+    } catch {
+      return false
+    }
+  }
+  for (const [path, signature] of cache.fileSignatures) {
+    inspections += 1
+    if (inspections > ARCHIVED_THREAD_INDEX_MAX_VALIDATION_INSPECTIONS || Date.now() > deadline) {
+      throw archivedThreadStateUnavailable()
+    }
+    try {
+      const info = await runArchivedThreadIndexOperation(lstat(path), deadline)
+      if (!info.isFile() || info.isSymbolicLink() || archiveDirectorySignature(info) !== signature) {
+        return false
+      }
+    } catch {
+      return false
+    }
+  }
+  return true
+}
+
+type ArchivedThreadIndexOperations = {
+  readDirectory?: (path: string) => Promise<Array<{
+    name: string
+    isDirectory: () => boolean
+    isFile: () => boolean
+  }>>
+}
+
+export async function readArchivedThreadIndexRecord(
+  archivedRoot: string,
+  fresh = false,
+  operations: ArchivedThreadIndexOperations = {},
+): Promise<NonNullable<typeof archivedThreadIndexCache>> {
+  if (
+    !fresh
+    &&
+    archivedThreadIndexCache?.root === archivedRoot
+    && await isArchivedThreadIndexCurrent(archivedThreadIndexCache)
+  ) return archivedThreadIndexCache
+
+  const deadline = Date.now() + ARCHIVED_THREAD_INDEX_MAX_BUILD_MS
+  const directories = [archivedRoot]
+  const directorySignatures = new Map<string, string>()
+  const directoryEntriesSignatures = new Map<string, string>()
+  const fileSignatures = new Map<string, string>()
+  const signatureHash = createHash('sha256')
+  const ids = new Set<string>()
+  let fileCount = 0
+  let nonUuidFileCount = 0
+  while (directories.length > 0) {
+    if (Date.now() > deadline) throw archivedThreadStateUnavailable()
+    const directory = directories.shift()!
+    let entries
+    try {
+      const info = await runArchivedThreadIndexOperation(lstat(directory), deadline)
+      if (!info.isDirectory() || info.isSymbolicLink()) throw archivedThreadStateUnavailable()
+      const signature = archiveDirectorySignature(info)
+      directorySignatures.set(directory, signature)
+      if (!isArchivedThreadIndexSizeSupported(directorySignatures.size, fileCount)) {
+        throw archivedThreadStateUnavailable()
+      }
+      signatureHash.update(`${relative(archivedRoot, directory)}\0${signature}\n`)
+      entries = await runArchivedThreadIndexOperation(
+        operations.readDirectory
+          ? operations.readDirectory(directory)
+          : readdir(directory, { withFileTypes: true }),
+        deadline,
+      )
+    } catch {
+      throw archivedThreadStateUnavailable()
+    }
+    if (Date.now() > deadline || entries.length > ARCHIVED_THREAD_INDEX_MAX_DIRECTORY_ENTRIES) {
+      throw archivedThreadStateUnavailable()
+    }
+    const openingEntriesSignature = archiveDirectoryEntriesSignature(entries)
+    directoryEntriesSignatures.set(directory, openingEntriesSignature)
+    entries.sort((left, right) => left.name.localeCompare(right.name))
+    for (const entry of entries) {
+      if (Date.now() > deadline) throw archivedThreadStateUnavailable()
+      if (entry.isDirectory()) {
+        directories.push(join(directory, entry.name))
+        if (directories.length + directorySignatures.size > ARCHIVED_THREAD_INDEX_MAX_DIRECTORIES) {
+          throw archivedThreadStateUnavailable()
+        }
+        continue
+      }
+      if (!entry.isFile() || !entry.name.endsWith('.jsonl')) continue
+      const archivedUuid = archivedUuidFromFileName(entry.name)
+      const filePath = join(directory, entry.name)
+      const info = await runArchivedThreadIndexOperation(lstat(filePath), deadline)
+      if (!info.isFile() || info.isSymbolicLink()) throw archivedThreadStateUnavailable()
+      const fileSignature = archiveDirectorySignature(info)
+      fileSignatures.set(filePath, fileSignature)
+      signatureHash.update(`${relative(archivedRoot, directory)}\0${entry.name}\0${fileSignature}\n`)
+      fileCount += 1
+      if (
+        fileCount > ARCHIVED_THREAD_INDEX_MAX_FILES
+        || !isArchivedThreadIndexSizeSupported(directorySignatures.size, fileCount)
+      ) throw archivedThreadStateUnavailable()
+      if (!archivedUuid) {
+        nonUuidFileCount += 1
+        if (nonUuidFileCount > ARCHIVED_THREAD_INDEX_MAX_NON_UUID_FILES) {
+          throw archivedThreadStateUnavailable()
+        }
+      }
+      try {
+        const id = await runArchivedThreadIndexOperation(
+          readArchivedThreadIdFromFile(filePath, entry.name),
+          deadline,
+        )
+        if (!id) throw archivedThreadStateUnavailable()
+        ids.add(id)
+      } catch {
+        throw archivedThreadStateUnavailable()
+      }
+    }
+    try {
+      const closingInfo = await runArchivedThreadIndexOperation(lstat(directory), deadline)
+      const closingEntries = await runArchivedThreadIndexOperation(
+        operations.readDirectory
+          ? operations.readDirectory(directory)
+          : readdir(directory, { withFileTypes: true }),
+        deadline,
+      )
+      if (
+        !closingInfo.isDirectory()
+        || closingInfo.isSymbolicLink()
+        || archiveDirectorySignature(closingInfo) !== directorySignatures.get(directory)
+        || closingEntries.length > ARCHIVED_THREAD_INDEX_MAX_DIRECTORY_ENTRIES
+        || archiveDirectoryEntriesSignature(closingEntries) !== openingEntriesSignature
+      ) throw archivedThreadStateUnavailable()
+    } catch {
+      throw archivedThreadStateUnavailable()
+    }
+  }
+  for (const [directory, openingSignature] of directorySignatures) {
+    try {
+      const closingInfo = await runArchivedThreadIndexOperation(lstat(directory), deadline)
+      const closingEntries = await runArchivedThreadIndexOperation(
+        operations.readDirectory
+          ? operations.readDirectory(directory)
+          : readdir(directory, { withFileTypes: true }),
+        deadline,
+      )
+      if (
+        !closingInfo.isDirectory()
+        || closingInfo.isSymbolicLink()
+        || archiveDirectorySignature(closingInfo) !== openingSignature
+        || closingEntries.length > ARCHIVED_THREAD_INDEX_MAX_DIRECTORY_ENTRIES
+        || archiveDirectoryEntriesSignature(closingEntries) !== directoryEntriesSignatures.get(directory)
+      ) throw archivedThreadStateUnavailable()
+    } catch {
+      throw archivedThreadStateUnavailable()
+    }
+  }
+  archivedThreadIndexCache = {
+    root: archivedRoot,
+    signature: signatureHash.digest('hex'),
+    directorySignatures,
+    fileSignatures,
+    ids,
+  }
+  return archivedThreadIndexCache
+}
+
+async function readArchivedThreadIndex(archivedRoot: string, fresh = false): Promise<Set<string>> {
+  return (await readArchivedThreadIndexRecord(archivedRoot, fresh)).ids
+}
+
+async function readArchivedThreadIdsFromTree(
+  threadIds: readonly string[],
+  options: { fresh?: boolean } = {},
+): Promise<Set<string>> {
+  const normalizedIds = Array.from(new Set(threadIds.map((id) => id.trim()).filter(Boolean)))
+  if (normalizedIds.length === 0) return new Set()
+  const archivedRoot = join(getCodexHomeDir(), 'archived_sessions')
+  try {
+    const rootInfo = await stat(archivedRoot)
+    if (!rootInfo.isDirectory()) throw new Error('Archived sessions root is not a directory.')
+  } catch (error) {
+    if (getErrorCode(error) === 'ENOENT') return new Set()
+    const unavailable = new Error('Cannot verify archived task state.')
+    unavailable.name = 'ArchivedThreadStateUnavailableError'
+    throw unavailable
+  }
+  const archivedIds = new Set<string>()
+  const unresolvedIds = new Set(normalizedIds)
+  if (normalizedIds.length <= ARCHIVED_THREAD_EXACT_LOOKUP_MAX_IDS) {
+    let nextIndex = 0
+    const workerCount = Math.min(16, normalizedIds.length)
+    await Promise.all(Array.from({ length: workerCount }, async () => {
+      while (nextIndex < normalizedIds.length) {
+        const id = normalizedIds[nextIndex++]!
+        for (const path of archivedRolloutPathCandidates(id)) {
+          try {
+            const archivedId = await readArchivedThreadIdFromFile(path, basename(path))
+            if (!archivedId || archivedId !== id) throw archivedThreadStateUnavailable()
+            archivedIds.add(id)
+            unresolvedIds.delete(id)
+            break
+          } catch (error) {
+            const code = getErrorCode(error)
+            if (code === 'ENOENT' || code === 'ENOTDIR') continue
+            const unavailable = new Error('Cannot verify archived task state.')
+            unavailable.name = 'ArchivedThreadStateUnavailableError'
+            throw unavailable
+          }
+        }
+      }
+    }))
+  }
+  if (unresolvedIds.size > 0) {
+    const unresolvedUuidIds = new Set([...unresolvedIds].filter((id) => archivedUuidFromFileName(`${id}.jsonl`)))
+    if (unresolvedUuidIds.size > 0) {
+      try {
+        const uuidScan = await readArchivedUuidIdsByFileNameScan(
+          archivedRoot,
+          unresolvedUuidIds,
+          options.fresh === true,
+        )
+        for (const id of uuidScan.archivedIds) {
+          archivedIds.add(id)
+          unresolvedIds.delete(id)
+        }
+        if (uuidScan.complete) {
+          for (const id of unresolvedUuidIds) unresolvedIds.delete(id)
+        }
+      } catch {
+        throw archivedThreadStateUnavailable()
+      }
+    }
+  }
+  if (unresolvedIds.size > 0) {
+    const indexedIds = await readArchivedThreadIndex(archivedRoot, options.fresh === true)
+    for (const id of unresolvedIds) {
+      if (indexedIds.has(id)) archivedIds.add(id)
+    }
   }
   return archivedIds
 }
 
-async function readAuthoritativeArchivedThreadIds(threadIds: readonly string[]): Promise<Set<string>> {
+async function readAuthoritativeArchivedThreadIds(
+  threadIds: readonly string[],
+  options: { fresh?: boolean } = {},
+): Promise<Set<string>> {
   const normalizedIds = Array.from(new Set(threadIds.map((id) => id.trim()).filter(Boolean)))
   if (normalizedIds.length === 0) return new Set()
   if (existsSync(join(getCodexHomeDir(), 'state_5.sqlite'))) {
-    return await readStateDbArchivedThreadIds(normalizedIds)
+    return await readStateDbArchivedThreadIds(normalizedIds, options)
   }
-  const archivedRoot = join(getCodexHomeDir(), 'archived_sessions')
-  let entries: string[]
-  try {
-    entries = await readdir(archivedRoot, { recursive: true })
-  } catch {
-    if (!existsSync(archivedRoot)) return new Set()
-    const error = new Error('Cannot verify archived task state.')
-    error.name = 'ArchivedThreadStateUnavailableError'
-    throw error
-  }
-  const archivedIds = new Set<string>()
-  for (const id of normalizedIds) {
-    if (entries.some((entry) => entry.endsWith(`${id}.jsonl`))) archivedIds.add(id)
-  }
-  return archivedIds
+  return await readArchivedThreadIdsFromTree(normalizedIds, options)
 }
 
-async function readArchivedSessionsTreeSignature(): Promise<string> {
-  const archivedRoot = join(getCodexHomeDir(), 'archived_sessions')
-  try {
-    const entries = await readdir(archivedRoot, { recursive: true })
-    return createHash('sha256').update(entries.sort().join('\n')).digest('hex').slice(0, 24)
-  } catch {
-    return existsSync(archivedRoot) ? 'unreadable' : 'missing'
-  }
-}
-
-async function isThreadArchivedForMutation(appServer: RpcExecutor, threadId: string): Promise<boolean> {
+async function isThreadArchivedForMutation(
+  appServer: RpcExecutor,
+  threadId: string,
+  options: { fresh?: boolean } = { fresh: true },
+): Promise<boolean> {
   const stateDbPath = join(getCodexHomeDir(), 'state_5.sqlite')
   if (existsSync(stateDbPath)) {
-    const archived = await readStateDbThreadArchived(threadId)
-    if (archived !== null) return archived
+    const archived = await readStateDbThreadArchived(threadId, options)
+    if (archived === true) return true
+    if ((await readArchivedThreadIdsFromTree([threadId], options)).has(threadId)) return true
+    if (archived === false) return false
   } else if (!existsSync(join(getCodexHomeDir(), 'archived_sessions'))) {
     return false
   }
@@ -3255,7 +4201,7 @@ async function isThreadArchivedForMutation(appServer: RpcExecutor, threadId: str
   throw error
 }
 
-function ensureImportedThreadsStateDbTable(stateDbPath: string): boolean {
+async function ensureImportedThreadsStateDbTable(stateDbPath: string): Promise<boolean> {
   const sql = `
 CREATE TABLE IF NOT EXISTS threads (
   id TEXT PRIMARY KEY,
@@ -3283,7 +4229,7 @@ CREATE TABLE IF NOT EXISTS threads (
   thread_source TEXT,
   preview TEXT
 );`
-  const result = spawnSync('sqlite3', [stateDbPath, sql], { encoding: 'utf8' })
+  const result = await runSqliteQuery(stateDbPath, sql)
   if (result.status !== 0) {
     console.warn('[project-import] failed to initialize state database', result.stderr || result.stdout)
     return false
@@ -3292,7 +4238,8 @@ CREATE TABLE IF NOT EXISTS threads (
 }
 
 function buildImportedSessionStateDbValues(session: ImportedSessionRecord): Record<string, string> {
-  const title = session.title || session.firstUserMessage || 'Imported chat'
+  const boundedText = (value: string): string => value.slice(0, 4_096)
+  const title = boundedText(session.title || session.firstUserMessage || 'Imported chat')
   const createdAt = Math.floor(session.createdAtMs / 1000)
   const updatedAt = Math.floor(session.updatedAtMs / 1000)
   const sandboxPolicy = JSON.stringify({ type: 'workspace-write', network_access: true })
@@ -3302,8 +4249,8 @@ function buildImportedSessionStateDbValues(session: ImportedSessionRecord): Reco
     created_at: String(createdAt),
     updated_at: String(updatedAt),
     source: "'cli'",
-    model: sqlString(session.model),
-    model_provider: sqlString(session.modelProvider),
+    model: sqlString(boundedText(session.model)),
+    model_provider: sqlString(boundedText(session.modelProvider)),
     cwd: sqlString(session.cwd),
     title: sqlString(title),
     sandbox_policy: sqlString(sandboxPolicy),
@@ -3315,8 +4262,8 @@ function buildImportedSessionStateDbValues(session: ImportedSessionRecord): Reco
     git_sha: 'NULL',
     git_branch: 'NULL',
     git_origin_url: 'NULL',
-    cli_version: sqlString(session.cliVersion),
-    first_user_message: sqlString(session.firstUserMessage),
+    cli_version: sqlString(boundedText(session.cliVersion)),
+    first_user_message: sqlString(boundedText(session.firstUserMessage)),
     created_at_ms: String(Math.trunc(session.createdAtMs)),
     updated_at_ms: String(Math.trunc(session.updatedAtMs)),
     thread_source: "'user'",
@@ -3324,14 +4271,15 @@ function buildImportedSessionStateDbValues(session: ImportedSessionRecord): Reco
   }
 }
 
-function registerImportedSessionsInStateDb(sessions: ImportedSessionRecord[]): void {
+export async function registerImportedSessionsInStateDb(sessions: ImportedSessionRecord[]): Promise<void> {
   if (sessions.length === 0) return
   const stateDbPath = join(getCodexHomeDir(), 'state_5.sqlite')
-  if (!ensureImportedThreadsStateDbTable(stateDbPath)) return
-  const columnsResult = spawnSync('sqlite3', [stateDbPath, 'PRAGMA table_info(threads);'], { encoding: 'utf8' })
+  if (!await ensureImportedThreadsStateDbTable(stateDbPath)) {
+    throw new Error('Failed to initialize imported session state database.')
+  }
+  const columnsResult = await runSqliteQuery(stateDbPath, 'PRAGMA table_info(threads);')
   if (columnsResult.status !== 0) {
-    console.warn('[project-import] failed to inspect state database', columnsResult.stderr || columnsResult.stdout)
-    return
+    throw new Error(columnsResult.stderr || columnsResult.stdout || 'Failed to inspect imported session state database.')
   }
   const availableColumns = new Set(columnsResult.stdout
     .split(/\r?\n/u)
@@ -3339,80 +4287,494 @@ function registerImportedSessionsInStateDb(sessions: ImportedSessionRecord[]): v
     .filter((value): value is string => Boolean(value)))
   const values = buildImportedSessionStateDbValues(sessions[0])
   const columns = Object.keys(values).filter((column) => availableColumns.has(column))
-  const inserts = sessions.map((session) => {
-    const sessionValues = buildImportedSessionStateDbValues(session)
-    return `INSERT OR REPLACE INTO threads (${columns.join(', ')}) VALUES (${columns.map((column) => sessionValues[column]).join(', ')});`
-  })
-  const sql = ['BEGIN;', ...inserts, 'COMMIT;'].join('\n')
-  const result = spawnSync('sqlite3', [stateDbPath, sql], { encoding: 'utf8' })
-  if (result.status !== 0) {
-    console.warn('[project-import] failed to register imported sessions in state database', result.stderr || result.stdout)
+  if (columns.length === 0) throw new Error('Imported session state database has no supported columns.')
+  const stagingTable = `codex_mobile_import_${randomUUID().replace(/-/gu, '')}`
+  const runStatement = async (sql: string): Promise<void> => {
+    const result = await runSqliteQuery(stateDbPath, sql, { bailOnError: true })
+    if (result.status !== 0) {
+      throw new Error(result.stderr || result.stdout || 'Failed to register imported sessions in state database.')
+    }
   }
+  let stagingCreated = false
+  let registrationError: unknown = null
+  try {
+    await runStatement(`CREATE TABLE ${stagingTable} AS SELECT ${columns.join(', ')} FROM threads WHERE 0;`)
+    stagingCreated = true
+    const maxBatchRows = 64
+    const maxBatchBytes = 64 * 1024
+    let inserts: string[] = []
+    let batchBytes = 0
+    const flush = async (): Promise<void> => {
+      if (inserts.length === 0) return
+      await runStatement(['BEGIN;', ...inserts, 'COMMIT;'].join('\n'))
+      inserts = []
+      batchBytes = 0
+    }
+    for (const session of sessions) {
+      const sessionValues = buildImportedSessionStateDbValues(session)
+      const insert = `INSERT INTO ${stagingTable} (${columns.join(', ')}) VALUES (${columns.map((column) => sessionValues[column]).join(', ')});`
+      const insertBytes = Buffer.byteLength(insert, 'utf8') + 1
+      if (inserts.length > 0 && (inserts.length >= maxBatchRows || batchBytes + insertBytes > maxBatchBytes)) {
+        await flush()
+      }
+      inserts.push(insert)
+      batchBytes += insertBytes
+    }
+    await flush()
+    await runStatement([
+      'BEGIN;',
+      `INSERT OR REPLACE INTO threads (${columns.join(', ')}) SELECT ${columns.join(', ')} FROM ${stagingTable};`,
+      `DROP TABLE ${stagingTable};`,
+      'COMMIT;',
+    ].join('\n'))
+    stagingCreated = false
+  } catch (error) {
+    registrationError = error
+    throw error
+  } finally {
+    if (stagingCreated) {
+      const cleanup = await runSqliteQuery(
+        stateDbPath,
+        `DROP TABLE IF EXISTS ${stagingTable};`,
+        { bailOnError: true },
+      )
+      if (cleanup.status !== 0) {
+        const error = new Error(cleanup.stderr || cleanup.stdout || 'Failed to clean up imported session staging state.')
+        error.name = 'ImportedSessionStateDbCleanupError'
+        Object.assign(error, { cause: registrationError })
+        throw error
+      }
+    }
+  }
+}
+
+export async function removeImportedSessionsFromStateDbInternal(
+  threadIds: readonly string[],
+): Promise<void> {
+  const ids = Array.from(new Set(threadIds.map((id) => id.trim()).filter(Boolean)))
+  if (ids.length === 0) return
+  const stateDbPath = join(getCodexHomeDir(), 'state_5.sqlite')
+  if (!existsSync(stateDbPath)) return
+  const rollbackTable = `codex_mobile_rollback_${randomUUID().replace(/-/gu, '')}`
+  const runStatement = async (sql: string): Promise<void> => {
+    const result = await runSqliteQuery(stateDbPath, sql, { bailOnError: true })
+    if (result.status !== 0) {
+      throw new Error(result.stderr || result.stdout || 'Failed to roll back imported sessions in state database.')
+    }
+  }
+  let stagingCreated = false
+  try {
+    await runStatement(`CREATE TABLE ${rollbackTable} (id TEXT PRIMARY KEY);`)
+    stagingCreated = true
+    for (let offset = 0; offset < ids.length; offset += 64) {
+      const batch = ids.slice(offset, offset + 64)
+      await runStatement([
+        'BEGIN;',
+        ...batch.map((id) => `INSERT OR IGNORE INTO ${rollbackTable} (id) VALUES (${sqlString(id)});`),
+        'COMMIT;',
+      ].join('\n'))
+    }
+    await runStatement([
+      'BEGIN IMMEDIATE;',
+      `DELETE FROM threads WHERE id IN (SELECT id FROM ${rollbackTable});`,
+      `DROP TABLE ${rollbackTable};`,
+      'COMMIT;',
+    ].join('\n'))
+    stagingCreated = false
+  } finally {
+    if (stagingCreated) {
+      const cleanup = await runSqliteQuery(
+        stateDbPath,
+        `DROP TABLE IF EXISTS ${rollbackTable};`,
+        { bailOnError: true },
+      )
+      if (cleanup.status !== 0) {
+        const error = new Error(cleanup.stderr || cleanup.stdout || 'Failed to clean up imported rollback staging state.')
+        error.name = 'ImportedSessionStateDbCleanupError'
+        throw error
+      }
+    }
+  }
+}
+
+export async function removeImportedSessionsFromStateDb(threadIds: readonly string[]): Promise<void> {
+  await removeImportedSessionsFromStateDbInternal(threadIds)
+}
+
+type ProjectImportGlobalStateSnapshot = {
+  threadTitles: ThreadTitleCache
+  persistedThreadTitles: ThreadTitleCache
+  importedThreadIds: string[]
+  projectPath: string
+  projectWorkspace: {
+    order: string[]
+    active: string[]
+    projectOrder: string[]
+    labelPresent: boolean
+    label: string
+    persistedLabel: string
+  }
+}
+
+async function persistImportedProjectGlobalState(
+  sessions: readonly ImportedSessionRecord[],
+  projectPath: string,
+  projectName: string,
+  captureSnapshot: (snapshot: ProjectImportGlobalStateSnapshot) => void,
+): Promise<void> {
+  await queueWorkspaceRootsMutation(async () => {
+    await updateCodexGlobalState(async (payload) => {
+      const threadTitles = normalizeThreadTitleCache(payload['thread-titles'])
+      const workspaceRoots = await readWorkspaceRootsStateFromPayload(payload)
+      let nextThreadTitles = threadTitles
+      for (const session of sessions) {
+        if (session.title) nextThreadTitles = updateThreadTitleCache(nextThreadTitles, session.id, session.title)
+      }
+      captureSnapshot({
+        threadTitles: {
+          titles: { ...threadTitles.titles },
+          order: [...threadTitles.order],
+        },
+        persistedThreadTitles: {
+          titles: { ...nextThreadTitles.titles },
+          order: [...nextThreadTitles.order],
+        },
+        importedThreadIds: sessions.map((session) => session.id),
+        projectPath,
+        projectWorkspace: {
+          order: [...workspaceRoots.order],
+          active: [...workspaceRoots.active],
+          projectOrder: [...workspaceRoots.projectOrder],
+          labelPresent: Object.prototype.hasOwnProperty.call(workspaceRoots.labels, projectPath),
+          label: workspaceRoots.labels[projectPath] ?? '',
+          persistedLabel: projectName.trim(),
+        },
+      })
+      payload['thread-titles'] = nextThreadTitles
+      const labels = { ...workspaceRoots.labels }
+      if (projectName.trim()) labels[projectPath] = projectName.trim()
+      writeWorkspaceRootsStateToPayload(payload, {
+        order: prependUniqueString(projectPath, workspaceRoots.order),
+        labels,
+        active: prependUniqueString(projectPath, workspaceRoots.active),
+        projectOrder: prependUniqueString(projectPath, workspaceRoots.projectOrder),
+        remoteProjects: workspaceRoots.remoteProjects,
+      })
+    })
+  })
+}
+
+async function restoreImportedProjectGlobalState(snapshot: ProjectImportGlobalStateSnapshot): Promise<void> {
+  await queueWorkspaceRootsMutation(async () => {
+    await updateCodexGlobalState(async (payload) => {
+      const importedThreadIds = new Set(snapshot.importedThreadIds)
+      const currentThreadTitles = normalizeThreadTitleCache(payload['thread-titles'])
+      const restoredTitles = { ...currentThreadTitles.titles }
+      for (const id of importedThreadIds) delete restoredTitles[id]
+      const titlesEvictedByImport = snapshot.threadTitles.order.filter((id) => (
+        !snapshot.persistedThreadTitles.order.includes(id)
+      ))
+      for (const id of titlesEvictedByImport) {
+        const title = snapshot.threadTitles.titles[id]
+        if (title && !(id in restoredTitles)) restoredTitles[id] = title
+      }
+      const restoredOrder = currentThreadTitles.order.filter((id) => !importedThreadIds.has(id))
+      for (const id of titlesEvictedByImport) {
+        if (!restoredOrder.includes(id) && id in restoredTitles) restoredOrder.push(id)
+      }
+      const boundedOrder = restoredOrder
+        .filter((id) => typeof restoredTitles[id] === 'string' && restoredTitles[id]!.length > 0)
+        .slice(0, MAX_THREAD_TITLES)
+      payload['thread-titles'] = {
+        titles: Object.fromEntries(boundedOrder.map((id) => [id, restoredTitles[id]!])),
+        order: boundedOrder,
+      }
+
+      const currentWorkspaceRoots = await readWorkspaceRootsStateFromPayload(payload)
+      const restoreArray = (current: string[], original: string[]): string[] => {
+        const originalIndex = original.indexOf(snapshot.projectPath)
+        const currentIndex = current.indexOf(snapshot.projectPath)
+        if (originalIndex < 0) return current.filter((path) => path !== snapshot.projectPath)
+        if (currentIndex < 0 || originalIndex === 0) return current
+        const previousAnchor = original
+          .slice(0, originalIndex)
+          .reverse()
+          .find((path) => current.includes(path))
+        if (!previousAnchor) return current
+        const previousAnchorIndex = current.indexOf(previousAnchor)
+        if (currentIndex > previousAnchorIndex) return current
+        const restored = current.filter((path) => path !== snapshot.projectPath)
+        restored.splice(restored.indexOf(previousAnchor) + 1, 0, snapshot.projectPath)
+        return restored
+      }
+      const restoredLabels = { ...currentWorkspaceRoots.labels }
+      const currentLabelPresent = Object.prototype.hasOwnProperty.call(restoredLabels, snapshot.projectPath)
+      if (currentLabelPresent && restoredLabels[snapshot.projectPath] === snapshot.projectWorkspace.persistedLabel) {
+        if (snapshot.projectWorkspace.labelPresent) {
+          restoredLabels[snapshot.projectPath] = snapshot.projectWorkspace.label
+        } else {
+          delete restoredLabels[snapshot.projectPath]
+        }
+      }
+      writeWorkspaceRootsStateToPayload(payload, {
+        order: restoreArray(currentWorkspaceRoots.order, snapshot.projectWorkspace.order),
+        labels: restoredLabels,
+        active: restoreArray(currentWorkspaceRoots.active, snapshot.projectWorkspace.active),
+        projectOrder: restoreArray(currentWorkspaceRoots.projectOrder, snapshot.projectWorkspace.projectOrder),
+        remoteProjects: currentWorkspaceRoots.remoteProjects,
+      })
+    })
+  })
 }
 
 type ImportedThreadListQuery = {
   beforeUpdatedAt?: number | null
   beforeId?: string
-  excludedIds?: string[]
+  excludedIds?: readonly string[] | ReadonlySet<string>
+  additionalExcludedIds?: readonly string[]
   limit?: number
   threadIds?: string[]
+  skipArchiveFilter?: boolean
+}
+
+function isReadonlyStringSet(value: unknown): value is ReadonlySet<string> {
+  return value !== null
+    && typeof value === 'object'
+    && !Array.isArray(value)
+    && typeof (value as ReadonlySet<string>).has === 'function'
+    && typeof (value as ReadonlySet<string>)[Symbol.iterator] === 'function'
 }
 
 const MAX_THREAD_LIST_PAGE_SIZE = 100
+const MAX_THREAD_LIST_STATE_DB_EXCLUSION_IDS = 64
 
-async function listImportedThreadsFromStateDb(
+export function boundThreadListStateDbExclusionIds(threadIds: readonly string[]): string[] {
+  return threadIds
+    .slice(-MAX_THREAD_LIST_STATE_DB_EXCLUSION_IDS)
+    .map((threadId) => threadId.trim())
+    .filter(Boolean)
+}
+
+const BUILTIN_SQLITE_QUERY_WORKER_SOURCE = `
+const { parentPort, workerData } = require('node:worker_threads')
+const { DatabaseSync } = require('node:sqlite')
+const database = new DatabaseSync(workerData.stateDbPath)
+let result
+try {
+  const operation = workerData.sql.trimStart().split(/\\s+/u)[0]?.toUpperCase() ?? ''
+  if (['SELECT', 'PRAGMA', 'WITH', 'EXPLAIN'].includes(operation)) {
+    const rows = database.prepare(workerData.sql).all()
+    const stdout = workerData.json
+      ? JSON.stringify(rows)
+      : rows.map((row) => Object.values(row).map((value) => value ?? '').join('|')).join('\\n')
+    result = { ok: true, stdout }
+  } else {
+    database.exec(workerData.sql)
+    result = { ok: true, stdout: '' }
+  }
+} catch (error) {
+  result = {
+    ok: false,
+    error: error instanceof Error ? error.message : 'Built-in SQLite query failed.',
+  }
+}
+database.close()
+parentPort.postMessage(result)
+`
+
+export function runBuiltinSqliteQueryCapture(
+  stateDbPath: string,
+  sql: string,
+  json: boolean,
+  timeoutMs: number,
+): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const worker = new Worker(BUILTIN_SQLITE_QUERY_WORKER_SOURCE, {
+      eval: true,
+      workerData: { stateDbPath, sql, json },
+    })
+    let settled = false
+    const finish = (error: Error | null, stdout = '') => {
+      if (settled) return
+      settled = true
+      clearTimeout(timeout)
+      void worker.terminate()
+      if (error) reject(error)
+      else resolve(stdout)
+    }
+    const timeout = setTimeout(() => {
+      finish(new Error('Built-in SQLite query timed out.'))
+    }, Math.max(1, timeoutMs))
+    timeout.unref?.()
+    worker.once('message', (message: unknown) => {
+      const result = asRecord(message)
+      if (result?.ok === true && typeof result.stdout === 'string') {
+        finish(null, result.stdout)
+      } else {
+        finish(new Error(readNonEmptyString(result?.error) || 'Built-in SQLite query failed.'))
+      }
+    })
+    worker.once('error', (error) => finish(error))
+    worker.once('exit', (code) => {
+      if (code !== 0) finish(new Error(`Built-in SQLite worker exited with code ${String(code)}.`))
+    })
+  })
+}
+
+async function runSqliteQuery(
+  stateDbPath: string,
+  sql: string,
+  options: { bailOnError?: boolean; json?: boolean; timeoutMs?: number } = {},
+): Promise<{ status: number; stderr: string; stdout: string }> {
+  try {
+    return {
+      status: 0,
+      stderr: '',
+      stdout: await runSqliteQueryCapture(stateDbPath, sql, {
+        bailOnError: options.bailOnError,
+        json: options.json,
+        timeoutMs: options.timeoutMs ?? 5_000,
+      }),
+    }
+  } catch (error) {
+    return { status: 1, stderr: getErrorMessage(error, 'SQLite query failed.'), stdout: '' }
+  }
+}
+
+export async function runSqliteQueryCapture(
+  stateDbPath: string,
+  sql: string,
+  options: { bailOnError?: boolean; json?: boolean; sqlAsArgument?: boolean; timeoutMs?: number } = {},
+): Promise<string> {
+  const timeoutMs = options.timeoutMs ?? 5_000
+  const command = await resolveSqliteCommandAsync()
+  if (command) {
+    const commandSql = options.bailOnError ? `.bail on\n${sql}` : sql
+    const args = [...(options.json ? ['-json'] : []), stateDbPath]
+    if (options.sqlAsArgument) args.push(commandSql)
+    return runCommandCapture(command, args, {
+      ...(options.sqlAsArgument ? {} : { stdin: commandSql }),
+      timeoutMs,
+    })
+  }
+  return runBuiltinSqliteQueryCapture(
+    stateDbPath,
+    sql,
+    options.json === true,
+    timeoutMs,
+  )
+}
+
+const MAX_IMPORTED_THREAD_LIST_SCAN_ROWS = 404
+
+function isUnsupportedImportedThreadListSchemaError(error: unknown): boolean {
+  return /no such (?:column|table):/iu.test(getErrorMessage(error, ''))
+}
+
+export type ImportedThreadListScanContinuation = {
+  beforeUpdatedAt: number
+  beforeId: string
+}
+
+export async function listImportedThreadsFromStateDbPage(
   query: ImportedThreadListQuery = {},
-): Promise<Array<Record<string, unknown>>> {
+): Promise<{
+  data: Array<Record<string, unknown>>
+  scanContinuation: ImportedThreadListScanContinuation | null
+}> {
   const stateDbPath = join(getCodexHomeDir(), 'state_5.sqlite')
-  if (!existsSync(stateDbPath)) return []
-  const predicates = [
-    'archived = 0',
-    `replace(rollout_path, '\\\\', '/') LIKE '%/sessions/%'`,
-    `id IN (SELECT id FROM threads WHERE first_user_message != '' OR title != '')`,
-  ]
+  if (!existsSync(stateDbPath)) return { data: [], scanContinuation: null }
   const threadIds = normalizeStringArray(query.threadIds)
-  if (query.threadIds && threadIds.length === 0) return []
-  if (threadIds.length > 0) {
-    predicates.push(`id IN (${threadIds.map(sqlString).join(', ')})`)
-  }
-  const excludedIds = normalizeStringArray(query.excludedIds)
-  if (excludedIds.length > 0) {
-    predicates.push(`id NOT IN (${excludedIds.map(sqlString).join(', ')})`)
-  }
-  if (query.beforeUpdatedAt !== undefined && query.beforeUpdatedAt !== null) {
-    const beforeUpdatedAt = Number.isFinite(query.beforeUpdatedAt) ? query.beforeUpdatedAt : 0
-    const beforeId = readNonEmptyString(query.beforeId)
-    predicates.push(`(updated_at < ${beforeUpdatedAt} OR (updated_at = ${beforeUpdatedAt} AND id < ${sqlString(beforeId)}))`)
-  }
+  if (query.threadIds && threadIds.length === 0) return { data: [], scanContinuation: null }
+  const excludedIds = isReadonlyStringSet(query.excludedIds)
+    ? query.excludedIds
+    : normalizeStringArray(query.excludedIds)
+  const excludedIdSet = isReadonlyStringSet(query.excludedIds)
+    ? query.excludedIds
+    : new Set(excludedIds)
+  const additionalExcludedIds = normalizeStringArray(query.additionalExcludedIds)
+  const additionalExcludedIdSet = new Set(additionalExcludedIds)
+  const sqlExcludedIds = boundThreadListStateDbExclusionIds([
+    ...(Array.isArray(excludedIds) ? excludedIds : []),
+    ...additionalExcludedIds,
+  ])
   const limit = Math.min(
     MAX_THREAD_LIST_PAGE_SIZE + 1,
     Math.max(1, Number.isSafeInteger(query.limit) ? query.limit! : MAX_THREAD_LIST_PAGE_SIZE + 1),
   )
-  const sql = `
-SELECT id, rollout_path, created_at, updated_at, source, model_provider, cwd, title,
-       cli_version, first_user_message, archived
+  const batchLimit = MAX_THREAD_LIST_PAGE_SIZE + 1
+  let beforeUpdatedAt = query.beforeUpdatedAt !== undefined && query.beforeUpdatedAt !== null
+    ? (Number.isFinite(query.beforeUpdatedAt) ? query.beforeUpdatedAt : 0)
+    : null
+  let beforeId = readNonEmptyString(query.beforeId)
+  const result: Array<Record<string, unknown>> = []
+  let scannedRows = 0
+  let lastSuccessfulBoundary: ImportedThreadListScanContinuation | null = null
+
+  const recoverPartialScan = (): {
+    data: Array<Record<string, unknown>>
+    scanContinuation: ImportedThreadListScanContinuation | null
+  } => {
+    if (lastSuccessfulBoundary) return { data: result, scanContinuation: lastSuccessfulBoundary }
+    throw new Error('Unable to read imported thread list from state database.')
+  }
+
+  while (result.length < limit && scannedRows < MAX_IMPORTED_THREAD_LIST_SCAN_ROWS) {
+    const predicates = [
+      'archived = 0',
+      `replace(rollout_path, '\\\\', '/') LIKE '%/sessions/%'`,
+    ]
+    if (threadIds.length > 0) {
+      predicates.push(`id IN (${threadIds.map(sqlString).join(', ')})`)
+    }
+    if (sqlExcludedIds.length > 0) {
+      predicates.push(`id NOT IN (${sqlExcludedIds.map(sqlString).join(', ')})`)
+    }
+    if (beforeUpdatedAt !== null) {
+      predicates.push(`(updated_at < ${beforeUpdatedAt} OR (updated_at = ${beforeUpdatedAt} AND id < ${sqlString(beforeId)}))`)
+    }
+    const queryLimit = Math.min(batchLimit, MAX_IMPORTED_THREAD_LIST_SCAN_ROWS - scannedRows)
+    const sql = `
+SELECT id, rollout_path, created_at, updated_at, source, model_provider, cwd,
+       substr(CASE WHEN title != '' THEN title ELSE first_user_message END, 1, ${THREAD_LIST_ROW_PREVIEW_LIMIT}) AS display_title,
+       cli_version, archived
 FROM threads
 WHERE ${predicates.join(' AND ')}
 ORDER BY updated_at DESC, id DESC
-LIMIT ${limit}
+LIMIT ${queryLimit}
 `
-  let stdout: string
-  try {
-    stdout = await runCommandCapture('sqlite3', ['-json', stateDbPath, sql])
-  } catch {
-    return []
-  }
-  if (!stdout.trim()) return []
-  try {
-    const rows = JSON.parse(stdout) as unknown
-    if (!Array.isArray(rows)) return []
-    return rows.flatMap((row) => {
+    let stdout: string
+    try {
+      stdout = await runSqliteQueryCapture(stateDbPath, sql, { json: true })
+    } catch (error) {
+      if (!lastSuccessfulBoundary && isUnsupportedImportedThreadListSchemaError(error)) {
+        return { data: [], scanContinuation: null }
+      }
+      return recoverPartialScan()
+    }
+    if (!stdout.trim()) break
+    let rows: unknown[]
+    try {
+      const parsed = JSON.parse(stdout) as unknown
+      if (!Array.isArray(parsed)) return recoverPartialScan()
+      rows = parsed
+    } catch {
+      return recoverPartialScan()
+    }
+    if (rows.length === 0) break
+    scannedRows += rows.length
+    const lastRecord = asRecord(rows.at(-1))
+    const lastId = readNonEmptyString(lastRecord?.id)
+    const lastUpdatedAt = typeof lastRecord?.updated_at === 'number' ? lastRecord.updated_at : null
+    if (!lastId || lastUpdatedAt === null) return recoverPartialScan()
+    lastSuccessfulBoundary = { beforeUpdatedAt: lastUpdatedAt, beforeId: lastId }
+    const candidates = rows.flatMap((row) => {
       const record = asRecord(row)
       const id = readNonEmptyString(record?.id)
       const path = readNonEmptyString(record?.rollout_path)
       const cwd = readNonEmptyString(record?.cwd)
       if (!id || !path || !cwd) return []
-      const title = readNonEmptyString(record?.title) || readNonEmptyString(record?.first_user_message) || 'Imported chat'
+      const title = readNonEmptyString(record?.display_title) || 'Imported chat'
       const createdAt = typeof record?.created_at === 'number' ? record.created_at : Math.floor(Date.now() / 1000)
       const updatedAt = typeof record?.updated_at === 'number' ? record.updated_at : createdAt
       return [{
@@ -3428,15 +4790,50 @@ LIMIT ${limit}
         gitInfo: null,
       }]
     })
-  } catch {
-    return []
+    const archivedIds = query.skipArchiveFilter
+      ? new Set<string>()
+      : await readAuthoritativeArchivedThreadIds(candidates.map((row) => readNonEmptyString(row.id)))
+    for (const candidate of candidates) {
+      const id = readNonEmptyString(candidate.id)
+      if (
+        !id
+        || excludedIdSet.has(id)
+        || additionalExcludedIdSet.has(id)
+        || archivedIds.has(id)
+      ) continue
+      result.push(candidate)
+      if (result.length >= limit) break
+    }
+    if (result.length >= limit) break
+    if (rows.length < queryLimit || (beforeUpdatedAt === lastUpdatedAt && beforeId === lastId)) break
+    if (scannedRows >= MAX_IMPORTED_THREAD_LIST_SCAN_ROWS) {
+      return {
+        data: result,
+        scanContinuation: { beforeUpdatedAt: lastUpdatedAt, beforeId: lastId },
+      }
+    }
+    beforeUpdatedAt = lastUpdatedAt
+    beforeId = lastId
   }
+  return { data: result, scanContinuation: null }
 }
 
-function readStateDbThreadExportMetadata(): Map<string, ExportedThreadMetadata> {
+async function listImportedThreadsFromStateDb(
+  query: ImportedThreadListQuery = {},
+): Promise<Array<Record<string, unknown>>> {
+  return (await listImportedThreadsFromStateDbPage(query)).data
+}
+
+export async function readStateDbThreadExportMetadata(
+  threadIds: readonly string[],
+): Promise<Map<string, ExportedThreadMetadata>> {
+  const normalizedThreadIds = Array.from(new Set(
+    threadIds.map((id) => id.trim()).filter(isSafeThreadIdForLocalRolloutPath),
+  ))
+  if (normalizedThreadIds.length === 0) return new Map()
   const stateDbPath = join(getCodexHomeDir(), 'state_5.sqlite')
   if (!existsSync(stateDbPath)) return new Map()
-  const columnsResult = spawnSync('sqlite3', [stateDbPath, 'PRAGMA table_info(threads);'], { encoding: 'utf8' })
+  const columnsResult = await runSqliteQuery(stateDbPath, 'PRAGMA table_info(threads);')
   if (columnsResult.status !== 0) return new Map()
   const availableColumns = new Set(columnsResult.stdout
     .split(/\r?\n/u)
@@ -3445,23 +4842,28 @@ function readStateDbThreadExportMetadata(): Map<string, ExportedThreadMetadata> 
   if (!availableColumns.has('id')) return new Map()
   const selectColumns = [
     'id',
-    availableColumns.has('title') ? 'title' : "'' AS title",
-    availableColumns.has('preview') ? 'preview' : "'' AS preview",
+    availableColumns.has('title') ? 'substr(title, 1, 4096) AS title' : "'' AS title",
+    availableColumns.has('preview') ? 'substr(preview, 1, 4096) AS preview' : "'' AS preview",
     availableColumns.has('updated_at') ? 'updated_at' : '0 AS updated_at',
     availableColumns.has('updated_at_ms') ? 'updated_at_ms' : '0 AS updated_at_ms',
   ]
-  const archivedPredicate = availableColumns.has('archived') ? 'WHERE archived = 0' : ''
-  const sql = `
+  const metadata = new Map<string, ExportedThreadMetadata>()
+  for (const batch of chunkSqlInValues(normalizedThreadIds, 100, SQLITE_IN_QUERY_MAX_BYTES)) {
+    const activePredicate = availableColumns.has('archived') ? ' AND archived = 0' : ''
+    const sql = `
 SELECT ${selectColumns.join(', ')}
 FROM threads
-${archivedPredicate};
+WHERE id IN (${batch.map(sqlString).join(', ')})${activePredicate};
 `
-  const result = spawnSync('sqlite3', ['-json', stateDbPath, sql], { encoding: 'utf8' })
-  if (result.status !== 0 || !result.stdout.trim()) return new Map()
-  try {
-    const rows = JSON.parse(result.stdout) as unknown
-    if (!Array.isArray(rows)) return new Map()
-    const metadata = new Map<string, ExportedThreadMetadata>()
+    const result = await runSqliteQuery(stateDbPath, sql, { json: true })
+    if (result.status !== 0 || !result.stdout.trim()) continue
+    let rows: unknown
+    try {
+      rows = JSON.parse(result.stdout) as unknown
+    } catch {
+      continue
+    }
+    if (!Array.isArray(rows)) continue
     for (const row of rows) {
       const record = asRecord(row)
       const id = readNonEmptyString(record?.id)
@@ -3476,154 +4878,910 @@ ${archivedPredicate};
       if (!title && updatedAtMs <= 0) continue
       metadata.set(id, { title, updatedAtMs })
     }
-    return metadata
-  } catch {
-    return new Map()
   }
+  return metadata
 }
 
+const stateDbThreadReadMetadataInFlight = new Map<
+  string,
+  Promise<Map<string, StateDbThreadReadMetadata>>
+>()
+let stateDbThreadReadMetadataCache: {
+  key: string
+  metadata: Map<string, StateDbThreadReadMetadata>
+} | null = null
+
 async function readStateDbThreadReadMetadata(threadIds: string[]): Promise<Map<string, StateDbThreadReadMetadata>> {
-  const uniqueThreadIds = Array.from(new Set(threadIds.filter((id) => id.trim().length > 0)))
+  const uniqueThreadIds = Array.from(new Set(threadIds
+    .map((id) => id.trim())
+    .filter(isSafeThreadIdForLocalRolloutPath))).sort()
   if (uniqueThreadIds.length === 0) return new Map()
   const stateDbPath = join(getCodexHomeDir(), 'state_5.sqlite')
   if (!existsSync(stateDbPath)) return new Map()
-  const idList = uniqueThreadIds.map(sqlString).join(', ')
-  let stdout: string
+  const signature = await readStateDbArchiveSignature(stateDbPath)
+  const key = `${signature}\0${uniqueThreadIds.join('\0')}`
+  if (stateDbThreadReadMetadataCache?.key === key) {
+    return new Map(stateDbThreadReadMetadataCache.metadata)
+  }
+  let operation = stateDbThreadReadMetadataInFlight.get(key)
+  if (!operation) {
+    operation = readStateDbThreadReadMetadataUncached(uniqueThreadIds)
+    stateDbThreadReadMetadataInFlight.set(key, operation)
+  }
   try {
-    stdout = await runCommandCapture('sqlite3', [
-      '-json', stateDbPath, `SELECT id, has_user_event, archived FROM threads WHERE id IN (${idList});`,
-    ])
-  } catch {
+    const metadata = await operation
+    stateDbThreadReadMetadataCache = { key, metadata: new Map(metadata) }
+    return new Map(metadata)
+  } finally {
+    if (stateDbThreadReadMetadataInFlight.get(key) === operation) {
+      stateDbThreadReadMetadataInFlight.delete(key)
+    }
+  }
+}
+
+async function readStateDbThreadReadMetadataUncached(
+  threadIds: string[],
+): Promise<Map<string, StateDbThreadReadMetadata>> {
+  const uniqueThreadIds = Array.from(new Set(threadIds
+    .map((id) => id.trim())
+    .filter(isSafeThreadIdForLocalRolloutPath)))
+  if (uniqueThreadIds.length === 0) return new Map()
+  const stateDbPath = join(getCodexHomeDir(), 'state_5.sqlite')
+  if (!existsSync(stateDbPath)) return new Map()
+  const metadata = new Map<string, StateDbThreadReadMetadata>()
+  for (const batch of chunkSqlInValues(uniqueThreadIds, 100, SQLITE_IN_QUERY_MAX_BYTES)) {
+    const idList = batch.map(sqlString).join(', ')
+    let stdout: string
     try {
-      stdout = await runCommandCapture('sqlite3', [
-        '-json', stateDbPath, `SELECT id, archived FROM threads WHERE id IN (${idList});`,
-      ])
+      stdout = await runSqliteQueryCapture(
+        stateDbPath,
+        `SELECT id, has_user_event, archived FROM threads WHERE id IN (${idList});`,
+        { json: true },
+      )
+    } catch {
+      try {
+        stdout = await runSqliteQueryCapture(
+          stateDbPath,
+          `SELECT id, archived FROM threads WHERE id IN (${idList});`,
+          { json: true },
+        )
+      } catch {
+        const error = new Error('Cannot verify archived task state.')
+        error.name = 'ArchivedThreadStateUnavailableError'
+        throw error
+      }
+    }
+    try {
+      const rows = JSON.parse(stdout || '[]') as unknown
+      if (!Array.isArray(rows)) throw new Error('Invalid archived task query result.')
+      for (const row of rows) {
+        const record = asRecord(row)
+        const id = readNonEmptyString(record?.id)
+        if (!id) continue
+        const rawHasUserEvent = record?.has_user_event
+        if (record?.archived !== 0 && record?.archived !== 1) {
+          throw new Error('Invalid archived task query result.')
+        }
+        metadata.set(id, {
+          ...(typeof rawHasUserEvent === 'number' ? { hasUserEvent: rawHasUserEvent !== 0 } : {}),
+          archived: record.archived === 1,
+        })
+      }
     } catch {
       const error = new Error('Cannot verify archived task state.')
       error.name = 'ArchivedThreadStateUnavailableError'
       throw error
     }
   }
-  try {
-    const rows = JSON.parse(stdout || '[]') as unknown
-    if (!Array.isArray(rows)) return new Map()
-    const metadata = new Map<string, StateDbThreadReadMetadata>()
-    for (const row of rows) {
-      const record = asRecord(row)
-      const id = readNonEmptyString(record?.id)
-      if (!id) continue
-      const rawHasUserEvent = record?.has_user_event
-      if (record?.archived !== 0 && record?.archived !== 1) {
-        throw new Error('Invalid archived task query result.')
-      }
-      metadata.set(id, {
-        ...(typeof rawHasUserEvent === 'number' ? { hasUserEvent: rawHasUserEvent !== 0 } : {}),
-        archived: record.archived === 1,
-      })
-    }
-    return metadata
-  } catch {
-    const error = new Error('Cannot verify archived task state.')
-    error.name = 'ArchivedThreadStateUnavailableError'
-    throw error
-  }
+  return metadata
 }
 
 type ThreadListCursorPayload =
-  | { kind: 'native'; cursor: string; seenImportedIds: string[] }
-  | { kind: 'imports'; beforeUpdatedAt: number | null; beforeId: string; seenImportedIds: string[] }
-  | { kind: 'session-index'; beforeUpdatedAtMs: number; beforeId: string; seenThreadIds: string[] }
+  | {
+      kind: 'native'
+      cursor: string | null
+      seenNativeIds: string[]
+      importBeforeUpdatedAt?: number
+      importBeforeId?: string
+      seenImportedIds: string[]
+      seenImportedSnapshotId: string
+      seenImportedSnapshotOffset?: number
+    }
+  | {
+      kind: 'imports'
+      beforeUpdatedAt: number | null
+      beforeId: string
+      seenImportedIds: string[]
+      seenImportedSnapshotId: string
+      seenImportedSnapshotOffset?: number
+    }
+  | {
+      kind: 'session-index'
+      beforeUpdatedAtMs: number
+      beforeId: string
+      beforeOffset?: number
+      sessionIndexSignature?: string
+      seenImportedIds: string[]
+      seenImportedSnapshotId: string
+      seenImportedSnapshotOffset?: number
+    }
 
-const THREAD_LIST_CURSOR_STATE_TTL_MS = 24 * 60 * 60 * 1000
-const MAX_THREAD_LIST_CURSOR_STATES = 4_096
-const threadListCursorStates = new Map<string, {
-  expiresAt: number
-  payload: ThreadListCursorPayload
-}>()
+const THREAD_LIST_CURSOR_KEY_FILE = '.thread-list-cursor-key'
+const THREAD_LIST_CURSOR_VERSION = 'v1'
+const THREAD_LIST_CURSOR_NONCE_BYTES = 12
+const THREAD_LIST_CURSOR_TAG_BYTES = 16
+const MAX_THREAD_LIST_CURSOR_TOKEN_LENGTH = 64 * 1024
+const MAX_THREAD_LIST_CURSOR_PAYLOAD_BYTES = 32 * 1024
+const MAX_THREAD_LIST_CURSOR_NATIVE_LENGTH = 16 * 1024
+const MAX_THREAD_LIST_CURSOR_ID_LENGTH = 512
+const MAX_THREAD_LIST_CURSOR_INLINE_IDS = 32
+const MAX_THREAD_LIST_CURSOR_SNAPSHOT_IDS = 100_000
+const MAX_THREAD_LIST_CURSOR_SNAPSHOT_BYTES = 8 * 1024 * 1024
+const THREAD_LIST_CURSOR_SNAPSHOT_DIR = 'thread-list-cursor-state'
+const THREAD_LIST_CURSOR_SNAPSHOT_TTL_MS = 24 * 60 * 60 * 1_000
+const MAX_THREAD_LIST_CURSOR_SNAPSHOT_FILES = 2_048
+const MAX_THREAD_LIST_CURSOR_SNAPSHOT_TOTAL_BYTES = 128 * 1024 * 1024
+const THREAD_LIST_CURSOR_SNAPSHOT_LOCK_DIR = '.write-lock'
+const THREAD_LIST_CURSOR_SNAPSHOT_LOCK_TIMEOUT_MS = 10_000
+const THREAD_LIST_CURSOR_SNAPSHOT_LOCK_STALE_MS = 30_000
+const THREAD_LIST_CURSOR_KEY_TEMP_TTL_MS = 5 * 60 * 1_000
+const threadListCursorKeyPromises = new Map<string, Promise<Buffer>>()
+const threadListCursorSnapshotWriteLocks = new Map<string, Promise<void>>()
+type ThreadListSeenIdState = {
+  ids: string[]
+  indexById: Map<string, number>
+  estimatedBytes: number
+}
 
-function pruneThreadListCursorStates(now = Date.now()): void {
-  for (const [token, state] of threadListCursorStates) {
-    if (state.expiresAt <= now) threadListCursorStates.delete(token)
+class ThreadListSeenIdView implements ReadonlySet<string> {
+  readonly [Symbol.toStringTag] = 'ThreadListSeenIdView'
+
+  constructor(
+    readonly state: ThreadListSeenIdState,
+    readonly size: number,
+  ) {}
+
+  has(value: string): boolean {
+    const index = this.state.indexById.get(value)
+    return index !== undefined && index < this.size
   }
-  while (threadListCursorStates.size >= MAX_THREAD_LIST_CURSOR_STATES) {
-    const oldestToken = threadListCursorStates.keys().next().value
-    if (typeof oldestToken !== 'string') break
-    threadListCursorStates.delete(oldestToken)
+
+  *values(): SetIterator<string> {
+    for (let index = 0; index < this.size; index += 1) yield this.state.ids[index]!
+  }
+
+  keys(): SetIterator<string> {
+    return this.values()
+  }
+
+  *entries(): SetIterator<[string, string]> {
+    for (const value of this.values()) yield [value, value]
+  }
+
+  [Symbol.iterator](): SetIterator<string> {
+    return this.values()
+  }
+
+  forEach(
+    callbackfn: (value: string, value2: string, set: ReadonlySet<string>) => void,
+    thisArg?: unknown,
+  ): void {
+    for (const value of this.values()) callbackfn.call(thisArg, value, value, this)
   }
 }
 
-function encodeThreadListCursor(payload: ThreadListCursorPayload): string {
-  const now = Date.now()
-  pruneThreadListCursorStates(now)
-  let token = randomBytes(18).toString('base64url')
-  while (threadListCursorStates.has(token)) token = randomBytes(18).toString('base64url')
-  threadListCursorStates.set(token, {
-    expiresAt: now + THREAD_LIST_CURSOR_STATE_TTL_MS,
-    payload,
+function createThreadListSeenIdState(ids: Iterable<string> = []): ThreadListSeenIdState {
+  const state: ThreadListSeenIdState = { ids: [], indexById: new Map(), estimatedBytes: 0 }
+  appendThreadListSeenIds(state, ids)
+  return state
+}
+
+function appendThreadListSeenIds(state: ThreadListSeenIdState, ids: Iterable<string>): void {
+  for (const id of ids) {
+    if (state.indexById.has(id)) continue
+    state.indexById.set(id, state.ids.length)
+    state.ids.push(id)
+    state.estimatedBytes += id.length * 2
+  }
+}
+
+const THREAD_LIST_SEEN_SNAPSHOT_CACHE_MAX_ENTRIES = 64
+const THREAD_LIST_SEEN_SNAPSHOT_CACHE_MAX_IDS = 250_000
+const THREAD_LIST_SEEN_SNAPSHOT_CACHE_MAX_ESTIMATED_BYTES = 16 * 1024 * 1024
+const threadListSeenSnapshotCache = new Map<string, {
+  offset: number
+  state: ThreadListSeenIdState
+}>()
+
+function trimThreadListSeenSnapshotCache(): void {
+  let totalIds = 0
+  let totalEstimatedBytes = 0
+  for (const entry of threadListSeenSnapshotCache.values()) {
+    totalIds += entry.state.ids.length
+    totalEstimatedBytes += entry.state.estimatedBytes
+  }
+  while (
+    threadListSeenSnapshotCache.size > THREAD_LIST_SEEN_SNAPSHOT_CACHE_MAX_ENTRIES
+    || totalIds > THREAD_LIST_SEEN_SNAPSHOT_CACHE_MAX_IDS
+    || totalEstimatedBytes > THREAD_LIST_SEEN_SNAPSHOT_CACHE_MAX_ESTIMATED_BYTES
+  ) {
+    const oldestPath = threadListSeenSnapshotCache.keys().next().value as string | undefined
+    if (!oldestPath) break
+    const removed = threadListSeenSnapshotCache.get(oldestPath)
+    threadListSeenSnapshotCache.delete(oldestPath)
+    totalIds -= removed?.state.ids.length ?? 0
+    totalEstimatedBytes -= removed?.state.estimatedBytes ?? 0
+  }
+}
+
+function cacheThreadListSeenSnapshot(
+  path: string,
+  entry: { offset: number; state: ThreadListSeenIdState },
+): void {
+  threadListSeenSnapshotCache.delete(path)
+  threadListSeenSnapshotCache.set(path, entry)
+  trimThreadListSeenSnapshotCache()
+}
+
+export function getThreadListSeenSnapshotCacheMetrics(): {
+  entries: number
+  ids: number
+  estimatedBytes: number
+  entriesAtMostLimit: boolean
+  idsAtMostLimit: boolean
+  bytesAtMostLimit: boolean
+} {
+  let ids = 0
+  let estimatedBytes = 0
+  for (const entry of threadListSeenSnapshotCache.values()) {
+    ids += entry.state.ids.length
+    estimatedBytes += entry.state.estimatedBytes
+  }
+  return {
+    entries: threadListSeenSnapshotCache.size,
+    ids,
+    estimatedBytes,
+    entriesAtMostLimit: threadListSeenSnapshotCache.size <= THREAD_LIST_SEEN_SNAPSHOT_CACHE_MAX_ENTRIES,
+    idsAtMostLimit: ids <= THREAD_LIST_SEEN_SNAPSHOT_CACHE_MAX_IDS,
+    bytesAtMostLimit: estimatedBytes <= THREAD_LIST_SEEN_SNAPSHOT_CACHE_MAX_ESTIMATED_BYTES,
+  }
+}
+
+export async function withThreadListCursorSnapshotWriteLock<T>(
+  snapshotRoot: string,
+  callback: () => Promise<T>,
+): Promise<T> {
+  const previous = threadListCursorSnapshotWriteLocks.get(snapshotRoot) ?? Promise.resolve()
+  let release!: () => void
+  const gate = new Promise<void>((resolve) => { release = resolve })
+  const tail = previous.catch(() => undefined).then(() => gate)
+  threadListCursorSnapshotWriteLocks.set(snapshotRoot, tail)
+  await previous.catch(() => undefined)
+  try {
+    return await withCrossProcessDirectoryLock(
+      snapshotRoot,
+      THREAD_LIST_CURSOR_SNAPSHOT_LOCK_DIR,
+      {
+        timeoutMs: THREAD_LIST_CURSOR_SNAPSHOT_LOCK_TIMEOUT_MS,
+        staleMs: THREAD_LIST_CURSOR_SNAPSHOT_LOCK_STALE_MS,
+      },
+      callback,
+    )
+  } finally {
+    release()
+    if (threadListCursorSnapshotWriteLocks.get(snapshotRoot) === tail) {
+      threadListCursorSnapshotWriteLocks.delete(snapshotRoot)
+    }
+  }
+}
+
+function invalidThreadListCursor(): Error {
+  const error = new Error('Invalid thread list cursor.')
+  error.name = 'InvalidThreadListCursorError'
+  return error
+}
+
+export function isThreadListCursorFileMetadataValid(
+  metadata: { isFile: boolean; isSymbolicLink: boolean; mode: number; uid: number },
+  platform: NodeJS.Platform,
+  currentUid: number | null,
+): boolean {
+  return metadata.isFile
+    && !metadata.isSymbolicLink
+    && (platform === 'win32' || (metadata.mode & 0o077) === 0)
+    && (currentUid === null || metadata.uid === currentUid)
+}
+
+async function readThreadListCursorKey(): Promise<Buffer> {
+  const cacheRoot = join(getCodexHomeDir(), 'codex-mobile-cache')
+  const keyPath = join(cacheRoot, THREAD_LIST_CURSOR_KEY_FILE)
+  const existing = threadListCursorKeyPromises.get(keyPath)
+  if (existing) return existing
+  const promise = (async () => {
+    await mkdir(cacheRoot, { recursive: true, mode: 0o700 })
+    const currentUid = typeof process.getuid === 'function' ? process.getuid() : null
+    for (const name of await readdir(cacheRoot)) {
+      if (!/^\.thread-list-cursor-key\.[0-9a-f-]{36}\.tmp$/iu.test(name)) continue
+      const stalePath = join(cacheRoot, name)
+      try {
+        const info = await lstat(stalePath)
+        if (!isThreadListCursorFileMetadataValid({
+          isFile: info.isFile(),
+          isSymbolicLink: info.isSymbolicLink(),
+          mode: info.mode,
+          uid: info.uid,
+        }, process.platform, currentUid)) continue
+        if (Date.now() - info.mtimeMs > THREAD_LIST_CURSOR_KEY_TEMP_TTL_MS) {
+          await rm(stalePath, { force: true })
+        }
+      } catch (error) {
+        if (getErrorCode(error) !== 'ENOENT') throw error
+      }
+    }
+    const temporaryKeyPath = `${keyPath}.${randomUUID()}.tmp`
+    try {
+      await writeFile(temporaryKeyPath, randomBytes(32), { flag: 'wx', mode: 0o600 })
+      await link(temporaryKeyPath, keyPath)
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error
+    } finally {
+      await rm(temporaryKeyPath, { force: true }).catch(() => undefined)
+    }
+    const info = await lstat(keyPath)
+    if (!isThreadListCursorFileMetadataValid({
+      isFile: info.isFile(),
+      isSymbolicLink: info.isSymbolicLink(),
+      mode: info.mode,
+      uid: info.uid,
+    }, process.platform, currentUid)) {
+      throw invalidThreadListCursor()
+    }
+    const key = await readFile(keyPath)
+    if (key.length !== 32) throw invalidThreadListCursor()
+    return key
+  })()
+  threadListCursorKeyPromises.set(keyPath, promise)
+  try {
+    return await promise
+  } catch (error) {
+    threadListCursorKeyPromises.delete(keyPath)
+    throw error
+  }
+}
+
+function parseThreadListCursorIds(value: unknown): string[] {
+  if (!Array.isArray(value) || value.length > MAX_THREAD_LIST_PAGE_SIZE) {
+    throw invalidThreadListCursor()
+  }
+  const ids: string[] = []
+  const seen = new Set<string>()
+  for (const entry of value) {
+    if (typeof entry !== 'string') throw invalidThreadListCursor()
+    const id = entry.trim()
+    if (!id || id.length > MAX_THREAD_LIST_CURSOR_ID_LENGTH) throw invalidThreadListCursor()
+    if (!seen.has(id)) {
+      seen.add(id)
+      ids.push(id)
+    }
+  }
+  return ids
+}
+
+function parseThreadListCursorSnapshotId(value: unknown): string {
+  if (value === undefined || value === null || value === '') return ''
+  const snapshotId = readNonEmptyString(value)
+  if (!/^[0-9a-f-]{36}$/iu.test(snapshotId)) throw invalidThreadListCursor()
+  return snapshotId
+}
+
+function parseThreadListCursorSeenState(record: Record<string, unknown>): {
+  seenImportedIds: string[]
+  seenImportedSnapshotId: string
+  seenImportedSnapshotOffset?: number
+} {
+  const seenImportedIds = parseThreadListCursorIds(record.seenImportedIds)
+  const seenImportedSnapshotId = parseThreadListCursorSnapshotId(record.seenImportedSnapshotId)
+  const rawOffset = record.seenImportedSnapshotOffset
+  if (!seenImportedSnapshotId) {
+    if (rawOffset !== undefined && rawOffset !== 0) throw invalidThreadListCursor()
+    return { seenImportedIds, seenImportedSnapshotId }
+  }
+  if (
+    seenImportedIds.length > 0
+    || typeof rawOffset !== 'number'
+    || !Number.isSafeInteger(rawOffset)
+    || rawOffset <= 0
+    || rawOffset > MAX_THREAD_LIST_CURSOR_SNAPSHOT_BYTES
+  ) {
+    throw invalidThreadListCursor()
+  }
+  return {
+    seenImportedIds,
+    seenImportedSnapshotId,
+    seenImportedSnapshotOffset: rawOffset,
+  }
+}
+
+async function decodeThreadListSeenSnapshotChunk(
+  snapshotId: string,
+  encoded: string,
+  offset: number,
+): Promise<string[]> {
+  try {
+    const [version, nonceEncoded, ciphertextEncoded, tagEncoded, ...extra] = encoded.split('.')
+    if (
+      version !== THREAD_LIST_CURSOR_VERSION
+      || !nonceEncoded
+      || !ciphertextEncoded
+      || !tagEncoded
+      || extra.length > 0
+    ) throw invalidThreadListCursor()
+    const nonce = Buffer.from(nonceEncoded, 'base64url')
+    const ciphertext = Buffer.from(ciphertextEncoded, 'base64url')
+    const tag = Buffer.from(tagEncoded, 'base64url')
+    if (nonce.length !== THREAD_LIST_CURSOR_NONCE_BYTES || tag.length !== THREAD_LIST_CURSOR_TAG_BYTES) {
+      throw invalidThreadListCursor()
+    }
+    const decipher = createDecipheriv('aes-256-gcm', await readThreadListCursorKey(), nonce)
+    decipher.setAAD(Buffer.from(`${snapshotId}:${offset}`, 'utf8'))
+    decipher.setAuthTag(tag)
+    const plaintext = Buffer.concat([decipher.update(ciphertext), decipher.final()])
+    const snapshot = asRecord(JSON.parse(plaintext.toString('utf8')) as unknown)
+    const createdAt = snapshot?.createdAt
+    if (
+      snapshot?.version !== 2
+      || typeof createdAt !== 'number'
+      || !Number.isSafeInteger(createdAt)
+      || createdAt > Date.now() + 60_000
+      || Date.now() - createdAt > THREAD_LIST_CURSOR_SNAPSHOT_TTL_MS
+      || !Array.isArray(snapshot.ids)
+      || snapshot.ids.length > MAX_THREAD_LIST_PAGE_SIZE
+    ) throw invalidThreadListCursor()
+    return snapshot.ids.map((entry) => {
+      if (typeof entry !== 'string') throw invalidThreadListCursor()
+      const id = entry.trim()
+      if (!id || id.length > MAX_THREAD_LIST_CURSOR_ID_LENGTH) throw invalidThreadListCursor()
+      return id
+    })
+  } catch (error) {
+    if (error instanceof Error && error.name === 'InvalidThreadListCursorError') throw error
+    throw invalidThreadListCursor()
+  }
+}
+
+async function encodeThreadListSeenSnapshotChunk(
+  snapshotId: string,
+  offset: number,
+  ids: readonly string[],
+): Promise<Buffer> {
+  const plaintext = Buffer.from(JSON.stringify({
+    version: 2,
+    createdAt: Date.now(),
+    ids,
+  }), 'utf8')
+  const nonce = randomBytes(THREAD_LIST_CURSOR_NONCE_BYTES)
+  const cipher = createCipheriv('aes-256-gcm', await readThreadListCursorKey(), nonce)
+  cipher.setAAD(Buffer.from(`${snapshotId}:${offset}`, 'utf8'))
+  const ciphertext = Buffer.concat([cipher.update(plaintext), cipher.final()])
+  return Buffer.from(`${[
+    THREAD_LIST_CURSOR_VERSION,
+    nonce.toString('base64url'),
+    ciphertext.toString('base64url'),
+    cipher.getAuthTag().toString('base64url'),
+  ].join('.')}\n`, 'utf8')
+}
+
+export async function readThreadListSeenImportedIds(
+  cursor: {
+    seenImportedIds: string[]
+    seenImportedSnapshotId: string
+    seenImportedSnapshotOffset?: number
+  },
+): Promise<ReadonlySet<string>> {
+  if (!cursor.seenImportedSnapshotId) return new Set(cursor.seenImportedIds)
+  const snapshotOffset = cursor.seenImportedSnapshotOffset
+  if (!snapshotOffset) throw invalidThreadListCursor()
+  const snapshotPath = join(
+    getCodexHomeDir(),
+    'codex-mobile-cache',
+    THREAD_LIST_CURSOR_SNAPSHOT_DIR,
+    `${cursor.seenImportedSnapshotId}.json`,
+  )
+  let handle: FileHandle | null = null
+  try {
+    const info = await lstat(snapshotPath)
+    const currentUid = typeof process.getuid === 'function' ? process.getuid() : null
+    if (
+      info.size > MAX_THREAD_LIST_CURSOR_SNAPSHOT_BYTES
+      || snapshotOffset > info.size
+      || !isThreadListCursorFileMetadataValid({
+        isFile: info.isFile(),
+        isSymbolicLink: info.isSymbolicLink(),
+        mode: info.mode,
+        uid: info.uid,
+      }, process.platform, currentUid)
+    ) {
+      throw invalidThreadListCursor()
+    }
+    const flags = fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0)
+    handle = await open(snapshotPath, flags)
+    const openedInfo = await handle.stat()
+    if (
+      !openedInfo.isFile()
+      || openedInfo.dev !== info.dev
+      || openedInfo.ino !== info.ino
+      || snapshotOffset > openedInfo.size
+    ) throw invalidThreadListCursor()
+  } catch (error) {
+    await handle?.close().catch(() => undefined)
+    if (error instanceof Error && error.name === 'InvalidThreadListCursorError') throw error
+    throw invalidThreadListCursor()
+  }
+  try {
+    const cached = threadListSeenSnapshotCache.get(snapshotPath)
+    if (cached?.offset === snapshotOffset) {
+      cacheThreadListSeenSnapshot(snapshotPath, cached)
+      return new ThreadListSeenIdView(cached.state, cached.state.ids.length)
+    }
+    const startOffset = cached && cached.offset < snapshotOffset ? cached.offset : 0
+    const state = cached && cached.offset < snapshotOffset
+      ? cached.state
+      : createThreadListSeenIdState()
+    const raw = Buffer.alloc(snapshotOffset - startOffset)
+    const { bytesRead } = await handle!.read(raw, 0, raw.length, startOffset)
+    if (bytesRead !== raw.length) throw invalidThreadListCursor()
+    let relativeOffset = 0
+    while (relativeOffset < raw.length) {
+      const newlineOffset = raw.indexOf(0x0a, relativeOffset)
+      if (newlineOffset < 0) throw invalidThreadListCursor()
+      const absoluteOffset = startOffset + relativeOffset
+      const encoded = raw.subarray(relativeOffset, newlineOffset).toString('utf8')
+      for (const id of await decodeThreadListSeenSnapshotChunk(
+        cursor.seenImportedSnapshotId,
+        encoded,
+        absoluteOffset,
+      )) appendThreadListSeenIds(state, [id])
+      if (state.ids.length > MAX_THREAD_LIST_CURSOR_SNAPSHOT_IDS) throw invalidThreadListCursor()
+      relativeOffset = newlineOffset + 1
+    }
+    if (!cached || snapshotOffset >= cached.offset) {
+      cacheThreadListSeenSnapshot(snapshotPath, { offset: snapshotOffset, state })
+    }
+    return new ThreadListSeenIdView(state, state.ids.length)
+  } finally {
+    await handle?.close().catch(() => undefined)
+  }
+}
+
+export async function pruneThreadListCursorSnapshots(
+  snapshotRoot: string,
+  incomingBytes: number,
+  incomingFiles = 1,
+  preservedPath = '',
+  operations: {
+    readDirectory?: (path: string) => Promise<string[]>
+    removeFile?: (path: string) => Promise<void>
+  } = {},
+): Promise<void> {
+  const readDirectory = operations.readDirectory ?? readdir
+  const removeFile = operations.removeFile ?? ((path: string) => rm(path, { force: true }))
+  const names = await readDirectory(snapshotRoot)
+  const currentUid = typeof process.getuid === 'function' ? process.getuid() : null
+  const files: Array<{ path: string; mtimeMs: number; size: number }> = []
+  for (const name of names) {
+    const isSnapshot = /^[0-9a-f-]{36}\.json$/iu.test(name)
+    const isTemporarySnapshot = /^[0-9a-f-]{36}\.json\.[0-9a-f-]{36}\.tmp$/iu.test(name)
+    if (!isSnapshot && !isTemporarySnapshot) continue
+    const path = join(snapshotRoot, name)
+    try {
+      const info = await lstat(path)
+      if (!isThreadListCursorFileMetadataValid({
+        isFile: info.isFile(),
+        isSymbolicLink: info.isSymbolicLink(),
+        mode: info.mode,
+        uid: info.uid,
+      }, process.platform, currentUid)) continue
+      if (isTemporarySnapshot) {
+        await removeFile(path)
+        continue
+      }
+      if (Date.now() - info.mtimeMs > THREAD_LIST_CURSOR_SNAPSHOT_TTL_MS) {
+        await removeFile(path)
+        threadListSeenSnapshotCache.delete(path)
+        continue
+      }
+      files.push({ path, mtimeMs: info.mtimeMs, size: info.size })
+    } catch (error) {
+      if (getErrorCode(error) !== 'ENOENT') throw error
+    }
+  }
+  files.sort((left, right) => left.mtimeMs - right.mtimeMs)
+  let totalBytes = files.reduce((total, file) => total + file.size, 0)
+  while (
+    files.length + incomingFiles > MAX_THREAD_LIST_CURSOR_SNAPSHOT_FILES
+    || totalBytes + incomingBytes > MAX_THREAD_LIST_CURSOR_SNAPSHOT_TOTAL_BYTES
+  ) {
+    const oldestIndex = files.findIndex((file) => file.path !== preservedPath)
+    const oldest = oldestIndex >= 0 ? files[oldestIndex] : undefined
+    if (!oldest) break
+    await removeFile(oldest.path)
+    files.splice(oldestIndex, 1)
+    threadListSeenSnapshotCache.delete(oldest.path)
+    totalBytes -= oldest.size
+  }
+  if (
+    files.length + incomingFiles > MAX_THREAD_LIST_CURSOR_SNAPSHOT_FILES
+    || totalBytes + incomingBytes > MAX_THREAD_LIST_CURSOR_SNAPSHOT_TOTAL_BYTES
+  ) throw invalidThreadListCursor()
+}
+
+export async function writeThreadListSeenImportedIds(
+  cursor: {
+    seenImportedIds: string[]
+    seenImportedSnapshotId: string
+    seenImportedSnapshotOffset?: number
+  } | null,
+  existingIds: ReadonlySet<string>,
+  addedIds: readonly string[],
+): Promise<{
+  seenImportedIds: string[]
+  seenImportedSnapshotId: string
+  seenImportedSnapshotOffset?: number
+}> {
+  const normalizedAddedIds: string[] = []
+  const addedIdSet = new Set<string>()
+  for (const value of addedIds) {
+    const id = value.trim()
+    if (!id || id.length > MAX_THREAD_LIST_CURSOR_ID_LENGTH) throw invalidThreadListCursor()
+    if (!existingIds.has(id) && !addedIdSet.has(id)) {
+      addedIdSet.add(id)
+      normalizedAddedIds.push(id)
+    }
+  }
+  if (existingIds.size + normalizedAddedIds.length > MAX_THREAD_LIST_CURSOR_SNAPSHOT_IDS) {
+    throw invalidThreadListCursor()
+  }
+  if (normalizedAddedIds.length === 0 && cursor) {
+    return {
+      seenImportedIds: cursor.seenImportedIds,
+      seenImportedSnapshotId: cursor.seenImportedSnapshotId,
+      ...(cursor.seenImportedSnapshotOffset === undefined
+        ? {}
+        : { seenImportedSnapshotOffset: cursor.seenImportedSnapshotOffset }),
+    }
+  }
+  const combinedIds = [...existingIds, ...normalizedAddedIds]
+  if (!cursor?.seenImportedSnapshotId && combinedIds.length <= MAX_THREAD_LIST_CURSOR_INLINE_IDS) {
+    return { seenImportedIds: combinedIds, seenImportedSnapshotId: '' }
+  }
+  const appendSnapshotId = cursor?.seenImportedSnapshotId ?? ''
+  const appendOffset = cursor?.seenImportedSnapshotOffset
+  if (appendSnapshotId && appendOffset) {
+    const snapshotRoot = join(getCodexHomeDir(), 'codex-mobile-cache', THREAD_LIST_CURSOR_SNAPSHOT_DIR)
+    const snapshotPath = join(snapshotRoot, `${appendSnapshotId}.json`)
+    await mkdir(snapshotRoot, { recursive: true, mode: 0o700 })
+    const appended = await withThreadListCursorSnapshotWriteLock(snapshotRoot, async () => {
+      const info = await lstat(snapshotPath).catch(() => null)
+      const currentUid = typeof process.getuid === 'function' ? process.getuid() : null
+      if (!info || !isThreadListCursorFileMetadataValid({
+        isFile: info.isFile(),
+        isSymbolicLink: info.isSymbolicLink(),
+        mode: info.mode,
+        uid: info.uid,
+      }, process.platform, currentUid) || info.size !== appendOffset) return null
+      const encoded = await encodeThreadListSeenSnapshotChunk(
+        appendSnapshotId,
+        appendOffset,
+        normalizedAddedIds,
+      )
+      if (appendOffset + encoded.length > MAX_THREAD_LIST_CURSOR_SNAPSHOT_BYTES) {
+        throw invalidThreadListCursor()
+      }
+      await pruneThreadListCursorSnapshots(snapshotRoot, encoded.length, 0, snapshotPath)
+      let handle: FileHandle | null = null
+      try {
+        const flags = fsConstants.O_WRONLY | fsConstants.O_APPEND | (fsConstants.O_NOFOLLOW ?? 0)
+        handle = await open(snapshotPath, flags)
+        const openedInfo = await handle.stat()
+        if (openedInfo.dev !== info.dev || openedInfo.ino !== info.ino || openedInfo.size !== appendOffset) {
+          return null
+        }
+        await handle.writeFile(encoded)
+        await handle.sync()
+      } finally {
+        await handle?.close().catch(() => undefined)
+      }
+      const nextOffset = appendOffset + encoded.length
+      const state = existingIds instanceof ThreadListSeenIdView
+        && existingIds.size === existingIds.state.ids.length
+        ? existingIds.state
+        : createThreadListSeenIdState(existingIds)
+      appendThreadListSeenIds(state, normalizedAddedIds)
+      cacheThreadListSeenSnapshot(snapshotPath, { offset: nextOffset, state })
+      return {
+        seenImportedIds: [],
+        seenImportedSnapshotId: appendSnapshotId,
+        seenImportedSnapshotOffset: nextOffset,
+      }
+    })
+    if (appended) return appended
+  }
+  const nextSnapshotId = randomUUID()
+  if (!/^[0-9a-f-]{36}$/iu.test(nextSnapshotId)) throw invalidThreadListCursor()
+  const snapshotRoot = join(getCodexHomeDir(), 'codex-mobile-cache', THREAD_LIST_CURSOR_SNAPSHOT_DIR)
+  await mkdir(snapshotRoot, { recursive: true, mode: 0o700 })
+  const encodedChunks: Buffer[] = []
+  let encodedOffset = 0
+  for (let index = 0; index < combinedIds.length; index += MAX_THREAD_LIST_PAGE_SIZE) {
+    const encodedChunk = await encodeThreadListSeenSnapshotChunk(
+      nextSnapshotId,
+      encodedOffset,
+      combinedIds.slice(index, index + MAX_THREAD_LIST_PAGE_SIZE),
+    )
+    encodedChunks.push(encodedChunk)
+    encodedOffset += encodedChunk.length
+  }
+  const encoded = Buffer.concat(encodedChunks)
+  if (encoded.length > MAX_THREAD_LIST_CURSOR_SNAPSHOT_BYTES) throw invalidThreadListCursor()
+  const snapshotPath = join(snapshotRoot, `${nextSnapshotId}.json`)
+  const temporaryPath = `${snapshotPath}.${randomUUID()}.tmp`
+  await withThreadListCursorSnapshotWriteLock(snapshotRoot, async () => {
+    await pruneThreadListCursorSnapshots(snapshotRoot, encoded.length)
+    try {
+      await writeFile(temporaryPath, encoded, { flag: 'wx', mode: 0o600 })
+      await rename(temporaryPath, snapshotPath)
+      await pruneThreadListCursorSnapshots(snapshotRoot, 0, 0)
+    } finally {
+      await rm(temporaryPath, { force: true }).catch(() => undefined)
+    }
   })
+  cacheThreadListSeenSnapshot(snapshotPath, {
+    offset: encoded.length,
+    state: createThreadListSeenIdState(combinedIds),
+  })
+  return {
+    seenImportedIds: [],
+    seenImportedSnapshotId: nextSnapshotId,
+    seenImportedSnapshotOffset: encoded.length,
+  }
+}
+
+function parseThreadListCursorPayload(value: unknown): ThreadListCursorPayload {
+  const parsed = asRecord(value)
+  const kind = readNonEmptyString(parsed?.kind)
+  if (kind === 'native') {
+    const cursor = parsed?.cursor === null ? null : readNonEmptyString(parsed?.cursor)
+    const importBeforeUpdatedAt = parsed?.importBeforeUpdatedAt
+    const importBeforeId = readNonEmptyString(parsed?.importBeforeId)
+    if (cursor !== null && (!cursor || cursor.length > MAX_THREAD_LIST_CURSOR_NATIVE_LENGTH)) {
+      throw invalidThreadListCursor()
+    }
+    if (
+      (importBeforeUpdatedAt !== undefined && (
+        typeof importBeforeUpdatedAt !== 'number'
+        || !Number.isFinite(importBeforeUpdatedAt)
+        || !importBeforeId
+        || importBeforeId.length > MAX_THREAD_LIST_CURSOR_ID_LENGTH
+      ))
+      || (importBeforeUpdatedAt === undefined && importBeforeId)
+    ) throw invalidThreadListCursor()
+    return {
+      kind,
+      cursor,
+      seenNativeIds: parseThreadListCursorIds(parsed?.seenNativeIds ?? []),
+      ...(typeof importBeforeUpdatedAt === 'number' ? { importBeforeUpdatedAt, importBeforeId } : {}),
+      ...parseThreadListCursorSeenState(parsed ?? {}),
+    }
+  }
+  if (kind === 'imports') {
+    const beforeUpdatedAt = parsed?.beforeUpdatedAt === null
+      ? null
+      : typeof parsed?.beforeUpdatedAt === 'number' && Number.isFinite(parsed.beforeUpdatedAt)
+        ? parsed.beforeUpdatedAt
+        : Number.NaN
+    const beforeId = typeof parsed?.beforeId === 'string' ? parsed.beforeId.trim() : ''
+    if (
+      Number.isNaN(beforeUpdatedAt)
+      || (beforeUpdatedAt !== null && (!beforeId || beforeId.length > MAX_THREAD_LIST_CURSOR_ID_LENGTH))
+      || (beforeUpdatedAt === null && beforeId.length > MAX_THREAD_LIST_CURSOR_ID_LENGTH)
+    ) {
+      throw invalidThreadListCursor()
+    }
+    return {
+      kind,
+      beforeUpdatedAt,
+      beforeId,
+      ...parseThreadListCursorSeenState(parsed ?? {}),
+    }
+  }
+  if (kind === 'session-index') {
+    const beforeUpdatedAtMs = parsed?.beforeUpdatedAtMs
+    const beforeId = readNonEmptyString(parsed?.beforeId)
+    const beforeOffset = parsed?.beforeOffset
+    const sessionIndexSignature = readNonEmptyString(parsed?.sessionIndexSignature)
+    if (
+      typeof beforeUpdatedAtMs !== 'number'
+      || !Number.isSafeInteger(beforeUpdatedAtMs)
+      || beforeUpdatedAtMs < 0
+      || !beforeId
+      || beforeId.length > MAX_THREAD_LIST_CURSOR_ID_LENGTH
+      || (beforeOffset !== undefined && (
+        typeof beforeOffset !== 'number'
+        || !Number.isSafeInteger(beforeOffset)
+        || beforeOffset < 0
+      ))
+      || sessionIndexSignature.length > 512
+    ) {
+      throw invalidThreadListCursor()
+    }
+    return {
+      kind,
+      beforeUpdatedAtMs,
+      beforeId,
+      ...(typeof beforeOffset === 'number' ? { beforeOffset } : {}),
+      ...(sessionIndexSignature ? { sessionIndexSignature } : {}),
+      ...parseThreadListCursorSeenState(parsed ?? {}),
+    }
+  }
+  throw invalidThreadListCursor()
+}
+
+async function encodeThreadListCursor(payload: ThreadListCursorPayload): Promise<string> {
+  const plaintext = Buffer.from(JSON.stringify(parseThreadListCursorPayload(payload)), 'utf8')
+  if (plaintext.length > MAX_THREAD_LIST_CURSOR_PAYLOAD_BYTES) throw invalidThreadListCursor()
+  const key = await readThreadListCursorKey()
+  const nonce = randomBytes(THREAD_LIST_CURSOR_NONCE_BYTES)
+  const cipher = createCipheriv('aes-256-gcm', key, nonce)
+  const ciphertext = Buffer.concat([cipher.update(plaintext), cipher.final()])
+  const token = [
+    THREAD_LIST_CURSOR_VERSION,
+    nonce.toString('base64url'),
+    ciphertext.toString('base64url'),
+    cipher.getAuthTag().toString('base64url'),
+  ].join('.')
+  if (token.length > MAX_THREAD_LIST_CURSOR_TOKEN_LENGTH) throw invalidThreadListCursor()
   return `${CODEX_MOBILE_THREAD_LIST_CURSOR_PREFIX}${token}`
 }
 
-function decodeThreadListCursor(value: unknown): ThreadListCursorPayload | null {
+async function decodeThreadListCursor(value: unknown): Promise<ThreadListCursorPayload | null> {
   const cursor = readNonEmptyString(value)
   if (!cursor.startsWith(CODEX_MOBILE_THREAD_LIST_CURSOR_PREFIX)) return null
-  const encoded = cursor.slice(CODEX_MOBILE_THREAD_LIST_CURSOR_PREFIX.length)
-  const registered = threadListCursorStates.get(encoded)
-  if (registered) {
-    if (registered.expiresAt > Date.now()) {
-      threadListCursorStates.delete(encoded)
-      threadListCursorStates.set(encoded, {
-        expiresAt: Date.now() + THREAD_LIST_CURSOR_STATE_TTL_MS,
-        payload: registered.payload,
-      })
-      return registered.payload
-    }
-    threadListCursorStates.delete(encoded)
+  const token = cursor.slice(CODEX_MOBILE_THREAD_LIST_CURSOR_PREFIX.length)
+  if (!token || token.length > MAX_THREAD_LIST_CURSOR_TOKEN_LENGTH) throw invalidThreadListCursor()
+  const [version, encodedNonce, encodedCiphertext, encodedTag, ...extra] = token.split('.')
+  if (
+    version !== THREAD_LIST_CURSOR_VERSION
+    || !encodedNonce
+    || !encodedCiphertext
+    || !encodedTag
+    || extra.length > 0
+    || !/^[A-Za-z0-9_-]+$/u.test(encodedNonce)
+    || !/^[A-Za-z0-9_-]+$/u.test(encodedCiphertext)
+    || !/^[A-Za-z0-9_-]+$/u.test(encodedTag)
+  ) {
+    throw invalidThreadListCursor()
   }
   try {
-    const parsed = asRecord(JSON.parse(Buffer.from(
-      encoded,
-      'base64url',
-    ).toString('utf8')))
-    const kind = readNonEmptyString(parsed?.kind)
-    if (kind === 'native') {
-      const nativeCursor = readNonEmptyString(parsed?.cursor)
-      if (!nativeCursor) throw new Error('Missing native cursor')
-      return { kind, cursor: nativeCursor, seenImportedIds: normalizeStringArray(parsed?.seenImportedIds) }
+    const nonce = Buffer.from(encodedNonce, 'base64url')
+    const ciphertext = Buffer.from(encodedCiphertext, 'base64url')
+    const tag = Buffer.from(encodedTag, 'base64url')
+    if (
+      nonce.length !== THREAD_LIST_CURSOR_NONCE_BYTES
+      || tag.length !== THREAD_LIST_CURSOR_TAG_BYTES
+      || ciphertext.length === 0
+      || ciphertext.length > MAX_THREAD_LIST_CURSOR_PAYLOAD_BYTES
+    ) {
+      throw invalidThreadListCursor()
     }
-    if (kind === 'imports') {
-      const beforeUpdatedAt = parsed?.beforeUpdatedAt === null
-        ? null
-        : typeof parsed?.beforeUpdatedAt === 'number' && Number.isFinite(parsed.beforeUpdatedAt)
-          ? parsed.beforeUpdatedAt
-          : Number.NaN
-      const beforeId = readNonEmptyString(parsed?.beforeId)
-      if (Number.isNaN(beforeUpdatedAt) || (beforeUpdatedAt !== null && !beforeId)) {
-        throw new Error('Invalid import cursor boundary')
-      }
-      return { kind, beforeUpdatedAt, beforeId, seenImportedIds: normalizeStringArray(parsed?.seenImportedIds) }
-    }
-    if (kind === 'session-index') {
-      const beforeUpdatedAtMs = parsed?.beforeUpdatedAtMs
-      const beforeId = readNonEmptyString(parsed?.beforeId)
-      if (
-        typeof beforeUpdatedAtMs !== 'number'
-        || !Number.isSafeInteger(beforeUpdatedAtMs)
-        || beforeUpdatedAtMs < 0
-        || !beforeId
-      ) {
-        throw new Error('Invalid session index cursor boundary')
-      }
-      return { kind, beforeUpdatedAtMs, beforeId, seenThreadIds: normalizeStringArray(parsed?.seenThreadIds) }
-    }
-  } catch {
-    const error = new Error('Invalid thread list cursor.')
-    error.name = 'InvalidThreadListCursorError'
-    throw error
+    const decipher = createDecipheriv('aes-256-gcm', await readThreadListCursorKey(), nonce)
+    decipher.setAuthTag(tag)
+    const plaintext = Buffer.concat([decipher.update(ciphertext), decipher.final()])
+    if (plaintext.length > MAX_THREAD_LIST_CURSOR_PAYLOAD_BYTES) throw invalidThreadListCursor()
+    return parseThreadListCursorPayload(JSON.parse(plaintext.toString('utf8')) as unknown)
+  } catch (error) {
+    if (error instanceof Error && error.name === 'InvalidThreadListCursorError') throw error
+    throw invalidThreadListCursor()
   }
-  const error = new Error('Invalid thread list cursor.')
-  error.name = 'InvalidThreadListCursorError'
-  throw error
 }
 
 async function readImportedThreadListCursorPage(
@@ -3634,24 +5792,33 @@ async function readImportedThreadListCursorPage(
   const limit = typeof paramsRecord?.limit === 'number' && Number.isInteger(paramsRecord.limit)
     ? Math.min(MAX_THREAD_LIST_PAGE_SIZE, Math.max(1, paramsRecord.limit))
     : 5
-  const available = await listImportedThreadsFromStateDb({
+  const availablePage = await listImportedThreadsFromStateDbPage({
     beforeUpdatedAt: cursor.beforeUpdatedAt,
     beforeId: cursor.beforeId,
-    excludedIds: cursor.seenImportedIds,
+    excludedIds: await readThreadListSeenImportedIds(cursor),
     limit: limit + 1,
   })
+  const available = availablePage.data
   const data = available.slice(0, limit)
   const last = asRecord(data.at(-1))
   const lastId = readNonEmptyString(last?.id)
   const lastUpdatedAt = typeof last?.updatedAt === 'number' ? last.updatedAt : 0
   return {
     data,
-    nextCursor: available.length > data.length && lastId
-      ? encodeThreadListCursor({
+    nextCursor: ((available.length > data.length && lastId) || availablePage.scanContinuation)
+      ? await encodeThreadListCursor({
           kind: 'imports',
-          beforeUpdatedAt: lastUpdatedAt,
-          beforeId: lastId,
+          beforeUpdatedAt: available.length > data.length && lastId
+            ? lastUpdatedAt
+            : availablePage.scanContinuation!.beforeUpdatedAt,
+          beforeId: available.length > data.length && lastId
+            ? lastId
+            : availablePage.scanContinuation!.beforeId,
           seenImportedIds: cursor.seenImportedIds,
+          seenImportedSnapshotId: cursor.seenImportedSnapshotId,
+          ...(cursor.seenImportedSnapshotOffset === undefined
+            ? {}
+            : { seenImportedSnapshotOffset: cursor.seenImportedSnapshotOffset }),
         })
       : null,
   }
@@ -3669,82 +5836,225 @@ async function mergeImportedThreadsIntoThreadListResult(
   const nativeThreadIds = data
     .map((item) => readNonEmptyString(asRecord(item)?.id))
     .filter(Boolean)
+  const seenImportedIds = requestCursor
+    ? await readThreadListSeenImportedIds(requestCursor)
+    : new Set<string>()
   const importedById = new Map<string, Record<string, unknown>>()
-  for (const thread of await listImportedThreadsFromStateDb({
-    threadIds: nativeThreadIds,
-    limit: Math.min(MAX_THREAD_LIST_PAGE_SIZE + 1, nativeThreadIds.length || 1),
-  })) {
+  const limit = typeof paramsRecord?.limit === 'number' && Number.isInteger(paramsRecord.limit)
+    ? Math.min(MAX_THREAD_LIST_PAGE_SIZE, Math.max(1, paramsRecord.limit))
+    : data.length
+  const [nativeImports, importedStatePage] = await Promise.all([
+    listImportedThreadsFromStateDb({
+      threadIds: nativeThreadIds,
+      limit: Math.min(MAX_THREAD_LIST_PAGE_SIZE + 1, nativeThreadIds.length || 1),
+      skipArchiveFilter: true,
+    }),
+    listImportedThreadsFromStateDbPage({
+      ...(requestCursor?.importBeforeUpdatedAt !== undefined ? {
+        beforeUpdatedAt: requestCursor.importBeforeUpdatedAt,
+        beforeId: requestCursor.importBeforeId,
+      } : {}),
+      excludedIds: seenImportedIds,
+      additionalExcludedIds: nativeThreadIds,
+      limit: limit + 1,
+      skipArchiveFilter: true,
+    }),
+  ])
+  for (const thread of nativeImports) {
     const id = readNonEmptyString(thread.id)
     if (id) importedById.set(id, thread)
   }
-  const seenImportedIds = new Set(requestCursor?.seenImportedIds ?? [])
-  const mergedData: unknown[] = []
+  const nativeImportedIds = new Set<string>()
+  const enrichedNativeData: unknown[] = []
   for (const item of data) {
     const id = readNonEmptyString(asRecord(item)?.id)
     const imported = id ? importedById.get(id) : undefined
     if (imported) {
-      seenImportedIds.add(id)
-      mergedData.push({ ...asRecord(item), ...imported })
+      nativeImportedIds.add(id)
+      enrichedNativeData.push({ ...asRecord(item), ...imported })
       importedById.delete(id)
     } else {
-      mergedData.push(item)
+      enrichedNativeData.push(item)
     }
   }
-  const limit = typeof paramsRecord?.limit === 'number' && Number.isInteger(paramsRecord.limit)
-    ? Math.min(MAX_THREAD_LIST_PAGE_SIZE, Math.max(1, paramsRecord.limit))
-    : data.length
+  const compareRows = (a: unknown, b: unknown): number => {
+    const aRecord = asRecord(a)
+    const bRecord = asRecord(b)
+    const aUpdated = typeof aRecord?.updatedAt === 'number' ? aRecord.updatedAt : 0
+    const bUpdated = typeof bRecord?.updatedAt === 'number' ? bRecord.updatedAt : 0
+    return bUpdated - aUpdated
+      || readNonEmptyString(bRecord?.id).localeCompare(readNonEmptyString(aRecord?.id))
+  }
+  const seenNativeIds = new Set(requestCursor?.seenNativeIds ?? [])
+  const remainingNativeData = enrichedNativeData.filter((item) => {
+    const id = readNonEmptyString(asRecord(item)?.id)
+    return !id || (!seenNativeIds.has(id) && !seenImportedIds.has(id))
+  })
   const nativeNextCursor = readNonEmptyString(record.nextCursor)
   const hasNextPage = nativeNextCursor.length > 0
-  let nextCursor: string | null = hasNextPage
-    ? encodeThreadListCursor({
-        kind: 'native',
-        cursor: nativeNextCursor,
-        seenImportedIds: [...seenImportedIds],
-      })
+  const sortedNativeData = [...enrichedNativeData].sort(compareRows)
+  const nativePageBoundary = sortedNativeData.at(-1)
+  const eligibleImportedData = importedStatePage.data.filter((item) => (
+    !hasNextPage
+    || (nativePageBoundary !== undefined && compareRows(item, nativePageBoundary) <= 0)
+  ))
+  const eligibleImportedIds = new Set(eligibleImportedData
+    .map((item) => readNonEmptyString(asRecord(item)?.id))
+    .filter(Boolean))
+  const importedScanBoundary = importedStatePage.scanContinuation
+    ? {
+        id: importedStatePage.scanContinuation.beforeId,
+        updatedAt: importedStatePage.scanContinuation.beforeUpdatedAt,
+      }
     : null
-  if (!hasNextPage) {
-    const appendCount = Math.max(0, limit - mergedData.length)
-    const importedRemainder = await listImportedThreadsFromStateDb({
-      excludedIds: [...seenImportedIds],
-      limit: appendCount + 1,
+  const safelyOrderedNativeData = importedScanBoundary
+    ? remainingNativeData.filter((item) => compareRows(item, importedScanBoundary) <= 0)
+    : remainingNativeData
+  const mergedData = [...safelyOrderedNativeData, ...eligibleImportedData].sort(compareRows).slice(0, limit)
+  const emittedRows = new Set(mergedData)
+  const emittedNativeIds = safelyOrderedNativeData
+    .filter((item) => emittedRows.has(item))
+    .map((item) => readNonEmptyString(asRecord(item)?.id))
+    .filter(Boolean)
+  const newlySeenImportedIds = emittedNativeIds.filter((id) => nativeImportedIds.has(id))
+  const emittedImportedIds = mergedData
+    .map((item) => readNonEmptyString(asRecord(item)?.id))
+    .filter((id) => eligibleImportedIds.has(id))
+  newlySeenImportedIds.push(...emittedImportedIds)
+  const nativeRemainder = remainingNativeData.filter((item) => !emittedRows.has(item))
+  let persistedSeenState: Awaited<ReturnType<typeof writeThreadListSeenImportedIds>> | null = null
+  const persistSeenState = async (): Promise<Awaited<ReturnType<typeof writeThreadListSeenImportedIds>>> => {
+    persistedSeenState ??= await writeThreadListSeenImportedIds(
+      requestCursor,
+      seenImportedIds,
+      newlySeenImportedIds,
+    )
+    return persistedSeenState
+  }
+  let nextCursor: string | null = null
+  const emittedImportedIdSet = new Set(emittedImportedIds)
+  const consumedImportedScan = importedStatePage.data.every((item) => (
+    emittedImportedIdSet.has(readNonEmptyString(asRecord(item)?.id))
+  ))
+  const importedScanCursor = importedStatePage.scanContinuation && consumedImportedScan
+    ? {
+        importBeforeUpdatedAt: importedStatePage.scanContinuation.beforeUpdatedAt,
+        importBeforeId: importedStatePage.scanContinuation.beforeId,
+      }
+    : requestCursor?.importBeforeUpdatedAt !== undefined
+      ? {
+          importBeforeUpdatedAt: requestCursor.importBeforeUpdatedAt,
+          importBeforeId: requestCursor.importBeforeId,
+        }
+      : {}
+  if (nativeRemainder.length > 0) {
+    const seenState = await persistSeenState()
+    nextCursor = await encodeThreadListCursor({
+      kind: 'native',
+      cursor: requestCursor?.cursor ?? (readNonEmptyString(paramsRecord?.cursor) || null),
+      seenNativeIds: [...seenNativeIds, ...emittedNativeIds],
+      ...importedScanCursor,
+      ...seenState,
     })
-    const appendedImports = importedRemainder.slice(0, appendCount)
-    mergedData.push(...appendedImports)
-    if (importedRemainder.length > appendedImports.length) {
-      const lastAppended = asRecord(appendedImports.at(-1))
+  } else if (hasNextPage) {
+    const seenState = await persistSeenState()
+    nextCursor = await encodeThreadListCursor({
+      kind: 'native',
+      cursor: nativeNextCursor,
+      seenNativeIds: [],
+      ...importedScanCursor,
+      ...seenState,
+    })
+  } else {
+    const hasImportedRemainder = importedStatePage.data.length > emittedImportedIds.length
+      || importedStatePage.scanContinuation !== null
+    if (hasImportedRemainder) {
+      const seenState = await persistSeenState()
+      const lastAppended = asRecord(mergedData.filter((item) => (
+        eligibleImportedIds.has(readNonEmptyString(asRecord(item)?.id))
+      )).at(-1))
       const lastAppendedId = readNonEmptyString(lastAppended?.id)
       const lastAppendedUpdatedAt = typeof lastAppended?.updatedAt === 'number'
         ? lastAppended.updatedAt
         : null
-      nextCursor = encodeThreadListCursor({
+      nextCursor = await encodeThreadListCursor({
         kind: 'imports',
-        beforeUpdatedAt: lastAppendedId ? lastAppendedUpdatedAt : null,
-        beforeId: lastAppendedId,
-        seenImportedIds: [...seenImportedIds],
+        beforeUpdatedAt: lastAppendedId
+          ? lastAppendedUpdatedAt
+          : null,
+        beforeId: lastAppendedId
+          ? lastAppendedId
+          : '',
+        ...seenState,
       })
     }
   }
   return {
     ...record,
     nextCursor,
-    data: mergedData.sort((a, b) => {
-      const aUpdated = typeof asRecord(a)?.updatedAt === 'number' ? asRecord(a)?.updatedAt as number : 0
-      const bUpdated = typeof asRecord(b)?.updatedAt === 'number' ? asRecord(b)?.updatedAt as number : 0
-      return bUpdated - aUpdated
-    }).slice(0, limit),
+    data: mergedData,
   }
 }
 
-async function collectProjectChatZipEntries(projectRoot: string): Promise<ProjectZipVirtualEntry[]> {
+type ProjectChatZipCollectionOperations = {
+  readThreadMetadata?: (threadIds: readonly string[]) => Promise<Map<string, ExportedThreadMetadata>>
+  readArchivedThreadIds?: (threadIds: readonly string[]) => Promise<Set<string>>
+}
+
+async function readFirstJsonlLineFromHandle(
+  handle: FileHandle,
+  onBytesRead?: (bytesRead: number) => void,
+): Promise<string> {
+  const chunks: Buffer[] = []
+  let totalBytes = 0
+  while (totalBytes <= PROJECT_ZIP_SESSION_META_MAX_BYTES) {
+    const remaining = PROJECT_ZIP_SESSION_META_MAX_BYTES + 1 - totalBytes
+    const buffer = Buffer.alloc(Math.min(64 * 1024, remaining))
+    const { bytesRead } = await handle.read(buffer, 0, buffer.length, totalBytes)
+    if (bytesRead === 0) return Buffer.concat(chunks, totalBytes).toString('utf8')
+    onBytesRead?.(bytesRead)
+    const chunk = buffer.subarray(0, bytesRead)
+    const newline = chunk.indexOf(0x0a)
+    if (newline >= 0) {
+      const lineBytes = totalBytes + newline
+      if (lineBytes > PROJECT_ZIP_SESSION_META_MAX_BYTES) return ''
+      chunks.push(chunk.subarray(0, newline))
+      return Buffer.concat(chunks, lineBytes).toString('utf8').replace(/\r$/u, '')
+    }
+    chunks.push(chunk)
+    totalBytes += bytesRead
+    if (totalBytes > PROJECT_ZIP_SESSION_META_MAX_BYTES) return ''
+  }
+  return ''
+}
+
+async function readFirstJsonlLine(
+  path: string,
+  onBytesRead?: (bytesRead: number) => void,
+): Promise<string> {
+  const handle = await open(path, 'r')
+  try {
+    return await readFirstJsonlLineFromHandle(handle, onBytesRead)
+  } finally {
+    await handle.close().catch(() => undefined)
+  }
+}
+
+export async function collectProjectChatZipEntries(
+  projectRoot: string,
+  operations: ProjectChatZipCollectionOperations = {},
+): Promise<ProjectZipVirtualEntry[]> {
   const canonicalProjectRoot = await realpath(projectRoot)
   const codexHome = getCodexHomeDir()
   const threadTitles = await readMergedThreadTitleCache()
-  const stateDbThreadMetadata = readStateDbThreadExportMetadata()
   const exportedTitles: Record<string, string> = {}
   const exportedThreads: Record<string, ExportedThreadMetadata> = {}
+  const pendingSessions: Array<{ zipPath: string; sessionPath: string; sessionId: string }> = []
+  const pendingSessionBounds = createProjectZipExportBoundsState()
+  let scannedSessionFiles = 0
+  let scannedSessionMetaBytes = 0
   const roots = [
     { disk: join(codexHome, 'sessions'), zip: '.codex-project/chats/sessions' },
-    { disk: join(codexHome, 'archived_sessions'), zip: '.codex-project/chats/archived_sessions' },
   ]
   const entries: ProjectZipVirtualEntry[] = [{
     path: '.codex-project/manifest.json',
@@ -3755,30 +6065,19 @@ async function collectProjectChatZipEntries(projectRoot: string): Promise<Projec
     }, null, 2)),
     mtime: new Date(),
   }]
-
-  for (const root of roots) {
-    for await (const sessionPath of walkFiles(root.disk)) {
-      if (extname(sessionPath) !== '.jsonl') continue
-      let raw = ''
-      try {
-        raw = await readFile(sessionPath, 'utf8')
-      } catch {
-        continue
-      }
-      const sessionCwd = readSessionMetaCwd(raw)
-      if (!sessionCwd) continue
-      let canonicalSessionCwd = ''
-      try {
-        canonicalSessionCwd = await realpath(sessionCwd)
-      } catch {
-        canonicalSessionCwd = isAbsolute(sessionCwd) ? resolve(sessionCwd) : resolve(sessionCwd)
-      }
-      if (!isSameOrDescendantPath(canonicalSessionCwd, canonicalProjectRoot)) continue
-      const rel = relative(root.disk, sessionPath).split(sep).join('/')
-      const zipPath = `${root.zip}/${rel}`
-      const sessionId = readSessionMetaId(raw)
+  const appendSessionBatch = async (
+    currentBatch: Array<{ zipPath: string; sessionPath: string; sessionId: string }>,
+    archivedSessionIds: ReadonlySet<string>,
+  ): Promise<void> => {
+    const sessionIds = currentBatch.map(({ sessionId }) => sessionId).filter(Boolean)
+    const stateDbThreadMetadata = await (
+      operations.readThreadMetadata ?? readStateDbThreadExportMetadata
+    )(sessionIds)
+    for (const { zipPath, sessionPath, sessionId } of currentBatch) {
+      if (!sessionId || archivedSessionIds.has(sessionId)) continue
       const stateMetadata = sessionId ? stateDbThreadMetadata.get(sessionId) : undefined
-      const title = readNonEmptyString(stateMetadata?.title) || (sessionId ? readNonEmptyString(threadTitles.titles[sessionId]) : '')
+      const title = readNonEmptyString(stateMetadata?.title)
+        || (sessionId ? readNonEmptyString(threadTitles.titles[sessionId]) : '')
       if (title) exportedTitles[zipPath] = title
       if (title || (stateMetadata?.updatedAtMs ?? 0) > 0) {
         exportedThreads[zipPath] = {
@@ -3792,6 +6091,57 @@ async function collectProjectChatZipEntries(projectRoot: string): Promise<Projec
         mtime: new Date(),
       })
     }
+  }
+
+  for (const root of roots) {
+    for await (const sessionPath of walkFiles(root.disk)) {
+      if (extname(sessionPath) !== '.jsonl') continue
+      scannedSessionFiles += 1
+      if (scannedSessionFiles > PROJECT_ZIP_SESSION_SCAN_MAX_FILES) {
+        throw new Error('Project chat export exceeds the session scan limit')
+      }
+      let raw = ''
+      let sessionMetaBytesRead = 0
+      try {
+        raw = await readFirstJsonlLine(sessionPath, (bytesRead) => {
+          sessionMetaBytesRead += bytesRead
+        })
+      } catch {
+        continue
+      } finally {
+        scannedSessionMetaBytes += sessionMetaBytesRead
+        if (scannedSessionMetaBytes > PROJECT_ZIP_SESSION_SCAN_MAX_META_BYTES) {
+          throw new Error('Project chat export exceeds the session metadata scan limit')
+        }
+      }
+      const sessionCwd = readSessionMetaCwd(raw)
+      if (!sessionCwd) continue
+      let canonicalSessionCwd = ''
+      try {
+        canonicalSessionCwd = await realpath(sessionCwd)
+      } catch {
+        canonicalSessionCwd = isAbsolute(sessionCwd) ? resolve(sessionCwd) : resolve(sessionCwd)
+      }
+      if (!isSameOrDescendantPath(canonicalSessionCwd, canonicalProjectRoot)) continue
+      const rel = relative(root.disk, sessionPath).split(sep).join('/')
+      const zipPath = `${root.zip}/${rel}`
+      const sessionId = readSessionMetaId(raw)
+      if (!sessionId) continue
+      addProjectZipExportBound(pendingSessionBounds, {
+        zipPath,
+        size: (await stat(sessionPath)).size,
+      })
+      pendingSessions.push({ zipPath, sessionPath, sessionId })
+    }
+  }
+  const sessionIds = pendingSessions.map(({ sessionId }) => sessionId).filter(Boolean)
+  const archivedSessionIds = sessionIds.length === 0
+    ? new Set<string>()
+    : operations.readArchivedThreadIds
+      ? await operations.readArchivedThreadIds(sessionIds)
+      : await readAuthoritativeArchivedThreadIds(sessionIds, { fresh: true })
+  for (let offset = 0; offset < pendingSessions.length; offset += 100) {
+    await appendSessionBatch(pendingSessions.slice(offset, offset + 100), archivedSessionIds)
   }
   if (Object.keys(exportedTitles).length > 0 || Object.keys(exportedThreads).length > 0) {
     entries.push({
@@ -3822,44 +6172,144 @@ function normalizeImportedZipPath(value: string): string {
   return normalized
 }
 
-function parseStoredProjectZip(buffer: Buffer): ParsedProjectZipEntry[] {
-  const eocdSignature = Buffer.from([0x50, 0x4b, 0x05, 0x06])
-  const eocdOffset = buffer.lastIndexOf(eocdSignature)
+export function parseStoredProjectZip(buffer: Buffer): ParsedProjectZipEntry[] {
+  let eocdOffset = -1
+  for (let offset = buffer.length - 22; offset >= Math.max(0, buffer.length - 22 - 0xffff); offset -= 1) {
+    if (
+      readZipUInt32(buffer, offset) === 0x06054b50
+      && offset + 22 + readZipUInt16(buffer, offset + 20) === buffer.length
+    ) {
+      eocdOffset = offset
+      break
+    }
+  }
   if (eocdOffset < 0) throw new Error('Project ZIP is missing a central directory')
+  if (
+    readZipUInt16(buffer, eocdOffset + 4) !== 0
+    || readZipUInt16(buffer, eocdOffset + 6) !== 0
+  ) throw new Error('Invalid project ZIP: multi-disk archives are unsupported')
+  const diskEntryCount = readZipUInt16(buffer, eocdOffset + 8)
   const entryCount = readZipUInt16(buffer, eocdOffset + 10)
+  if (diskEntryCount !== entryCount) throw new Error('Invalid project ZIP: entry count mismatch')
+  if (entryCount > PROJECT_ZIP_IMPORT_MAX_ENTRIES) throw new Error('Invalid project ZIP: too many entries')
+  const centralSize = readZipUInt32(buffer, eocdOffset + 12)
   const centralOffset = readZipUInt32(buffer, eocdOffset + 16)
+  const centralEnd = centralOffset + centralSize
+  if (centralEnd !== eocdOffset || centralEnd > buffer.length) {
+    throw new Error('Invalid project ZIP: central directory bounds are invalid')
+  }
   const entries: ParsedProjectZipEntry[] = []
+  const pendingEntries: Array<ParsedProjectZipEntry & { crcData: Buffer; expectedCrc32: number }> = []
+  const seenPaths = new Set<string>()
+  const seenLocalOffsets = new Set<number>()
+  const localRecordRanges: Array<{ start: number; end: number }> = []
+  let logicalBytes = 0
   let cursor = centralOffset
 
   for (let index = 0; index < entryCount; index += 1) {
+    if (cursor + 46 > centralEnd) throw new Error('Invalid project ZIP: central entry is truncated')
     if (readZipUInt32(buffer, cursor) !== 0x02014b50) throw new Error('Project ZIP central directory is invalid')
+    const flags = readZipUInt16(buffer, cursor + 8)
     const method = readZipUInt16(buffer, cursor + 10)
     if (method !== 0) throw new Error('Project ZIP import only supports stored entries')
+    if ((flags & ~0x0808) !== 0) throw new Error('Invalid project ZIP: unsupported entry flags')
+    const expectedCrc32 = readZipUInt32(buffer, cursor + 16)
     const compressedSize = readZipUInt32(buffer, cursor + 20)
+    const uncompressedSize = readZipUInt32(buffer, cursor + 24)
+    if (compressedSize !== uncompressedSize) throw new Error('Invalid project ZIP: stored entry size mismatch')
     const fileNameLength = readZipUInt16(buffer, cursor + 28)
     const extraLength = readZipUInt16(buffer, cursor + 30)
     const commentLength = readZipUInt16(buffer, cursor + 32)
     const externalAttributes = readZipUInt32(buffer, cursor + 38)
     const localHeaderOffset = readZipUInt32(buffer, cursor + 42)
-    const rawPath = buffer.subarray(cursor + 46, cursor + 46 + fileNameLength).toString('utf8')
+    const centralEntryEnd = cursor + 46 + fileNameLength + extraLength + commentLength
+    if (centralEntryEnd > centralEnd) throw new Error('Invalid project ZIP: central entry exceeds its directory')
+    const centralName = buffer.subarray(cursor + 46, cursor + 46 + fileNameLength)
+    const rawPath = centralName.toString('utf8')
     const path = normalizeImportedZipPath(rawPath)
-    const isDirectory = path.endsWith('/') || ((externalAttributes >>> 4) & 0x10) === 0x10
+    if (seenPaths.has(path) || seenLocalOffsets.has(localHeaderOffset)) {
+      throw new Error('Invalid project ZIP: duplicate entry')
+    }
+    seenPaths.add(path)
+    seenLocalOffsets.add(localHeaderOffset)
+    const isDirectory = path.endsWith('/') || (externalAttributes & 0x10) === 0x10
 
+    if (localHeaderOffset + 30 > centralOffset) throw new Error('Invalid project ZIP: local header is out of bounds')
     if (readZipUInt32(buffer, localHeaderOffset) !== 0x04034b50) throw new Error('Project ZIP local header is invalid')
+    const localFlags = readZipUInt16(buffer, localHeaderOffset + 6)
+    const localMethod = readZipUInt16(buffer, localHeaderOffset + 8)
+    if (localFlags !== flags || localMethod !== method) {
+      throw new Error('Invalid project ZIP: local and central headers disagree')
+    }
     const localNameLength = readZipUInt16(buffer, localHeaderOffset + 26)
     const localExtraLength = readZipUInt16(buffer, localHeaderOffset + 28)
+    const localNameEnd = localHeaderOffset + 30 + localNameLength
+    if (localNameEnd + localExtraLength > centralOffset) throw new Error('Invalid project ZIP: local entry is truncated')
+    const localName = buffer.subarray(localHeaderOffset + 30, localNameEnd)
+    if (!localName.equals(centralName)) throw new Error('Invalid project ZIP: local entry name mismatch')
     const dataOffset = localHeaderOffset + 30 + localNameLength + localExtraLength
-    entries.push({
+    const dataEnd = dataOffset + compressedSize
+    if (dataEnd > centralOffset) throw new Error('Invalid project ZIP: entry data is truncated')
+    let localRecordEnd = dataEnd
+    if ((flags & 0x0008) !== 0) {
+      let descriptorOffset = dataEnd
+      if (readZipUInt32(buffer, descriptorOffset) === 0x08074b50) descriptorOffset += 4
+      if (
+        descriptorOffset + 12 > centralOffset
+        || readZipUInt32(buffer, descriptorOffset) !== expectedCrc32
+        || readZipUInt32(buffer, descriptorOffset + 4) !== compressedSize
+        || readZipUInt32(buffer, descriptorOffset + 8) !== uncompressedSize
+      ) throw new Error('Invalid project ZIP: data descriptor mismatch')
+      localRecordEnd = descriptorOffset + 12
+    } else if (
+      readZipUInt32(buffer, localHeaderOffset + 14) !== expectedCrc32
+      || readZipUInt32(buffer, localHeaderOffset + 18) !== compressedSize
+      || readZipUInt32(buffer, localHeaderOffset + 22) !== uncompressedSize
+    ) {
+      throw new Error('Invalid project ZIP: local entry integrity mismatch')
+    }
+    localRecordRanges.push({ start: localHeaderOffset, end: localRecordEnd })
+    logicalBytes += uncompressedSize
+    if (logicalBytes > PROJECT_ZIP_IMPORT_MAX_LOGICAL_BYTES) {
+      throw new Error('Invalid project ZIP: logical data exceeds the import limit')
+    }
+    const data = buffer.subarray(dataOffset, dataEnd)
+    pendingEntries.push({
       path,
-      data: isDirectory ? Buffer.alloc(0) : buffer.subarray(dataOffset, dataOffset + compressedSize),
+      data: isDirectory ? Buffer.alloc(0) : data,
       isDirectory,
+      crcData: data,
+      expectedCrc32,
     })
-    cursor += 46 + fileNameLength + extraLength + commentLength
+    cursor = centralEntryEnd
+  }
+  if (cursor !== centralEnd) throw new Error('Invalid project ZIP: central directory size mismatch')
+  localRecordRanges.sort((left, right) => left.start - right.start || left.end - right.end)
+  for (let index = 1; index < localRecordRanges.length; index += 1) {
+    if (localRecordRanges[index - 1]!.end > localRecordRanges[index]!.start) {
+      throw new Error('Invalid project ZIP: local entry records overlap')
+    }
+  }
+  for (const { crcData, expectedCrc32, ...entry } of pendingEntries) {
+    const actualCrc32 = (updateZipCrc32(0xffffffff, crcData) ^ 0xffffffff) >>> 0
+    if (actualCrc32 !== expectedCrc32) throw new Error('Invalid project ZIP: entry CRC mismatch')
+    entries.push(entry)
   }
   return entries
 }
 
-async function importProjectZip(buffer: Buffer, destinationParent: string): Promise<{ projectPath: string; importedSessions: number }> {
+type ImportProjectZipOperations = {
+  writeSessionFile?: (path: string, contents: string) => Promise<void>
+  afterGlobalStatePersist?: () => Promise<void>
+}
+
+const PROJECT_IMPORT_LOCK_DIRECTORY = '.codex-mobile-project-import.lock'
+
+async function importProjectZipWithLockHeld(
+  buffer: Buffer,
+  destinationParent: string,
+  operations: ImportProjectZipOperations = {},
+): Promise<{ projectPath: string; importedSessions: number }> {
   const entries = parseStoredProjectZip(buffer)
   const manifestEntry = entries.find((entry) => entry.path === '.codex-project/manifest.json' && !entry.isDirectory)
   let projectName = 'imported-project'
@@ -3901,63 +6351,132 @@ async function importProjectZip(buffer: Buffer, destinationParent: string): Prom
   }
 
   const parent = await realpath(destinationParent)
-  let projectPath = join(parent, projectName)
-  for (let index = 2; existsSync(projectPath); index += 1) {
-    projectPath = join(parent, `${projectName}-${index}`)
+  let projectPath = ''
+  for (let index = 1; ; index += 1) {
+    const candidate = join(parent, index === 1 ? projectName : `${projectName}-${index}`)
+    try {
+      await mkdir(candidate, { recursive: false })
+      projectPath = candidate
+      break
+    } catch (error) {
+      if (getErrorCode(error) === 'EEXIST') continue
+      throw error
+    }
   }
-  await mkdir(projectPath, { recursive: true })
-
-  let importedSessions = 0
   const importedSessionRecords: ImportedSessionRecord[] = []
+  const importedSessionPaths: string[] = []
   const importedSessionsRoot = join(getCodexHomeDir(), 'sessions')
-  const chatEntries = entries
-    .filter((entry) => entry.path.startsWith('.codex-project/chats/') && !entry.isDirectory && extname(entry.path) === '.jsonl')
-    .map((entry) => {
-      const importedMetadata = importedThreadMetadata.get(entry.path)
+  let stateDbMutationAttempted = false
+  let globalStateSnapshot: ProjectImportGlobalStateSnapshot | null = null
+  try {
+    const chatEntries = entries
+      .filter((entry) => (
+        entry.path.startsWith('.codex-project/chats/sessions/')
+        && !entry.isDirectory
+        && extname(entry.path) === '.jsonl'
+      ))
+      .map((entry) => {
+        const importedMetadata = importedThreadMetadata.get(entry.path)
+        const sourceSessionRaw = entry.data.toString('utf8')
+        const sourceRecord = readImportedSessionRecord(
+          sourceSessionRaw,
+          entry.path,
+          projectPath,
+          readSessionMetaId(sourceSessionRaw) || randomUUID(),
+          importedMetadata?.title ?? '',
+        )
+        const updatedAtMs = (importedMetadata?.updatedAtMs ?? 0) > 0
+          ? importedMetadata?.updatedAtMs ?? 0
+          : sourceRecord.updatedAtMs
+        return { entry, importedMetadata, sourceRecord, updatedAtMs }
+      })
+      .sort((first, second) => second.updatedAtMs - first.updatedAtMs)
+    for (const [index, chatEntry] of chatEntries.entries()) {
+      const { entry, importedMetadata, sourceRecord, updatedAtMs } = chatEntry
       const sourceSessionRaw = entry.data.toString('utf8')
-      const sourceRecord = readImportedSessionRecord(sourceSessionRaw, entry.path, projectPath, readSessionMetaId(sourceSessionRaw) || randomUUID(), importedMetadata?.title ?? '')
-      const updatedAtMs = (importedMetadata?.updatedAtMs ?? 0) > 0 ? importedMetadata?.updatedAtMs ?? 0 : sourceRecord.updatedAtMs
-      return { entry, importedMetadata, sourceSessionRaw, sourceRecord, updatedAtMs }
-    })
-    .sort((first, second) => second.updatedAtMs - first.updatedAtMs)
-
-  for (const [index, chatEntry] of chatEntries.entries()) {
-    const importedThreadId = randomUUID()
-    const target = join(importedSessionsRoot, 'imported', `${String(index + 1).padStart(6, '0')}-${importedThreadId}.jsonl`)
-    await mkdir(dirname(target), { recursive: true })
-    const importedSessionRaw = rewriteImportedSession(chatEntry.sourceSessionRaw, projectPath, importedThreadId)
-    await writeFile(target, importedSessionRaw, 'utf8')
-    const importedRecord = readImportedSessionRecord(importedSessionRaw, target, projectPath, importedThreadId, chatEntry.importedMetadata?.title ?? '')
-    if (chatEntry.updatedAtMs > 0) {
-      importedRecord.updatedAtMs = chatEntry.updatedAtMs
-      importedRecord.createdAtMs = Math.min(chatEntry.sourceRecord.createdAtMs, importedRecord.updatedAtMs)
-      const updatedAtDate = new Date(chatEntry.updatedAtMs)
-      await utimes(target, updatedAtDate, updatedAtDate).catch(() => {})
-    }
-    importedSessionRecords.push(importedRecord)
-    if (importedRecord.title) {
-      await updateThreadTitleState(importedThreadId, importedRecord.title)
-    }
-    importedSessions += 1
-  }
-  registerImportedSessionsInStateDb(importedSessionRecords)
-
-  for (const entry of entries) {
-    if (entry.path.startsWith('.codex-project/chats/')) {
-      continue
-    }
-    const target = join(projectPath, entry.path)
-    if (!isSameOrDescendantPath(target, projectPath)) throw new Error('Project ZIP contains an unsafe path')
-    if (entry.isDirectory) {
-      await mkdir(target, { recursive: true })
-    } else {
+      const importedThreadId = randomUUID()
+      const target = join(importedSessionsRoot, 'imported', `${String(index + 1).padStart(6, '0')}-${importedThreadId}.jsonl`)
       await mkdir(dirname(target), { recursive: true })
-      await writeFile(target, entry.data)
+      const importedSessionRaw = rewriteImportedSession(sourceSessionRaw, projectPath, importedThreadId)
+      importedSessionPaths.push(target)
+      if (operations.writeSessionFile) await operations.writeSessionFile(target, importedSessionRaw)
+      else await writeFile(target, importedSessionRaw, 'utf8')
+      const importedRecord = readImportedSessionRecord(
+        importedSessionRaw,
+        target,
+        projectPath,
+        importedThreadId,
+        importedMetadata?.title ?? '',
+      )
+      if (updatedAtMs > 0) {
+        importedRecord.updatedAtMs = updatedAtMs
+        importedRecord.createdAtMs = Math.min(sourceRecord.createdAtMs, importedRecord.updatedAtMs)
+        const updatedAtDate = new Date(updatedAtMs)
+        await utimes(target, updatedAtDate, updatedAtDate).catch(() => {})
+      }
+      importedSessionRecords.push(importedRecord)
     }
-  }
 
-  await persistWorkspaceRoot(projectPath, projectName)
-  return { projectPath, importedSessions }
+    for (const entry of entries) {
+      if (entry.path.startsWith('.codex-project/chats/')) continue
+      const target = join(projectPath, entry.path)
+      if (!isSameOrDescendantPath(target, projectPath)) throw new Error('Project ZIP contains an unsafe path')
+      if (entry.isDirectory) {
+        await mkdir(target, { recursive: true })
+      } else {
+        await mkdir(dirname(target), { recursive: true })
+        await writeFile(target, entry.data)
+      }
+    }
+
+    if (importedSessionRecords.length > 0) {
+      stateDbMutationAttempted = true
+      await registerImportedSessionsInStateDb(importedSessionRecords)
+    }
+    await persistImportedProjectGlobalState(
+      importedSessionRecords,
+      projectPath,
+      projectName,
+      (snapshot) => { globalStateSnapshot = snapshot },
+    )
+    await operations.afterGlobalStatePersist?.()
+    return { projectPath, importedSessions: importedSessionRecords.length }
+  } catch (error) {
+    const rollbackOperations: Array<Promise<unknown>> = [
+      rm(projectPath, { recursive: true, force: true }),
+      ...importedSessionPaths.map((path) => rm(path, { force: true })),
+    ]
+    if (stateDbMutationAttempted) {
+      rollbackOperations.push(removeImportedSessionsFromStateDb(
+        importedSessionRecords.map((session) => session.id),
+      ))
+    }
+    if (globalStateSnapshot) rollbackOperations.push(restoreImportedProjectGlobalState(globalStateSnapshot))
+    const rollbackResults = await Promise.allSettled(rollbackOperations)
+    const rollbackFailures = rollbackResults.flatMap((result) => (
+      result.status === 'rejected' ? [result.reason] : []
+    ))
+    if (rollbackFailures.length > 0) {
+      const rollbackError = new Error('Project import failed and rollback was incomplete.')
+      rollbackError.name = 'ProjectImportRollbackError'
+      Object.assign(rollbackError, { cause: error, rollbackFailures })
+      throw rollbackError
+    }
+    throw error
+  }
+}
+
+export async function importProjectZip(
+  buffer: Buffer,
+  destinationParent: string,
+  operations: ImportProjectZipOperations = {},
+): Promise<{ projectPath: string; importedSessions: number }> {
+  return await withCrossProcessDirectoryLock(
+    getCodexHomeDir(),
+    PROJECT_IMPORT_LOCK_DIRECTORY,
+    { timeoutMs: 60_000, staleMs: 120_000 },
+    () => importProjectZipWithLockHeld(buffer, destinationParent, operations),
+  )
 }
 
 function logProviderModelDiscoveryWarning(message: string, details: Record<string, unknown>): void {
@@ -4437,12 +6956,16 @@ export async function callRpcWithArchiveRecovery(
   method: string,
   params: unknown,
   runtimeProbe?: Pick<ThreadRuntimeProbe, 'registerThread' | 'inspect'> &
-    Partial<Pick<ExternalThreadRuntimeProbe, 'interrupt'>>,
+    Partial<Pick<
+      ExternalThreadRuntimeProbe,
+      'interrupt' | 'inspectWriterEvidence' | 'inspectWriterEvidenceSnapshot' | 'inspectUnexpectedLifecycleSince'
+    >>,
   excludedPid: number | null = null,
   options: { locallyCreatedFirstTurn?: boolean } = {},
 ): Promise<unknown> {
   const paramsRecord = asRecord(params)
   const threadId = readNonEmptyString(paramsRecord?.threadId)
+  let turnStartWriterEvidenceBaseline: ExternalWriterEvidenceSnapshot | undefined
   await assertThreadActiveForRpc(appServer, method, threadId)
   if (threadId && runtimeProbe && THREAD_WRITER_METHODS_REQUIRING_IDLE.has(method)) {
     const inspection = await inspectThreadWriter(appServer, runtimeProbe, excludedPid, threadId)
@@ -4452,7 +6975,11 @@ export async function callRpcWithArchiveRecovery(
     if (inspection.state !== 'idle' && !allowsUnmaterializedFirstTurn) {
       const error = new Error('Cannot mutate a task because task writer ownership is not idle.')
       error.name = 'ThreadWriterOwnershipConflictError'
+      Object.assign(error, { turnStartDelivery: 'not_started' })
       throw error
+    }
+    if (method === 'turn/start' && inspection.state === 'idle') {
+      turnStartWriterEvidenceBaseline = inspection.writerEvidenceSnapshot
     }
   }
   if (method === 'thread/resume' && threadId && runtimeProbe) {
@@ -4480,6 +7007,8 @@ export async function callRpcWithArchiveRecovery(
         threadId,
         rawResult,
         options.locallyCreatedFirstTurn === true,
+        turnStartWriterEvidenceBaseline,
+        readNonEmptyString(paramsRecord?.clientUserMessageId),
       )
     }
     return rawResult
@@ -4512,6 +7041,8 @@ export async function callRpcWithArchiveRecovery(
             threadId,
             recovered,
             options.locallyCreatedFirstTurn === true,
+            turnStartWriterEvidenceBaseline,
+            readNonEmptyString(paramsRecord?.clientUserMessageId),
           )
         : recovered
     }
@@ -6699,6 +9230,20 @@ function localSessionCandidateDirsForThreadId(threadId: string): string[] {
   return [...dirs]
 }
 
+async function localRolloutPathMatchesThreadId(path: string, threadId: string): Promise<boolean> {
+  let handle: FileHandle | null = null
+  try {
+    const info = await lstat(path)
+    if (!info.isFile() || info.isSymbolicLink()) return false
+    handle = await open(path, 'r')
+    return readSessionMetaId(await readFirstJsonlLineFromHandle(handle)) === threadId
+  } catch {
+    return false
+  } finally {
+    await handle?.close().catch(() => undefined)
+  }
+}
+
 async function findLocalRolloutPathForThreadId(threadId: string): Promise<string> {
   if (!isSafeThreadIdForLocalRolloutPath(threadId)) return ''
   let best: { path: string; mtimeMs: number } | null = null
@@ -6709,6 +9254,7 @@ async function findLocalRolloutPathForThreadId(threadId: string): Promise<string
         if (!entry.isFile() || !entry.name.endsWith('.jsonl') || !entry.name.includes(threadId)) continue
         const candidate = join(directory, entry.name)
         try {
+          if (!(await localRolloutPathMatchesThreadId(candidate, threadId))) continue
           const s = await stat(candidate)
           if (!s.isFile()) continue
           if (!best || s.mtimeMs > best.mtimeMs) {
@@ -6723,6 +9269,26 @@ async function findLocalRolloutPathForThreadId(threadId: string): Promise<string
     }
   }
   return best?.path ?? ''
+}
+
+async function resolvePassiveThreadRolloutPath(
+  appServer: Pick<AppServerProcess, 'getLastThreadReadSnapshot'>,
+  threadId: string,
+): Promise<string> {
+  const snapshotPath = readNonEmptyString(
+    asRecord(asRecord(appServer.getLastThreadReadSnapshot(threadId))?.thread)?.path,
+  )
+  if (snapshotPath && isAbsolute(snapshotPath)) {
+    try {
+      const snapshotStats = await stat(snapshotPath)
+      if (snapshotStats.isFile()) return snapshotPath
+    } catch { /* Resolve through local metadata below. */ }
+  }
+  const stateMetadata = await readStateDbRolloutMetadata(threadId)
+  if (stateMetadata && await localRolloutPathMatchesThreadId(stateMetadata.path, threadId)) {
+    return stateMetadata.path
+  }
+  return await findLocalRolloutPathForThreadId(threadId) ?? ''
 }
 
 function getSkillsInstallDir(): string {
@@ -6902,7 +9468,7 @@ async function ensureRepoHasInitialCommit(repoRoot: string): Promise<void> {
 async function runCommandCapture(
   command: string,
   args: string[],
-  options: { cwd?: string; timeoutMs?: number } = {},
+  options: { cwd?: string; timeoutMs?: number; stdin?: string } = {},
 ): Promise<string> {
   return (await runCommandCaptureRaw(command, args, options)).trim()
 }
@@ -6910,17 +9476,19 @@ async function runCommandCapture(
 async function runCommandCaptureRaw(
   command: string,
   args: string[],
-  options: { cwd?: string; timeoutMs?: number } = {},
+  options: { cwd?: string; timeoutMs?: number; stdin?: string } = {},
 ): Promise<string> {
   return await new Promise<string>((resolve, reject) => {
     const proc = spawn(command, args, {
       cwd: options.cwd,
       env: process.env,
-      stdio: ['ignore', 'pipe', 'pipe'],
+      stdio: ['pipe', 'pipe', 'pipe'],
     })
     let stdout = ''
     let stderr = ''
     let settled = false
+    proc.stdin.on('error', () => {})
+    proc.stdin.end(options.stdin ?? '')
     const timeoutMs = typeof options.timeoutMs === 'number' && Number.isFinite(options.timeoutMs)
       ? Math.max(1, Math.floor(options.timeoutMs))
       : 0
@@ -7202,8 +9770,10 @@ async function runCommandWithOutput(command: string, args: string[], options: { 
 function normalizeStringArray(value: unknown): string[] {
   if (!Array.isArray(value)) return []
   const normalized: string[] = []
+  const seen = new Set<string>()
   for (const item of value) {
-    if (typeof item === 'string' && item.length > 0 && !normalized.includes(item)) {
+    if (typeof item === 'string' && item.length > 0 && !seen.has(item)) {
+      seen.add(item)
       normalized.push(item)
     }
   }
@@ -8150,12 +10720,14 @@ type SessionIndexThreadTitle = {
 }
 
 let sessionIndexThreadListCache: {
-  archivedIds: Set<string> | null
-  archiveSignature: string | null
   path: string
   signature: string
+  endOffset: number
+  startOffset: number
   entries: SessionIndexThreadTitle[]
 } | null = null
+
+const SESSION_INDEX_THREAD_LIST_MAX_READ_BYTES = 16 * 1024 * 1024
 
 function normalizeSessionIndexThreadTitle(value: unknown): SessionIndexThreadTitle | null {
   const record = asRecord(value)
@@ -8166,41 +10738,75 @@ function normalizeSessionIndexThreadTitle(value: unknown): SessionIndexThreadTit
   const updatedAtIso = typeof record.updated_at === 'string' ? record.updated_at.trim() : ''
   const updatedAtMs = updatedAtIso ? Date.parse(updatedAtIso) : Number.NaN
 
-  if (!id || !title) return null
+  if (!id || id.length > MAX_THREAD_LIST_CURSOR_ID_LENGTH || !title) return null
   return {
     id,
-    title,
+    title: truncateThreadListPreview(title) as string,
     updatedAtMs: Number.isFinite(updatedAtMs) ? updatedAtMs : 0,
   }
 }
 
 async function readSessionIndexThreadListEntries(
   sessionIndexPath: string,
-): Promise<SessionIndexThreadTitle[] | null> {
+  requestedEndOffset?: number,
+): Promise<{
+  entries: SessionIndexThreadTitle[]
+  endOffset: number
+  signature: string
+  startOffset: number
+} | null> {
   let signature: string
+  let fileSize: number
   try {
-    signature = getSessionIndexFileSignature(await stat(sessionIndexPath))
+    const info = await stat(sessionIndexPath)
+    signature = getSessionIndexFileSignature(info)
+    fileSize = info.size
   } catch {
     return null
   }
+  const endOffset = Math.min(
+    fileSize,
+    Math.max(0, Number.isSafeInteger(requestedEndOffset) ? requestedEndOffset! : fileSize),
+  )
   if (
     sessionIndexThreadListCache?.path === sessionIndexPath
     && sessionIndexThreadListCache.signature === signature
+    && sessionIndexThreadListCache.endOffset === endOffset
   ) {
-    return sessionIndexThreadListCache.entries
+    return sessionIndexThreadListCache
   }
   const latestById = new Map<string, SessionIndexThreadTitle>()
-  let input: ReturnType<typeof createReadStream> | null = null
-  let lines: ReturnType<typeof createInterface> | null = null
-
+  let handle: FileHandle | null = null
+  let startOffset = endOffset
   try {
-    input = createReadStream(sessionIndexPath, { encoding: 'utf8' })
-    lines = createInterface({
-      input,
-      crlfDelay: Infinity,
-    })
-
-    for await (const line of lines) {
+    handle = await open(sessionIndexPath, 'r')
+    const rawStartOffset = Math.max(0, endOffset - SESSION_INDEX_THREAD_LIST_MAX_READ_BYTES)
+    const buffer = Buffer.alloc(endOffset - rawStartOffset)
+    const { bytesRead } = await handle.read(buffer, 0, buffer.length, rawStartOffset)
+    let contentsBuffer = buffer.subarray(0, bytesRead)
+    startOffset = rawStartOffset
+    if (rawStartOffset > 0) {
+      const precedingByte = Buffer.alloc(1)
+      const precedingRead = await handle.read(precedingByte, 0, 1, rawStartOffset - 1)
+      const startsAtLineBoundary = precedingRead.bytesRead === 1 && precedingByte[0] === 0x0a
+      if (startsAtLineBoundary) {
+        startOffset = rawStartOffset
+      } else {
+        const firstLineEnd = contentsBuffer.indexOf(0x0a)
+        if (firstLineEnd >= 0) {
+          const remainingContents = contentsBuffer.subarray(firstLineEnd + 1)
+          startOffset = remainingContents.length > 0
+            ? rawStartOffset + firstLineEnd + 1
+            : rawStartOffset
+          contentsBuffer = remainingContents
+        } else {
+          startOffset = rawStartOffset
+          contentsBuffer = Buffer.alloc(0)
+        }
+      }
+    }
+    const contents = contentsBuffer.toString('utf8')
+    for (const line of contents.split(/\r?\n/u)) {
       const trimmed = line.trim()
       if (!trimmed) continue
 
@@ -8219,20 +10825,19 @@ async function readSessionIndexThreadListEntries(
   } catch {
     return null
   } finally {
-    lines?.close()
-    input?.close()
+    await handle?.close().catch(() => undefined)
   }
 
   const entries = Array.from(latestById.values())
     .sort((first, second) => second.updatedAtMs - first.updatedAtMs || second.id.localeCompare(first.id))
   sessionIndexThreadListCache = {
-    archivedIds: null,
-    archiveSignature: null,
     path: sessionIndexPath,
     signature,
+    endOffset,
+    startOffset,
     entries,
   }
-  return entries
+  return sessionIndexThreadListCache
 }
 
 function findSessionIndexPageStart(
@@ -8254,22 +10859,55 @@ function findSessionIndexPageStart(
 }
 
 async function readSessionIndexArchivedIds(entries: SessionIndexThreadTitle[]): Promise<Set<string>> {
+  return await readAuthoritativeArchivedThreadIds(entries.map((entry) => entry.id))
+}
+
+const SESSION_INDEX_ARCHIVE_CANDIDATE_LIMIT = 1_024
+const SESSION_INDEX_ARCHIVE_SCAN_LIMIT = 2 * SESSION_INDEX_ARCHIVE_CANDIDATE_LIMIT
+
+async function readStateDbRolloutMetadata(
+  threadId: string,
+): Promise<{ path: string; cwd: string } | null> {
   const stateDbPath = join(getCodexHomeDir(), 'state_5.sqlite')
-  const archiveSignature = existsSync(stateDbPath)
-    ? await readStateDbArchiveSignature(stateDbPath)
-    : `tree:${await readArchivedSessionsTreeSignature()}`
-  if (
-    sessionIndexThreadListCache?.archiveSignature === archiveSignature
-    && sessionIndexThreadListCache.archivedIds
-  ) {
-    return sessionIndexThreadListCache.archivedIds
+  if (!existsSync(stateDbPath)) return null
+  let stdout: string
+  try {
+    stdout = await runSqliteQueryCapture(
+      stateDbPath,
+      `SELECT rollout_path, cwd, archived FROM threads WHERE id = ${sqlString(threadId)} LIMIT 1;`,
+      { json: true },
+    )
+  } catch {
+    return null
   }
-  const archivedIds = await readAuthoritativeArchivedThreadIds(entries.map((entry) => entry.id))
-  if (sessionIndexThreadListCache) {
-    sessionIndexThreadListCache.archiveSignature = archiveSignature
-    sessionIndexThreadListCache.archivedIds = archivedIds
+  try {
+    const rows = JSON.parse(stdout || '[]') as unknown
+    const row = Array.isArray(rows) ? asRecord(rows[0]) : null
+    const path = readNonEmptyString(row?.rollout_path)
+    if (!path || row?.archived !== 0) return null
+    return { path, cwd: readNonEmptyString(row?.cwd) }
+  } catch {
+    return null
   }
-  return archivedIds
+}
+
+export async function readSessionIndexFallbackRolloutMetadata(
+  threadId: string,
+): Promise<{ path: string; cwd: string }> {
+  const stateMetadata = await readStateDbRolloutMetadata(threadId)
+  if (stateMetadata && await localRolloutPathMatchesThreadId(stateMetadata.path, threadId)) {
+    return stateMetadata
+  }
+  const path = await findLocalRolloutPathForThreadId(threadId)
+  if (!path) return { path: '', cwd: '' }
+  try {
+    return {
+      path,
+      cwd: readSessionMetaCwd(await readFirstJsonlLine(path)),
+    }
+  } catch {
+    return { path: '', cwd: '' }
+  }
 }
 
 async function readSessionIndexThreadListFallback(
@@ -8290,80 +10928,245 @@ async function readSessionIndexThreadListFallback(
     : []
   if (modelProviders.length > 0) return null
 
-  if (!cursor && existsSync(join(getCodexHomeDir(), 'state_5.sqlite'))) {
-    const stateDbEntries = await listImportedThreadsFromStateDb({ limit: limit + 1 })
-    if (stateDbEntries.length > 0) {
+  const sessionIndexPath = getCodexSessionIndexPath()
+  let requestedEndOffset: number | undefined
+  if (cursor?.beforeOffset !== undefined) {
+    try {
+      const signature = getSessionIndexFileSignature(await stat(sessionIndexPath))
+      if (!cursor.sessionIndexSignature || cursor.sessionIndexSignature === signature) {
+        requestedEndOffset = cursor.beforeOffset
+      }
+    } catch {
+      requestedEndOffset = undefined
+    }
+  }
+  const indexWindow = await readSessionIndexThreadListEntries(
+    sessionIndexPath,
+    requestedEndOffset,
+  )
+  const entries = indexWindow?.entries ?? null
+  if ((!entries || entries.length === 0) && !cursor && existsSync(join(getCodexHomeDir(), 'state_5.sqlite'))) {
+    const stateDbPage = await listImportedThreadsFromStateDbPage({ limit: limit + 1 })
+    const stateDbEntries = stateDbPage.data
+    if (stateDbEntries.length > 0 || stateDbPage.scanContinuation) {
       const pageEntries = stateDbEntries.slice(0, limit)
       const lastPageEntry = pageEntries.at(-1)
       const lastUpdatedAt = typeof lastPageEntry?.updatedAt === 'number' ? lastPageEntry.updatedAt : null
       const lastId = readNonEmptyString(lastPageEntry?.id)
+      const hasAcceptedRemainder = stateDbEntries.length > pageEntries.length
+      const seenState = (hasAcceptedRemainder || stateDbPage.scanContinuation)
+        ? await writeThreadListSeenImportedIds(
+            null,
+            new Set<string>(),
+            pageEntries.map((entry) => readNonEmptyString(entry.id)).filter(Boolean),
+          )
+        : null
       return {
         data: pageEntries,
-        nextCursor: stateDbEntries.length > pageEntries.length && lastUpdatedAt !== null && lastId
-          ? encodeThreadListCursor({
+        nextCursor: (hasAcceptedRemainder || stateDbPage.scanContinuation)
+          ? await encodeThreadListCursor({
               kind: 'imports',
-              beforeUpdatedAt: lastUpdatedAt,
-              beforeId: lastId,
-              seenImportedIds: pageEntries.map((entry) => readNonEmptyString(entry.id)).filter(Boolean),
+              beforeUpdatedAt: hasAcceptedRemainder && lastUpdatedAt !== null && lastId
+                ? lastUpdatedAt
+                : stateDbPage.scanContinuation!.beforeUpdatedAt,
+              beforeId: hasAcceptedRemainder && lastId
+                ? lastId
+                : stateDbPage.scanContinuation!.beforeId,
+              ...seenState!,
             })
           : null,
       }
     }
   }
-
-  const entries = await readSessionIndexThreadListEntries(getCodexSessionIndexPath())
-  if (!entries) return null
-  const archivedIds = await readSessionIndexArchivedIds(entries)
-  const seenThreadIds = new Set(cursor?.seenThreadIds ?? [])
+  if (!entries || !indexWindow) return null
   if (entries.length === 0 && !cursor) return null
+  const seenThreadIds = cursor
+    ? await readThreadListSeenImportedIds(cursor)
+    : new Set<string>()
+  const pageStart = findSessionIndexPageStart(entries, cursor)
   const available: SessionIndexThreadTitle[] = []
-  for (let index = findSessionIndexPageStart(entries, cursor); index < entries.length; index += 1) {
-    const entry = entries[index]!
-    if (archivedIds.has(entry.id) || seenThreadIds.has(entry.id)) continue
-    available.push(entry)
-    if (available.length > limit) break
+  const scannedIndexIds = new Set<string>()
+  const archivedScannedIds = new Set<string>()
+  let candidateEnd = pageStart
+  let scannedCount = 0
+  while (
+    candidateEnd < entries.length
+    && available.length <= limit
+    && scannedCount < SESSION_INDEX_ARCHIVE_SCAN_LIMIT
+  ) {
+    const candidates = entries.slice(
+      candidateEnd,
+      Math.min(
+        entries.length,
+        candidateEnd + SESSION_INDEX_ARCHIVE_CANDIDATE_LIMIT,
+        pageStart + SESSION_INDEX_ARCHIVE_SCAN_LIMIT,
+      ),
+    )
+    candidateEnd += candidates.length
+    scannedCount += candidates.length
+    for (const candidate of candidates) scannedIndexIds.add(candidate.id)
+    const archivedIds = await readSessionIndexArchivedIds(candidates)
+    for (const archivedId of archivedIds) archivedScannedIds.add(archivedId)
+    available.push(...candidates.filter((entry) => (
+      !archivedIds.has(entry.id) && !seenThreadIds.has(entry.id)
+    )))
   }
-  const pageEntries = available.slice(0, limit)
-  for (const entry of pageEntries) seenThreadIds.add(entry.id)
-  const lastPageEntry = pageEntries.at(-1)
-  let nextCursor: string | null = available.length > pageEntries.length && lastPageEntry
-    ? encodeThreadListCursor({
-        kind: 'session-index',
-        beforeUpdatedAtMs: lastPageEntry.updatedAtMs,
-        beforeId: lastPageEntry.id,
-        seenThreadIds: [...seenThreadIds],
-      })
+
+  const stateDbPage = await listImportedThreadsFromStateDbPage({
+    ...(cursor ? {
+      beforeUpdatedAt: cursor.beforeUpdatedAtMs / 1_000,
+      beforeId: cursor.beforeId,
+    } : {}),
+    excludedIds: seenThreadIds,
+    limit: limit + 1,
+  })
+  const stateDbCandidates = stateDbPage.data
+  const stateOnlyIds = stateDbCandidates
+    .map((entry) => readNonEmptyString(entry.id))
+    .filter((id) => id && !scannedIndexIds.has(id))
+  const archivedStateOnlyIds = stateOnlyIds.length > 0
+    ? await readAuthoritativeArchivedThreadIds(stateOnlyIds)
+    : new Set<string>()
+  const combinedById = new Map<string, {
+    id: string
+    updatedAtMs: number
+    indexEntry?: SessionIndexThreadTitle
+    stateRow?: Record<string, unknown>
+  }>()
+  for (const entry of available) {
+    combinedById.set(entry.id, { id: entry.id, updatedAtMs: entry.updatedAtMs, indexEntry: entry })
+  }
+  for (const stateRow of stateDbCandidates) {
+    const id = readNonEmptyString(stateRow.id)
+    if (!id || seenThreadIds.has(id) || archivedScannedIds.has(id) || archivedStateOnlyIds.has(id)) continue
+    const stateUpdatedAtMs = typeof stateRow.updatedAt === 'number' ? stateRow.updatedAt * 1_000 : 0
+    const existing = combinedById.get(id)
+    combinedById.set(id, {
+      id,
+      updatedAtMs: Math.max(existing?.updatedAtMs ?? 0, stateUpdatedAtMs),
+      ...(existing?.indexEntry ? { indexEntry: existing.indexEntry } : {}),
+      stateRow,
+    })
+  }
+  const combined = [...combinedById.values()]
+    .sort((left, right) => right.updatedAtMs - left.updatedAtMs || right.id.localeCompare(left.id))
+  const pageCandidates = combined.slice(0, limit)
+  const lastScannedEntry = entries[Math.max(pageStart, candidateEnd) - 1]
+  const hasMoreInCurrentWindow = candidateEnd < entries.length
+  const hasMoreCombined = combined.length > pageCandidates.length
+  const hasPreviousWindow = indexWindow.startOffset > 0
+  const hasMoreStateDbScan = stateDbPage.scanContinuation !== null
+  const shouldContinue = hasMoreInCurrentWindow || hasMoreCombined || hasPreviousWindow || hasMoreStateDbScan
+  const stateDbScanBoundary = stateDbPage.scanContinuation
+    ? {
+        id: stateDbPage.scanContinuation.beforeId,
+        updatedAtMs: stateDbPage.scanContinuation.beforeUpdatedAt * 1_000,
+      }
     : null
-  if (!nextCursor) {
-    const hasUnseenImports = (await listImportedThreadsFromStateDb({
-      excludedIds: [...seenThreadIds],
-      limit: 1,
-    })).length > 0
-    if (hasUnseenImports) {
-      nextCursor = encodeThreadListCursor({
-        kind: 'imports',
-        beforeUpdatedAt: null,
-        beforeId: '',
-        seenImportedIds: [...seenThreadIds],
-      })
-    }
+  const scannedBoundary = [lastScannedEntry, stateDbScanBoundary]
+    .filter((entry): entry is { id: string; updatedAtMs: number } => Boolean(entry))
+    .sort((left, right) => right.updatedAtMs - left.updatedAtMs || right.id.localeCompare(left.id))[0]
+  const emittedBoundary = pageCandidates.at(-1)
+  const nextBoundary = shouldContinue
+    ? [emittedBoundary, scannedBoundary]
+        .filter((entry): entry is { id: string; updatedAtMs: number } => Boolean(entry))
+        .sort((left, right) => right.updatedAtMs - left.updatedAtMs || right.id.localeCompare(left.id))[0]
+        ?? (cursor ? { id: cursor.beforeId, updatedAtMs: cursor.beforeUpdatedAtMs } : null)
+    : null
+  const nextCursor = nextBoundary
+    ? await (async () => {
+        const seenState = await writeThreadListSeenImportedIds(
+          cursor,
+          seenThreadIds,
+          pageCandidates.map((entry) => entry.id),
+        )
+        return await encodeThreadListCursor({
+          kind: 'session-index',
+          beforeUpdatedAtMs: nextBoundary.updatedAtMs,
+          beforeId: nextBoundary.id,
+          beforeOffset: hasMoreInCurrentWindow || hasMoreCombined || hasMoreStateDbScan
+            ? indexWindow.endOffset
+            : indexWindow.startOffset,
+          sessionIndexSignature: indexWindow.signature,
+          ...seenState,
+        })
+      })()
+    : null
+
+  const stateDbMetadata = new Map<string, Record<string, unknown>>()
+  for (const candidate of pageCandidates) {
+    if (candidate.stateRow) stateDbMetadata.set(candidate.id, candidate.stateRow)
   }
+  for (const row of await listImportedThreadsFromStateDb({
+    threadIds: pageCandidates.filter((entry) => !entry.stateRow).map((entry) => entry.id),
+    limit: Math.max(1, pageCandidates.length),
+  })) {
+    const id = readNonEmptyString(row.id)
+    if (id) stateDbMetadata.set(id, row)
+  }
+  const data = await Promise.all(pageCandidates.map(async (candidate) => {
+    const stateMetadata = stateDbMetadata.get(candidate.id)
+    if (!candidate.indexEntry && stateMetadata) return stateMetadata
+    const entry = candidate.indexEntry!
+    const rolloutMetadata = stateMetadata
+      ? { path: readNonEmptyString(stateMetadata.path), cwd: readNonEmptyString(stateMetadata.cwd) }
+      : await readSessionIndexFallbackRolloutMetadata(entry.id)
+    const updatedAtSeconds = Math.max(0, entry.updatedAtMs / 1000)
+    return {
+      ...(stateMetadata ?? {}),
+      id: entry.id,
+      title: entry.title,
+      name: entry.title,
+      path: rolloutMetadata.path,
+      cwd: rolloutMetadata.cwd,
+      preview: '',
+      createdAt: updatedAtSeconds,
+      updatedAt: updatedAtSeconds,
+      source: { type: 'session-index' },
+    }
+  }))
 
   return {
-    data: pageEntries.map((entry) => {
-      const updatedAtSeconds = Math.max(0, entry.updatedAtMs / 1000)
-      return {
-        id: entry.id,
-        title: entry.title,
-        name: entry.title,
-        cwd: '',
-        preview: '',
-        createdAt: updatedAtSeconds,
-        updatedAt: updatedAtSeconds,
-        source: { type: 'session-index' },
-      }
-    }),
+    data,
     nextCursor,
+  }
+}
+
+async function readPassiveThreadSummary(threadId: string): Promise<Record<string, unknown> | null> {
+  try {
+    const stateRow = (await listImportedThreadsFromStateDb({ threadIds: [threadId], limit: 1 }))[0]
+    if (stateRow && readNonEmptyString(stateRow.id) === threadId) return stateRow
+  } catch {
+    // Fall through to the append-only index and local rollout metadata.
+  }
+
+  const indexEntry = (await readSessionIndexThreadListEntries(getCodexSessionIndexPath()))
+    ?.entries.find((entry) => entry.id === threadId)
+  const rolloutMetadata = await readSessionIndexFallbackRolloutMetadata(threadId)
+  if (!indexEntry && !rolloutMetadata.path) return null
+
+  let createdAtMs = indexEntry?.updatedAtMs ?? 0
+  let updatedAtMs = createdAtMs
+  if (rolloutMetadata.path) {
+    try {
+      const info = await stat(rolloutMetadata.path)
+      createdAtMs = createdAtMs || info.birthtimeMs || info.ctimeMs
+      updatedAtMs = Math.max(updatedAtMs, info.mtimeMs)
+    } catch {
+      // The index metadata is still sufficient for a passive pinned row.
+    }
+  }
+  const title = indexEntry?.title || threadId
+  return {
+    id: threadId,
+    title,
+    name: title,
+    path: rolloutMetadata.path,
+    cwd: rolloutMetadata.cwd,
+    preview: '',
+    createdAt: Math.max(0, createdAtMs / 1_000),
+    updatedAt: Math.max(0, updatedAtMs / 1_000),
+    source: { type: 'session-index' },
   }
 }
 
@@ -8448,13 +11251,15 @@ const THREAD_QUEUE_WRITER_ID_KEY = 'thread-queue-writer-id'
 const THREAD_QUEUE_CHANGED_REVISIONS_KEY = 'thread-queue-changed-revisions'
 const THREAD_ACTIVE_MANAGED_MESSAGES_KEY = 'thread-active-managed-messages'
 const THREAD_START_CLAIMS_KEY = 'thread-start-claims'
+const MAX_THREAD_START_CLAIMS = 1_024
+const MAX_THREAD_START_CLAIM_ID_LENGTH = 512
 const THREAD_QUEUE_RECEIPT_LIMIT = 2048
 const THREAD_QUEUE_CHANGED_REVISION_LIMIT = 2048
 const THREAD_QUEUE_DEPENDENCY_WAIT_MS = 30_000
 const threadQueueRevisionListeners = new Set<(event: { threadIds: string[]; revision: number }) => void>()
 const threadQueueWriterId = randomUUID()
 
-function subscribeThreadQueueRevisions(
+export function subscribeThreadQueueRevisions(
   listener: (event: { threadIds: string[]; revision: number }) => void,
 ): () => void {
   threadQueueRevisionListeners.add(listener)
@@ -8924,13 +11729,22 @@ export async function replaceThreadQueueState(
   nextState: ThreadQueueState,
   expectedRevision: number,
 ): Promise<number> {
-  return withThreadQueueStateUpdate((state, _receipts, processing, revision) => {
+  return withThreadQueueStateUpdate((state, receipts, processing, revision) => {
     if (revision !== expectedRevision) {
       const error = new Error(`Thread queue revision changed from ${expectedRevision} to ${revision}`)
       error.name = 'ThreadQueueRevisionConflictError'
       throw error
     }
-    const normalizedNextState = normalizeThreadQueueState(nextState)
+    const receiptKeys = new Set(receipts.map((receipt) => `${receipt.threadId}\u0000${receipt.messageId}`))
+    const normalizedNextState = Object.fromEntries(
+      Object.entries(normalizeThreadQueueState(nextState)).flatMap(([threadId, messages]) => {
+        const currentIds = new Set((state[threadId] ?? []).map((message) => message.id))
+        const filtered = messages.filter((message) => (
+          currentIds.has(message.id) || !receiptKeys.has(`${threadId}\u0000${message.id}`)
+        ))
+        return filtered.length > 0 ? [[threadId, filtered]] : []
+      }),
+    )
     for (const [threadId, entry] of Object.entries(processing)) {
       if (entry.attempted !== true) continue
       const currentMessage = state[threadId]?.find((message) => message.id === entry.messageId)
@@ -9151,8 +11965,9 @@ function normalizeThreadStartClaims(value: unknown): ThreadStartClaimState {
     const ownerPid = typeof claim?.ownerPid === 'number' && Number.isSafeInteger(claim.ownerPid)
       ? claim.ownerPid
       : 0
-    if (threadId.trim() && ownerId && ownerPid > 0) {
-      claims[threadId.trim()] = {
+    const normalizedThreadId = threadId.trim()
+    if (normalizedThreadId && normalizedThreadId.length <= MAX_THREAD_START_CLAIM_ID_LENGTH && ownerId && ownerPid > 0) {
+      claims[normalizedThreadId] = {
         ownerId,
         ownerPid,
         ...(readNonEmptyString(claim?.ownerProcessStartIdentity)
@@ -9164,40 +11979,77 @@ function normalizeThreadStartClaims(value: unknown): ThreadStartClaimState {
   return claims
 }
 
-export async function withThreadStartClaim<T>(
-  threadId: string,
+function normalizeRequestedThreadStartClaimIds(threadIds: readonly string[]): string[] {
+  const normalized = Array.from(new Set(threadIds.map((threadId) => threadId.trim()).filter(Boolean))).sort()
+  if (
+    normalized.length > MAX_THREAD_START_CLAIMS
+    || normalized.some((threadId) => threadId.length > MAX_THREAD_START_CLAIM_ID_LENGTH)
+  ) {
+    const error = new Error('Thread start claim request exceeds the supported limit.')
+    error.name = 'ThreadStartClaimLimitError'
+    throw error
+  }
+  return normalized
+}
+
+async function pruneDeadThreadStartClaims(claims: ThreadStartClaimState): Promise<ThreadStartClaimState> {
+  const entries = Object.entries(claims)
+  const retained: ThreadStartClaimState = {}
+  let nextIndex = 0
+  const workerCount = Math.min(16, entries.length)
+  await Promise.all(Array.from({ length: workerCount }, async () => {
+    while (nextIndex < entries.length) {
+      const [threadId, claim] = entries[nextIndex++]!
+      const live = claim.ownerPid === process.pid
+        ? liveThreadStartClaimOwnerIds.has(claim.ownerId)
+        : await isProcessOwnerAlive({
+            pid: claim.ownerPid,
+            processStartIdentity: claim.ownerProcessStartIdentity,
+          })
+      if (live) retained[threadId] = claim
+    }
+  }))
+  return retained
+}
+
+async function withThreadStartClaims<T>(
+  threadIds: readonly string[],
   operation: () => Promise<T>,
 ): Promise<T> {
-  const normalizedThreadId = threadId.trim()
-  if (!normalizedThreadId) return operation()
+  const normalizedThreadIds = normalizeRequestedThreadStartClaimIds(threadIds)
+  if (normalizedThreadIds.length === 0) return operation()
   const ownerId = randomUUID()
   const ownerProcessStartIdentity = await getServerProcessStartIdentity()
   liveThreadStartClaimOwnerIds.add(ownerId)
   let acquired: boolean
   try {
     acquired = await updateCodexGlobalState(async (payload) => {
-    const claims = normalizeThreadStartClaims(payload[THREAD_START_CLAIMS_KEY])
-    const existing = claims[normalizedThreadId]
-    const existingIsLive = existing
-      ? (
-          existing.ownerPid === process.pid
-            ? liveThreadStartClaimOwnerIds.has(existing.ownerId)
-            : await isProcessOwnerAlive({
-                pid: existing.ownerPid,
-                processStartIdentity: existing.ownerProcessStartIdentity,
-              })
-        )
-      : false
-    if (existingIsLive) return false
-    payload[THREAD_START_CLAIMS_KEY] = {
-      ...claims,
-      [normalizedThreadId]: {
-        ownerId,
-        ownerPid: process.pid,
-        ...(ownerProcessStartIdentity ? { ownerProcessStartIdentity } : {}),
-      },
-    }
-    return true
+      const claims = await pruneDeadThreadStartClaims(normalizeThreadStartClaims(payload[THREAD_START_CLAIMS_KEY]))
+      if (Object.keys(claims).length > MAX_THREAD_START_CLAIMS) {
+        const error = new Error('Thread start claim state exceeds the supported limit.')
+        error.name = 'ThreadStartClaimLimitError'
+        throw error
+      }
+      if (Object.keys(claims).length > 0) payload[THREAD_START_CLAIMS_KEY] = claims
+      else delete payload[THREAD_START_CLAIMS_KEY]
+      for (const threadId of normalizedThreadIds) {
+        if (claims[threadId]) return false
+      }
+      if (new Set([...Object.keys(claims), ...normalizedThreadIds]).size > MAX_THREAD_START_CLAIMS) {
+        const error = new Error('Thread start claim state exceeds the supported limit.')
+        error.name = 'ThreadStartClaimLimitError'
+        throw error
+      }
+      const nextClaims = { ...claims }
+      for (const threadId of normalizedThreadIds) {
+        nextClaims[threadId] = {
+          ownerId,
+          ownerPid: process.pid,
+          ...(ownerProcessStartIdentity ? { ownerProcessStartIdentity } : {}),
+        }
+      }
+      payload[THREAD_START_CLAIMS_KEY] = nextClaims
+      return true
     })
   } catch (error) {
     liveThreadStartClaimOwnerIds.delete(ownerId)
@@ -9216,12 +12068,20 @@ export async function withThreadStartClaim<T>(
     liveThreadStartClaimOwnerIds.delete(ownerId)
     await updateCodexGlobalState((payload) => {
       const claims = normalizeThreadStartClaims(payload[THREAD_START_CLAIMS_KEY])
-      if (claims[normalizedThreadId]?.ownerId !== ownerId) return
-      delete claims[normalizedThreadId]
+      for (const threadId of normalizedThreadIds) {
+        if (claims[threadId]?.ownerId === ownerId) delete claims[threadId]
+      }
       if (Object.keys(claims).length > 0) payload[THREAD_START_CLAIMS_KEY] = claims
       else delete payload[THREAD_START_CLAIMS_KEY]
     })
   }
+}
+
+export async function withThreadStartClaim<T>(
+  threadId: string,
+  operation: () => Promise<T>,
+): Promise<T> {
+  return withThreadStartClaims([threadId], operation)
 }
 
 async function withThreadStartClaimWait<T>(
@@ -9233,6 +12093,49 @@ async function withThreadStartClaimWait<T>(
   while (true) {
     try {
       return await withThreadStartClaim(threadId, operation)
+    } catch (error) {
+      if (!(error instanceof Error) || error.name !== 'ThreadStartClaimConflictError' || Date.now() >= deadline) {
+        throw error
+      }
+      await new Promise((resolve) => setTimeout(resolve, 25))
+    }
+  }
+}
+
+async function areThreadStartClaimsAvailable(threadIds: readonly string[]): Promise<boolean> {
+  const claims = normalizeThreadStartClaims((await readCodexGlobalStateSnapshot())[THREAD_START_CLAIMS_KEY])
+  for (const threadId of threadIds) {
+    const existing = claims[threadId]
+    if (!existing) continue
+    const existingIsLive = existing.ownerPid === process.pid
+      ? liveThreadStartClaimOwnerIds.has(existing.ownerId)
+      : await isProcessOwnerAlive({
+          pid: existing.ownerPid,
+          processStartIdentity: existing.ownerProcessStartIdentity,
+        })
+    if (existingIsLive) return false
+  }
+  return true
+}
+
+export async function withThreadStartClaimsWait<T>(
+  threadIds: readonly string[],
+  operation: () => Promise<T>,
+): Promise<T> {
+  const orderedThreadIds = normalizeRequestedThreadStartClaimIds(threadIds)
+  const deadline = Date.now() + 5_000
+  while (true) {
+    if (!(await areThreadStartClaimsAvailable(orderedThreadIds))) {
+      if (Date.now() >= deadline) {
+        const error = new Error('Cannot start a turn because another start is already in progress.')
+        error.name = 'ThreadStartClaimConflictError'
+        throw error
+      }
+      await new Promise((resolve) => setTimeout(resolve, 25))
+      continue
+    }
+    try {
+      return await withThreadStartClaims(orderedThreadIds, operation)
     } catch (error) {
       if (!(error instanceof Error) || error.name !== 'ThreadStartClaimConflictError' || Date.now() >= deadline) {
         throw error
@@ -9348,8 +12251,14 @@ async function writeFirstLaunchPluginsCardDismissed(dismissed: boolean): Promise
   })
 }
 
-function getSessionIndexFileSignature(stats: { mtimeMs: number; size: number }): string {
-  return `${String(stats.mtimeMs)}:${String(stats.size)}`
+export function getSessionIndexFileSignature(stats: {
+  mtimeMs: number
+  ctimeMs: number
+  size: number
+  ino: number
+  dev: number
+}): string {
+  return [stats.mtimeMs, stats.ctimeMs, stats.size, stats.ino, stats.dev].map(String).join(':')
 }
 
 function cloneCacheableRpcResult(value: unknown): unknown {
@@ -9408,9 +12317,7 @@ async function readThreadListRpcCacheSignature(): Promise<string> {
   const archiveStateSignature = async (): Promise<string> => [
     `state:${await signatureForPath(join(getCodexHomeDir(), 'state_5.sqlite'))}`,
     `wal:${await signatureForPath(join(getCodexHomeDir(), 'state_5.sqlite-wal'))}`,
-    ...(existsSync(join(getCodexHomeDir(), 'state_5.sqlite'))
-      ? []
-      : [`archived:${await readArchivedSessionsTreeSignature()}`]),
+    `archived:${await signatureForPath(join(getCodexHomeDir(), 'archived_sessions'))}`,
   ].join('|')
   try {
     const stats = await stat(getCodexSessionIndexPath())
@@ -9434,7 +12341,7 @@ async function readPersistedThreadListRpcCache(key: string, signature: string): 
   try {
     const raw = await readFile(getPersistedThreadListRpcCachePath(key), 'utf8')
     const record = asRecord(JSON.parse(raw))
-    if (!record || record.version !== 1 || record.key !== key || record.signature !== signature) return null
+    if (!record || record.version !== 2 || record.key !== key || record.signature !== signature) return null
     const savedAtMs = typeof record.savedAtMs === 'number' && Number.isFinite(record.savedAtMs)
       ? record.savedAtMs
       : 0
@@ -9452,7 +12359,7 @@ async function writePersistedThreadListRpcCache(key: string, signature: string, 
   try {
     await mkdir(dirname(cachePath), { recursive: true })
     await writeFile(tempPath, JSON.stringify({
-      version: 1,
+      version: 2,
       key,
       signature,
       savedAtMs: Date.now(),
@@ -9482,9 +12389,13 @@ async function prewarmFirstPageThreadListRpcCache(shared: SharedBridgeState): Pr
       shared.runtimeProbe,
       shared.appServer.getPid(),
     )
-    const canonicalResult = await canonicalizeThreadListResponseForRead(freshResult)
-    shared.appServer.cacheThreadListRpcResult(key, signature, canonicalResult)
-    await writePersistedThreadListRpcCache(key, signature, canonicalResult)
+    const cacheableResult = await prepareThreadListResponseForCache(freshResult)
+    const mergedResult = await mergeImportedThreadsIntoThreadListResult(cacheableResult, params, null)
+    const canonicalResult = await canonicalizeThreadListResponseForRead(mergedResult)
+    if (readThreadListDataLength(cacheableResult) > 0) {
+      shared.appServer.cacheThreadListRpcResult(key, signature, cacheableResult)
+      await writePersistedThreadListRpcCache(key, signature, canonicalResult)
+    }
     return canonicalResult
   })
 }
@@ -9648,6 +12559,34 @@ async function canonicalizeThreadCwdRecord(
   return canonicalCwd === cwd ? value : { ...record, cwd: canonicalCwd }
 }
 
+async function prepareThreadListResponseForCache(
+  payload: unknown,
+  pathRealpath: PathRealpathResolver = realpath,
+): Promise<unknown> {
+  const record = asRecord(payload)
+  if (!record || !Array.isArray(record.data)) return payload
+  const cwdCanonicalizationByValue = new Map<string, Promise<string>>()
+  const canonicalizeCwd = (cwd: string): Promise<string> => {
+    let canonicalized = cwdCanonicalizationByValue.get(cwd)
+    if (!canonicalized) {
+      canonicalized = canonicalizeWorkspaceRootPath(cwd, pathRealpath)
+      cwdCanonicalizationByValue.set(cwd, canonicalized)
+    }
+    return canonicalized
+  }
+  return {
+    ...record,
+    data: await Promise.all(record.data.map(async (item) => (
+      stripThreadListRowHeavyPayload(await canonicalizeThreadCwdRecord(item, canonicalizeCwd))
+    ))),
+  }
+}
+
+function readThreadListDataLength(payload: unknown): number {
+  const data = asRecord(payload)?.data
+  return Array.isArray(data) ? data.length : 0
+}
+
 export async function canonicalizeThreadListResponseForRead(
   payload: unknown,
   pathRealpath: PathRealpathResolver = realpath,
@@ -9658,11 +12597,12 @@ export async function canonicalizeThreadListResponseForRead(
     .map((item) => readNonEmptyString(asRecord(item)?.id))
     .filter((id) => id.length > 0)
   const readMetadataByThreadId = await readStateDbThreadReadMetadata(threadIds)
-  const archivedThreadIds = existsSync(join(getCodexHomeDir(), 'state_5.sqlite'))
-    ? new Set(Array.from(readMetadataByThreadId.entries())
-        .filter(([, metadata]) => metadata.archived === true)
-        .map(([id]) => id))
-    : await readAuthoritativeArchivedThreadIds(threadIds)
+  const archivedThreadIds = new Set(Array.from(readMetadataByThreadId.entries())
+    .filter(([, metadata]) => metadata.archived === true)
+    .map(([id]) => id))
+  for (const id of await readArchivedThreadIdsFromTree(threadIds)) {
+    archivedThreadIds.add(id)
+  }
   const visibleData = record.data.filter((item) => {
     const id = readNonEmptyString(asRecord(item)?.id)
     return !id || !archivedThreadIds.has(id)
@@ -9909,12 +12849,25 @@ async function readJsonBody(req: IncomingMessage): Promise<unknown> {
   return JSON.parse(text) as unknown
 }
 
-async function readRawBody(req: IncomingMessage): Promise<Buffer> {
-  const chunks: Uint8Array[] = []
-  for await (const chunk of req) {
-    chunks.push(typeof chunk === 'string' ? Buffer.from(chunk) : chunk)
+class RequestBodyTooLargeError extends Error {
+  constructor() {
+    super('Request body is too large')
+    this.name = 'RequestBodyTooLargeError'
   }
-  return Buffer.concat(chunks)
+}
+
+export async function readRawBody(req: IncomingMessage, maxBytes = Number.POSITIVE_INFINITY): Promise<Buffer> {
+  const contentLength = Number(req.headers['content-length'])
+  if (Number.isFinite(contentLength) && contentLength > maxBytes) throw new RequestBodyTooLargeError()
+  const chunks: Uint8Array[] = []
+  let totalBytes = 0
+  for await (const chunk of req) {
+    const bytes = typeof chunk === 'string' ? Buffer.from(chunk) : chunk
+    totalBytes += bytes.length
+    if (totalBytes > maxBytes) throw new RequestBodyTooLargeError()
+    chunks.push(bytes)
+  }
+  return Buffer.concat(chunks, totalBytes)
 }
 
 function bufferIndexOf(buf: Buffer, needle: Buffer, start = 0): number {
@@ -10788,6 +13741,22 @@ class AppServerProcess {
     }
   }
 
+  clearThreadReadState(threadId: string): void {
+    this.streamEventsByThreadId.delete(threadId)
+    this.lastThreadReadSnapshotByThreadId.delete(threadId)
+    this.threadTurnPageReadCacheByThreadId.delete(threadId)
+    this.threadTurnPageReadPromiseByThreadId.delete(threadId)
+    this.capturedItemsByThreadId.delete(threadId)
+    this.invalidateLiveStateCache(threadId)
+    this.invalidateExternalRuntimeObservationCache(threadId)
+    for (const key of this.liveStateHttpResponsePromiseByKey.keys()) {
+      if (key.startsWith(`${threadId}\0`)) this.liveStateHttpResponsePromiseByKey.delete(key)
+    }
+    for (const key of this.threadTextPageHttpResponsePromiseByKey.keys()) {
+      if (key.startsWith(`${threadId}\0`)) this.threadTextPageHttpResponsePromiseByKey.delete(key)
+    }
+  }
+
   getCachedLiveStateHttpResponse(key: string): CachedHttpResponse | null {
     pruneExpiredCachedHttpResponses(this.liveStateHttpResponseCacheByKey)
     const cached = this.liveStateHttpResponseCacheByKey.get(key)
@@ -11255,10 +14224,7 @@ export class BackendQueueProcessor {
 
   constructor(
     private readonly appServer: AppServerProcess,
-    private readonly runtimeProbe: (
-      Pick<ThreadRuntimeProbe, 'registerThread' | 'inspect'>
-      & Partial<Pick<ExternalThreadRuntimeProbe, 'inspectWriterEvidence'>>
-    ) | null = null,
+    private readonly runtimeProbe: ThreadWriterRuntimeProbe | null = null,
   ) {
     liveBackendQueueClaimOwnerIds.add(this.claimOwnerId)
     this.unsubscribe = appServer.onNotification((notification) => {
@@ -11404,6 +14370,10 @@ export class BackendQueueProcessor {
         if (await this.hasQueuedTurns(threadId)) this.scheduleThreadQueueDrain(threadId)
         return
       }
+      if (next.attempted) {
+        this.scheduleThreadQueueDrain(threadId, BackendQueueProcessor.BLOCKED_RETRY_MS)
+        return
+      }
       if (!beforeStart.canStart) {
         await this.releaseUnattemptedQueuedTurnClaim(next)
         this.scheduleThreadQueueDrain(threadId, BackendQueueProcessor.BLOCKED_RETRY_MS)
@@ -11422,10 +14392,10 @@ export class BackendQueueProcessor {
         }
       } catch (error) {
         if (error instanceof Error && error.name === 'ThreadWriterOwnershipConflictError') {
-          const rollbackTurnId = readNonEmptyString((error as Error & { turnId?: unknown }).turnId)
-          await this.releaseQueuedTurnClaimAfterRollback(next, rollbackTurnId)
-          if (managedMessage && this.activeManagedMessagesByThreadId.get(threadId) === managedMessage) {
-            await this.deactivateManagedMessage(threadId, managedMessage)
+          const finalized = await this.finalizeQueuedTurn(next)
+          if (managedMessage && finalized) {
+            this.runtimeQueuedMessages.delete(runtimeKey)
+            await this.releaseActiveManagedMessage(threadId)
           }
         } else {
           const afterFailure = await this.inspectQueuedTurn(next)
@@ -11488,9 +14458,22 @@ export class BackendQueueProcessor {
     accepted: boolean
     acceptedInProgress: boolean
     canStart: boolean
+    writerEvidenceSnapshot?: ExternalWriterEvidenceSnapshot
   }> {
     const threadId = turn.threadId
+    if ((await readAuthoritativeArchivedThreadIds([threadId], { fresh: true })).has(threadId)) {
+      await this.discardArchivedThreadQueue(threadId)
+      const error = new Error('Cannot inspect queued work for an archived task.')
+      error.name = 'ArchivedThreadConflictError'
+      throw error
+    }
     const response = asRecord(await this.appServer.rpc('thread/read', { threadId, includeTurns: true }))
+    if ((await readAuthoritativeArchivedThreadIds([threadId], { fresh: true })).has(threadId)) {
+      await this.discardArchivedThreadQueue(threadId)
+      const error = new Error('Queued work was archived while its state was being inspected.')
+      error.name = 'ArchivedThreadConflictError'
+      throw error
+    }
     const thread = asRecord(response?.thread)
     if (!thread) return { accepted: false, acceptedInProgress: false, canStart: false }
     const turns = Array.isArray(thread.turns) ? thread.turns : []
@@ -11522,6 +14505,24 @@ export class BackendQueueProcessor {
 
     this.runtimeProbe.registerThread(threadId, rolloutPath)
     const externalRuntime = await this.runtimeProbe.inspect(threadId, this.appServer.getPid())
+    if (externalRuntime.state === 'idle') {
+      const writerEvidenceSnapshot = await readWriterEvidenceSnapshot(
+        this.runtimeProbe,
+        threadId,
+        this.appServer.getPid(),
+      )
+      if (writerEvidenceSnapshot === null) {
+        return { accepted: false, acceptedInProgress: false, canStart: false }
+      }
+      if (writerEvidenceSnapshot) {
+        return {
+          accepted: false,
+          acceptedInProgress: false,
+          canStart: true,
+          writerEvidenceSnapshot,
+        }
+      }
+    }
     if (
       externalRuntime.state === 'idle'
       && typeof this.runtimeProbe.inspectWriterEvidence === 'function'
@@ -11641,32 +14642,6 @@ export class BackendQueueProcessor {
       const nextProcessing = { ...processing }
       delete nextProcessing[turn.threadId]
       return { nextState: state, nextProcessing, result: undefined }
-    })
-  }
-
-  private async releaseQueuedTurnClaimAfterRollback(turn: BackendQueuedTurn, rollbackTurnId: string): Promise<void> {
-    await withThreadQueueStateUpdate((state, _receipts, processing) => {
-      const current = processing[turn.threadId]
-      if (current?.messageId !== turn.message.id || current.ownerId !== turn.ownerId) {
-        return { nextState: state, result: undefined }
-      }
-      const nextQueue = (state[turn.threadId] ?? []).map((message) => {
-        if (message.id !== turn.message.id || !rollbackTurnId) return message
-        return {
-          ...message,
-          ownershipRollbackTurnIds: [
-            ...(message.ownershipRollbackTurnIds ?? []).filter((turnId) => turnId !== rollbackTurnId),
-            rollbackTurnId,
-          ],
-        }
-      })
-      const nextProcessing = { ...processing }
-      delete nextProcessing[turn.threadId]
-      return {
-        nextState: { ...state, [turn.threadId]: nextQueue },
-        nextProcessing,
-        result: undefined,
-      }
     })
   }
 
@@ -11923,21 +14898,18 @@ export class BackendQueueProcessor {
           throw new Error('Cannot resume a task owned by another app-server process.')
         }
       }
-      if (await isThreadArchivedForMutation(this.appServer, turn.threadId)) {
+      if (await isThreadArchivedForMutation(this.appServer, turn.threadId, { fresh: true })) {
         await this.discardArchivedThreadQueue(turn.threadId)
         const error = new Error('Cannot start queued work for an archived task.')
         error.name = 'ArchivedThreadConflictError'
         throw error
       }
       await this.appServer.rpc('thread/resume', { threadId: turn.threadId })
-      if (await isThreadArchivedForMutation(this.appServer, turn.threadId)) {
+      if (await isThreadArchivedForMutation(this.appServer, turn.threadId, { fresh: true })) {
         await this.discardArchivedThreadQueue(turn.threadId)
         const error = new Error('Cannot resume queued work for an archived task.')
         error.name = 'ArchivedThreadConflictError'
         throw error
-      }
-      if (!(await this.markQueuedTurnAttempted(turn))) {
-        throw new Error('Queued turn claim was lost before turn/start.')
       }
       if (managedMessage) {
         await this.persistActiveManagedMessage(turn.threadId, managedMessage)
@@ -11948,6 +14920,27 @@ export class BackendQueueProcessor {
       if (!finalState.canStart) {
         throw new Error('Cannot start a queued turn after writer ownership changed.')
       }
+      const unexpectedLifecycle = this.runtimeProbe
+        ? await inspectUnexpectedWriterLifecycle(
+            this.runtimeProbe,
+            turn.threadId,
+            currentState.writerEvidenceSnapshot,
+            '',
+          )
+        : undefined
+      if (
+        (unexpectedLifecycle !== undefined && unexpectedLifecycle !== false)
+        || (
+          currentState.writerEvidenceSnapshot
+          && finalState.writerEvidenceSnapshot
+          && hasNewWriterEvidence(currentState.writerEvidenceSnapshot, finalState.writerEvidenceSnapshot)
+        )
+      ) {
+        throw new Error('Cannot start a queued turn after writer ownership changed.')
+      }
+      if (!(await this.markQueuedTurnAttempted(turn))) {
+        throw new Error('Queued turn claim was lost before turn/start.')
+      }
       let result: unknown
       try {
         result = await this.appServer.rpc('turn/start', params)
@@ -11957,7 +14950,7 @@ export class BackendQueueProcessor {
         definitiveError.name = 'DefinitiveQueuedTurnStartError'
         throw definitiveError
       }
-      if (await isThreadArchivedForMutation(this.appServer, turn.threadId)) {
+      if (await isThreadArchivedForMutation(this.appServer, turn.threadId, { fresh: true })) {
         const turnId = readNonEmptyString(asRecord(asRecord(result)?.turn)?.id)
         if (turnId) {
           await this.appServer.rpc('turn/interrupt', { threadId: turn.threadId, turnId }).catch(() => undefined)
@@ -11974,6 +14967,9 @@ export class BackendQueueProcessor {
           this.appServer.getPid(),
           turn.threadId,
           result,
+          false,
+          finalState.writerEvidenceSnapshot,
+          readNonEmptyString(params.clientUserMessageId),
         )
       }
     })
@@ -12200,7 +15196,7 @@ function getSharedBridgeState(): SharedBridgeState {
 }
 
 async function loadAllThreadsForSearch(appServer: AppServerProcess): Promise<ThreadSearchDocument[]> {
-  const threads: Array<{ id: string; title: string; preview: string }> = []
+  const threads: Array<{ id: string; title: string; preview: string; path: string }> = []
   let cursor: string | null = null
 
   do {
@@ -12220,7 +15216,8 @@ async function loadAllThreadsForSearch(appServer: AppServerProcess): Promise<Thr
         ? record.name.trim()
         : (typeof record?.preview === 'string' && record.preview.trim().length > 0 ? record.preview.trim() : 'Untitled thread')
       const preview = typeof record?.preview === 'string' ? record.preview : ''
-      threads.push({ id, title, preview })
+      const path = readNonEmptyString(record?.path)
+      threads.push({ id, title, preview, path })
     }
     cursor = typeof response?.nextCursor === 'string' && response.nextCursor.length > 0 ? response.nextCursor : null
   } while (cursor)
@@ -12245,11 +15242,24 @@ async function loadAllThreadsForSearch(appServer: AppServerProcess): Promise<Thr
     const batch = fullTextThreads.slice(offset, offset + concurrency)
     const loaded = await Promise.all(batch.map(async (thread) => {
       try {
-        const readResponse = await appServer.rpc('thread/read', {
-          threadId: thread.id,
-          includeTurns: true,
-        })
-        const messageText = extractThreadMessageText(readResponse)
+        if ((await readAuthoritativeArchivedThreadIds([thread.id], { fresh: true })).has(thread.id)) {
+          return [thread.id, null] as const
+        }
+        const listedPathMatches = thread.path
+          && isAbsolute(thread.path)
+          && await localRolloutPathMatchesThreadId(thread.path, thread.id)
+        const sessionPath = listedPathMatches
+          ? thread.path
+          : await findLocalRolloutPathForThreadId(thread.id)
+        const page = sessionPath
+          ? await readLocalRolloutThreadTurnPageFallback(sessionPath, 50)
+          : null
+        if ((await readAuthoritativeArchivedThreadIds([thread.id], { fresh: true })).has(thread.id)) {
+          return [thread.id, null] as const
+        }
+        const messageText = page
+          ? extractThreadMessageText({ thread: { id: thread.id, turns: page.turns } })
+          : ''
         const searchableText = [thread.title, thread.preview, messageText].filter(Boolean).join('\n')
         return [thread.id, {
           id: thread.id,
@@ -12259,12 +15269,12 @@ async function loadAllThreadsForSearch(appServer: AppServerProcess): Promise<Thr
           searchableText,
         } satisfies ThreadSearchDocument] as const
       } catch {
-        return null
+        return [thread.id, null] as const
       }
     }))
     for (const row of loaded) {
-      if (!row) continue
-      docsById.set(row[0], row[1])
+      if (row[1]) docsById.set(row[0], row[1])
+      else docsById.delete(row[0])
     }
   }
 
@@ -12392,6 +15402,87 @@ export function createCodexBridgeMiddleware(options: {
       .catch(() => {})
   }
 
+  const rejectArchivedThreadHttpRequest = async (
+    res: ServerResponse,
+    threadIds: readonly string[],
+  ): Promise<boolean> => {
+    for (const threadId of Array.from(new Set(threadIds.map((id) => id.trim()).filter(Boolean)))) {
+      if (!(await readAuthoritativeArchivedThreadIds([threadId], { fresh: true })).has(threadId)) continue
+      appServer.clearThreadReadState(threadId)
+      setJson(res, 409, { error: 'Cannot operate on an archived task.' })
+      return true
+    }
+    return false
+  }
+
+  const verifyThreadHttpResponse = async (
+    threadId: string,
+    response: CachedHttpResponse,
+  ): Promise<CachedHttpResponse> => {
+    if (response.status !== 200) return response
+    try {
+      if (!(await readAuthoritativeArchivedThreadIds([threadId], { fresh: true })).has(threadId)) return response
+    } catch (error) {
+      if (!(error instanceof Error) || error.name !== 'ArchivedThreadStateUnavailableError') throw error
+      return { status: 409, payload: { error: 'Cannot verify archived task state.' } }
+    }
+    appServer.clearThreadReadState(threadId)
+    return { status: 409, payload: { error: 'Cannot operate on an archived task.' } }
+  }
+
+  const readPrunedThreadQueueStore = async (): Promise<Awaited<ReturnType<typeof readThreadQueueStore>>> => {
+    let store = await readThreadQueueStore()
+    for (let pass = 0; pass < 2; pass += 1) {
+      const threadIds = Object.keys(store.state)
+      if (threadIds.length === 0) break
+      const archivedThreadIds = await readAuthoritativeArchivedThreadIds(threadIds, { fresh: true })
+      for (const threadId of [...archivedThreadIds].sort()) {
+        await withThreadStartClaimWait(threadId, async () => {
+          if (await isThreadArchivedForMutation(appServer, threadId, { fresh: true })) {
+            await backendQueueProcessor.discardArchivedThreadQueue(threadId)
+          }
+        })
+      }
+      if (archivedThreadIds.size > 0 || pass === 0) store = await readThreadQueueStore()
+    }
+    return store
+  }
+
+  const assertThreadQueuesActiveAfterMutation = async (
+    threadIds: readonly string[],
+    message: string,
+    beforeConflict?: () => void | Promise<void>,
+  ): Promise<void> => {
+    const normalizedThreadIds = Array.from(new Set(threadIds.map((id) => id.trim()).filter(Boolean)))
+    const archivedThreadIds: string[] = []
+    try {
+      for (const threadId of normalizedThreadIds) {
+        if (await isThreadArchivedForMutation(appServer, threadId, { fresh: true })) {
+          archivedThreadIds.push(threadId)
+        }
+      }
+    } catch (error) {
+      await beforeConflict?.()
+      throw error
+    }
+    if (archivedThreadIds.length === 0) return
+    await beforeConflict?.()
+    for (const threadId of archivedThreadIds) {
+      appServer.clearThreadReadState(threadId)
+      await backendQueueProcessor.discardArchivedThreadQueue(threadId)
+    }
+    const error = new Error(message)
+    error.name = 'ArchivedThreadConflictError'
+    throw error
+  }
+
+  const rethrowQueuePostCommitError = (error: unknown, committedRevision: number): never => {
+    if (error instanceof Error && error.name === 'ArchivedThreadStateUnavailableError') {
+      Object.assign(error, { committedRevision })
+    }
+    throw error
+  }
+
   const middleware = async (req: IncomingMessage, res: ServerResponse, next: () => void) => {
     const requestStartNs = process.hrtime.bigint()
     const rawUrl = req.url ?? ''
@@ -12453,14 +15544,40 @@ export function createCodexBridgeMiddleware(options: {
           setJson(res, 400, { error: 'Missing threadId' })
           return
         }
+        if (await rejectArchivedThreadHttpRequest(res, [threadId])) return
         const state = await observeThreadRuntimeState(
           threadId,
           runtimeProbe,
           localRuntimeLedger,
           appServer.getPid(),
         )
-        appServer.cacheExternalRuntimeObservation(threadId, state)
-        setJson(res, 200, state)
+        const response = await verifyThreadHttpResponse(threadId, { status: 200, payload: state })
+        if (response.status === 200) appServer.cacheExternalRuntimeObservation(threadId, state)
+        setJson(res, response.status, response.payload)
+        return
+      }
+
+      if (req.method === 'GET' && url.pathname === '/codex-api/thread-summary') {
+        const threadId = url.searchParams.get('threadId')?.trim() ?? ''
+        if (!threadId) {
+          setJson(res, 400, { error: 'Missing threadId' })
+          return
+        }
+        if (await rejectArchivedThreadHttpRequest(res, [threadId])) return
+        const thread = await readPassiveThreadSummary(threadId)
+        if (!thread) {
+          if (await rejectArchivedThreadHttpRequest(res, [threadId])) return
+          setJson(res, 503, {
+            error: 'Thread metadata lookup was inconclusive',
+            retryable: true,
+          })
+          return
+        }
+        const response = await verifyThreadHttpResponse(threadId, {
+          status: 200,
+          payload: { result: { thread } },
+        })
+        setJson(res, response.status, response.payload)
         return
       }
 
@@ -12477,13 +15594,25 @@ export function createCodexBridgeMiddleware(options: {
           setJson(res, 400, { error: 'Expected 1-50 unique non-empty threadIds' })
           return
         }
+        const archivedThreadIds = await readAuthoritativeArchivedThreadIds(threadIds)
+        const activeThreadIds = threadIds.filter((threadId) => !archivedThreadIds.has(threadId))
         const states = await observeThreadRuntimeStates(
-          threadIds,
+          activeThreadIds,
           runtimeProbe,
           localRuntimeLedger,
           appServer.getPid(),
         )
-        appServer.cacheExternalRuntimeObservations(states)
+        for (const threadId of await readAuthoritativeArchivedThreadIds(activeThreadIds)) {
+          archivedThreadIds.add(threadId)
+          delete states[threadId]
+        }
+        for (const threadId of archivedThreadIds) {
+          appServer.clearThreadReadState(threadId)
+          states[threadId] = { state: 'archived' }
+        }
+        appServer.cacheExternalRuntimeObservations(Object.fromEntries(
+          Object.entries(states).filter(([, state]) => state.state !== 'archived'),
+        ))
         setJson(res, 200, { states })
         return
       }
@@ -12503,13 +15632,15 @@ export function createCodexBridgeMiddleware(options: {
           setJson(res, 400, { error: 'Missing threadId or turnId' })
           return
         }
+        if (await rejectArchivedThreadHttpRequest(res, [threadId])) return
         const result = await runtimeProbe.interrupt(threadId, turnId, appServer.getPid())
         if (!result.interrupted) {
           const reason = result.reason ?? 'writer-not-found'
           setJson(res, 409, { error: `External runtime interrupt unavailable: ${reason}` })
           return
         }
-        setJson(res, 200, { ok: true })
+        const response = await verifyThreadHttpResponse(threadId, { status: 200, payload: { ok: true } })
+        setJson(res, response.status, response.payload)
         return
       }
 
@@ -12993,6 +16124,7 @@ export function createCodexBridgeMiddleware(options: {
             runtimeProbe,
             appServer.getPid(),
           )
+          archivedThreadIndexCache = null
           if (!(await isThreadArchivedForMutation(appServer, threadId))) {
             const error = new Error('Task archive could not be verified.')
             error.name = 'ArchivedThreadStateUnavailableError'
@@ -13000,8 +16132,7 @@ export function createCodexBridgeMiddleware(options: {
           }
           await appServer.rpc('thread/goal/clear', { threadId })
           await backendQueueProcessor.discardArchivedThreadQueue(threadId)
-          appServer.invalidateExternalRuntimeObservationCache(threadId)
-          appServer.invalidateLiveStateCache(threadId)
+          appServer.clearThreadReadState(threadId)
           appServer.invalidateThreadListRpcCache()
           threadSearchIndex = null
           threadSearchIndexSignature = ''
@@ -13039,7 +16170,7 @@ export function createCodexBridgeMiddleware(options: {
         const preparedRpcRequest = prepareRpcProxyRequest(body.method, body.params ?? null)
         const rawThreadListParams = body.method === 'thread/list' ? asRecord(preparedRpcRequest.params) : null
         const threadListCursor = rawThreadListParams
-          ? decodeThreadListCursor(rawThreadListParams.cursor)
+          ? await decodeThreadListCursor(rawThreadListParams.cursor)
           : null
         if (threadListCursor?.kind === 'native') {
           preparedRpcRequest.params = { ...rawThreadListParams, cursor: threadListCursor.cursor }
@@ -13056,6 +16187,10 @@ export function createCodexBridgeMiddleware(options: {
 
         let rpcResult: unknown
         let threadListResultSource: 'native' | 'imports' | 'session-index' = 'native'
+        let threadListResultIsCanonical = false
+        let threadListResultIncludesImported = false
+        let threadListCacheKey: string | null = null
+        let threadListCacheSignature = ''
         try {
           const requestThreadId = readNonEmptyString(asRecord(preparedRpcRequest.params)?.threadId)
           if (
@@ -13073,14 +16208,14 @@ export function createCodexBridgeMiddleware(options: {
           const sessionIndexThreadListCursorPage = threadListCursor?.kind === 'session-index'
             ? await readSessionIndexThreadListFallback(preparedRpcRequest.params, threadListCursor)
             : null
-          const threadListCacheKey = body.method === 'thread/list'
+          threadListCacheKey = body.method === 'thread/list'
             && !importedThreadListCursorPage
             && !sessionIndexThreadListCursorPage
             ? buildThreadListRpcCacheKey(preparedRpcRequest.params)
             : null
           const shouldBypassThreadListCache = body.method === 'thread/list'
             && preparedRpcRequest.forceFreshThreadList === true
-          const threadListCacheSignature = threadListCacheKey
+          threadListCacheSignature = threadListCacheKey
             ? await readThreadListRpcCacheSignature()
             : ''
           const isPendingFirstTurn = body.method === 'turn/start'
@@ -13089,52 +16224,75 @@ export function createCodexBridgeMiddleware(options: {
           const cachedThreadListResult = threadListCacheKey && !shouldBypassThreadListCache
             ? appServer.getCachedThreadListRpcResult(threadListCacheKey, threadListCacheSignature)
             : null
+          const refreshThreadListCacheKey = threadListCacheKey
+          const refreshThreadListCacheSignature = threadListCacheSignature
+          const startThreadListRefresh = refreshThreadListCacheKey
+            ? () => appServer.getOrStartThreadListRpcRefresh(refreshThreadListCacheKey, async () => {
+                const freshResult = await callRpcWithArchiveRecovery(
+                  appServer,
+                  body.method,
+                  preparedRpcRequest.params,
+                  runtimeProbe,
+                  appServer.getPid(),
+                  {
+                    locallyCreatedFirstTurn: isPendingFirstTurn,
+                  },
+                )
+                const cacheableResult = await prepareThreadListResponseForCache(freshResult)
+                if (readThreadListDataLength(cacheableResult) === 0) return cacheableResult
+                appServer.cacheThreadListRpcResult(
+                  refreshThreadListCacheKey,
+                  refreshThreadListCacheSignature,
+                  cacheableResult,
+                )
+                const mergedResult = await mergeImportedThreadsIntoThreadListResult(
+                  cacheableResult,
+                  preparedRpcRequest.params,
+                  threadListCursor?.kind === 'native' ? threadListCursor : null,
+                )
+                const canonicalResult = await canonicalizeThreadListResponseForRead(mergedResult)
+                if (readThreadListDataLength(canonicalResult) > 0) {
+                  await writePersistedThreadListRpcCache(
+                    refreshThreadListCacheKey,
+                    refreshThreadListCacheSignature,
+                    canonicalResult,
+                  )
+                }
+                return canonicalResult
+              })
+            : null
           if (importedThreadListCursorPage) {
             threadListResultSource = 'imports'
             rpcResult = importedThreadListCursorPage
+            threadListResultIsCanonical = true
           } else if (sessionIndexThreadListCursorPage) {
             threadListResultSource = 'session-index'
             rpcResult = sessionIndexThreadListCursorPage
+            threadListResultIsCanonical = true
           } else if (cachedThreadListResult) {
             rpcResult = cachedThreadListResult
           } else if (threadListCacheKey) {
-            const startThreadListRefresh = () => appServer.getOrStartThreadListRpcRefresh(threadListCacheKey, async () => {
-              const freshResult = await callRpcWithArchiveRecovery(
-                appServer,
-                body.method,
-                preparedRpcRequest.params,
-                runtimeProbe,
-                appServer.getPid(),
-                {
-                  locallyCreatedFirstTurn: isPendingFirstTurn,
-                },
-              )
-              const canonicalResult = await canonicalizeThreadListResponseForRead(freshResult)
-              appServer.cacheThreadListRpcResult(threadListCacheKey, threadListCacheSignature, canonicalResult)
-              await writePersistedThreadListRpcCache(threadListCacheKey, threadListCacheSignature, canonicalResult)
-              return canonicalResult
-            })
             const persistedThreadListResult = await readPersistedThreadListRpcCache(
               threadListCacheKey,
               threadListCacheSignature,
             )
             if (persistedThreadListResult) {
-              setTimeout(() => {
-                startThreadListRefresh().catch(() => {})
-              }, 0)
               rpcResult = persistedThreadListResult
+              threadListResultIncludesImported = true
+              void startThreadListRefresh!().catch(() => {})
             } else {
               const sessionIndexThreadListResult = await readSessionIndexThreadListFallback(
                 preparedRpcRequest.params,
               )
               if (sessionIndexThreadListResult) {
                 threadListResultSource = 'session-index'
-                setTimeout(() => {
-                  startThreadListRefresh().catch(() => {})
-                }, 0)
+                threadListResultIsCanonical = true
+                void startThreadListRefresh!().catch(() => {})
                 rpcResult = sessionIndexThreadListResult
               } else {
-                rpcResult = await startThreadListRefresh()
+                rpcResult = await startThreadListRefresh!()
+                threadListResultIncludesImported = true
+                threadListResultIsCanonical = true
               }
             }
           } else {
@@ -13199,23 +16357,26 @@ export function createCodexBridgeMiddleware(options: {
           }
 		          throw error
 		        }
-        const canonicalRpcResult = body.method === 'thread/list'
-          ? await canonicalizeThreadListResponseForRead(rpcResult)
-          : rpcResult
-        const trimmedResult = trimThreadTurnsInRpcResult(body.method, canonicalRpcResult)
+	        const importedMergedRpcResult = body.method === 'thread/list'
+	          && threadListResultSource === 'native'
+	          && !threadListResultIncludesImported
+	          ? await mergeImportedThreadsIntoThreadListResult(
+	              rpcResult,
+	              preparedRpcRequest.params,
+	              threadListCursor?.kind === 'native' ? threadListCursor : null,
+	            )
+	          : rpcResult
+	        const canonicalRpcResult = body.method === 'thread/list'
+	          && !threadListResultIsCanonical
+	          ? await canonicalizeThreadListResponseForRead(importedMergedRpcResult)
+	          : importedMergedRpcResult
+	        const trimmedResult = trimThreadTurnsInRpcResult(body.method, canonicalRpcResult)
         const errorMergedResult = THREAD_METHODS_WITH_TURNS.has(body.method)
           ? mergeStreamTurnErrorsIntoThreadResult(appServer, trimmedResult)
           : trimmedResult
-        const listMergedResult = body.method === 'thread/list' && threadListResultSource === 'native'
-          ? await mergeImportedThreadsIntoThreadListResult(
-              errorMergedResult,
-              preparedRpcRequest.params,
-              threadListCursor?.kind === 'native' ? threadListCursor : null,
-            )
-          : errorMergedResult
-        const clientThreadResult = await prepareThreadRpcResultForClient(
-          body.method,
-          listMergedResult,
+	        const clientThreadResult = await prepareThreadRpcResultForClient(
+	          body.method,
+	          errorMergedResult,
           preparedRpcRequest.skipSessionSkillEnrichment,
         )
         const result = await enrichThreadResultWithSessionModelSettings(body.method, clientThreadResult)
@@ -13257,69 +16418,64 @@ export function createCodexBridgeMiddleware(options: {
             setJson(res, 400, { error: 'Missing threadId' })
             return
           }
+          if (await rejectArchivedThreadHttpRequest(res, [threadId])) return
 
           const isLocalRolloutCursor = isLocalRolloutTurnPageCursor(cursor)
-          let pageWasLocalFallback = false
-          let page = isLocalRolloutCursor
+          const localSessionPath = (await readSessionIndexFallbackRolloutMetadata(threadId)).path
+          const shouldUseLocalRollout = isLocalRolloutCursor || cursor.length === 0
+          const localPage = localSessionPath && shouldUseLocalRollout
+            ? await readLocalRolloutThreadTurnPageFallback(
+                localSessionPath,
+                limit,
+                isLocalRolloutCursor ? cursor : '',
+              )
+            : null
+          let pageWasLocalFallback = localPage !== null
+          let page = localPage ?? (isLocalRolloutCursor
             ? { turns: [] as unknown[], nextCursor: null as string | null, backwardsCursor: null as string | null }
             : await readNativeThreadTurnPage(
-              (method, params) => appServer.rpc(method, params),
-              {
-                threadId,
-                cursor: cursor || undefined,
-                limit,
-              },
-            )
-          if (isLocalRolloutCursor || (!cursor && page.turns.length === 0)) {
-            let sessionPath = await findLocalRolloutPathForThreadId(threadId)
-            if (!sessionPath) {
-              try {
-                const metadataResult = await appServer.rpc('thread/read', {
+                (method, params) => appServer.rpc(method, params),
+                {
                   threadId,
-                  includeTurns: false,
-                })
-                sessionPath = readNonEmptyString(asRecord(asRecord(metadataResult)?.thread)?.path)
-              } catch {
-                sessionPath = ''
-              }
-            }
-            const fallbackPage = await readLocalRolloutThreadTurnPageFallback(
-              sessionPath,
-              limit,
-              isLocalRolloutCursor ? cursor : '',
-            )
-            if (fallbackPage && fallbackPage.turns.length > 0) {
-              page = fallbackPage
-              pageWasLocalFallback = true
-            } else if (isLocalRolloutCursor) {
-              setJson(res, 400, { error: 'Invalid thread turn cursor' })
-              return
-            }
+                  cursor: cursor || undefined,
+                  limit,
+                },
+              ))
+          if (!localPage && isLocalRolloutCursor) {
+            setJson(res, 400, { error: 'Invalid thread turn cursor' })
+            return
           }
           const activeCompactedTurns = compactActiveTurnTextForTurnPage(page.turns, activeTurnId, {
             compactRunningWhenActiveUnknown: pageWasLocalFallback,
           })
           const turns = compactHistoricalTurnTextForTurnPage(activeCompactedTurns, activeTurnId)
-          const pagedResult = mergeStreamTurnErrorsIntoThreadResult(appServer, {
+          let pagedResult = mergeStreamTurnErrorsIntoThreadResult(appServer, {
             thread: {
               id: threadId,
+              ...(localSessionPath ? { path: localSessionPath } : {}),
               turns: pruneHistoricalReasoningItemsFromTurns(turns, activeTurnId),
             },
           })
+          if (localSessionPath) {
+            pagedResult = mergeSessionModelSettingsIntoThreadResult(
+              pagedResult,
+              await readSessionModelSettingsFromFile(localSessionPath),
+            ) as typeof pagedResult
+          }
           const result = await prepareThreadRpcResultForClient('thread/read', pagedResult, true)
 
-          setJson(res, 200, {
+          const response = await verifyThreadHttpResponse(threadId, { status: 200, payload: {
             result,
             nextCursor: page.nextCursor,
             backwardsCursor: page.backwardsCursor,
             startTurnIndex: 0,
             hasMoreOlder: page.nextCursor !== null,
-          })
+          } })
+          setJson(res, response.status, response.payload)
         } catch (error) {
           if (isThreadTurnsListMethodNotFoundError(error)) {
             setJson(res, 501, {
               error: 'thread/turns/list is not supported by this Codex app-server',
-              fallback: 'thread/read',
             })
             return
           }
@@ -13339,6 +16495,7 @@ export function createCodexBridgeMiddleware(options: {
           setJson(res, 400, { error: 'Missing threadId or turnId' })
           return
         }
+        if (await rejectArchivedThreadHttpRequest(res, [threadId])) return
         const requestKey = buildThreadTextPageHttpCacheKey({
           threadId,
           turnId,
@@ -13349,12 +16506,13 @@ export function createCodexBridgeMiddleware(options: {
         })
         const cachedResponse = appServer.getCachedThreadTextPageHttpResponse(requestKey)
         if (cachedResponse) {
-          setJson(res, cachedResponse.status, cachedResponse.payload)
+          const response = await verifyThreadHttpResponse(threadId, cachedResponse)
+          setJson(res, response.status, response.payload)
           return
         }
         const pendingResponse = appServer.getPendingThreadTextPageHttpResponse(requestKey)
         if (pendingResponse) {
-          const response = await pendingResponse
+          const response = await verifyThreadHttpResponse(threadId, await pendingResponse)
           setJson(res, response.status, response.payload)
           return
         }
@@ -13363,15 +16521,15 @@ export function createCodexBridgeMiddleware(options: {
           resolveThreadTextPageResponse = resolve
         })
         appServer.setPendingThreadTextPageHttpResponse(requestKey, responsePromise)
-        const sendThreadTextPageJson = (status: number, payload: unknown): void => {
-          const response = { status, payload }
+        const sendThreadTextPageJson = async (status: number, payload: unknown): Promise<void> => {
+          const response = await verifyThreadHttpResponse(threadId, { status, payload })
           appServer.finishThreadTextPageHttpResponse(
             requestKey,
             response,
             knownTailSignature.length > 0,
           )
           resolveThreadTextPageResponse(response)
-          setJson(res, status, payload)
+          setJson(res, response.status, response.payload)
         }
 
         try {
@@ -13382,10 +16540,10 @@ export function createCodexBridgeMiddleware(options: {
             try {
               const stats = await stat(sessionPath)
               if (stats.isFile()) sessionStats = stats
-            } catch { /* fall back to thread/read */ }
+            } catch { /* Resolve the rollout from local metadata below. */ }
           }
           if (!sessionStats) {
-            const localSessionPath = await findLocalRolloutPathForThreadId(threadId)
+            const localSessionPath = await resolvePassiveThreadRolloutPath(appServer, threadId)
             if (localSessionPath) {
               try {
                 const stats = await stat(localSessionPath)
@@ -13393,24 +16551,15 @@ export function createCodexBridgeMiddleware(options: {
                   sessionPath = localSessionPath
                   sessionStats = stats
                 }
-              } catch { /* fall back to thread/read */ }
+              } catch { /* Treat a disappearing rollout as unavailable. */ }
             }
           }
           if (!sessionStats) {
-            const threadRead = await appServer.rpc('thread/read', {
-              threadId,
-              includeTurns: false,
-            })
-            const thread = asRecord(asRecord(threadRead)?.thread)
-            sessionPath = readNonEmptyString(thread?.path)
-            if (!sessionPath || !isAbsolute(sessionPath)) {
-              sendThreadTextPageJson(404, { error: 'No rollout available for thread' })
-              return
-            }
-            sessionStats = await stat(sessionPath)
+            await sendThreadTextPageJson(404, { error: 'No rollout available for thread' })
+            return
           }
           if (!sessionStats.isFile()) {
-            sendThreadTextPageJson(404, { error: 'No rollout available for thread' })
+            await sendThreadTextPageJson(404, { error: 'No rollout available for thread' })
             return
           }
           runtimeProbe.registerThread(threadId, sessionPath)
@@ -13438,14 +16587,14 @@ export function createCodexBridgeMiddleware(options: {
             trustedActiveTurn: runtimeMatchesRequestedTurn,
             trustedSnapshotEndOffset: sessionStats.size,
           })
-          sendThreadTextPageJson(200, page)
+          await sendThreadTextPageJson(200, page)
         } catch (error) {
           if (error instanceof ThreadTextPageError) {
-            sendThreadTextPageJson(error.statusCode, { error: error.message })
+            await sendThreadTextPageJson(error.statusCode, { error: error.message })
           } else if (getErrorCode(error) === 'ENOENT') {
-            sendThreadTextPageJson(404, { error: 'No rollout available for thread' })
+            await sendThreadTextPageJson(404, { error: 'No rollout available for thread' })
           } else {
-            sendThreadTextPageJson(500, { error: 'Failed to load thread text page' })
+            await sendThreadTextPageJson(500, { error: 'Failed to load thread text page' })
           }
         } finally {
           appServer.clearPendingThreadTextPageHttpResponse(requestKey)
@@ -13461,8 +16610,10 @@ export function createCodexBridgeMiddleware(options: {
           setJson(res, 400, { error: 'Missing threadId' })
           return
         }
+        if (await rejectArchivedThreadHttpRequest(res, [threadId])) return
         const events = appServer.getStreamEvents(threadId, limit)
-        setJson(res, 200, { events })
+        const response = await verifyThreadHttpResponse(threadId, { status: 200, payload: { events } })
+        setJson(res, response.status, response.payload)
         return
       }
 
@@ -13472,16 +16623,18 @@ export function createCodexBridgeMiddleware(options: {
           setJson(res, 400, { error: 'Missing threadId' })
           return
         }
+        if (await rejectArchivedThreadHttpRequest(res, [threadId])) return
         const knownProjectionKey = url.searchParams.get('knownProjectionKey')?.trim() ?? ''
         const requestKey = buildThreadLiveStateHttpCacheKey(threadId, knownProjectionKey)
         const cachedResponse = appServer.getCachedLiveStateHttpResponse(requestKey)
         if (cachedResponse) {
-          setJson(res, cachedResponse.status, cachedResponse.payload)
+          const response = await verifyThreadHttpResponse(threadId, cachedResponse)
+          setJson(res, response.status, response.payload)
           return
         }
         const pendingResponse = appServer.getPendingLiveStateHttpResponse(requestKey)
         if (pendingResponse) {
-          const response = await pendingResponse
+          const response = await verifyThreadHttpResponse(threadId, await pendingResponse)
           setJson(res, response.status, response.payload)
           return
         }
@@ -13490,22 +16643,23 @@ export function createCodexBridgeMiddleware(options: {
           resolveLiveStateResponse = resolve
         })
         appServer.setPendingLiveStateHttpResponse(requestKey, liveStateResponsePromise)
-        const sendLiveStateJson = (status: number, payload: unknown): void => {
-          const response = { status, payload }
+        const sendLiveStateJson = async (status: number, payload: unknown): Promise<void> => {
+          const response = await verifyThreadHttpResponse(threadId, { status, payload })
           appServer.finishLiveStateHttpResponse(
             requestKey,
             response,
-            status === 200 && knownProjectionKey ? liveStateHttpResponseTtlMs(payload) : 0,
+            response.status === 200 && knownProjectionKey ? liveStateHttpResponseTtlMs(response.payload) : 0,
           )
           resolveLiveStateResponse(response)
-          setJson(res, status, payload)
+          setJson(res, response.status, response.payload)
         }
 
         let precheckedExternalRuntime: unknown | null = null
         let precheckedThreadLiveSnapshot: ThreadLiveSnapshot | null = null
         try {
           const lastSnapshot = appServer.getLastThreadReadSnapshot(threadId)
-          if (lastSnapshot) {
+          if (lastSnapshot && Array.isArray(asRecord(asRecord(lastSnapshot)?.thread)?.turns)
+            && (asRecord(asRecord(lastSnapshot)?.thread)?.turns as unknown[]).length > 0) {
             const snapshotRecord = asRecord(lastSnapshot)
             const snapshotThread = asRecord(snapshotRecord?.thread)
             const snapshotTurns = Array.isArray(snapshotThread?.turns) ? snapshotThread.turns : []
@@ -13534,7 +16688,7 @@ export function createCodexBridgeMiddleware(options: {
                   rawLiveAuthority === 'missing'
                   ? rawLiveAuthority
                   : 'persisted'
-                sendLiveStateJson(200, buildThreadLiveStateNotModifiedResponse({
+                await sendLiveStateJson(200, buildThreadLiveStateNotModifiedResponse({
                   threadId,
                   projectionKey: cachedProjectionKey,
                   isInProgress: false,
@@ -13599,7 +16753,7 @@ export function createCodexBridgeMiddleware(options: {
                   liveSnapshot,
                 })
                 if (knownProjectionKey === projectionKey) {
-                  sendLiveStateJson(200, buildThreadLiveStateNotModifiedResponse({
+                  await sendLiveStateJson(200, buildThreadLiveStateNotModifiedResponse({
                     threadId,
                     projectionKey,
                     isInProgress: true,
@@ -13609,7 +16763,7 @@ export function createCodexBridgeMiddleware(options: {
                   }))
                   return
                 }
-                sendLiveStateJson(200, buildThreadLiveStateNotModifiedResponse({
+                await sendLiveStateJson(200, buildThreadLiveStateNotModifiedResponse({
                   threadId,
                   projectionKey,
                   isInProgress: true,
@@ -13698,7 +16852,7 @@ export function createCodexBridgeMiddleware(options: {
               }
               appServer.cacheLiveState(threadId, responseData, snapshotTurns.length, snapshotSessionSize)
               if (knownProjectionKey && knownProjectionKey === projectionKey) {
-                sendLiveStateJson(200, buildThreadLiveStateNotModifiedResponse({
+                await sendLiveStateJson(200, buildThreadLiveStateNotModifiedResponse({
                   threadId,
                   projectionKey,
                   isInProgress: true,
@@ -13709,7 +16863,7 @@ export function createCodexBridgeMiddleware(options: {
                 return
               }
               if (knownProjectionKey) {
-                sendLiveStateJson(200, buildThreadLiveStateNotModifiedResponse({
+                await sendLiveStateJson(200, buildThreadLiveStateNotModifiedResponse({
                   threadId,
                   projectionKey,
                   isInProgress: true,
@@ -13719,13 +16873,13 @@ export function createCodexBridgeMiddleware(options: {
                 }))
                 return
               }
-              sendLiveStateJson(200, responseData)
+              await sendLiveStateJson(200, responseData)
               return
             }
           }
 
           if (knownProjectionKey) {
-            const localSessionPath = await findLocalRolloutPathForThreadId(threadId)
+            const localSessionPath = await resolvePassiveThreadRolloutPath(appServer, threadId)
             if (localSessionPath) {
               try {
                 const localSessionStats = await stat(localSessionPath)
@@ -13767,7 +16921,7 @@ export function createCodexBridgeMiddleware(options: {
                       liveAuthority,
                       liveSnapshot,
                     })
-                    sendLiveStateJson(200, buildThreadLiveStateNotModifiedResponse({
+                    await sendLiveStateJson(200, buildThreadLiveStateNotModifiedResponse({
                       threadId,
                       projectionKey,
                       isInProgress: true,
@@ -13778,67 +16932,29 @@ export function createCodexBridgeMiddleware(options: {
                     return
                   }
                 }
-              } catch {
-                // Fall back to thread/read below if the local path disappears.
-              }
+              } catch { /* Resolve the current local rollout again below. */ }
             }
           }
 
-          const rawThreadMetadataResult = await appServer.rpc('thread/read', {
-            threadId,
-            includeTurns: false,
-          })
-          const metadataRecord = asRecord(rawThreadMetadataResult)
-          const metadataThread = asRecord(metadataRecord?.thread)
-          let rawThreadReadResult: unknown
-          let olderCursor: string | null = null
-          let usedNativeTurnPagination = false
-          try {
-            let page = await readNativeThreadTurnPage(
-              (method, params) => appServer.rpc(method, params),
-              {
-                threadId,
-                limit: THREAD_TURN_PAGE_DEFAULT_LIMIT,
-              },
-            )
-            if (page.turns.length === 0) {
-              const metadataSessionPath = readNonEmptyString(metadataThread?.path)
-              const fallbackPage = await readLocalRolloutThreadTurnPageFallback(
-                metadataSessionPath,
-                THREAD_TURN_PAGE_DEFAULT_LIMIT,
-              )
-              if (fallbackPage && fallbackPage.turns.length > 0) {
-                page = fallbackPage
-              }
-            }
-            olderCursor = page.nextCursor
-            usedNativeTurnPagination = true
-            rawThreadReadResult = {
-              ...(metadataRecord ?? {}),
-              thread: {
-                ...(metadataThread ?? {}),
-                id: readNonEmptyString(metadataThread?.id) || threadId,
-                turns: page.turns,
-              },
-            }
-          } catch (paginationError) {
-            const paginationMessage = getErrorMessage(paginationError, '')
-            if (isThreadTurnsListMethodNotFoundError(paginationError)) {
-              rawThreadReadResult = await appServer.rpc('thread/read', {
-                threadId,
-                includeTurns: true,
-              })
-            } else if (
-              paginationMessage.includes('returned an invalid response')
-              && Array.isArray(metadataThread?.turns)
-              && metadataThread.turns.length > 0
-            ) {
-              // Some older test doubles and app-server builds ignore includeTurns:false.
-              // Reuse those already-returned turns without issuing an expensive second read.
-              rawThreadReadResult = rawThreadMetadataResult
-            } else {
-              throw paginationError
-            }
+          const sessionPath = await resolvePassiveThreadRolloutPath(appServer, threadId)
+          let sessionSize = 0
+          if (sessionPath) {
+            try {
+              const sessionStats = await stat(sessionPath)
+              if (sessionStats.isFile()) sessionSize = sessionStats.size
+            } catch { /* A missing rollout yields an empty passive projection. */ }
+          }
+          const localPage = sessionPath
+            ? await readLocalRolloutThreadTurnPageFallback(sessionPath, THREAD_TURN_PAGE_DEFAULT_LIMIT)
+            : null
+          const olderCursor = localPage?.nextCursor ?? null
+          const usedNativeTurnPagination = true
+          const rawThreadReadResult: unknown = {
+            thread: {
+              id: threadId,
+              path: sessionPath,
+              turns: localPage?.turns ?? [],
+            },
           }
           const threadReadResult = mergeStreamTurnErrorsIntoThreadResult(appServer, rawThreadReadResult)
           const sanitized = await sanitizeThreadTurnsInlinePayloads('thread/read', threadReadResult)
@@ -13851,15 +16967,7 @@ export function createCodexBridgeMiddleware(options: {
             typeof threadTurnStartIndexRaw === 'number' ? threadTurnStartIndexRaw : 0,
           ))
 
-          const sessionPath = readNonEmptyString(thread?.path)
           runtimeProbe.registerThread(threadId, sessionPath)
-          let sessionSize = 0
-          if (sessionPath && isAbsolute(sessionPath)) {
-            try {
-              const s = await stat(sessionPath)
-              sessionSize = s.size
-            } catch { /* missing */ }
-          }
           const sessionModelSettings = await readSessionModelSettingsFromFile(sessionPath)
 
           let turns = appServer.mergeItemsIntoTurns(threadId, rawTurns)
@@ -13919,7 +17027,7 @@ export function createCodexBridgeMiddleware(options: {
                 rawLiveAuthority === 'missing'
                 ? rawLiveAuthority
                 : 'persisted'
-              sendLiveStateJson(200, buildThreadLiveStateNotModifiedResponse({
+              await sendLiveStateJson(200, buildThreadLiveStateNotModifiedResponse({
                 threadId,
                 projectionKey: cachedProjectionKey,
                 isInProgress: false,
@@ -13929,7 +17037,7 @@ export function createCodexBridgeMiddleware(options: {
               }))
               return
             }
-            sendLiveStateJson(200, sanitizeThreadLiveStateResponseForClient(cached))
+            await sendLiveStateJson(200, sanitizeThreadLiveStateResponseForClient(cached))
             return
           }
           const isInProgress = isLocallyInProgress || isExternalInProgress
@@ -13986,7 +17094,7 @@ export function createCodexBridgeMiddleware(options: {
             liveSnapshot: sanitizeThreadLiveSnapshotForClient(liveSnapshot),
           })
           if (knownProjectionKey && knownProjectionKey === projectionKey) {
-            sendLiveStateJson(200, buildThreadLiveStateNotModifiedResponse({
+            await sendLiveStateJson(200, buildThreadLiveStateNotModifiedResponse({
               threadId,
               projectionKey,
               isInProgress,
@@ -14027,10 +17135,10 @@ export function createCodexBridgeMiddleware(options: {
             appServer.cacheLiveState(threadId, responseData, rawTurns.length, sessionSize)
           }
 
-          sendLiveStateJson(200, responseData)
+          await sendLiveStateJson(200, responseData)
         } catch (error) {
           if (isThreadMaterializationPendingError(error)) {
-            sendLiveStateJson(200, {
+            await sendLiveStateJson(200, {
               threadId,
               conversationState: { turns: [] },
               ownerClientId: null,
@@ -14055,7 +17163,7 @@ export function createCodexBridgeMiddleware(options: {
                   nowMs: Date.now(),
                 })
               : null
-            sendLiveStateJson(200, buildThreadLiveStateReadFailureFallback(
+            await sendLiveStateJson(200, buildThreadLiveStateReadFailureFallback(
               threadId,
               snapshot,
               error,
@@ -14068,7 +17176,7 @@ export function createCodexBridgeMiddleware(options: {
               },
             ))
           } else {
-            sendLiveStateJson(200, {
+            await sendLiveStateJson(200, {
               threadId,
               conversationState: null,
               ownerClientId: null,
@@ -14363,7 +17471,7 @@ export function createCodexBridgeMiddleware(options: {
       }
 
       if (req.method === 'GET' && url.pathname === '/codex-api/thread-queue-state') {
-        const { state, revision } = await readThreadQueueStore()
+        const { state, revision } = await readPrunedThreadQueueStore()
         setJson(res, 200, { data: state, revision })
         return
       }
@@ -14375,8 +17483,13 @@ export function createCodexBridgeMiddleware(options: {
           setJson(res, 400, { error: 'Missing threadId or messageId' })
           return
         }
+        if (await rejectArchivedThreadHttpRequest(res, [threadId])) return
         const accepted = await hasThreadQueueAppendReceipt(threadId, messageId)
-        setJson(res, 200, { data: { accepted } })
+        const response = await verifyThreadHttpResponse(threadId, {
+          status: 200,
+          payload: { data: { accepted } },
+        })
+        setJson(res, response.status, response.payload)
         return
       }
 
@@ -14984,15 +18097,10 @@ export function createCodexBridgeMiddleware(options: {
         const runtimeState = normalizeThreadQueueState(queueStateRecord)
         const existingQueueStore = await readThreadQueueStore()
         const existingQueueState = existingQueueStore.state
-        for (const threadId of new Set([
+        const affectedThreadIds = Array.from(new Set([
           ...Object.keys(existingQueueState),
           ...Object.keys(runtimeState),
-        ])) {
-          if (!(await isThreadWriterIdleForMutation(appServer, runtimeProbe, appServer.getPid(), threadId))) {
-            setJson(res, 409, { error: 'Cannot replace a queue while another writer owns the task.' })
-            return
-          }
-        }
+        ]))
         const baseRevision = typeof record.baseRevision === 'number' && Number.isSafeInteger(record.baseRevision)
           ? record.baseRevision
           : null
@@ -15001,20 +18109,40 @@ export function createCodexBridgeMiddleware(options: {
           return
         }
         const transferManagedMessageIds = new Set(normalizeStringArray(record.transferManagedMessageIds))
-        let revision: number
-        try {
-          revision = await replaceThreadQueueState(runtimeState, baseRevision)
-        } catch (error) {
-          if (error instanceof Error && (
-            error.name === 'ThreadQueueRevisionConflictError'
-            || error.name === 'ThreadQueueMutationConflictError'
-          )) {
-            setJson(res, 409, { error: error.message })
-            return
+        const revision = await withThreadStartClaimsWait(affectedThreadIds, async () => {
+          for (const threadId of affectedThreadIds) {
+            const archived = await isThreadArchivedForMutation(appServer, threadId, { fresh: true })
+            if (archived) {
+              if ((runtimeState[threadId]?.length ?? 0) > 0) {
+                const error = new Error('Cannot replace queued work for an archived task.')
+                error.name = 'ArchivedThreadConflictError'
+                throw error
+              }
+              continue
+            }
+            if (!(await isThreadWriterIdleForMutation(appServer, runtimeProbe, appServer.getPid(), threadId))) {
+              const error = new Error('Cannot replace a queue while another writer owns the task.')
+              error.name = 'ThreadWriterOwnershipConflictError'
+              throw error
+            }
           }
-          throw error
-        }
-        backendQueueProcessor.replaceRuntimeQueueState(runtimeState, transferManagedMessageIds)
+          const committedRevision = await replaceThreadQueueState(runtimeState, baseRevision)
+          try {
+            await assertThreadQueuesActiveAfterMutation(
+              affectedThreadIds,
+              'Cannot replace queued work for an archived task.',
+            )
+            backendQueueProcessor.replaceRuntimeQueueState(runtimeState, transferManagedMessageIds)
+            await assertThreadQueuesActiveAfterMutation(
+              affectedThreadIds,
+              'Cannot replace queued work for an archived task.',
+            )
+          } catch (error) {
+            void backendQueueProcessor.scheduleAllQueuedThreads()
+            rethrowQueuePostCommitError(error, committedRevision)
+          }
+          return committedRevision
+        })
         void backendQueueProcessor.scheduleAllQueuedThreads()
         setJson(res, 200, { ok: true, revision })
         return
@@ -15035,10 +18163,6 @@ export function createCodexBridgeMiddleware(options: {
           setJson(res, 400, { error: 'Missing valid baseRevision' })
           return
         }
-        if (!(await isThreadWriterIdleForMutation(appServer, runtimeProbe, appServer.getPid(), threadId))) {
-          setJson(res, 409, { error: 'Cannot mutate queued work while another writer owns the task.' })
-          return
-        }
         if (operation === 'remove') {
           const messageId = readNonEmptyString(record?.messageId)
           if (!messageId) {
@@ -15048,7 +18172,37 @@ export function createCodexBridgeMiddleware(options: {
           let removedMessage: StoredQueuedMessage | null
           let committedRevision: number
           try {
-            const removed = await removeThreadQueuedMessageWithRevision(threadId, messageId, baseRevision)
+            const removed = await withThreadStartClaimWait(threadId, async () => {
+              if (await isThreadArchivedForMutation(appServer, threadId, { fresh: true })) {
+                const error = new Error('Cannot mutate queued work for an archived task.')
+                error.name = 'ArchivedThreadConflictError'
+                throw error
+              }
+              if (!(await isThreadWriterIdleForMutation(appServer, runtimeProbe, appServer.getPid(), threadId))) {
+                const error = new Error('Cannot mutate queued work while another writer owns the task.')
+                error.name = 'ThreadWriterOwnershipConflictError'
+                throw error
+              }
+              const result = await removeThreadQueuedMessageWithRevision(threadId, messageId, baseRevision)
+              try {
+                await assertThreadQueuesActiveAfterMutation(
+                  [threadId],
+                  'Cannot mutate queued work for an archived task.',
+                  () => {
+                    if (!result.removedMessage) return
+                    backendQueueProcessor.forgetRuntimeQueuedMessage(
+                      threadId,
+                      messageId,
+                      record?.transferManagedUploads === true,
+                      result.removedMessage,
+                    )
+                  },
+                )
+              } catch (error) {
+                rethrowQueuePostCommitError(error, result.revision)
+              }
+              return result
+            })
             removedMessage = removed.removedMessage
             committedRevision = removed.revision
           } catch (error) {
@@ -15074,11 +18228,33 @@ export function createCodexBridgeMiddleware(options: {
         } else if (operation === 'reorder') {
           let committedRevision: number
           try {
-            committedRevision = await reorderThreadQueuedMessages(
-              threadId,
-              normalizeStringArray(record?.orderedMessageIds),
-              baseRevision,
-            )
+            committedRevision = await withThreadStartClaimWait(threadId, async () => {
+              if (await isThreadArchivedForMutation(appServer, threadId, { fresh: true })) {
+                const error = new Error('Cannot mutate queued work for an archived task.')
+                error.name = 'ArchivedThreadConflictError'
+                throw error
+              }
+              if (!(await isThreadWriterIdleForMutation(appServer, runtimeProbe, appServer.getPid(), threadId))) {
+                const error = new Error('Cannot mutate queued work while another writer owns the task.')
+                error.name = 'ThreadWriterOwnershipConflictError'
+                throw error
+              }
+              const revision = await reorderThreadQueuedMessages(
+                threadId,
+                normalizeStringArray(record?.orderedMessageIds),
+                baseRevision,
+              )
+              try {
+                await assertThreadQueuesActiveAfterMutation(
+                  [threadId],
+                  'Cannot mutate queued work for an archived task.',
+                )
+              } catch (error) {
+                backendQueueProcessor.scheduleThreadQueueDrain(threadId, 0)
+                rethrowQueuePostCommitError(error, revision)
+              }
+              return revision
+            })
           } catch (error) {
             if (error instanceof Error && (
               error.name === 'ThreadQueueRevisionConflictError'
@@ -15111,21 +18287,38 @@ export function createCodexBridgeMiddleware(options: {
           ? record.queueInsertIndex
           : undefined
         const committedRevision = await withThreadStartClaimWait(threadId, async () => {
-          if (await isThreadArchivedForMutation(appServer, threadId)) {
+          if (await isThreadArchivedForMutation(appServer, threadId, { fresh: true })) {
             const error = new Error('Cannot queue work for an archived task.')
             error.name = 'ArchivedThreadConflictError'
             throw error
           }
           const revision = await appendThreadQueuedMessage(threadId, message, queueInsertIndex)
-          backendQueueProcessor.rememberRuntimeQueuedMessage(threadId, message)
-          backendQueueProcessor.scheduleThreadQueueDrain(threadId, 0)
+          try {
+            await assertThreadQueuesActiveAfterMutation(
+              [threadId],
+              'Cannot queue work for an archived task.',
+            )
+            backendQueueProcessor.rememberRuntimeQueuedMessage(threadId, message)
+            await assertThreadQueuesActiveAfterMutation(
+              [threadId],
+              'Cannot queue work for an archived task.',
+            )
+          } catch (error) {
+            backendQueueProcessor.scheduleThreadQueueDrain(threadId, 0)
+            rethrowQueuePostCommitError(error, revision)
+          }
           return revision
         })
+        backendQueueProcessor.scheduleThreadQueueDrain(threadId, 0)
         setJson(res, 200, { ok: true, revision: committedRevision })
         return
       }
 
       if ((req.method === 'GET' || req.method === 'HEAD') && url.pathname === '/codex-api/project-zip') {
+        if (!projectZipDescriptorDirectoryPath(0)) {
+          setJson(res, 501, { error: 'Project ZIP export is unavailable on this platform.' })
+          return
+        }
         const rawCwd = (url.searchParams.get('cwd') ?? '').trim()
         if (!rawCwd) {
           setJson(res, 400, { error: 'Missing cwd' })
@@ -15147,12 +18340,14 @@ export function createCodexBridgeMiddleware(options: {
         }
 
         try {
-          setProjectZipHeaders(res, toProjectZipFileName(cwd))
           if (req.method === 'HEAD') {
+            setProjectZipHeaders(res, toProjectZipFileName(cwd))
             res.end()
             return
           }
           const chatEntries = await collectProjectChatZipEntries(cwd)
+          await assertProjectZipCanRoundTrip(cwd, chatEntries)
+          setProjectZipHeaders(res, toProjectZipFileName(cwd))
           await streamProjectZip(cwd, res, chatEntries)
           res.end()
         } catch (error) {
@@ -15184,7 +18379,7 @@ export function createCodexBridgeMiddleware(options: {
         }
 
         try {
-          const buffer = await readRawBody(req)
+          const buffer = await readRawBody(req, PROJECT_ZIP_IMPORT_MAX_BYTES)
           if (buffer.length === 0) {
             setJson(res, 400, { error: 'Missing project ZIP' })
             return
@@ -15192,7 +18387,9 @@ export function createCodexBridgeMiddleware(options: {
           const result = await importProjectZip(buffer, parent)
           setJson(res, 200, { data: { path: result.projectPath, importedSessions: result.importedSessions } })
         } catch (error) {
-          setJson(res, 400, { error: getErrorMessage(error, 'Failed to import project') })
+          setJson(res, error instanceof RequestBodyTooLargeError ? 413 : 400, {
+            error: getErrorMessage(error, 'Failed to import project'),
+          })
         }
         return
       }
@@ -15458,7 +18655,10 @@ export function createCodexBridgeMiddleware(options: {
         }
 
         const index = await getThreadSearchIndex()
-        const archivedIds = await readAuthoritativeArchivedThreadIds(Array.from(index.docsById.keys()))
+        const archivedIds = await readAuthoritativeArchivedThreadIds(
+          Array.from(index.docsById.keys()),
+          { fresh: true },
+        )
         const matchedIds = Array.from(index.docsById.entries())
           .filter(([id, doc]) => !archivedIds.has(id) && isExactPhraseMatch(query, doc))
           .slice(0, limit)
@@ -15670,17 +18870,43 @@ export function createCodexBridgeMiddleware(options: {
       next()
     } catch (error) {
       const message = getErrorMessage(error, 'Unknown bridge error')
+      const isConflict = error instanceof Error && (
+        error.name === 'ThreadStartClaimConflictError'
+        || error.name === 'ThreadWriterOwnershipConflictError'
+        || error.name === 'ArchivedThreadConflictError'
+        || error.name === 'ArchivedThreadStateUnavailableError'
+        || error.name === 'ThreadQueueRevisionConflictError'
+        || error.name === 'ThreadQueueMutationConflictError'
+      )
       const status = error instanceof Error && error.name === 'InvalidThreadListCursorError'
         ? 400
-        : error instanceof Error && (
+        : error instanceof Error && error.name === 'ThreadStartClaimLimitError'
+          ? 400
+          : isConflict
+            ? 409
+            : 502
+      const committedRevision = error instanceof Error
+        ? (error as Error & { committedRevision?: unknown }).committedRevision
+        : undefined
+      const explicitTurnStartDelivery = error instanceof Error
+        ? (error as Error & { turnStartDelivery?: unknown }).turnStartDelivery
+        : undefined
+      const turnStartDelivery = explicitTurnStartDelivery === 'started'
+        || explicitTurnStartDelivery === 'not_started'
+        ? explicitTurnStartDelivery
+        : rpcMethod === 'turn/start' && error instanceof Error && (
             error.name === 'ThreadStartClaimConflictError'
             || error.name === 'ThreadWriterOwnershipConflictError'
-            || error.name === 'ArchivedThreadConflictError'
-            || error.name === 'ArchivedThreadStateUnavailableError'
           )
-          ? 409
-          : 502
-      setJson(res, status, { error: message })
+          ? 'not_started'
+          : undefined
+      setJson(res, status, {
+        error: message,
+        ...(typeof committedRevision === 'number' && Number.isSafeInteger(committedRevision)
+          ? { committedRevision }
+          : {}),
+        ...(turnStartDelivery ? { turnStartDelivery } : {}),
+      })
     }
   }
 

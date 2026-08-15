@@ -14,6 +14,7 @@ import {
   getThreadQueueSnapshot,
   getThreadRuntimeState,
   getThreadRuntimeStates,
+  getThreadSummary,
   getThreadTextPage,
   getThreadQueueState,
   interruptThreadTurn,
@@ -31,6 +32,52 @@ import {
   clearThreadGoal,
   uploadFile,
 } from './codexGateway'
+
+describe('passive thread summary', () => {
+  afterEach(() => {
+    vi.unstubAllGlobals()
+  })
+
+  it('uses the metadata-only summary endpoint instead of thread/read', async () => {
+    const requests: Array<{ url: string; init?: RequestInit }> = []
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      requests.push({ url: String(input), init })
+      return new Response(JSON.stringify({
+        result: {
+          thread: {
+            id: 'pinned-old',
+            name: 'Pinned old thread',
+            cwd: '/tmp/project',
+            createdAt: 1,
+            updatedAt: 2,
+            preview: '',
+          },
+        },
+      }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    }))
+
+    await expect(getThreadSummary('pinned-old')).resolves.toMatchObject({
+      id: 'pinned-old',
+      title: 'Pinned old thread',
+      cwd: '/tmp/project',
+    })
+    expect(requests).toEqual([{
+      url: '/codex-api/thread-summary?threadId=pinned-old',
+      init: undefined,
+    }])
+  })
+
+  it('preserves summary HTTP status for authoritative missing classification', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({
+      error: 'Thread metadata not found',
+    }), { status: 404, headers: { 'Content-Type': 'application/json' } })))
+
+    await expect(getThreadSummary('missing-thread')).rejects.toMatchObject({
+      name: 'CodexApiError',
+      status: 404,
+    })
+  })
+})
 
 function runtimePayload(thread: Record<string, unknown>): ThreadReadResponse {
   return { thread } as unknown as ThreadReadResponse
@@ -103,6 +150,22 @@ describe('startThreadTurn collaboration mode payloads', () => {
     expect(requests).toHaveLength(1)
     expect(requests[0].method).toBe('turn/start')
     expect(requests[0].params.__codexMobileExternalSteer).toBeUndefined()
+  })
+
+  it('preserves the machine-readable turn delivery stage from an RPC error', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({
+      error: 'Cannot start a turn because task writer ownership is not idle.',
+      turnStartDelivery: 'started',
+    }), {
+      status: 409,
+      headers: { 'Content-Type': 'application/json' },
+    })))
+
+    await expect(startThreadTurn('thread-1', 'do not duplicate', [], 'gpt-5.4', 'medium'))
+      .rejects.toMatchObject({
+        status: 409,
+        turnStartDelivery: 'started',
+      })
   })
 
   it('allows max and ultra reasoning efforts in turn payloads and config reads', async () => {
@@ -372,6 +435,29 @@ describe('managed uploads', () => {
     })
   })
 
+  it.each([
+    ['replace', () => setThreadQueueState({}, { baseRevision: 7 })],
+    ['remove', () => removeThreadQueuedMessage('thread-1', 'queued-1', { baseRevision: 7 })],
+    ['reorder', () => reorderThreadQueuedMessages('thread-1', ['queued-1'], { baseRevision: 7 })],
+  ])('accepts a committed revision from an ambiguous queue %s response', async (_name, mutate) => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({
+      error: 'Cannot verify archived task state.',
+      committedRevision: 8,
+    }), { status: 409, headers: { 'Content-Type': 'application/json' } })))
+
+    await expect(mutate()).resolves.toBe(8)
+  })
+
+  it('normalizes a non-JSON queue replacement failure', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response('upstream unavailable', {
+      status: 502,
+      headers: { 'Content-Type': 'text/plain' },
+    })))
+
+    await expect(setThreadQueueState({}, { baseRevision: 7 }))
+      .rejects.toThrow('Failed to save thread queue state')
+  })
+
   it('uses exact PATCH operations for queue removal and reorder', async () => {
     const requests: RequestInit[] = []
     vi.stubGlobal('fetch', vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
@@ -577,6 +663,17 @@ describe('managed uploads', () => {
     }), { status: 409, headers: { 'Content-Type': 'application/json' } })))
     await expect(appendThreadQueuedMessage('thread-1', message))
       .rejects.not.toMatchObject({ name: 'ThreadQueueAppendAmbiguousError' })
+  })
+
+  it('marks a post-commit archive verification failure as an ambiguous append', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({
+      error: 'Cannot verify archived task state.',
+    }), { status: 409, headers: { 'Content-Type': 'application/json' } })))
+
+    await expect(appendThreadQueuedMessage('thread-1', {
+      id: 'queued-post-commit-verification', text: 'already persisted', imageUrls: [], skills: [], fileAttachments: [],
+      collaborationMode: 'default', model: '', effort: '',
+    })).rejects.toMatchObject({ name: 'ThreadQueueAppendAmbiguousError' })
   })
 
   it('queries a durable queue append receipt by thread and message id', async () => {
@@ -946,6 +1043,49 @@ describe('getAvailableModelIds', () => {
 })
 
 describe('getThreadDetail', () => {
+  it('loads a listed CLI thread without issuing a passive thread/read RPC', async () => {
+    const requests: string[] = []
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input)
+      requests.push(url)
+      if (url === '/codex-api/thread-runtime-state?threadId=cli-passive') {
+        return new Response(JSON.stringify({ state: 'idle', cwd: '/tmp/project' }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        })
+      }
+      if (url === '/codex-api/thread-turn-page?threadId=cli-passive&limit=3') {
+        return new Response(JSON.stringify({
+          result: {
+            model: 'gpt-5.6-sol',
+            modelProvider: 'openai',
+            reasoningEffort: 'max',
+            thread: {
+              id: 'cli-passive',
+              turns: [{
+                id: 'turn-cli',
+                status: 'completed',
+                items: [{ id: 'agent-cli', type: 'agentMessage', text: 'CLI output' }],
+              }],
+            },
+          },
+          nextCursor: null,
+          hasMoreOlder: false,
+        }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      throw new Error(`Unexpected passive request: ${url}`)
+    }))
+
+    await expect(getThreadDetail('cli-passive')).resolves.toMatchObject({
+      model: 'gpt-5.6-sol',
+      ownership: 'idle',
+      messages: [expect.objectContaining({ id: 'agent-cli', text: 'CLI output' })],
+    })
+    expect(requests).toEqual([
+      '/codex-api/thread-runtime-state?threadId=cli-passive',
+      '/codex-api/thread-turn-page?threadId=cli-passive&limit=3',
+    ])
+  })
   afterEach(() => {
     vi.unstubAllGlobals()
   })
@@ -955,23 +1095,17 @@ describe('getThreadDetail', () => {
     const controller = new AbortController()
     vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       const url = String(input)
-      if (url === '/codex-api/rpc') {
-        const body = JSON.parse(String(init?.body)) as { method: string; params: Record<string, unknown> }
-        requests.push({ url, method: body.method, params: body.params, signal: init?.signal })
-        return new Response(JSON.stringify({
-          result: {
-            thread: {
-              id: 'thread-paged',
-              model: 'gpt-5.5',
-              reasoning_effort: 'xhigh',
-              turns: [],
-            },
-          },
-        }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      if (url === '/codex-api/thread-runtime-state?threadId=thread-paged') {
+        requests.push({ url, signal: init?.signal })
+        return new Response(JSON.stringify({ state: 'idle' }), {
+          status: 200, headers: { 'Content-Type': 'application/json' },
+        })
       }
       requests.push({ url, signal: init?.signal })
       return new Response(JSON.stringify({
         result: {
+          model: 'gpt-5.5',
+          reasoningEffort: 'xhigh',
           thread: {
             id: 'thread-paged',
             turns: [
@@ -1005,19 +1139,14 @@ describe('getThreadDetail', () => {
       ],
     })
     expect(requests).toContainEqual({
-      url: '/codex-api/rpc',
-      method: 'thread/read',
-      params: { threadId: 'thread-paged', includeTurns: false },
+      url: '/codex-api/thread-runtime-state?threadId=thread-paged',
       signal: controller.signal,
     })
     expect(requests).toContainEqual({
       url: '/codex-api/thread-turn-page?threadId=thread-paged&limit=3',
       signal: controller.signal,
     })
-    expect(requests).not.toContainEqual(expect.objectContaining({
-      method: 'thread/read',
-      params: expect.objectContaining({ includeTurns: true }),
-    }))
+    expect(requests.some((request) => request.url === '/codex-api/rpc')).toBe(false)
   })
 
   it('falls back to a terminal external live-state snapshot when the native turn page is empty', async () => {
@@ -1025,21 +1154,10 @@ describe('getThreadDetail', () => {
     vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       const url = String(input)
       requests.push(url)
-      if (url === '/codex-api/rpc') {
-        const body = JSON.parse(String(init?.body)) as { method: string; params: Record<string, unknown> }
-        expect(body).toMatchObject({
-          method: 'thread/read',
-          params: { threadId: 'external-terminal', includeTurns: false },
+      if (url === '/codex-api/thread-runtime-state?threadId=external-terminal') {
+        return new Response(JSON.stringify({ state: 'unknown' }), {
+          status: 200, headers: { 'Content-Type': 'application/json' },
         })
-        return new Response(JSON.stringify({
-          result: {
-            thread: {
-              id: 'external-terminal',
-              turns: [],
-              externalRuntime: { state: 'unknown' },
-            },
-          },
-        }), { status: 200, headers: { 'Content-Type': 'application/json' } })
       }
       if (url === '/codex-api/thread-turn-page?threadId=external-terminal&limit=3') {
         return new Response(JSON.stringify({
@@ -1078,7 +1196,7 @@ describe('getThreadDetail', () => {
       })],
     })
     expect(requests).toEqual([
-      '/codex-api/rpc',
+      '/codex-api/thread-runtime-state?threadId=external-terminal',
       '/codex-api/thread-turn-page?threadId=external-terminal&limit=3',
       '/codex-api/thread-live-state?threadId=external-terminal',
     ])
@@ -1089,33 +1207,20 @@ describe('getThreadDetail', () => {
     vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       const url = String(input)
       requests.push(url)
-      if (url === '/codex-api/rpc') {
-        const body = JSON.parse(String(init?.body)) as { method: string; params: Record<string, unknown> }
-        expect(body).toMatchObject({
-          method: 'thread/read',
-          params: { threadId: 'external-running', includeTurns: false },
-        })
+      if (url === '/codex-api/thread-runtime-state?threadId=external-running') {
         return new Response(JSON.stringify({
-          result: {
-            thread: {
-              id: 'external-running',
-              turns: [],
-              externalRuntime: {
-                state: 'running',
-                turnId: 'turn-live',
-                interruptible: false,
-                source: 'external-session-writer',
-              },
-            },
-            model: 'gpt-5.6-sol',
-            modelProvider: 'openai',
-            reasoningEffort: 'max',
-          },
+          state: 'running',
+          turnId: 'turn-live',
+          interruptible: false,
+          source: 'external-session-writer',
         }), { status: 200, headers: { 'Content-Type': 'application/json' } })
       }
       if (url === '/codex-api/thread-turn-page?threadId=external-running&activeTurnId=turn-live&limit=3') {
         return new Response(JSON.stringify({
           result: {
+            model: 'gpt-5.6-sol',
+            modelProvider: 'openai',
+            reasoningEffort: 'max',
             thread: {
               id: 'external-running',
               turns: [{
@@ -1154,7 +1259,7 @@ describe('getThreadDetail', () => {
       ],
     })
     expect(requests).toEqual([
-      '/codex-api/rpc',
+      '/codex-api/thread-runtime-state?threadId=external-running',
       '/codex-api/thread-turn-page?threadId=external-running&activeTurnId=turn-live&limit=3',
     ])
   })
@@ -1162,18 +1267,10 @@ describe('getThreadDetail', () => {
   it('marks a compressed locally running active turn page as partial', async () => {
     vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       const url = String(input)
-      if (url === '/codex-api/rpc') {
-        const body = JSON.parse(String(init?.body)) as { method: string }
-        expect(body.method).toBe('thread/read')
-        return new Response(JSON.stringify({
-          result: {
-            thread: {
-              id: 'thread-local',
-              externalRuntime: { state: 'idle' },
-              turns: [],
-            },
-          },
-        }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      if (url === '/codex-api/thread-runtime-state?threadId=thread-local') {
+        return new Response(JSON.stringify({ state: 'idle' }), {
+          status: 200, headers: { 'Content-Type': 'application/json' },
+        })
       }
       expect(url).toBe('/codex-api/thread-turn-page?threadId=thread-local&limit=3')
       return new Response(JSON.stringify({
@@ -1240,62 +1337,73 @@ describe('getThreadDetail', () => {
     )
   })
 
-  it('falls back to one legacy full read only when native pagination is unsupported', async () => {
-    const readParams: Record<string, unknown>[] = []
+  it('uses a passive live snapshot when native pagination is unsupported', async () => {
+    const requests: string[] = []
     vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       const url = String(input)
+      requests.push(url)
+      if (url.startsWith('/codex-api/thread-runtime-state')) {
+        return new Response(JSON.stringify({ state: 'idle' }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        })
+      }
       if (url.startsWith('/codex-api/thread-turn-page')) {
-        return new Response(JSON.stringify({ fallback: 'thread/read' }), {
+        return new Response(JSON.stringify({
+          error: 'thread/turns/list is not supported by this Codex app-server',
+        }), {
           status: 501,
           headers: { 'Content-Type': 'application/json' },
         })
       }
-      const body = JSON.parse(String(init?.body)) as { method: string; params: Record<string, unknown> }
-      readParams.push(body.params)
-      const includeTurns = body.params.includeTurns === true
-      return new Response(JSON.stringify({
-        result: {
-          thread: {
-            id: 'thread-legacy',
-            turns: includeTurns
-              ? [{
-                  id: 'turn-legacy',
-                  status: 'completed',
-                  items: [{ id: 'agent-legacy', type: 'agentMessage', text: 'legacy' }],
-                }]
-              : [],
+      if (url.startsWith('/codex-api/thread-live-state')) {
+        return new Response(JSON.stringify({
+          threadId: 'thread-legacy',
+          conversationState: {
+            turns: [{
+              id: 'turn-legacy',
+              status: 'completed',
+              items: [{ id: 'agent-legacy', type: 'agentMessage', text: 'legacy output' }],
+            }],
           },
-        },
-      }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+          threadTurnStartIndex: 0,
+          hasMoreOlder: false,
+          olderCursor: null,
+          isInProgress: false,
+          externalRuntime: { state: 'idle' },
+        }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      throw new Error(`Unexpected passive request: ${url} ${String(init?.body ?? '')}`)
     }))
 
     await expect(getThreadDetail('thread-legacy')).resolves.toMatchObject({
       olderCursor: null,
       hasMoreOlder: false,
-      messages: [expect.objectContaining({ id: 'agent-legacy', text: 'legacy' })],
+      messages: [expect.objectContaining({ id: 'agent-legacy', text: 'legacy output' })],
+      ownership: 'idle',
     })
-    expect(readParams).toEqual([
-      { threadId: 'thread-legacy', includeTurns: false },
-      { threadId: 'thread-legacy', includeTurns: true },
+    expect(requests).toEqual([
+      '/codex-api/thread-runtime-state?threadId=thread-legacy',
+      '/codex-api/thread-turn-page?threadId=thread-legacy&limit=3',
+      '/codex-api/thread-live-state?threadId=thread-legacy',
     ])
   })
 
-  it('forwards the caller abort signal to thread/read', async () => {
+  it('forwards the caller abort signal to passive detail endpoints', async () => {
     const controller = new AbortController()
-    let requestSignal: AbortSignal | null | undefined
-    vi.stubGlobal('fetch', vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
-      requestSignal = init?.signal
+    const requestSignals: Array<AbortSignal | null | undefined> = []
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      requestSignals.push(init?.signal)
+      if (String(input).startsWith('/codex-api/thread-runtime-state')) {
+        return new Response(JSON.stringify({
+          state: 'running', turnId: 'turn-external', interruptible: false, source: 'external-session-writer',
+        }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
       return new Response(JSON.stringify({
         result: {
           thread: {
             id: 'external-thread',
             turns: [],
-            externalRuntime: {
-              state: 'running',
-              turnId: 'turn-external',
-              interruptible: false,
-              source: 'external-session-writer',
-            },
           },
         },
       }), { status: 200, headers: { 'Content-Type': 'application/json' } })
@@ -1305,7 +1413,7 @@ describe('getThreadDetail', () => {
       ownership: 'external',
       activeTurnId: 'turn-external',
     })
-    expect(requestSignal).toBe(controller.signal)
+    expect(requestSignals).toEqual([controller.signal, controller.signal, controller.signal])
   })
 
   it('hides managed user-upload previews while preserving assistant-generated images', async () => {
@@ -1741,13 +1849,16 @@ describe('getThreadDetail', () => {
     })
   })
 
-  it('reads model, reasoning effort, and modelProvider from nested thread payloads returned by thread/read', async () => {
+  it('reads model, reasoning effort, and modelProvider from the passive turn page', async () => {
     vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       if (String(input).startsWith('/codex-api/thread-turn-page')) {
         return new Response(JSON.stringify({
           result: {
             thread: {
               id: 'legacy-thread',
+              model: 'gpt-5.5',
+              reasoning_effort: 'xhigh',
+              modelProvider: 'opencode_zen',
               turns: [],
             },
           },
@@ -1758,21 +1869,7 @@ describe('getThreadDetail', () => {
           headers: { 'Content-Type': 'application/json' },
         })
       }
-      const body = typeof init?.body === 'string'
-        ? JSON.parse(init.body) as { method: string; params: Record<string, unknown> }
-        : { method: '', params: {} }
-      expect(body.method).toBe('thread/read')
-      return new Response(JSON.stringify({
-        result: {
-          thread: {
-            id: body.params.threadId,
-            model: 'gpt-5.5',
-            reasoning_effort: 'xhigh',
-            modelProvider: 'opencode_zen',
-            turns: [],
-          },
-        },
-      }), {
+      return new Response(JSON.stringify({ state: 'unknown' }), {
         status: 200,
         headers: { 'Content-Type': 'application/json' },
       })
@@ -2501,6 +2598,23 @@ describe('getThreadRuntimeStates', () => {
     await expect(getThreadRuntimeStates(['thread-a', 'thread-b'])).resolves.toEqual({
       'thread-a': { state: 'unknown' },
       'thread-b': { state: 'unknown' },
+    })
+  })
+
+  it('preserves exact archived markers from a runtime batch', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({
+      states: {
+        'thread-archived': { state: 'archived' },
+        'thread-active': { state: 'idle' },
+      },
+    }), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' },
+    })))
+
+    await expect(getThreadRuntimeStates(['thread-archived', 'thread-active'])).resolves.toEqual({
+      'thread-archived': { state: 'archived' },
+      'thread-active': { state: 'idle' },
     })
   })
 

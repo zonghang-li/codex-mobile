@@ -22,7 +22,7 @@
     "cli"
   ],
   "engines": {
-    "node": ">=18"
+    "node": ">=22.13"
   },
   "bin": {
     "codexapp": "dist-cli/index.js",

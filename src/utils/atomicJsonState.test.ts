@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, readFile, rm, utimes, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, readdir, rm, utimes, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { describe, expect, it } from 'vitest'
@@ -24,6 +24,30 @@ describe('mutateJsonStateFile', () => {
     expect(isLockDestinationConflict(Object.assign(new Error('exists'), { code: 'EEXIST' }))).toBe(true)
     expect(isLockDestinationConflict(Object.assign(new Error('not empty'), { code: 'ENOTEMPTY' }))).toBe(true)
     expect(isLockDestinationConflict(Object.assign(new Error('denied'), { code: 'EACCES' }))).toBe(false)
+  })
+
+  it('keeps the previous file intact when durable replacement fails before rename', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'codex-mobile-durable-replace-failure-'))
+    const statePath = join(root, 'owner.json')
+    await writeFile(statePath, '{"token":"stable"}', 'utf8')
+    const stateModule = await import('./atomicJsonState') as unknown as {
+      replaceFileDurably?: (
+        path: string,
+        contents: string,
+        operations: { beforeRename: () => Promise<void> },
+      ) => Promise<void>
+    }
+
+    try {
+      expect(stateModule.replaceFileDurably).toBeTypeOf('function')
+      await expect(stateModule.replaceFileDurably!(statePath, '{"token":"next"}', {
+        beforeRename: async () => { throw new Error('simulated crash before rename') },
+      })).rejects.toThrow('simulated crash before rename')
+      await expect(readFile(statePath, 'utf8')).resolves.toBe('{"token":"stable"}')
+      expect((await readdir(root)).filter((name) => name.endsWith('.tmp'))).toEqual([])
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
   })
 
   it('treats an unreadable identity for a demonstrably live pid as still owned', () => {
@@ -161,6 +185,23 @@ describe('mutateJsonStateFile', () => {
         stable: true,
         next: true,
       })
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('repairs a malformed primary from backup even when the mutation is a no-op', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'codex-mobile-json-state-noop-recovery-'))
+    const statePath = join(root, 'state.json')
+
+    try {
+      await mutateJsonStateFile(statePath, (payload) => {
+        payload.stable = true
+      })
+      await writeFile(statePath, '{broken', 'utf8')
+
+      await expect(mutateJsonStateFile(statePath, () => undefined)).resolves.toBeUndefined()
+      await expect(readFile(statePath, 'utf8').then(JSON.parse)).resolves.toEqual({ stable: true })
     } finally {
       await rm(root, { recursive: true, force: true })
     }

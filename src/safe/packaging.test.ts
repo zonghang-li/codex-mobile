@@ -350,4 +350,60 @@ describe('local installation packaging', () => {
       join(temporaryRoot, 'prefix'),
     ])
   })
+
+  it('rejects an old Node runtime before build or installation mutations', async () => {
+    const temporaryRoot = await mkdtemp(join(tmpdir(), 'codex-mobile-node-version-test-'))
+    const binDirectory = join(temporaryRoot, 'bin')
+    const commandLog = join(temporaryRoot, 'commands.log')
+    await mkdir(binDirectory)
+    await writeFile(join(binDirectory, 'node'), '#!/bin/sh\nprintf "%s\\n" "22.12.0"\n')
+    await writeFile(join(binDirectory, 'pnpm'), `#!/bin/sh\nprintf 'pnpm %s\\n' "$*" >> '${commandLog}'\n`)
+    await writeFile(join(binDirectory, 'npm'), `#!/bin/sh\nprintf 'npm %s\\n' "$*" >> '${commandLog}'\n`)
+    await Promise.all(['node', 'pnpm', 'npm'].map((name) => chmod(join(binDirectory, name), 0o755)))
+
+    try {
+      await expect(execFileAsync('sh', [
+        fileURLToPath(new URL('../../scripts/install-local.sh', import.meta.url)),
+      ], {
+        env: {
+          ...process.env,
+          PATH: `${binDirectory}:/usr/bin:/bin`,
+          PREFIX: join(temporaryRoot, 'prefix'),
+        },
+      })).rejects.toMatchObject({
+        stderr: expect.stringContaining('Node.js 22.13'),
+      })
+      await expect(readFile(commandLog, 'utf8')).rejects.toMatchObject({ code: 'ENOENT' })
+    } finally {
+      await rm(temporaryRoot, { recursive: true, force: true })
+    }
+  })
+
+  it('reports an unavailable Node runtime before build or installation mutations', async () => {
+    const temporaryRoot = await mkdtemp(join(tmpdir(), 'codex-mobile-node-missing-test-'))
+    const binDirectory = join(temporaryRoot, 'bin')
+    const commandLog = join(temporaryRoot, 'commands.log')
+    await mkdir(binDirectory)
+    await writeFile(join(binDirectory, 'node'), '#!/bin/sh\nexit 127\n')
+    await writeFile(join(binDirectory, 'pnpm'), `#!/bin/sh\nprintf 'pnpm %s\\n' "$*" >> '${commandLog}'\n`)
+    await writeFile(join(binDirectory, 'npm'), `#!/bin/sh\nprintf 'npm %s\\n' "$*" >> '${commandLog}'\n`)
+    await Promise.all(['node', 'pnpm', 'npm'].map((name) => chmod(join(binDirectory, name), 0o755)))
+
+    try {
+      await expect(execFileAsync('sh', [
+        fileURLToPath(new URL('../../scripts/install-local.sh', import.meta.url)),
+      ], {
+        env: {
+          ...process.env,
+          PATH: `${binDirectory}:/usr/bin:/bin`,
+          PREFIX: join(temporaryRoot, 'prefix'),
+        },
+      })).rejects.toMatchObject({
+        stderr: expect.stringContaining('found unavailable'),
+      })
+      await expect(readFile(commandLog, 'utf8')).rejects.toMatchObject({ code: 'ENOENT' })
+    } finally {
+      await rm(temporaryRoot, { recursive: true, force: true })
+    }
+  })
 })

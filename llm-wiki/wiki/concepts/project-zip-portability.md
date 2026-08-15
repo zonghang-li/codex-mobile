@@ -2,7 +2,7 @@
 
 Project ZIP portability lets a user move a local project and its matching Codex chat history between Codex homes.
 
-Source: [project-zip-portability.md](../../raw/features/project-zip-portability.md)
+Sources: [project-zip-portability.md](../../raw/features/project-zip-portability.md), [project-zip-round-trip-limits-2026-08-15.md](../../raw/features/project-zip-round-trip-limits-2026-08-15.md)
 
 ## Export
 
@@ -26,19 +26,19 @@ Source: [project-zip-portability.md](../../raw/features/project-zip-portability.
 
 Project ZIP export streams the archive to the HTTP response instead of building the final ZIP buffer in memory. The stream writer handles response backpressure and client disconnects, and the project walker skips generated folders, dependency directories, build outputs, caches, OS metadata, and Git-ignored files when Git is available.
 
-Chat export scans matching session JSONL files and adds them to `.codex-project/chats/`; project import parses the selected ZIP into memory once because the browser provides the upload as a single file. Imported chat state database writes are batched into one SQLite transaction per import instead of spawning SQLite once per chat.
+Chat export scans matching session JSONL files and adds them to `.codex-project/chats/`; project import parses the selected ZIP into memory once because the browser provides the upload as a single file. Imported chat state database writes use bounded staging batches followed by one final atomic transaction that commits the imported rows.
 
 Measured validation for this branch: `pnpm run build` passes, and a fresh `dev2` import of `MiloAgent (4).zip` restored 10 visible imported chat rows in timestamp order on `http://127.0.0.1:5177/`. Full profiler traces were not captured for this local portability flow.
 
-Source: [project-zip-portability.md](../../raw/features/project-zip-portability.md)
+Sources: [project-zip-portability.md](../../raw/features/project-zip-portability.md), [project-zip-round-trip-limits-2026-08-15.md](../../raw/features/project-zip-round-trip-limits-2026-08-15.md)
 
 ## Boundaries
 
 `.codex-project/chats/` is the reserved namespace for imported Codex sessions. Other `.codex-project/` files round-trip as normal project files.
 
-The project import/export server endpoints intentionally do not add saved-root allowlists, import parent restrictions, ZIP upload caps, or local path redaction solely to satisfy review-bot comments. Those comments assume a hostile remote caller, while this app server is local-user facing and not meant to be exposed publicly. Treat such comments as rejected unless they show a concrete remote reachability or auth-bypass path.
+Project ZIP import and export use matching round-trip limits: at most 10,000 entries and at most 256 MiB for both the archive and logical file data. Export validates those bounds before sending ZIP headers, while import rejects oversized request bodies and archives before creating a destination project. The endpoints still rely on the server's existing authentication and project-path policy rather than a separate saved-root allowlist.
 
-Source: [project-zip-portability.md](../../raw/features/project-zip-portability.md)
+Sources: [project-zip-portability.md](../../raw/features/project-zip-portability.md), [project-zip-round-trip-limits-2026-08-15.md](../../raw/features/project-zip-round-trip-limits-2026-08-15.md)
 
 ## Docker Validation
 

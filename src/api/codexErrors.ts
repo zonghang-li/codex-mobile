@@ -11,17 +11,26 @@ export type CodexErrorCode =
   | 'invalid_response'
   | 'unknown_error'
 
+export type TurnStartDelivery = 'not_started' | 'started'
+
 export class CodexApiError extends Error {
   code: CodexErrorCode
   method?: string
   status?: number
+  turnStartDelivery?: TurnStartDelivery
 
-  constructor(message: string, options: { code: CodexErrorCode; method?: string; status?: number }) {
+  constructor(message: string, options: {
+    code: CodexErrorCode
+    method?: string
+    status?: number
+    turnStartDelivery?: TurnStartDelivery
+  }) {
     super(message)
     this.name = 'CodexApiError'
     this.code = options.code
     this.method = options.method
     this.status = options.status
+    this.turnStartDelivery = options.turnStartDelivery
   }
 }
 

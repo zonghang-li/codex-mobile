@@ -37,6 +37,17 @@ describe('server security policy', () => {
     expect(policy.isRpcMethodAllowed('thread/goal/delete')).toBe(false)
   })
 
+  it('applies the exact controlled-thread HTTP route allowlist in safe mode', () => {
+    const policy = buildSafeSecurityPolicy(loadSafeRuntimeConfig({}))
+
+    expect(policy.isRouteDisabled('POST', '/codex-api/thread-goal-set')).toBe(false)
+    expect(policy.isRouteDisabled('POST', '/codex-api/thread-stop-and-archive')).toBe(false)
+    expect(policy.isRouteDisabled('PATCH', '/codex-api/thread-queue-state')).toBe(false)
+    expect(policy.isRouteDisabled('GET', '/codex-api/thread-goal-set')).toBe(true)
+    expect(policy.isRouteDisabled('DELETE', '/codex-api/thread-queue-state')).toBe(true)
+    expect(policy.isRouteDisabled('POST', '/codex-api/thread-stop-and-archive/extra')).toBe(true)
+  })
+
   it('honors explicit safe raw-RPC and terminal/file switches without enabling disabled routes', () => {
     const policy = buildSafeSecurityPolicy(loadSafeRuntimeConfig({
       CODEX_MOBILE_SAFE_RAW_RPC: 'true',

@@ -1,7 +1,7 @@
 ### Thread list startup pagination and direct older-thread links
 
 #### Feature/Change Name
-Thread loading uses a smaller initial list page, hydrates later pages in the background, and direct thread URLs are not rejected just because the thread is outside the first page.
+Thread loading uses a smaller initial list page, hydrates later pages in the background, survives a service restart between pages, and direct thread URLs are not rejected just because the thread is outside the first page.
 
 #### Prerequisites/Setup
 1. Dev server running (`pnpm run dev`)
@@ -12,12 +12,15 @@ Thread loading uses a smaller initial list page, hydrates later pages in the bac
 1. Open the app home route
 2. Inspect the first `thread/list` RPC request
 3. Keep the app open and watch subsequent `thread/list` RPC requests
-4. Open `/thread/<older-thread-id>` directly for a valid thread outside the first page
+4. Capture a non-null `nextCursor`, restart the service, and request the next page with that same cursor
+5. Open `/thread/<older-thread-id>` directly for a valid thread outside the first page
 
 #### Expected Results
 - The first `thread/list` request uses a smaller initial limit instead of 100
 - Later thread pages load in the background using `nextCursor`
+- A cursor issued before restart remains valid afterward, and the next page neither skips nor duplicates threads
 - The sidebar gains older threads as background pages complete
+- Opening or refreshing the page does not issue `thread/resume`, `turn/start`, or another writer RPC for listed CLI-owned threads
 - The direct older thread URL stays on the thread route and loads messages instead of redirecting home
 
 #### Rollback/Cleanup

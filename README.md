@@ -7,7 +7,7 @@ This fork packages the upstream `codexapp` UI as two commands:
 
 ## Install from this fork
 
-Node.js 18+ and pnpm are required. Clone the repository so later updates remain an ordinary Git pull:
+Node.js 22.13+ and pnpm are required. Clone the repository so later updates remain an ordinary Git pull:
 
 ```bash
 git clone https://github.com/zonghang-li/codex-mobile.git
@@ -198,7 +198,7 @@ The remaining README describes upstream `codexapp`. Its `npx codexapp`, Telegram
 
 [![npm](https://img.shields.io/npm/v/codexapp?style=for-the-badge&logo=npm&logoColor=white)](https://www.npmjs.com/package/codexapp)
 [![platform](https://img.shields.io/badge/Platform-Linux%20%7C%20Windows%20%7C%20Android-blue?style=for-the-badge)](#-quick-start)
-[![node](https://img.shields.io/badge/Node-18%2B-339933?style=for-the-badge&logo=node.js&logoColor=white)](https://nodejs.org/)
+[![node](https://img.shields.io/badge/Node-22.13%2B-339933?style=for-the-badge&logo=node.js&logoColor=white)](https://nodejs.org/)
 [![license](https://img.shields.io/badge/License-MIT-yellow?style=for-the-badge)](./LICENSE)
 
 > **Codex UI in your browser. No drama. One command.**
@@ -254,13 +254,13 @@ npx codexapp --no-login
 
 ### Linux 🐧
 ```bash
-node -v   # should be 18+
+node -v   # should be 22.13+
 npx codexapp
 ```
 
 ### Windows 🪟 (PowerShell)
 ```powershell
-node -v   # 18+
+node -v   # 22.13+
 npx codexapp
 ```
 
@@ -436,7 +436,7 @@ Outgoing assistant messages are sent with Telegram `parse_mode=HTML` for formatt
 ---
 
 ## 🎯 Requirements
-- ✅ Node.js `18+`
+- ✅ Node.js `22.13+`
 - ✅ Codex app-server environment available
 - ✅ Browser access to host/port
 - ✅ Microphone permission (only for voice dictation)

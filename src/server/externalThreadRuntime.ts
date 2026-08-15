@@ -31,6 +31,12 @@ export type ExternalRolloutWriter = {
   pid: number
 }
 
+export type ExternalWriterEvidenceSnapshot = {
+  writers: string[]
+  rollout?: RuntimeFileIdentity
+  rolloutCheckpoint?: { offset: number; data: string }
+}
+
 export interface ExternalRuntimeSystem {
   readonly platform: NodeJS.Platform
   readonly uid: number | null
@@ -91,6 +97,7 @@ export const EXTERNAL_RUNTIME_MAX_FD_SNAPSHOTS = 8_192
 export const EXTERNAL_RUNTIME_SCAN_WALL_BUDGET_MS = 5_000
 export const EXTERNAL_RUNTIME_MAX_ROLLOUT_WRITERS = 256
 export const EXTERNAL_RUNTIME_RECENT_ACTIVE_ROLLOUT_MS = 15 * 60 * 1000
+const EXTERNAL_RUNTIME_MAX_OWNERSHIP_WINDOW_BYTES = 64 * 1024 * 1024
 
 class InconclusiveRuntimeScanError extends Error {
   constructor(message: string) {
@@ -763,6 +770,16 @@ function matchesWriter(
     && isWritableDescriptor(fd.flags)
 }
 
+function writerEvidenceKey(fd: RuntimeFdSnapshot): string {
+  return [
+    String(fd.pid),
+    fd.startTime ?? '',
+    fd.dev,
+    fd.ino,
+    String(fd.position),
+  ].join(':')
+}
+
 function isWritableDescriptor(flags: number): boolean {
   const accessMode = flags & 0b11
   return accessMode === 1 || accessMode === 2
@@ -974,10 +991,19 @@ export class ExternalThreadRuntimeProbe {
   }
 
   async inspectWriterEvidence(threadId: string, excludedPid: number | null): Promise<boolean | null> {
+    const snapshot = await this.inspectWriterEvidenceSnapshot(threadId, excludedPid)
+    return snapshot ? snapshot.writers.length > 0 : null
+  }
+
+  async inspectWriterEvidenceSnapshot(
+    threadId: string,
+    excludedPid: number | null,
+  ): Promise<ExternalWriterEvidenceSnapshot | null> {
     const runtime = await this.prepareInspection(threadId)
     if (runtime.state === 'unknown') return null
     try {
       let complete = true
+      const writers = new Set<string>()
       const iterator = this.system.listFdSnapshots()[Symbol.asyncIterator]()
       while (true) {
         const next = await iterator.next()
@@ -985,9 +1011,119 @@ export class ExternalThreadRuntimeProbe {
           complete = next.value !== false
           break
         }
-        if (matchesWriter(next.value, runtime.identity, this.system.uid!, excludedPid)) return true
+        if (matchesWriter(next.value, runtime.identity, this.system.uid!, excludedPid)) {
+          writers.add(writerEvidenceKey(next.value))
+        }
       }
-      return complete ? false : null
+      if (!complete) return null
+      const checkpointLength = Math.min(CACHE_CHECKPOINT_BYTES, runtime.identity.size)
+      const checkpointOffset = runtime.identity.size - checkpointLength
+      const checkpoint = checkpointLength > 0
+        ? await this.system.readRange(
+            runtime.identity.path,
+            checkpointOffset,
+            checkpointLength,
+            runtime.identity,
+          )
+        : Buffer.alloc(0)
+      const closingIdentity = await this.system.statFile(runtime.identity.path)
+      if (
+        !closingIdentity.regular
+        || !isSameRuntimeIdentity(runtime.identity, closingIdentity)
+        || closingIdentity.size !== runtime.identity.size
+        || checkpoint.length !== checkpointLength
+      ) return null
+      return {
+        writers: [...writers].sort(),
+        rollout: { ...runtime.identity },
+        rolloutCheckpoint: { offset: checkpointOffset, data: checkpoint.toString('base64') },
+      }
+    } catch {
+      return null
+    }
+  }
+
+  async inspectUnexpectedLifecycleSince(
+    threadId: string,
+    baseline: ExternalWriterEvidenceSnapshot,
+    expectedTurnId: string,
+    expectedClientUserMessageId = '',
+  ): Promise<boolean | null> {
+    const registered = this.threads.get(threadId)
+    const openingIdentity = baseline.rollout
+    if (!registered || !openingIdentity) return null
+    try {
+      if (await this.system.realpath(registered.rolloutPath) !== openingIdentity.path) return null
+      const currentIdentity = await this.system.statFile(openingIdentity.path)
+      if (
+        !currentIdentity.regular
+        || !isSameRuntimeIdentity(openingIdentity, currentIdentity)
+        || currentIdentity.size < openingIdentity.size
+      ) return null
+      const checkpoint = baseline.rolloutCheckpoint
+      if (!checkpoint || checkpoint.offset < 0 || checkpoint.offset > openingIdentity.size) return null
+      const expectedCheckpoint = Buffer.from(checkpoint.data, 'base64')
+      if (checkpoint.offset + expectedCheckpoint.length !== openingIdentity.size) return null
+      const currentCheckpoint = expectedCheckpoint.length > 0
+        ? await this.system.readRange(
+            openingIdentity.path,
+            checkpoint.offset,
+            expectedCheckpoint.length,
+            openingIdentity,
+          )
+        : Buffer.alloc(0)
+      if (!currentCheckpoint.equals(expectedCheckpoint)) return null
+      const deltaLength = currentIdentity.size - openingIdentity.size
+      if (deltaLength === 0) return false
+      if (deltaLength > EXTERNAL_RUNTIME_MAX_OWNERSHIP_WINDOW_BYTES) return null
+      if (openingIdentity.size > 0) {
+        const priorByte = await this.system.readRange(
+          openingIdentity.path,
+          openingIdentity.size - 1,
+          1,
+          openingIdentity,
+        )
+        if (priorByte.length !== 1 || priorByte[0] !== 0x0a) return null
+      }
+      const delta = await this.system.readRange(
+        openingIdentity.path,
+        openingIdentity.size,
+        deltaLength,
+        openingIdentity,
+      )
+      const closingIdentity = await this.system.statFile(openingIdentity.path)
+      if (
+        !closingIdentity.regular
+        || !isSameRuntimeIdentity(currentIdentity, closingIdentity)
+        || closingIdentity.size !== currentIdentity.size
+        || delta.length !== deltaLength
+        || delta.at(-1) !== 0x0a
+      ) return null
+      let expectedLifecycleStarted = false
+      for (const rawLine of delta.toString('utf8').split('\n')) {
+        if (!rawLine) continue
+        const row = asRecord(safeJsonParse(rawLine))
+        if (!row) return null
+        const payload = asRecord(row.payload)
+        const observedTurnId = readTurnIdFromRecord(row)
+        if (observedTurnId && observedTurnId !== expectedTurnId) return true
+        if (payload?.type === 'task_started') {
+          if (!observedTurnId) return null
+          expectedLifecycleStarted = true
+        }
+        if (!observedTurnId) {
+          const isOwnedUserMessage = row.type === 'event_msg'
+            && payload?.type === 'user_message'
+            && expectedClientUserMessageId.length > 0
+            && readNonEmptyString(payload.client_id) === expectedClientUserMessageId
+          if (payload?.type === 'user_message') {
+            if (!isOwnedUserMessage) return null
+          } else if (!expectedLifecycleStarted) {
+            return null
+          }
+        }
+      }
+      return false
     } catch {
       return null
     }

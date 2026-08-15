@@ -1,7 +1,7 @@
 import { mkdir, mkdtemp, readFile, rm, stat, symlink, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
-import { afterEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import {
   buildProjectlessFolderName,
   callRpcWithArchiveRecovery,
@@ -388,6 +388,18 @@ describe('writeWorkspaceRootsState', () => {
 })
 
 describe('canonicalizeThreadListResponseForRead', () => {
+  let codexHome = ''
+
+  beforeEach(async () => {
+    codexHome = await mkdtemp(join(tmpdir(), 'codex-thread-list-canonicalization-'))
+    process.env.CODEX_HOME = codexHome
+  })
+
+  afterEach(async () => {
+    await rm(codexHome, { recursive: true, force: true })
+    codexHome = ''
+  })
+
   it('removes heavy conversation payloads from thread-list rows', async () => {
     const payload = await canonicalizeThreadListResponseForRead({
       data: [

@@ -323,12 +323,12 @@ describe('Codex bridge security-policy wiring', () => {
     await expect(readFile(join(outside, 'keep.txt'), 'utf8')).resolves.toBe('keep')
   })
 
-  it('eventually reaps more than 512 expired uploads across repeated bounded batches', async () => {
+  it('eventually reaps more than the configured batch across repeated bounded batches', async () => {
     const root = await mkdtemp(join(tmpdir(), 'codex-managed-upload-batches-'))
     cleanupRoots.push(root)
     const nowMs = Date.now()
     const expiredDate = new Date(nowMs - 10_000)
-    const directories = Array.from({ length: 520 }, (_, index) => join(
+    const directories = Array.from({ length: 10 }, (_, index) => join(
       root,
       `upload-00000000-0000-4000-8000-${index.toString(16).padStart(12, '0')}`,
     ))
@@ -341,14 +341,14 @@ describe('Codex bridge security-policy wiring', () => {
       uploadRoot: root,
       nowMs,
       ttlMs: 5_000,
-      maxEntries: 512,
-    })).resolves.toBe(512)
+      maxEntries: 8,
+    })).resolves.toBe(8)
     await expect(reapExpiredManagedUploads({
       uploadRoot: root,
       nowMs,
       ttlMs: 5_000,
-      maxEntries: 512,
-    })).resolves.toBe(8)
+      maxEntries: 8,
+    })).resolves.toBe(2)
     await expect(Promise.all(directories.map((directory) => lstat(directory).then(
       () => true,
       () => false,
